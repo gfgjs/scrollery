@@ -97,7 +97,14 @@ describe('buildThumbInfoLines', () => {
   it('缺失字段逐项跳过:无 GPS/相机 → 对应行缺席', () => {
     const bare: MediaMeta = { ...meta, gpsLat: null, gpsLng: null, exifMake: null, exifModel: null }
     const lines = buildThumbInfoLines(item, bare, ALL)
-    expect(lines.some((l) => l.includes(','))).toBe(false)
+    // 日期格式可能包含逗号；精确核对保留行，避免把日期误认成 GPS。
+    expect(lines).toEqual([
+      'IMG_0001.jpg',
+      new Date(1700000000 * 1000).toLocaleString(),
+      '4000 × 3000',
+      'D:/photos/2026',
+      '35mm f/1.8 1/250s ISO100',
+    ])
     expect(lines).not.toContain('SONY ILCE-7M4')
   })
   it('拍摄参数部分缺失 → 只拼在场项', () => {
