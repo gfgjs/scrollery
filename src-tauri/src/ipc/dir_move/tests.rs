@@ -827,6 +827,12 @@ fn symlink_escaping_root_is_rejected() {
     let outside = f.tmp.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("secret.jpg"), b"secret").unwrap();
+    // 基础夹具已创建普通目录，先移开，才能在同一路径构造逃逸符号链接。
+    std::fs::rename(
+        f.root_a.join("Photos/Move"),
+        f.root_a.join("Photos/Original"),
+    )
+    .unwrap();
     std::os::unix::fs::symlink(&outside, f.root_a.join("Photos/Move")).unwrap();
 
     let err = load_plan(&f.conn(), 10, 20).unwrap_err();

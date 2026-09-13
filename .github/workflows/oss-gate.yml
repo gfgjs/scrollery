@@ -68,6 +68,10 @@ jobs:
       - name: vite build(生产 bundle)
         run: npm run build
 
+      # 独立 RAW 提前检查，避免 workspace 测试失败时遗漏其构建结果。
+      - name: cargo check(raw-worker 独立 workspace)
+        run: cargo check --manifest-path crates/exotic-workers/raw-worker/Cargo.toml --locked
+
       # 强制门:公开投影树必须能用**同步来的原锁**解析+编译(Cargo.lock 随投影同步,不重生)。
       - name: cargo check --workspace --locked
         run: cargo check --workspace --locked
@@ -77,10 +81,6 @@ jobs:
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked -- --test-threads=1
 
-      # RAW sidecar 刻意脱离根 workspace(crates/exotic-workers/raw-worker 自带 Cargo.lock),
-      # `cargo check --workspace` 天然漏掉它;Linux 侧构建脚本需 clang(见上方 apt 清单)。
-      - name: cargo check(raw-worker 独立 workspace)
-        run: cargo check --manifest-path crates/exotic-workers/raw-worker/Cargo.toml --locked
 
   # 密钥扫描:防私钥 / 私密签发凭证意外混入公开树或其历史(验签公钥本就可公开,不在此列;
   #    独立 ubuntu job,与 gate 并行)。

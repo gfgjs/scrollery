@@ -1618,6 +1618,8 @@ mod tests {
             io.set_results(true, true);
             io.set_nonempty_tiers(tiers);
             let slow_probes = ThumbProbeCache::new(THUMB_PROBE_TTL);
+            // 此处验证 TTL 内复用；IO 耗时仍测真实时间，缓存时间固定以免慢 runner 跨过 TTL。
+            let probe_now = std::time::Instant::now();
             let mut cold_counts = (0u64, 0u64, 0u64);
             let mut hot_counts = (0u64, 0u64, 0u64);
             let mut times = Vec::new();
@@ -1626,14 +1628,8 @@ mod tests {
                 io.reset_counts();
                 let t0 = std::time::Instant::now();
                 let requests = collect_serve_requests(&cache, &rows, 1.0);
-                let serve = ThumbServe::prepare_with(
-                    &io,
-                    &slow_probes,
-                    &dir,
-                    1.0,
-                    &requests,
-                    std::time::Instant::now(),
-                );
+                let serve =
+                    ThumbServe::prepare_with(&io, &slow_probes, &dir, 1.0, &requests, probe_now);
                 let _wire = hydrate_rows(&cache, rows.clone(), Some(&serve), None);
                 let dt = t0.elapsed().as_secs_f64() * 1000.0;
                 let (dirs, files) = io.counts();
