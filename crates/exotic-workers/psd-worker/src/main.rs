@@ -23,8 +23,19 @@ const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 源文件字节上限：读盘前用 metadata 拦截，避免巨文件吃满内存（→ resource_limit）。
 const MAX_SOURCE_FILE_BYTES: u64 = 512 << 20;
 
-fn log(msg: &str) {
-    eprintln!("[psd-worker] {msg}");
+// stderr 结构化日志行(日志能力重构线 阶段 3 · W3,D-313/D-314):替换原 `[psd-worker] {msg}`
+// 纯文本 eprintln,统一走 exotic_protocol::WorkerLogLine 单行 JSON——host 侧 supervisor 逐行解析
+// 转发进主 tracing/JSONL 体系。三档按调用点语义分:正常生命周期(EOF/Shutdown)=info、
+// 非致命异常(单请求解析失败/意外帧,worker 继续服务)=warn、致命错误(握手失败/协议损坏/panic,
+// 均以非零码退出进程)=error。定级清单见 docs/worklogs/2026-07-21-span埋点与worker日志汇入/findings.md。
+fn log_info(msg: impl Into<String>) {
+    exotic_protocol::emit_stderr_log("info", msg, serde_json::Map::new());
+}
+fn log_warn(msg: impl Into<String>) {
+    exotic_protocol::emit_stderr_log("warn", msg, serde_json::Map::new());
+}
+fn log_error(msg: impl Into<String>) {
+    exotic_protocol::emit_stderr_log("error", msg, serde_json::Map::new());
 }
 
 fn main() {
@@ -40,7 +51,7 @@ fn main() {
             // 解析 Hello 仅为记录；协议版本不一致由 Host 在收到 Ready 后判定（本端如实声明自己的版本）。
             if let Ok(hello) = f.parse_json::<exotic_protocol::HelloBody>() {
                 if hello.protocol_version != PROTOCOL_VERSION {
-                    log(&format!(
+                    log_warn(format!(
                         "Hello 协议版本 {} != 本端 {}（仍回 Ready，由 Host 决定）",
                         hello.protocol_version, PROTOCOL_VERSION
                     ));
@@ -48,12 +59,12 @@ fn main() {
             }
         }
         Ok(f) => {
-            log(&format!("握手期望 Hello，收到 {:?} → 退出", f.frame_type));
+            log_error(format!("握手期望 Hello，收到 {:?} → 退出", f.frame_type));
             std::process::exit(2);
         }
         Err(e) if e.is_clean_eof() => std::process::exit(0),
         Err(e) => {
-            log(&format!("握手读取失败：{e} → 退出"));
+            log_error(format!("握手读取失败：{e} → 退出"));
             std::process::exit(2);
         }
     }
@@ -69,7 +80,7 @@ fn main() {
         &mut writer,
         &Frame::control(FrameType::Ready, 0, &ready).unwrap(),
     ) {
-        log(&format!("发送 Ready 失败：{e} → 退出"));
+        log_error(format!("发送 Ready 失败：{e} → 退出"));
         std::process::exit(2);
     }
 
@@ -79,18 +90,18 @@ fn main() {
             Ok(f) => f,
             // stdin EOF（Host 关闭管道/消失）→ 正常退出。
             Err(e) if e.is_clean_eof() => {
-                log("stdin EOF → 退出");
+                log_info("stdin EOF → 退出");
                 std::process::exit(0);
             }
             Err(e) => {
-                log(&format!("读取帧失败（协议损坏）：{e} → 退出"));
+                log_error(format!("读取帧失败（协议损坏）：{e} → 退出"));
                 std::process::exit(3);
             }
         };
 
         match frame.frame_type {
             FrameType::Shutdown => {
-                log("收到 Shutdown → 退出");
+                log_info("收到 Shutdown → 退出");
                 std::process::exit(0);
             }
             FrameType::Request => {
@@ -122,13 +133,13 @@ fn main() {
                             &mut writer,
                             &Frame::control(FrameType::Failure, req_id, &fail).unwrap(),
                         );
-                        log("任务 panic → 已回 internal_error，主动退出进程");
+                        log_error("任务 panic → 已回 internal_error，主动退出进程");
                         std::process::exit(4);
                     }
                 }
             }
             other => {
-                log(&format!("意外帧类型 {other:?} → 忽略"));
+                log_warn(format!("意外帧类型 {other:?} → 忽略"));
             }
         }
     }
@@ -140,7 +151,7 @@ fn handle_request(frame: &Frame) -> Frame {
         Ok(r) => r,
         Err(e) => {
             // 请求体都解析不了：无法可靠取 item_id；回 internal_error（request_id 仍匹配）。
-            log(&format!("Request JSON 解析失败：{e}"));
+            log_warn(format!("Request JSON 解析失败：{e}"));
             let fail = FailureBody {
                 item_id: None,
                 input_fingerprint: None,
@@ -186,7 +197,22 @@ fn handle_request(frame: &Frame) -> Frame {
         | RequestBody::SessionClose { .. }
         | RequestBody::EmbedBatch { .. }
         | RequestBody::FaceDetectEmbed { .. }
-        | RequestBody::EncodeText { .. }) => {
+        | RequestBody::EncodeText { .. }
+        // OCR op 归 ai-worker,psd-worker 不支持。
+        | RequestBody::OcrSessionInit { .. }
+        | RequestBody::OcrSessionClose { .. }
+        | RequestBody::OcrBatch { .. }
+        // 影像增强三件套由独立 enhance-worker 处理,psd-worker 不支持。
+        | RequestBody::EnhanceSessionInit { .. }
+        | RequestBody::EnhanceSessionClose { .. }
+        | RequestBody::EnhanceRun { .. }
+        // 视频格式扩展子系统由独立 video-worker 处理,psd-worker 不支持。
+        | RequestBody::VideoSessionInit { .. }
+        | RequestBody::VideoSessionClose { .. }
+        | RequestBody::VideoProbe { .. }
+        | RequestBody::VideoRemux { .. }
+        | RequestBody::VideoTranscode { .. }
+        | RequestBody::VideoFrames { .. }) => {
             let fail = FailureBody {
                 item_id: other.item_id(),
                 input_fingerprint: other.input_fingerprint().map(str::to_string),

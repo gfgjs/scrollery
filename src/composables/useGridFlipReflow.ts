@@ -1,15 +1,13 @@
 // src/composables/useGridFlipReflow.ts
-// 网格删除/移除后的平滑重排动画（FLIP + 淡出），从 MediaGrid 抽出的自包含 DOM 工具
-// （T18 轨道 B：仅依赖渲染层 layerRef，与 selection / mediaStore / 对话框等全解耦）。
+// 网格删除/移除后的平滑重排动画(FLIP + 淡出),从 MediaGrid 抽出的自包含 DOM 工具
+// (T18 轨道 B:仅依赖渲染层 layerRef,与 selection/mediaStore/对话框等全解耦)。
 //
-// 为什么需要 FLIP：justify 布局在后端算，前端无法本地增量重排；删除一项后整张布局重算，
-// 若不处理则幸存格子会从旧位置**瞬跳**到新位置。FLIP（First-Last-Invert-Play）让幸存格子
-// 从旧屏幕位置平滑滑到新位置：重算前快照各格 rect（First），重算后读新 rect（Last），先无
-// 过渡地反向位移回旧位（Invert），再下一帧过渡回原位（Play）。按 data-item-id 匹配——重算
-// 会销毁重建行 DOM，但 item.id 稳定，故动画仍能续接。
+// 为什么需要 FLIP:justify 布局在后端算,前端无法本地增量重排,删除一项后整张布局重算,
+// 若不处理幸存格子会从旧位置瞬跳到新位置。FLIP(First-Last-Invert-Play):重算前快照各格
+// rect(First),重算后读新 rect(Last),先无过渡反向位移回旧位(Invert),再下一帧过渡回
+// 原位(Play)。按 data-item-id 匹配——重算会销毁重建行 DOM,但 item.id 稳定,动画仍能续接。
 //
-// 仅用于删除/移除路径，绝不挂到滚动驱动的 updateVisible（避免与虚拟滚动 + renderAnchor 打架）。
-// 尊重 prefers-reduced-motion：减少动效时直接跳过、无过渡。
+// 仅用于删除/移除路径,绝不挂到滚动驱动的 updateVisible(避免与虚拟滚动 + renderAnchor 打架)。
 
 import { nextTick } from 'vue'
 
@@ -32,13 +30,9 @@ export function useGridFlipReflow(layerRef: () => HTMLElement | null) {
     return m
   }
 
-  /**
-   * 执行会改变布局的 `mutate`（删除/移除 → 重算），并对幸存格子做 FLIP 平滑过渡。
-   * 尊重 prefers-reduced-motion：减少动效时直接跳过、无过渡。
-   */
+  /** 执行会改变布局的 `mutate`(删除/移除 → 重算),并对幸存格子做 FLIP 平滑过渡。 */
   async function flipReflow(mutate: () => Promise<void>) {
-    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
-    const first = reduce ? null : snapshotCellRects()
+    const first = snapshotCellRects()
 
     await mutate()
     await nextTick() // 等新布局渲染出 DOM，才能读到「Last」位置
@@ -86,8 +80,6 @@ export function useGridFlipReflow(layerRef: () => HTMLElement | null) {
    * 不可见的（虚拟滚动窗外）本就不在屏，直接被重算移除即可）。返回淡出耗时后 resolve。
    */
   async function fadeOutCells(ids: number[]) {
-    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
-    if (reduce) return
     const root = layerRef()
     if (!root) return
     const idSet = new Set(ids)

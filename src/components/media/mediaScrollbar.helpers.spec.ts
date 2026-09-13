@@ -48,4 +48,28 @@ describe('mediaScrollbar.helpers', () => {
     expect(thumbTopToLogicalY(1e9, 30_000_000, 900, 32)).toBe(30_000_000 - 900)
     expect(thumbTopToLogicalY(10, 2000, 1000, 1000)).toBe(0)
   })
+
+  it('固定指针模式(fixedThumb):高度恒定,不随比例/最小高计算', () => {
+    const g = thumbGeometry(0, 10000, 500, MIN_THUMB_PX, 48)!
+    expect(g.height).toBe(48)
+  })
+
+  it('固定指针模式:高度钳到轨道高上限', () => {
+    const g = thumbGeometry(0, 100, 40, MIN_THUMB_PX, 48)!
+    expect(g.height).toBe(40)
+  })
+
+  it('固定指针模式:round-trip 与比例模式互逆', () => {
+    const total = 30_000_000
+    const trackH = 900
+    for (const y of [0, 123_456, 15_000_000, total - trackH]) {
+      const g = thumbGeometry(y, total, trackH, MIN_THUMB_PX, 48)!
+      expect(g.height).toBe(48)
+      expect(thumbTopToLogicalY(g.top, total, trackH, g.height)).toBeCloseTo(y, 4)
+    }
+  })
+
+  it('固定指针模式:内容不足一屏仍返回 null', () => {
+    expect(thumbGeometry(0, 500, 1000, MIN_THUMB_PX, 48)).toBeNull()
+  })
 })

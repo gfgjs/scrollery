@@ -1,5 +1,4 @@
 // src-tauri/src/audio/mod.rs
-//! Audio metadata / cover art / lyrics extraction (P3, §3.6) via `lofty` (pure Rust, lightweight).
 //! 音频元数据 / 封面图 / 歌词提取（P3，§3.6），基于 `lofty`（纯 Rust，符合轻量原则）。
 //!
 //! 本模块是音频能力的纯函数层，供三处复用：
@@ -17,7 +16,6 @@ use lofty::read_from_path;
 
 use crate::error::{AppError, Result};
 
-/// Tags + properties read from an audio file (the subset persisted in `audio_meta` + duration).
 /// 从音频文件读取的标签 + 属性（`audio_meta` 持久化的子集 + 时长）。
 #[derive(Debug, Clone, Default)]
 pub struct AudioTags {
@@ -29,7 +27,6 @@ pub struct AudioTags {
     pub year: Option<i64>,
     pub genre: Option<String>,
     pub duration_ms: Option<i64>,
-    /// Embedded lyrics text (ID3 `USLT`, Vorbis `LYRICS`, MP4 `©lyr`…), if any.
     /// 内嵌歌词文本（ID3 `USLT`、Vorbis `LYRICS`、MP4 `©lyr`…），若有。
     pub lyrics: Option<String>,
 }
@@ -54,7 +51,6 @@ pub fn lyrics_source(tags: &AudioTags, lrc: &Option<PathBuf>) -> &'static str {
     }
 }
 
-/// A short, stable codec label from lofty's `FileType` (stored in `audio_meta.audio_codec`).
 /// 由 lofty `FileType` 得到的简短稳定编解码标签（存入 `audio_meta.audio_codec`）。
 fn codec_label(ft: lofty::file::FileType) -> &'static str {
     use lofty::file::FileType as F;
@@ -120,7 +116,6 @@ fn tags_from(tagged: &lofty::file::TaggedFile) -> AudioTags {
     };
     let codec = Some(codec_label(tagged.file_type()).to_string());
 
-    // primary_tag (the format's canonical tag) → first_tag fallback (e.g. ID3v1 only).
     // primary_tag（该格式的规范标签）→ first_tag 兜底（如仅 ID3v1）。
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
 
@@ -165,7 +160,6 @@ fn cover_from(tagged: &lofty::file::TaggedFile) -> Option<(Vec<u8>, &'static str
     if pics.is_empty() {
         return None;
     }
-    // Prefer the explicit front cover; else fall back to the first picture present.
     // 优先正面封面；否则退回第一张图片。
     let pic = pics
         .iter()
@@ -205,7 +199,6 @@ pub fn find_lrc(path: &Path) -> Option<PathBuf> {
 /// 从**已读取**的标签 + 文件路径为播放器解析歌词：先内嵌，再同名 `.lrc`。返回 `(文本, 是否带时间轴)`
 /// —— 文本含 LRC `[mm:ss]` 时间标签则为 true。接收预读标签，使调用方（如 `get_audio_detail`）无需重复解析文件。
 pub fn lyrics_from_tags(tags: &AudioTags, path: &Path) -> (Option<String>, bool) {
-    // Embedded lyrics win (already in the tag, no extra file read for the common case).
     // 内嵌歌词优先（已在标签内，常见情形无需额外读文件）。
     if let Some(text) = tags.lyrics.as_deref().filter(|s| !s.trim().is_empty()) {
         return (Some(text.to_string()), is_synced_lrc(text));
@@ -219,12 +212,10 @@ pub fn lyrics_from_tags(tags: &AudioTags, path: &Path) -> (Option<String>, bool)
     (None, false)
 }
 
-/// Heuristic: does this lyrics text contain at least one `[mm:ss(.xx)]` LRC timestamp?
 /// 启发式判断：歌词文本是否至少含一个 `[mm:ss(.xx)]` LRC 时间标签？
 fn is_synced_lrc(text: &str) -> bool {
     text.lines().any(|line| {
         let l = line.trim_start();
-        // Cheap shape check: `[` + digit, with a `:` before the closing `]`.
         // 轻量形状检查：`[` 后接数字，且 `]` 前含 `:`。
         if let Some(rest) = l.strip_prefix('[') {
             if let Some(close) = rest.find(']') {

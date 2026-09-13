@@ -27,11 +27,22 @@ pub mod decoded;
 pub mod embedding;
 #[cfg(feature = "inference")]
 pub mod engine;
+// 影像增强(降噪/去伪影/超分)模型契约:纯数据零 ort,同 ocr_profile/face_profile 模式,
+// 不门控 inference feature。推理面留 P0 批 2(crates/scrollery-ai-core/src/enhance/)。
+pub mod enhance_profile;
+// 影像增强推理面(P0 批 2):enhance/tiling 纯几何无门,enhance/chain 推理面在 inference 门内
+// (模块内自门,照 clip/ocr 门法)。mod 本身无门:纯类型/错误/tiling 恒可用。
+pub mod enhance;
 pub mod error;
 #[cfg(feature = "inference")]
 pub mod face;
 pub mod face_profile;
 pub mod face_types;
+// OCR 管线(自研 det+cls+rec+CTC):`ocr_profile` 纯契约不门控(src-tauri 关默认特性消费,
+// 同 face_profile 模式);`ocr` 推理面在 inference 门内(ort/imageproc)。
+#[cfg(feature = "inference")]
+pub mod ocr;
+pub mod ocr_profile;
 pub mod profile;
 #[cfg(feature = "inference")]
 pub mod provider;

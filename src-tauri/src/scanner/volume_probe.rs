@@ -61,6 +61,8 @@ pub trait VolumeResolver: Send + Sync {
 }
 
 /// 默认实现：以「卷挂载根」（盘符 / UNC share / POSIX `/`）派生稳定 ID，使同盘多根并卷。
+/// 该实现无法识别卷类型；它只适合非物理清理场景的路径级卷登记，Windows 生产路径由
+/// [`PlatformVolumeResolver`] 补充原生判定。
 pub struct PathVolumeResolver;
 
 impl VolumeResolver for PathVolumeResolver {
@@ -68,7 +70,8 @@ impl VolumeResolver for PathVolumeResolver {
         let root = derive_volume_root(root_path);
         ResolvedVolume {
             stable_id: format!("path:{root}"),
-            // 路径派生无法判定可移动 / 网络盘；保守 Local，原生解析时再细分。
+            // 独立的路径派生 resolver 没有卷类型能力；其返回值只供非物理清理路径使用。
+            // Windows 生产入口会在原生探测失败时把该结果收紧为 Unknown。
             kind: VolumeKind::Local,
             mount_path: root,
         }
@@ -105,7 +108,7 @@ pub fn derive_volume_root(path: &str) -> String {
 ///
 /// 防御原则：原生 API 任一步失败 → 回退路径派生，**绝不**因解析失败中断「添加扫描根」。
 /// 数据模型不变（仍按卷登记），故 win/path 两种 stable_id 可共存；新根用原生 GUID，
-/// 既有 path 派生卷行保持（重新添加该根即升级，无需强制迁移）。
+/// 既有 path 派生卷行由迁移收紧为 Unknown，重新添加并完成原生探测后才重新获得具体能力。
 pub struct PlatformVolumeResolver;
 
 impl VolumeResolver for PlatformVolumeResolver {
@@ -115,9 +118,16 @@ impl VolumeResolver for PlatformVolumeResolver {
             if let Some(v) = win_resolve_volume(root_path) {
                 return v;
             }
-            // 原生解析失败 → 回退路径派生（下方）。
+            // 原生 API 解析失败时仍保留路径派生的 stable_id，但能力必须标为 Unknown；
+            // 不能把“无法确认是固定本地卷”误报成 Local，从而开放物理清理。
+            let mut fallback = PathVolumeResolver.resolve(root_path);
+            fallback.kind = VolumeKind::Unknown;
+            fallback
         }
-        PathVolumeResolver.resolve(root_path)
+        #[cfg(not(windows))]
+        {
+            PathVolumeResolver.resolve(root_path)
+        }
     }
 }
 
@@ -158,9 +168,10 @@ fn win_resolve_volume(root_path: &str) -> Option<ResolvedVolume> {
 
     // 3) 盘类型 → VolumeKind。
     let kind = match unsafe { GetDriveTypeW(PCWSTR(mount.as_ptr())) } {
+        3 => VolumeKind::Local, // DRIVE_FIXED
         DRIVE_REMOVABLE => VolumeKind::Removable,
         DRIVE_REMOTE => VolumeKind::Network,
-        _ => VolumeKind::Local, // DRIVE_FIXED / 未知 一律按本地
+        _ => VolumeKind::Unknown,
     };
 
     Some(ResolvedVolume {
@@ -235,5 +246,14 @@ mod tests {
         let b = r.resolve("C:\\B\\videos");
         assert_eq!(a.stable_id, b.stable_id, "同盘多根应并为同一卷");
         assert_eq!(a.stable_id, "path:C:");
+    }
+
+    #[test]
+    fn unknown_volume_kind_is_not_coerced_to_local() {
+        assert_eq!(VolumeKind::Unknown.as_str(), "unknown");
+        assert!(matches!(
+            VolumeKind::from_str_lossy("future-volume-kind"),
+            VolumeKind::Unknown
+        ));
     }
 }

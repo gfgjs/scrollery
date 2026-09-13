@@ -1,5 +1,5 @@
 // src/composables/useHVirtualScroll.ts
-// H-Lab 横向虚拟滚动(x 轴可视窗口;plan-docs/2026-07-02-horizontal-gallery-lab.md §2-3)。
+// H-Lab 横向虚拟滚动(x 轴可视窗口;docs/designs/2026-07-02-horizontal-gallery-lab.md §2-3)。
 //
 // 与生产 useVirtualScroll 的关系:同款「rAF 节流 + 取数边界框去重 + fetchId 竞态守卫」模式
 // (那套已被实战验证),但**独立实现且刻意不移植坐标压缩**(SAFE_MAX 平移模式)——实验库
@@ -11,6 +11,7 @@
 
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import type { HBlock } from '../types/hgallery'
+import { logger } from '../utils/logger'
 
 const LOG = '[HVirtualScroll]'
 
@@ -29,30 +30,27 @@ interface UseHVirtualScrollOptions {
   containerRef: () => HTMLElement | null
 }
 
-// ── 滚轮动画器:定时长线性重定标(五轮手测收敛的终态模型)──────────────────────
+// 滚轮动画器:定时长线性重定标(五轮手测收敛的终态模型)。
 //
-// 为何自研(六轮演进,全史见 plan §2-3①):原生程序化平滑滚动(scrollBy/scrollTo
-// smooth)是 ease-in-out 曲线、每次重定标都从零速起步,且浏览器不提供缓动控制
-// API——快速启动的缓入迟滞(五轮反馈)在原生路线上无解。四条体验约束:不阶跃
-// (一轮)、慢滚不脉动(二轮)、连滚不丢量(四轮)、启动即跟手(五轮),线性段是
-// 唯一同时满足的曲线:输入即满速(ease-out 级跟手)而无其速度尖峰(慢滚不脉动)。
+// 为何自研(六轮演进,全史见 plan §2-3①):原生 scrollBy/scrollTo smooth 是 ease-in-out 曲线、
+// 每次重定标都从零速起步,且无缓动控制 API——快速启动的缓入迟滞在原生路线上无解。四条体验
+// 约束:不阶跃、慢滚不脉动、连滚不丢量、启动即跟手,线性段是唯一同时满足的曲线——
+// 输入即满速(跟手),又不带其速度尖峰(慢滚不脉动)。
 //
-// 实现 = **帧积分**而非锚点插值(六轮「极快启动顿滞」教训):输入只更新
-// 「累积目标 + 截止线(末次输入 + durMs)」,位移在帧循环里按帧间隔积分
-// `Δx = 剩余距离 × 帧dt / 剩余时间`——无输入时逐帧衔接即恒速线性(与锚点插值
-// 等价),但输入频率高于帧率时速度不塌缩(锚点插值每次输入把时间锚拉回当下,
-// 帧 dt 塌缩为输入间隔,速度随输入率反常下降,极快连滚起手形同冻结)。
+// 实现=帧积分而非锚点插值(六轮「极快启动顿滞」教训:锚点插值每次输入把时间锚拉回当下,帧 dt
+// 塌缩为输入间隔,速度随输入率反常下降,极快连滚起手形同冻结):输入只更新「累积目标 + 截止线
+// (末次输入 + durMs)」,位移在帧循环里按 `Δx = 剩余距离 × 帧dt / 剩余时间` 积分,无输入时
+// 逐帧衔接即恒速线性,输入频率高于帧率时速度不塌缩。
 //
-// 方向安全三道**构造性**约束(三轮方向乱跳教训——当时根因是未钳制 t 的实现 bug,
-// 却误判为模型缺陷整体撤销,后已复活模型并修复实现):
-// ① 帧 dt 钳 0:rAF 回调时间戳可早于输入侧 now() 时钟,负 dt 写值退化为
-//    原地(no-op)而非反向外插;
-// ② 目标仅在本次滚动方向前方时才累积,否则从当前位置重算——每帧写值恒在
-//    [当前位置, 目标] 区间内,方向单调由构造保证;反向输入/外源位移自动重基;
-// ③ 定时长 → 末次输入后 durMs 内必然终止,不与滚动条拖拽等外源滚动持续对抗。
+// 方向安全三道构造性约束(三轮方向乱跳教训——根因实为未钳制 t 的实现 bug,当时却误判为
+// 模型缺陷整体撤销,后已复活模型并修复实现):
+// ① 帧 dt 钳 0:rAF 时间戳可早于输入侧 now() 时钟,负 dt 退化为原地而非反向外插;
+// ② 目标仅在滚动方向前方时才累积,否则从当前位置重算——每帧写值恒在 [当前位置, 目标] 区间内,
+//    方向单调由构造保证,反向输入/外源位移自动重基;
+// ③ 定时长:末次输入后 durMs 内必然终止,不与滚动条拖拽等外源滚动持续对抗。
 //
-// 独立于 Vue 生命周期并注入 raf/时钟:四次翻车的命门路径,按「测点由风险决定」
-// 纪律做成确定性测试接缝(承接 R2-5 seam 做法),锁测见 useHVirtualScroll.spec.ts。
+// 独立于 Vue 生命周期并注入 raf/时钟:四次翻车的命门路径,做成确定性测试接缝,
+// 锁测见 useHVirtualScroll.spec.ts。
 
 /// 单段动画时长 ms:输入间隔 ≤ 此值时相邻段无缝衔接成连续运动(约两倍于快速
 /// 滚轮的格间隔);再大则慢滚每格拖尾过长,再小则退化向阶跃。
@@ -90,8 +88,8 @@ export function createWheelAnimator(deps: WheelAnimatorDeps) {
       rafId = null
       return
     }
-    // 帧积分:Δx = 剩余距离 × 帧dt / 剩余时间。dt 钳 0 防时间戳乱序反向外插
-    // (三轮教训);dt 吃满剩余时间即到点,快照目标并终止。
+    // 帧积分:Δx = 剩余距离 × 帧dt / 剩余时间。dt 钳 0 防时间戳乱序反向外插;
+    // dt 吃满剩余时间即到点,快照目标并终止。
     const dt = Math.max(0, frameNow - lastFrame)
     const timeLeft = deadline - lastFrame
     lastFrame = Math.max(lastFrame, frameNow)
@@ -154,7 +152,7 @@ export function useHVirtualScroll(opts: UseHVirtualScrollOptions) {
   let ticking = false
   let pendingUpdate = false
 
-  // ── 可视窗口计算(生产 updateVisible 的 x 轴版,无坐标平移分支)────────────────
+  // 可视窗口计算(生产 updateVisible 的 x 轴版,无坐标平移分支)。
   async function updateVisible(force = false) {
     if (force) {
       lastFetchedLeft = -1
@@ -195,7 +193,7 @@ export function useHVirtualScroll(opts: UseHVirtualScrollOptions) {
       if (myFetchId !== currentFetchId) return
       visibleBlocks.value = blocks
     } catch (err) {
-      console.error(LOG, 'fetchBlocksByX FAILED:', err)
+      logger.error(`${LOG} fetchBlocksByX FAILED`, { error: err })
     } finally {
       if (myFetchId === currentFetchId) {
         isFetching.value = false
@@ -224,7 +222,7 @@ export function useHVirtualScroll(opts: UseHVirtualScrollOptions) {
     }
   }
 
-  // ── 滚动中标志(2026-07-02 掉帧反馈修复)────────────────────────────────────
+  // 滚动中标志(2026-07-02 掉帧反馈修复)。
   /// 滚动进行中(160ms 空闲判定)。宿主用它在滚动期抑制 hover(pointer-events),
   /// 避免快速横扫时 hover 样式重算/悬停预览抖动——对齐生产网格 isScrolling 纪律。
   const isScrolling = ref(false)
@@ -243,7 +241,7 @@ export function useHVirtualScroll(opts: UseHVirtualScrollOptions) {
     scheduleUpdate()
   }
 
-  // ── 滚轮转译:竖滚 → 横滚(deltaMode 归一同生产 wheel 补偿)──────────────────
+  // 滚轮转译:竖滚 → 横滚(deltaMode 归一同生产 wheel 补偿)。
   /// 动画模型与方向安全约束见文件头部 createWheelAnimator;此处仅做事件归一与接线。
   const wheelAnim = createWheelAnimator({ el: () => opts.containerRef() })
 
@@ -260,7 +258,7 @@ export function useHVirtualScroll(opts: UseHVirtualScrollOptions) {
     // 动画帧内写 scrollLeft → scroll 事件 → onScroll → 取数调度,无需重复调度。
   }
 
-  // ── 键盘导航(宿主在容器 keydown 中调用)────────────────────────────────────────
+  // 键盘导航(宿主在容器 keydown 中调用)。
   /// 平移一个视口宽的 ratio 倍(翻屏用 smooth,方向键小步用 instant 以支持连按)。
   function scrollByViewport(ratio: number, smooth = true) {
     const container = opts.containerRef()
@@ -287,7 +285,7 @@ export function useHVirtualScroll(opts: UseHVirtualScrollOptions) {
   onMounted(() => {
     const el = opts.containerRef()
     if (!el) {
-      console.warn(LOG, 'onMounted: containerRef is null')
+      logger.warn(`${LOG} onMounted: containerRef is null`)
       return
     }
     containerWidth.value = el.clientWidth

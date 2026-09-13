@@ -1,10 +1,9 @@
-// scripts/exotic-issue-license.mjs
 // License token 签发器(Part8 D1 签发端;内测与生产签发机双形态,2026-07-06 硬化)。
 //
 // 产出一枚 `payload.sig` 形态的激活 token(exotic-trust §5.2),用户在应用
-// 「插件商店 → 激活」里粘贴即可解锁付费插件(安装包的信任根须含对应公钥:内测经
-// PICASA_EXOTIC_KEYSET_FILE 注入 internal-keyset.json,生产为 ceremony 产出的
-// exotic-keyset-prod.json)。
+// 「插件商店 → 激活」里粘贴即可解锁付费插件(统一信任根在 crates/scrollery-exotic-trust;
+// 安装包的信任根须含对应公钥:内测经 PICASA_EXOTIC_KEYSET_FILE 注入 internal-keyset.json,
+// 生产为 ceremony 产出的 exotic-keyset-prod.json)。
 //
 // 用法:
 //   node scripts/exotic-issue-license.mjs                      # PSD 插件,永久授权(内测)

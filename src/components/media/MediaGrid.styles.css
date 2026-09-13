@@ -1,0 +1,626 @@
+.media-grid-layout {
+  display: flex;
+  flex-direction: row;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  position: relative;
+  /* 画廊画布区专用底色(感知学红线):一切主题此 token 都是低饱和中性色,
+     暖调/冷调主题的"花样"只落在 chrome,照片观感不被 UI 带偏。 */
+  background: var(--color-bg-canvas);
+}
+
+.media-grid-wrapper {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 语义子视图返回栏（人物 / 收藏夹）：置于网格上方、不参与虚拟滚动。 */
+.view-back-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 8px var(--spacing-md);
+  background: var(--color-bg-surface);
+  border: none;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.view-back-bar:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.view-back-bar__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-grid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  /* 左右都不为原生滚动条留槽位:自绘 MediaScrollbar 浮于内容之上,不占布局宽度。 */
+  padding-left: 0;
+  padding-right: 0;
+  position: relative;
+  overflow-anchor: none;
+}
+
+/* T16 B3.2:bucket 引擎隐藏原生滚动条——原生拇指只跟随物理 spacer(映射态钳 16M),
+   结构上无法表达逻辑比例,且停稳偿债挪 scrollTop 时会可见回跳;改由 MediaScrollbar
+   渲染逻辑百分比。两引擎左右 padding 均为 0(见 .media-grid),故引擎切换零布局位移。 */
+.media-grid--bucket {
+  scrollbar-width: none;
+}
+.media-grid--bucket::-webkit-scrollbar {
+  display: none;
+}
+
+/* 行体抽入子组件 MediaGridRow 后(T16 收尾),行根类(.media-grid__row/.date-separator)
+   继承本组件作用域属性、原选择器照常命中;卡片/分隔符内部类则须 :deep() 穿透——
+   scoped 编译后特异性不变(同为一属性+一类),视觉零差异。 */
+.media-grid.is-scrolling :deep(.media-card) {
+  pointer-events: none !important;
+}
+
+.media-grid__content {
+  position: relative;
+  width: 100%;
+  /* 裁剪被 transform 定位的渲染层到本盒子（B1）。坐标平移模式下缓冲行会被定位到
+     [0, spacerHeight] 之外，不裁剪会泄漏进滚动容器的可滚动溢出区，使 scrollHeight
+     超过 spacerHeight，从而破坏物理↔逻辑映射（滚动条抖动、跳到底部、错位）。
+     裁剪后 scrollHeight 恒等于 spacerHeight；可视行始终落在 [0, spacerHeight] 内，
+     屏幕上不会被裁剪，仅裁剪视口外的缓冲行。 */
+  overflow: hidden;
+}
+
+/* compute_layout 首屏骨架(S5):flex 换行模拟 justified 网格的首屏落位。
+   height:100% + overflow:hidden 铺满整个画廊视口——格数由 skeletonCount 按视口宽高算得
+   略超一屏,溢出行被裁掉,既不留下半屏空白也不产生滚动。 */
+.media-grid__skeleton {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: var(--grid-gap);
+  padding: var(--spacing-sm);
+  height: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.media-grid__skeleton-cell {
+  height: calc(var(--grid-row-height) * 0.75);
+  flex: 1 1 200px;
+  max-width: 340px;
+}
+
+/* T16 方案B(B1.5):段行未到时的骨架条纹——远跳/横扫瞬间以行状占位替代白屏;
+   取数常态单飞、陈旧时最新段可旁路，落地通常只短暂可见。 */
+.media-grid__segment--loading {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--color-bg-surface) 0px,
+    var(--color-bg-surface) 172px,
+    transparent 172px,
+    transparent 180px
+  );
+  opacity: 0.6;
+}
+
+.media-grid__row {
+  display: flex;
+  flex-wrap: nowrap;
+  /* 溢出部分必须可见，这样悬停时缩放的卡片就可以超出该行的边界 */
+  overflow: visible;
+  z-index: 2;
+  /* 220ms 延迟复位为刻意行为:悬停放大的卡片会临时溢出行边界,若 hover 移出时 z-index
+     立即归位,溢出部分会被下一行相邻卡片瞬间盖住;延迟回落让缩放动画走完再降层级。 */
+  transition: z-index 220ms linear;
+}
+
+.media-grid__row:hover {
+  z-index: 100;
+  transition: z-index 0ms;
+}
+
+/* compact 模式下禁用行级 z-index transition 以减少不必要的重绘 */
+.is-compact .media-grid__row {
+  transition: none;
+}
+.is-compact .media-grid__row:hover {
+  z-index: 2;
+  transition: none;
+}
+
+/* 组标题行(2026-09-12 用户裁决):与画廊底沉浸融合——不铺底色、不投影、不画分隔线,
+   只有图标 + 文字 + 计数。行高/分组/sticky 定位逻辑不变。 */
+.date-separator {
+  display: flex;
+  min-height: 32px;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  align-items: center;
+  padding-left: 0;
+  background: transparent;
+}
+
+:deep(.separator-content) {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  width: 100%;
+  min-height: 20px;
+  padding: var(--spacing-xs) var(--spacing-xs);
+  background: transparent;
+}
+
+:deep(.date-separator .separator-content) {
+  position: sticky;
+  top: 0;
+}
+
+:deep(.separator-text) {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+:deep(.separator-count) {
+  margin-left: calc(var(--spacing-sm) * -1);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+
+:deep(.separator-icon) {
+  color: var(--color-text-secondary);
+}
+
+/* 重复组头(§6.1):复用 .separator-content 布局,仅补 h2 浏览器默认样式复位
+   (字号/外边距按现有分隔符密度对齐,不放大)。 */
+:deep(.separator-content--dup) {
+  margin: 0;
+  border: none;
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+/* 文件夹头(§7.2/§11.2,P3;h3 层级低于组头 h2):块级纵排——簇首三行(簇头行并入,
+   §7.2 避免两层 sticky)/其余两行(路径 + 三桶统计)。行盒 36px(SEPARATOR_HEIGHT),
+   紧凑行高压到 ~38.5px,溢出 ~2.5px 沉入段间 gap(4px),不压上下卡片行。图标(13/12px)+
+   缩进 + 字号与组头(CopyCheck 16px 单行)可区分,不只靠颜色。 */
+:deep(.separator-content--dupFolder) {
+  margin: 0;
+  border: none;
+  font-size: inherit;
+  font-weight: inherit;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 0;
+  min-height: 0;
+  padding: 2px var(--spacing-xs) 0;
+  line-height: 1.05;
+}
+/* 簇头行(§7.1):关联图标 + 文本,accent 色强化「这是簇不是文件夹」。 */
+:deep(.separator-content--dupFolder .dup-folder__cluster) {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  font-size: var(--font-size-2xs);
+  font-weight: 500;
+  color: var(--color-accent-text);
+}
+:deep(.separator-content--dupFolder .dup-folder__cluster-icon) {
+  flex-shrink: 0;
+}
+:deep(.separator-content--dupFolder .dup-folder__cluster-text) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+:deep(.separator-content--dupFolder .dup-folder__path) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+:deep(.separator-content--dupFolder .separator-text) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+/* 统计行:左缩进对齐路径文本(13px 图标 + 6px gap);11px 次要色,读感低于路径行。 */
+:deep(.separator-content--dupFolder .dup-folder__stats) {
+  padding-left: 19px;
+  font-size: var(--font-size-2xs);
+  font-weight: 400;
+  color: var(--color-text-secondary);
+}
+
+/* 重复镜头组内位次角标(§6.2,M/N):右上角,scrim 底与 MediaThumb 徽标体系同源
+   (--color-badge-scrim),与左下可用态/待删角标对角错开;紧凑不喧宾。 */
+:deep(.media-card__lens-badge) {
+  position: absolute;
+  top: var(--spacing-2xs);
+  right: var(--spacing-2xs);
+  z-index: 12;
+  font-size: var(--font-size-2xs);
+  font-weight: 700;
+  line-height: 1;
+  padding: var(--spacing-2xs) var(--spacing-xs);
+  border-radius: var(--radius-xs);
+  background: var(--color-badge-scrim);
+  color: var(--color-text-primary);
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+/* 问号角标(§7.3 尚未确认,folders):CircleHelp 图标复用同款角标底,图标块级消除基线空隙。 */
+:deep(.media-card__lens-badge-icon) {
+  display: block;
+}
+
+.timeline-sidebar-wrapper {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  height: 100%;
+  /* 显式宽度(与 .timeline-sidebar 同源变量):显隐折叠/时间轴↔minimap 形态切换都要做
+     width 动画,auto 宽不可过渡。 */
+  width: var(--timeline-axis-width, 44px);
+  transition: width var(--transition-normal);
+  /* 抬到画廊卡片(media-card z-index 2,hover 100)之上:年份标签用 right:100% 左浮进画廊区,
+     无 z-index 时会被缩略图盖住(用户实测)。101 让整条时间轴(含左浮标签/浮层)恒在缩略图上层。 */
+  z-index: 101;
+}
+
+.timeline-sidebar-wrapper--minimap {
+  width: var(--minimap-axis-width, 96px);
+}
+
+/* ── 轴显隐动画(axis-slide):wrapper 宽度折叠让画廊平滑回流,内层轴体右滑淡出。
+   overflow:hidden 只在动画期挂——静息态不能裁掉 right:100% 左浮进画廊的年份标签。
+   动画期画廊宽度逐帧变化会连续触发 ResizeObserver,但 onResize 经 resizeDebounceMs
+   防抖,布局只在动画收尾后重算一次。width:0 与形态修饰类同特异度,规则须排在其后。
+   系统「减少动态效果」由 animations.css 全局压时长,此处不需另设。 */
+.axis-slide-enter-active,
+.axis-slide-leave-active {
+  overflow: hidden;
+}
+
+.axis-slide-enter-from,
+.axis-slide-leave-to {
+  width: 0;
+}
+
+.axis-slide-enter-active .timeline-sidebar,
+.axis-slide-leave-active .timeline-sidebar {
+  transition:
+    transform var(--transition-normal),
+    opacity var(--transition-normal);
+}
+
+.axis-slide-enter-from .timeline-sidebar,
+.axis-slide-leave-to .timeline-sidebar {
+  transform: translateX(40%);
+  opacity: 0;
+}
+
+/* ── 轴控制簇(chevron + 形态钮 + dev 渲染药丸)──────────────────────────────
+   2026-07-24:迁 Teleport 到底栏 #statusbar-axis-outlet(AppStatusBar.vue),不再是画廊内
+   浮层——绝对定位/z-index 层叠对抗随迁移一并消解,底栏内恒显(不再靠 hover 才现)。 */
+
+/* 紧凑图标钮,镜像 .statusbar__settings-btn(22×22)尺寸档。 */
+.timeline-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 3px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+.timeline-toggle-btn.is-open {
+  color: var(--color-text-primary);
+}
+.timeline-toggle-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* 用户可见的轴形态切换；文字显示当前形态，title 描述目标动作。 */
+.axis-mode-btn {
+  min-width: 48px;
+  height: 24px;
+  padding: 0 var(--spacing-sm);
+  font-size: var(--font-size-2xs);
+  line-height: 1;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.axis-mode-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+.axis-mode-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.axis-mode-btn.is-minimap {
+  color: var(--color-accent-text);
+  background: var(--color-accent-subtle);
+}
+
+/* 时间轴渲染切换药丸(测试对比用):挂在轴控制簇末位,显当前模式,点击切换。 */
+.timeline-mode-btn {
+  height: 24px;
+  padding: 0 var(--spacing-sm);
+  display: flex;
+  align-items: center;
+  font-size: var(--font-size-2xs);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+.timeline-mode-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+.timeline-mode-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.timeline-mode-btn.is-canvas {
+  color: var(--color-accent-text);
+  background: var(--color-accent-subtle);
+}
+
+/* 画廊 DOM↔Canvas 一键切换药丸(§9 T4 原型对比):左上角,不与右侧时间轴药丸重叠。 */
+.gallery-mode-btn {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  height: 24px;
+  padding: 0 var(--spacing-sm);
+  display: flex;
+  align-items: center;
+  font-size: var(--font-size-2xs);
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  z-index: 102; /* 与轴控制簇同层:hover 卡片(100)不得压住 */
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+.gallery-mode-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+.gallery-mode-btn.is-canvas {
+  color: var(--color-accent-text);
+  background: var(--color-accent-subtle);
+}
+
+.timeline-toggle-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+
+.timeline-sidebar {
+  /* 轴宽可调(设置页「界面」节 timelineAxisWidth → --timeline-axis-width)；44px 保证密度带与刻度可辨。 */
+  width: var(--timeline-axis-width, 44px);
+  height: 100%;
+  background: var(--color-bg-primary);
+  border-left: 1px solid var(--color-border);
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  /* 与 wrapper 的 width transition 同步:形态切换时内外层一起过渡,轴体不与外框脱节。 */
+  transition: width var(--transition-normal);
+}
+
+/* minimap 形态:微缩预览需要比时间轴宽的画布(44px 放不下可辨内容),独立变量不动
+   --timeline-axis-width 的共享语义。 */
+.timeline-sidebar--minimap {
+  width: var(--minimap-axis-width, 96px);
+}
+
+:deep(.media-card) {
+  position: relative;
+  /* 形状剪裁在 .media-thumb 内部处理；保持卡片可见 */
+  overflow: visible;
+  border-radius: 2px;
+  cursor: pointer;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+
+  /* 基础状态: 位于相邻元素之后 */
+  z-index: 2;
+
+  /* 鼠标移出时，使用线性的 z-index 插值，使其平滑下降，避免被邻居瞬间遮挡，也能保证新 hovered 项在最前 */
+  transition:
+    transform 220ms cubic-bezier(0.34, 1.18, 0.64, 1),
+    box-shadow 220ms ease,
+    z-index 220ms linear;
+}
+
+/* ── 暂存删除（待重排）：置灰 + 降透明 + 「待删除」角标 ─────────────────────── */
+/* 退出选择模式时这些项会被 fadeOut + FLIP 一次性重排移除（撤销可恢复）。 */
+:deep(.media-card--pending-delete) {
+  filter: grayscale(1) brightness(0.7);
+  opacity: 0.45;
+  transition:
+    opacity 0.2s ease,
+    filter 0.2s ease;
+}
+:deep(.media-card__pending-badge) {
+  position: absolute;
+  bottom: var(--spacing-2xs); /* 左下角:让出左上给拖拽手柄(与 .media-thumb__avail 对齐) */
+  left: var(--spacing-2xs);
+  z-index: 12; /* 盖过缩略图徽标 */
+  font-size: var(--font-size-2xs);
+  font-weight: 700;
+  line-height: 1;
+  padding: var(--spacing-2xs) var(--spacing-xs);
+  border-radius: var(--radius-xs);
+  background: var(--color-error);
+  color: var(--color-text-on-error);
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+
+/* 待删态:评分星条上抬一档,避让左下角的「待删除」角标(与 MediaThumb 内 missing/offline 抬升同理;
+   pending 是卡级状态,故在宿主按 .media-card--pending-delete 命中 thumb 内的 rating-slot)。 */
+:deep(.media-card--pending-delete .media-thumb__rating-slot) {
+  bottom: 24px;
+}
+
+/* 极小单元模式：让浏览器跳过离屏单元的渲染。单元有显式行内宽高，
+   故尺寸包含不会使其塌陷。
+   同时禁用 will-change / transition / hover-scale 以释放 800+ GPU 合成层。 */
+:deep(.media-card--compact) {
+  content-visibility: auto;
+  will-change: auto;
+  transition: none;
+}
+
+/* compact 模式下彻底禁用 hover 放大——60px 格子放大 6% 仅多 3.6px，
+   视觉收益微乎其微但 800+ 合成层开销巨大 */
+:deep(.media-card--compact:hover) {
+  transform: none;
+  box-shadow: none;
+  z-index: 2;
+  transition: none;
+}
+
+:deep(.media-card:hover) {
+  transform: scale(1.06);
+  z-index: 100;
+  box-shadow: var(--shadow-sm);
+
+  /* 鼠标悬停时，立即应用 z-index（无延迟） */
+  transition:
+    transform 220ms cubic-bezier(0.34, 1.18, 0.64, 1),
+    box-shadow 220ms ease,
+    z-index 0ms;
+}
+
+.scroll-fab {
+  position: absolute;
+  bottom: 32px;
+  right: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  z-index: 100;
+}
+
+.fab-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--material-recipe-float-border-color);
+  color: var(--color-text-primary);
+  font-size: 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--material-recipe-float-box-shadow);
+  transition:
+    background 0.2s,
+    box-shadow 0.2s,
+    opacity 0.2s;
+  opacity: 0.4;
+}
+
+.fab-btn:hover,
+.fab-btn:focus-visible {
+  background: var(--color-bg-hover);
+  opacity: 1;
+  box-shadow: var(--material-recipe-float-box-shadow);
+}
+
+/* 选择模式：抑制悬停缩放以避免与选择遮罩的视觉冲突 */
+:deep(.media-card--selection-mode:hover) {
+  transform: none;
+  box-shadow: none;
+}
+
+/* 工具条的下滑过渡在 SelectionToolbar.vue 中实现 */
+
+/* ── 拖拽媒体到文件夹的浮动幽灵(问题5/问题2/问题3) ───────────────
+   以 transform 命令式定位;默认隐藏,经 .is-active 显示。 */
+.media-drag-ghost {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 10001;
+  pointer-events: none; /* 不能挡住 elementFromPoint */
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-on-accent);
+  background: var(--color-accent);
+  border: 1px solid var(--material-recipe-float-border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--material-recipe-float-box-shadow);
+  opacity: 0;
+  transition: opacity 120ms ease;
+  will-change: transform;
+}
+.media-drag-ghost.is-active {
+  opacity: 1;
+}
+.media-drag-ghost__badge {
+  font-size: var(--font-size-2xs);
+  padding: 1px var(--spacing-xs);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--color-text-on-accent) 24%, transparent);
+  font-weight: 600;
+}

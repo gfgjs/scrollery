@@ -1,18 +1,25 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema/acl/capability.json",
   "identifier": "default",
-  "description": "Default capability for Scrollery desktop app",
+  "description": "Default capability for Scrollery desktop app(allow-app-commands 由 src-tauri/build.rs 依据 src/ipc/registry.rs 生成,覆盖全部 app 自有命令)",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:default",
     "dialog:allow-open",
-    "fs:default",
-    "fs:read-all",
-    "fs:write-all",
-    "fs:allow-read-dir",
+    "allow-app-commands",
     "shell:default",
     "shell:allow-open",
-    "window-state:default"
+    "window-state:default",
+    "os:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-close",
+    "core:window:allow-set-theme",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-set-resizable"
   ]
 }

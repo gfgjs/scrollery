@@ -12,14 +12,18 @@
 
 mod frame;
 mod message;
+mod stderr_log;
 
 pub use frame::{
     read_frame, write_frame, Frame, FrameType, ProtocolError, HEADER_LEN, MAGIC, MAX_BLOB_LEN,
     MAX_JSON_LEN, PROTOCOL_VERSION,
 };
 pub use message::{
-    capability, EmbedBatchSuccess, EmbedItem, EmbedResult, FaceBatchSuccess, FaceDet, FaceItem,
-    FaceItemResult, FailureBody, HelloBody, ModelDescriptor, ModelHandle, ModelProfileSnapshot,
-    ModelRole, ReadyBody, RequestBody, SessionReadyBody, SuccessBody, TextEmbedSuccess,
-    WorkerErrorCode,
+    capability, EmbedBatchSuccess, EmbedItem, EmbedResult, EnhanceDone, EnhanceStep, EnhanceTask,
+    FaceBatchSuccess, FaceDet, FaceItem, FaceItemResult, FailureBody, HelloBody, ModelDescriptor,
+    ModelHandle, ModelProfileSnapshot, ModelRole, OcrBatchSuccess, OcrItem, OcrItemResult, OcrLine,
+    OcrSessionReadyBody, ProgressBody, ReadyBody, RequestBody, SessionReadyBody, SuccessBody,
+    TextEmbedSuccess, VideoAudioTrack, VideoFramesInfo, VideoFramesMode, VideoOutInfo,
+    VideoProbeInfo, VideoSessionInfo, WorkerErrorCode,
 };
+pub use stderr_log::{emit_stderr_log, WorkerLogLine};

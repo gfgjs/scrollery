@@ -1,4 +1,3 @@
-// src-tauri/src/ipc/audio_commands.rs
 //! Audio IPC commands (P3, §3.6). 音频相关 IPC 命令（P3，§3.6）。
 //!
 //! `get_audio_detail`：音频播放器（路由 `/audio/:id`）打开一首曲目时调用，返回核心项 + 绝对路径 +
@@ -53,12 +52,10 @@ pub async fn get_audio_detail(id: i64, state: State<'_, Arc<AppState>>) -> Resul
             lyrics_path: lrc.as_ref().map(|p| p.to_string_lossy().replace('\\', "/")),
         };
 
-        // Lyrics text (embedded or .lrc) + whether it carries LRC timestamps. Reuses the tags
-        // already read above (no re-parse). 歌词（内嵌或 .lrc）+ 是否带时间轴，复用上面已读标签（不重复解析）。
+        // 歌词（内嵌或 .lrc）+ 是否带时间轴，复用上面已读标签（不重复解析）。
         let (lyrics, lyrics_synced) = audio::lyrics_from_tags(&tags, path);
 
-        // Full-resolution cover → write the already-extracted bytes to cache once (keyed by
-        // cache_key), reuse if present. 全分辨率封面 → 把上面已抽出的字节写入缓存一次（以 cache_key 为键），已存在则复用。
+        // 全分辨率封面 → 把上面已抽出的字节写入缓存一次（以 cache_key 为键），已存在则复用。
         let cover_path = write_cover_to_cache(&state, cover, detail.item.cache_key)?;
 
         Ok(AudioDetail {
@@ -71,7 +68,7 @@ pub async fn get_audio_detail(id: i64, state: State<'_, Arc<AppState>>) -> Resul
         })
     })
     .await
-    .map_err(|e| AppError::System(e.to_string()))?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// Write the (already-extracted) full-resolution embedded cover to
@@ -87,14 +84,23 @@ fn write_cover_to_cache(
     let Some((bytes, ext)) = cover else {
         return Ok(None);
     };
-    let cache_dir = { state.thumb_config.read().unwrap().cache_dir.clone() };
-    let dir = cache_dir.join("audio_covers");
-    std::fs::create_dir_all(&dir).map_err(AppError::from)?;
-    let file = dir.join(format!("{cache_key:016x}.{ext}"));
-    // Write only if absent (covers are immutable for a given cache_key = path|mtime).
+    let cache_dir = {
+        state
+            .thumb_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .cache_dir
+            .clone()
+    };
+    // 路径经 cache.rs 单一事实源构造(R5):枚举清理/GC/统计按同一方案对账。
+    let file = crate::thumbnail::cache::audio_cover_cache_path(&cache_dir, cache_key, ext);
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(AppError::from)?;
+    }
     // 仅当不存在时写入（给定 cache_key = path|mtime 的封面是不可变的）。
+    // 原子落盘(2026-07-06 审查 R5):命中判定只查存在性,直写会让半截封面永久有效。
     if !file.exists() {
-        std::fs::write(&file, &bytes).map_err(AppError::from)?;
+        crate::thumbnail::generator::write_atomic(&file, &bytes).map_err(AppError::from)?;
     }
     Ok(Some(file.to_string_lossy().replace('\\', "/")))
 }

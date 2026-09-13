@@ -1,0 +1,323 @@
+.doc-viewer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  /* 原 --color-bg-base 为不存在的幽灵 token 且无 fallback——实际渲染透明(S5 修) */
+  background: var(--color-bg-primary);
+  z-index: 5;
+}
+/* 沉浸模式浮动退出按钮：右上角半透明，悬停显现，不喧宾夺主。 */
+.doc-viewer__immersive-exit {
+  position: absolute;
+  top: var(--spacing-sm);
+  right: var(--spacing-sm);
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-size-compact);
+  height: var(--control-size-compact);
+  border-radius: var(--radius-sm);
+  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--material-recipe-float-border-color);
+  box-shadow: var(--material-recipe-float-box-shadow);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  opacity: 0.35;
+  transition:
+    opacity var(--transition-fast),
+    color var(--transition-fast);
+}
+.doc-viewer__immersive-exit:hover {
+  opacity: 1;
+  color: var(--color-text-primary);
+}
+.doc-viewer__toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-height: var(--toolbar-height);
+  padding: 0 var(--spacing-md);
+  border-bottom: 1px solid var(--color-divider);
+  background: var(--color-bg-primary);
+}
+.doc-viewer__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-text-secondary);
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+}
+.doc-viewer__btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.doc-viewer__btn.is-active {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
+  border-color: transparent;
+}
+.doc-viewer__btn--primary {
+  background: var(--color-accent);
+  color: var(--color-text-on-accent);
+  border-color: transparent;
+}
+/* 侧栏开关与返回控件之间的分隔线：一个是 chrome 开关、一个是**离开本视图**，不同类。
+   分组是「容易误导」那条的收尾——形状已区分（图标 vs 带文字的宽控件），再补一道视觉边界。 */
+.doc-viewer__sep {
+  width: 1px;
+  height: 18px;
+  background: var(--color-divider);
+  flex-shrink: 0;
+}
+
+/* 返回控件：整条「← 书名」可点（见模板注释）。与其余 .doc-viewer__btn 有意长得不同 ——
+   它是**退出**，不是又一个工具；同款外观正是真机说的「不好找」。
+   无边框 + hover 底色 = ghost 读法，与 MediaGrid 的 .view-back-bar 同构。 */
+.doc-viewer__back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  min-width: 0; /* flex 子项默认 min-width:auto，会撑破 ellipsis */
+  max-width: 40vw;
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.doc-viewer__back:hover {
+  background: var(--color-bg-hover);
+}
+.doc-viewer__back:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-accent);
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+.doc-viewer__title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* max-width 移到 .doc-viewer__back：截断该由可点控件的边界决定，
+     标题在其内做 flex 收缩（min-width:0 见上），二者不再各管一半。 */
+  min-width: 0;
+  font-size: var(--font-size-sm);
+}
+.doc-viewer__page {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  /* 窄窗防线(2026-07-17):禁换行——旧版无此规则,挤压时「0% · 第一章」逐字竖排(真机截图);
+     收缩走 ellipsis,上限让给控件区。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 28vw;
+  flex-shrink: 1;
+}
+
+/* ── 工具栏折叠容器(2026-07-17,契约同 AppToolbar §G5):接替旧 .doc-viewer__spacer 的右对齐,
+   gap:0 + 逐项 margin-inline-end(折叠归 0 无碎屑;引擎测量含 margin)。 ── */
+.doc-viewer__foldable {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0;
+}
+/* 折叠项(与 GalleryViewControls 同款 CSS Grid 收缩):外层 grid 1fr→0fr 收真实宽度,
+   内层 overflow:hidden 裁内容 + translateX 收入。 */
+.fold-item {
+  display: grid;
+  grid-template-columns: 1fr;
+  flex-shrink: 0;
+  margin-inline-end: 12px;
+  transition:
+    grid-template-columns 0.28s ease,
+    opacity 0.28s ease,
+    margin 0.28s ease;
+}
+.fold-item--folded {
+  grid-template-columns: 0fr;
+  opacity: 0;
+  margin-inline-end: 0;
+  pointer-events: none;
+}
+.fold-item__inner {
+  overflow: hidden;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  transition: transform var(--duration-moderate) var(--ease-out);
+}
+.fold-item__inner > * {
+  flex-shrink: 0;
+}
+.fold-item--folded .fold-item__inner {
+  transform: translateX(10px);
+}
+/* 量尺态:引擎 measure() 同步段内短暂加类,强制全项展开读自然宽(同步段内加→读→移,不 paint 不闪);
+   落定态(is-settling):内容驱动的折叠瞬时完成、不走 0.28s 过渡(「唯窗口 resize 才动画」不变量)。 */
+.doc-viewer__foldable.is-measuring .fold-item {
+  grid-template-columns: 1fr;
+  opacity: 1;
+  margin-inline-end: 12px;
+  pointer-events: auto;
+}
+.doc-viewer__foldable.is-measuring .fold-item__inner {
+  transform: none;
+}
+.doc-viewer__foldable.is-measuring .fold-item,
+.doc-viewer__foldable.is-measuring .fold-item__inner,
+.doc-viewer__foldable.is-settling .fold-item,
+.doc-viewer__foldable.is-settling .fold-item__inner {
+  transition: none;
+}
+
+/* ── ⋯ 溢出菜单面(UiPopover slot 自带表面视觉的契约) ── */
+.doc-more {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  min-width: 180px;
+  padding: var(--spacing-xs);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.doc-more__row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-height: var(--control-size-default);
+  padding: 0 var(--spacing-sm);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  text-align: left;
+}
+.doc-more__row:hover {
+  background: var(--color-bg-hover);
+}
+.doc-more__row.is-active {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
+}
+/* select 项行:沿用 .doc-viewer__mode 外观,行内两端对齐。 */
+.doc-more__select {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 10px;
+}
+.doc-more__select select {
+  min-width: 0;
+  flex: 1;
+  height: var(--control-size-compact);
+  background: var(--color-input-bg);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--spacing-xs);
+}
+.doc-viewer__mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+.doc-viewer__mode select {
+  height: var(--control-size-compact);
+  background: var(--color-input-bg);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--spacing-xs);
+}
+.doc-viewer__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.doc-viewer__reader {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  position: relative;
+}
+.doc-viewer__reader > * {
+  height: 100%;
+}
+.doc-viewer__unsupported {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--color-text-secondary);
+}
+
+/* ── 编辑态 ─────────────────────────────────────────────────────────── */
+.doc-edit {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.doc-edit__bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  min-height: var(--toolbar-height);
+  padding: 0 var(--spacing-md);
+  border-bottom: 1px solid var(--color-divider);
+  background: var(--color-bg-primary);
+}
+.doc-edit__label {
+  flex: 1;
+  min-width: 0;
+  height: var(--control-size-default);
+  background: var(--color-input-bg);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  padding: 0 var(--spacing-sm);
+  font-size: var(--font-size-sm);
+}
+.doc-edit__area {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  border: none;
+  outline: none;
+  padding: 24px clamp(16px, 8vw, 120px);
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  line-height: 1.7;
+}

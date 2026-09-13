@@ -10,6 +10,7 @@ name = "psd-worker"
 # 真机验证「升级 → 版本对账 → done 任务失效重做」链路(病历 #4 修复的观察面)。
 version = "0.1.1"
 edition = "2021"
+license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)
 publish = false
 
 [[bin]]
@@ -23,6 +24,9 @@ exotic-protocol = { path = "../../exotic-protocol" }
 psd = "=0.3.5"
 # 后处理：缩放 + WebP 编码（与主程序 src-tauri 同系 0.25）。
 image = { version = "=0.25.10", default-features = false, features = ["webp"] }
+# stderr 日志行协议（日志能力重构线 阶段 3 · W3，D-313）：exotic_protocol::emit_stderr_log 的
+# fields 形参为 serde_json::Map<String, Value>，本 crate 调用点构造空 map 需直接可见该类型。
+serde_json = "1"
 
 # [profile.release] 已上移 workspace 根（../../../Cargo.toml）：member 内 profile 被 cargo 忽略。
 # 根 release 用默认 unwind（不设 abort），故顶层 catch_unwind 拦 psd 畸形输入 panic 的语义不变（§3.5）。

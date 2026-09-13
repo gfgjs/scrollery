@@ -1,14 +1,15 @@
 // src/stores/aiStore.ts
-// AI store — manages engine status, semantic search state, and analysis progress.
 // AI store — 管理引擎状态、语义搜索状态和分析进度。
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { Channel } from '@tauri-apps/api/core'
-import { invokeIpc } from '../utils/ipc'
+import { invokeIpc, ipcErrorMessage } from '../utils/ipc'
+import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
 import { useMediaStore } from './mediaStore'
 import { useUiStore } from './uiStore'
+import { useToastStore } from './toastStore'
 import { useAnalysisController } from '../composables/useAnalysisController'
 import type { AiStatusSummary, SearchMode, ModelRegistry, ModelDownloadProgress } from '../types/ai'
 
@@ -24,8 +25,10 @@ export const useAiStore = defineStore('ai', () => {
     totalItems: 0,
     analyzedItems: 0,
     pendingItems: 0,
+    errorItems: 0,
     isAnalyzing: false,
     analysisActive: false,
+    waitingOn: [],
   })
 
   const searchMode = ref<SearchMode>('mixed')
@@ -38,8 +41,8 @@ export const useAiStore = defineStore('ai', () => {
   const previousGroupBy = ref<'date' | 'folder' | 'none'>('date')
 
   // 分析管理半部（轮询 / start·pause·restart·stop / 自动续传 / 进度 / providerLabel）委托共享
-  // 控制器（S6 去重，与 faceStore 共用 useAnalysisController）。AI 专属:onStarted 清 searchError、
-  // onError 走 console；analyzedCount 取 analyzedItems。
+  // 控制器（S6 去重，与 faceStore 共用 useAnalysisController）。AI 专属:onStarted 清 searchError；
+  // analyzedCount 取 analyzedItems。
   const analysis = useAnalysisController<AiStatusSummary>({
     status,
     commands: {
@@ -51,7 +54,15 @@ export const useAiStore = defineStore('ai', () => {
     },
     analyzedCount: () => status.value.analyzedItems,
     logTag: '[AI]',
-    onError: (action, e) => console.error(`[AI] ${action} 分析出错 | analysis error:`, e),
+    onError: (action, e) => {
+      // start/restart 的后端拒绝（GPU 槽被人脸占用 / 模型未装）须用户可见 → toast
+      // （2026-07-10 审查 U2,对齐 faceStore 同场景）；其余记 logger。
+      if (action === 'start' || action === 'restart') {
+        useToastStore().addToast('error', ipcErrorMessage(e))
+      } else {
+        logger.error(`[AI] ${action} 分析出错 | analysis error`, { error: e })
+      }
+    },
     onStarted: () => {
       searchError.value = null
     },
@@ -60,6 +71,8 @@ export const useAiStore = defineStore('ai', () => {
     fetchStatus,
     analyzeProgress,
     providerLabel,
+    isWaitingBlocked,
+    waitingForSession,
     startAnalysis,
     pauseAnalysis,
     restartAnalysis,
@@ -76,37 +89,86 @@ export const useAiStore = defineStore('ai', () => {
 
   // ── Actions ───────────────────────────────────────────────────────────────
 
-  /** Initialise AI engine on demand (lazy) | 按需初始化 AI 引擎（懒加载） */
+  /** 按需初始化 AI 引擎（懒加载） */
   async function initEngine() {
     try {
       await invokeIpc(IPC.DETECT_AI_PROVIDER)
       await fetchStatus()
     } catch (e) {
-      console.error('[AI] Init engine error | 初始化引擎错误:', e)
+      logger.error('[AI] Init engine error | 初始化引擎错误', { error: e })
     }
   }
 
-  /** Reset all embeddings and re-analyze | 重置所有嵌入向量并重新分析 */
+  /** 非破坏重试失败项（审查 F9）：Error→Pending 复位后走既有 start 复跑，不触碰已完成向量 */
+  async function retryFailedItems() {
+    try {
+      const n = await invokeIpc<number>(IPC.RETRY_FAILED_AI_ITEMS)
+      if (n > 0) await startAnalysis()
+      await fetchStatus()
+    } catch (e) {
+      useToastStore().addToast('error', ipcErrorMessage(e))
+    }
+  }
+
+  /** 重置所有嵌入向量并重新分析 */
   async function rebuildEmbeddings() {
     try {
       await invokeIpc(IPC.REBUILD_EMBEDDINGS)
+      // 后端已清空嵌入并吊销在途搜索(P1-3):前端同步清展示态,别让画廊继续按旧向量排序。
+      clearSemanticSearch()
       await fetchStatus()
     } catch (e) {
-      console.error('[AI] Rebuild embeddings error | 重建嵌入向量错误:', e)
+      logger.error('[AI] Rebuild embeddings error | 重建嵌入向量错误', { error: e })
     }
   }
 
-  /** Run a semantic search query | 运行语义搜索查询 */
+  // 搜索代次令牌（2026-07-10 审查 U4）：两次查询并发在途时，后完成的**旧**应答会覆盖
+  // matchCount/加载态并触发 relayout（画廊显示 A 结果而 semanticQuery 是 B）。与
+  // ContentViewer 人脸加载的 faceToken 同一模式：应答落地前比对代次，旧应答整体丢弃
+  //（连 invalidateLayout 一起）。
+  //
+  // P1-3 补齐两侧：①后端现在按请求身份线性化提交，被取代的查询返回 null（不再落库），
+  // 前端收到 null 同样不动计数/布局；②清空、切模型、重建嵌入都会递增本令牌，让在途应答
+  // 整体作废——本地意图与后端吊销同步生效，不靠应答到达的先后。
+  let searchToken = 0
+
+  /**
+   * 清空语义搜索（P1-3）。本地先收尾、再发后端清空：
+   * - 本地令牌换代 + 清 loading/matchCount/错误 ⇒ 在途应答（含旧的 null）整体落不到新状态上，
+   *   spinner 立刻停，不会因为后端工作段晚跑而永远挂着；
+   * - 后端 clear_semantic_search 入口当场吊销在途请求、工作段按代次守卫擦库；
+   * - 后端擦除失败不回滚本地清空意图（用户已按下清空），只记日志。
+   *
+   * `skipWhenIdle` 给 mixed 模式的普通文字提交用:那条路径每次防抖提交都会走到,若本地没有
+   * 语义在场(无在途请求、无已展示结果),就没有需要吊销或擦除的东西,不必每键打一次 IPC;
+   * 一旦语义在场,该吊销的照样吊销。显式清空/切模式/切模型/重建嵌入一律不跳过。
+   */
+  function clearSemanticSearch({ skipWhenIdle = false } = {}) {
+    const semanticInPlay =
+      isSearching.value || semanticQuery.value !== '' || matchCount.value > 0
+    searchToken++
+    semanticQuery.value = ''
+    matchCount.value = 0
+    isSearching.value = false
+    searchError.value = null
+    if (skipWhenIdle && !semanticInPlay) return
+    void invokeIpc(IPC.CLEAR_SEMANTIC_SEARCH).catch((e) => {
+      logger.error('[AI] Clear semantic search error | 清空语义搜索错误', { error: e })
+    })
+    useMediaStore().invalidateLayout()
+  }
+
+  /** 运行语义搜索查询 */
   async function runSemanticSearch(query: string, limit = 1000) {
+    const token = ++searchToken
     if (!query.trim()) {
-      semanticQuery.value = ''
       if (searchMode.value === 'mixed') {
         activeMixedQueryType.value = 'none'
         const ui = useUiStore()
-        if (ui.sortWithinGroup === 'similarity') ui.setSortWithinGroup('datetime')
-        if (ui.groupBy === 'none') ui.setGroupBy(previousGroupBy.value)
+        if (ui.sortWithinGroup === 'similarity') ui.setSortWithinGroup('datetime', false)
+        if (ui.groupBy === 'none') ui.setGroupBy(previousGroupBy.value, false)
       }
-      useMediaStore().invalidateLayout()
+      clearSemanticSearch()
       return
     }
 
@@ -118,39 +180,48 @@ export const useAiStore = defineStore('ai', () => {
       activeMixedQueryType.value = 'semantic'
       const ui = useUiStore()
       ui.searchQuery = ''
-      if (ui.sortWithinGroup !== 'similarity') ui.setSortWithinGroup('similarity')
+      if (ui.sortWithinGroup !== 'similarity') ui.setSortWithinGroup('similarity', false)
       if (ui.groupBy !== 'none') {
         previousGroupBy.value = ui.groupBy
-        ui.setGroupBy('none')
+        ui.setGroupBy('none', false)
       }
     }
 
     try {
-      const count = await invokeIpc<number>(IPC.SEMANTIC_SEARCH_CMD, {
+      const count = await invokeIpc<number | null>(IPC.SEMANTIC_SEARCH_CMD, {
         query,
         limit,
       })
+      if (token !== searchToken) return // 旧应答:丢弃(U4)
+      // null = 本次请求已被更新的查询/清空/切模型取代(后端未写结果集):保持当前视图,
+      // 不刷新布局——旧查询的排名不该盖到新视图上(P1-3)。
+      if (count === null) return
       matchCount.value = count
-      // The results are stored in the ai_search_results table in DB.
-      // We just need to invalidate the layout so MediaGrid reloads.
+      // 结果已存于 DB 的 ai_search_results 表，这里只需 invalidate layout 让 MediaGrid 重载。
       useMediaStore().invalidateLayout()
     } catch (e) {
-      searchError.value = String(e)
+      // 展示文案统一走 ipcErrorMessage（2026-07-10 审查 U7）:String(e) 会带 "IpcError: " 前缀。
+      if (token === searchToken) searchError.value = ipcErrorMessage(e)
     } finally {
-      isSearching.value = false
+      // 旧请求的 finally 不得提前灭新请求的 spinner(U4)。归属仍只看本地令牌:后端侧吊销
+      // (重启分析/重建嵌入/切模型)不会给前端发新令牌,不在此收尾 spinner 会永远转(P1-3)。
+      if (token === searchToken) isSearching.value = false
     }
   }
 
   function setNormalSearchQueryInMixedMode(query: string) {
     const ui = useUiStore()
     ui.searchQuery = query
+    // 退出语义查询(mixed 下切普通文字,或清空文字)一律走清空意图:递增本地令牌 + 后端入口
+    // 吊销 + 守卫擦库。此前这里只清 `semanticQuery`,在途语义应答仍能写回 matchCount 并刷新
+    // 布局——画廊会跳成语义排名,而用户已经在看普通搜索结果(P1-3)。
+    clearSemanticSearch({ skipWhenIdle: true })
     if (!query.trim()) {
       activeMixedQueryType.value = 'none'
     } else {
       activeMixedQueryType.value = 'normal'
-      semanticQuery.value = ''
-      if (ui.sortWithinGroup === 'similarity') ui.setSortWithinGroup('datetime')
-      if (ui.groupBy === 'none') ui.setGroupBy(previousGroupBy.value)
+      if (ui.sortWithinGroup === 'similarity') ui.setSortWithinGroup('datetime', false)
+      if (ui.groupBy === 'none') ui.setGroupBy(previousGroupBy.value, false)
     }
   }
 
@@ -168,61 +239,62 @@ export const useAiStore = defineStore('ai', () => {
     searchMode.value = mode
     const ui = useUiStore()
 
-    // Reset queries and types on mode switch | 切换模式时重置查询和类型
+    // 切换模式时重置查询和类型
     ui.searchQuery = ''
-    semanticQuery.value = ''
     activeMixedQueryType.value = 'none'
-    searchError.value = null
+    // P1-3:语义结果集随模式切换一起作废(本地令牌换代 + 后端入口吊销 + 守卫擦库),
+    // 否则退到常规搜索后仍挂着上一次语义排名的结果行。
+    clearSemanticSearch()
 
     if (mode === 'semantic') {
       if (ui.sortWithinGroup !== 'similarity') {
-        ui.setSortWithinGroup('similarity')
+        ui.setSortWithinGroup('similarity', false)
       }
       if (ui.groupBy !== 'none') {
         previousGroupBy.value = ui.groupBy
-        ui.setGroupBy('none')
+        ui.setGroupBy('none', false)
       }
     } else {
-      // For both 'normal' and 'mixed' (initial state), we want regular sorting/grouping
+      // normal 与 mixed（初始态）都恢复常规排序/分组
       if (ui.sortWithinGroup === 'similarity') {
-        ui.setSortWithinGroup('datetime')
+        ui.setSortWithinGroup('datetime', false)
       }
       if (ui.groupBy === 'none') {
-        ui.setGroupBy(previousGroupBy.value)
+        ui.setGroupBy(previousGroupBy.value, false)
       }
     }
 
     useMediaStore().invalidateLayout()
   }
 
-  /** Reload the AI engine | 重新加载 AI 引擎 */
+  /** 重新加载 AI 引擎 */
   async function reloadAiEngine(): Promise<void> {
     try {
       await invokeIpc(IPC.RELOAD_AI_ENGINE)
       await fetchStatus()
     } catch (e) {
-      console.error('[AI] Reload engine error | 重载引擎错误:', e)
+      logger.error('[AI] Reload engine error | 重载引擎错误', { error: e })
       throw e
     }
   }
 
-  // ── Model registry / library (Layer B) | 模型注册表 / 模型库 ──────────────────
+  // ── 模型注册表 / 模型库（Layer B）──────────────────
 
-  /** List the built-in model registry with install/active status | 列出内置模型注册表（含安装/激活状态） */
+  /** 列出内置模型注册表（含安装/激活状态） */
   async function listModelRegistry(): Promise<ModelRegistry> {
     return await invokeIpc<ModelRegistry>(IPC.LIST_MODEL_REGISTRY)
   }
 
-  /** Switch the active model to a specific batch variant (validates installed; re-syncs status;
-   *  reloads engine). `imageFile` = the variant's image onnx filename.
-   *  切换激活模型到某 batch 变体（校验已安装；重同步状态；重载引擎）。`imageFile` = 该变体图像 onnx 文件名。 */
+  /** 切换激活模型到某 batch 变体（校验已安装；重同步状态；重载引擎）。`imageFile` = 该变体图像 onnx 文件名。 */
   async function setActiveModel(imageFile: string): Promise<void> {
     await invokeIpc(IPC.SET_ACTIVE_MODEL, { imageFile })
+    // P1-3:切模型 = 换向量空间。后端已吊销在途搜索并擦除旧结果集,前端同步清展示态,
+    // 不让画廊继续按旧模型的排名与计数显示。
+    clearSemanticSearch()
     await fetchStatus()
   }
 
-  /** Download a specific variant's assets (image+extra+shared text+vocab), streaming progress.
-   *  下载某变体的资产（图像+extra+共享文本塔+vocab），经 Channel 流式回传进度。 */
+  /** 下载某变体的资产（图像+extra+共享文本塔+vocab），经 Channel 流式回传进度。 */
   function downloadModel(
     imageFile: string,
     onProgress: (p: ModelDownloadProgress) => void,
@@ -245,6 +317,8 @@ export const useAiStore = defineStore('ai', () => {
     // computed
     analyzeProgress,
     providerLabel,
+    isWaitingBlocked,
+    waitingForSession,
     isSemanticMode,
     // actions
     fetchStatus,
@@ -254,8 +328,10 @@ export const useAiStore = defineStore('ai', () => {
     restartAnalysis,
     stopAnalysis,
     maybeAutoResume,
+    retryFailedItems,
     rebuildEmbeddings,
     runSemanticSearch,
+    clearSemanticSearch,
     setNormalSearchQueryInMixedMode,
     toggleSearchMode,
     setSearchMode,

@@ -6,10 +6,11 @@
 // Ctrl+A 只选一屏、框选漏掉滚出屏幕的项（Part5 G1 三症状）。本 composable 经后端 get_view_ids
 // 取布局缓存里已物化的 flat_ids（cache.rs:217 直接 clone,O(1) 无 DB），从根上解除对 DOM 的依赖。
 //
-// 设计依据：plan-docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §4。
+// 设计依据：docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §4。
 
 import { shallowRef, readonly } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { invokeIpc } from '../utils/ipc'
+import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
 
 // 模块级单例：同一时刻只有一个「当前视图」,与 useSelection 的单例模式一致。
@@ -20,24 +21,33 @@ const viewIds = shallowRef<readonly number[]>([])
 let idIndex = new Map<number, number>()
 // 已加载对应的 layout_version;null = 尚未加载 / 已失效清空,供 ensureFresh 判定。
 let loadedVersion: number | null = null
+// in-flight token(2026-07-06 审查 P0-2):refresh 必须是「最后发起者赢」而非「最后落地者赢」。
+// 布局版本快速连跳(缩略图滑块/enrichment 每 2s 重算)时多个 refresh 并发在途,
+// 若无 token,迟到的旧版本应答(尤其 ViewStale 拒绝走 catch)会把刚落地的新版本全集清空,
+// 且无人再触发重取 → Shift 区间选择静默退化为单项 toggle(Part5 G1 症状无声回归)。
+let refreshToken = 0
 
 /**
  * 拉取指定布局版本的全集 id 并重建索引。
  * 失败（ViewStale 版本不符 / LayoutNotReady 无布局 / 其它）→ 清空,等下次重取
  * (锚点失效保护:宁可让 range/全选暂时取不到,也不基于过期 flat_ids 误选)。
+ * 落地前复核 token:自己已不是最新发起者 → 结果直接丢弃(成功与失败路径同规)。
  */
 async function refresh(layoutVersion: number): Promise<void> {
+  const my = ++refreshToken
   try {
     // 后端 layout_version: Option<u64>,IPC 层自动 snake→camel
-    const ids = await invoke<number[]>(IPC.GET_VIEW_IDS, { layoutVersion })
+    const ids = await invokeIpc<number[]>(IPC.GET_VIEW_IDS, { layoutVersion })
+    if (my !== refreshToken) return // 迟到应答,已有更新的 refresh 在途/落地
     const idx = new Map<number, number>()
     for (let i = 0; i < ids.length; i++) idx.set(ids[i], i)
     viewIds.value = ids
     idIndex = idx
     loadedVersion = layoutVersion
   } catch (err) {
+    if (my !== refreshToken) return // 迟到的拒绝不得清掉新版本数据
     // ViewStale / LayoutNotReady 属预期路径;其它错误记录便于排查,但同样降级为「清空待重取」。
-    console.warn('[useViewIds] get_view_ids 失败,清空待重取：', err)
+    logger.warn('[useViewIds] get_view_ids 失败,清空待重取', { error: err })
     viewIds.value = []
     idIndex = new Map()
     loadedVersion = null

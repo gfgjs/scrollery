@@ -1,104 +1,98 @@
 <template>
-  <div
-    class="dialog-overlay"
-    @click.self="cancel"
-    tabindex="-1"
-    @keydown.esc.stop="cancel"
-    ref="overlayRef"
+  <!-- 外壳迁 UiDialog:恒 Teleport(此前原位渲染无 Teleport)+ 焦点陷阱(此前仅 focus 遮罩、Tab 会逃逸)。
+       树列表须满幅(hover 高亮到边)→ body-padding='0';树自身的定高滚动移到插槽内 .tree-scroll。
+       本组件由父 v-if 条件挂载,open 恒 true;焦点陷阱经 useFocusTrap immediate 挂载即 engage。 -->
+  <UiDialog
+    :open="true"
+    :title="title"
+    :close-label="t('common.cancel')"
+    max-width="500px"
+    body-padding="0"
+    @close="cancel"
   >
-    <div class="dialog-content">
-      <header class="dialog-header">
-        <h2 class="dialog-title">{{ title }}</h2>
-        <button
-          class="btn-close"
-          :title="t('common.cancel')"
-          :aria-label="t('common.cancel')"
-          @click="cancel"
-        >
-          <X :size="18" />
-        </button>
-      </header>
-
-      <main class="dialog-body" style="height: 320px; overflow-y: auto; padding: 0">
-        <div
-          v-if="folderTree.nodes.value.length === 0 && !folderTree.loading.value"
-          class="empty-state"
-        >
-          {{ t('folderPicker.empty') }}
-        </div>
-        <div class="tree-container" v-else>
-          <button
-            v-for="node in folderTree.nodes.value"
-            :key="node.id"
-            class="tree-item"
-            :class="{ active: selectedNodeId === node.id }"
-            :style="{ paddingLeft: node.depth * 16 + 12 + 'px' }"
-            @click="pickNode(node)"
-          >
-            <span class="tree-arrow" @click.stop="folderTree.toggleNode(node)">
-              <ChevronRight
-                v-if="node.hasChildren"
-                :size="14"
-                class="tree-chevron"
-                :class="{ expanded: node.expanded }"
-              />
-              <span v-else class="tree-chevron-spacer" />
-            </span>
-            <span class="tree-icon"><Folder :size="15" /></span>
-            <span class="tree-label" :title="getNodePath(node)">
-              <span class="name">{{ node.name }}</span>
-              <span class="path">{{ getNodePath(node) }}</span>
-            </span>
-          </button>
-        </div>
-      </main>
-
-      <footer
-        class="dialog-footer"
-        style="display: flex; justify-content: space-between; align-items: center"
+    <div class="tree-scroll">
+      <div
+        v-if="folderTree.nodes.value.length === 0 && !folderTree.loading.value"
+        class="empty-state"
       >
-        <div style="display: flex; gap: 8px">
-          <button
-            class="btn btn-secondary"
-            :disabled="!selectedNodeId"
-            @click="createNewFolderHere"
-            :title="t('folderPicker.newHereTitle')"
-          >
-            {{ t('folderPicker.newHere') }}
-          </button>
-          <button
-            class="btn btn-secondary"
-            @click="createNewGlobalFolder"
-            :title="t('folderPicker.newElsewhereTitle')"
-          >
-            {{ t('folderPicker.newElsewhere') }}
-          </button>
-        </div>
-        <div style="display: flex; gap: 8px">
-          <button class="btn btn-secondary" @click="cancel">{{ t('common.cancel') }}</button>
-          <button class="btn btn-primary" :disabled="!selectedNodeId" @click="confirm">
-            {{ t('common.ok') }}
-          </button>
-        </div>
-      </footer>
+        {{ t('folderPicker.empty') }}
+      </div>
+      <div class="tree-container" v-else>
+        <button
+          v-for="node in folderTree.nodes.value"
+          :key="node.nodeKey"
+          class="tree-item"
+          :class="{ active: selectedNode?.nodeKey === node.nodeKey }"
+          :style="{ paddingLeft: node.depth * 16 + 12 + 'px' }"
+          @click="pickNode(node)"
+        >
+          <span class="tree-arrow" @click.stop="folderTree.toggleNode(node)">
+            <ChevronRight
+              v-if="node.hasChildren"
+              :size="14"
+              class="tree-chevron"
+              :class="{ expanded: node.expanded }"
+            />
+            <span v-else class="tree-chevron-spacer" />
+          </span>
+          <span class="tree-icon"><Folder :size="15" /></span>
+          <span class="tree-label" :title="getNodePath(node)">
+            <span class="name">{{ node.name }}</span>
+            <span class="path">{{ getNodePath(node) }}</span>
+          </span>
+        </button>
+      </div>
     </div>
 
-    <FolderCreateDialog
-      v-if="folderCreateDialog.isOpen"
-      :base-path="folderCreateDialog.basePath"
-      @close="folderCreateDialog.isOpen = false"
-      @created="onFolderCreated"
-    />
-  </div>
+    <!-- 自定义左右分栏页脚:UiDialog 的 .dialog-footer 是 flex-end,故用 width:100% 的 footer-split 自撑 space-between。 -->
+    <template #footer>
+      <div class="footer-split">
+        <div class="footer-group">
+          <UiButton
+            variant="secondary"
+            :disabled="!selectedNodeId"
+            :title="t('folderPicker.newHereTitle')"
+            @click="createNewFolderHere"
+          >
+            {{ t('folderPicker.newHere') }}
+          </UiButton>
+          <UiButton
+            variant="secondary"
+            :title="t('folderPicker.newElsewhereTitle')"
+            @click="createNewGlobalFolder"
+          >
+            {{ t('folderPicker.newElsewhere') }}
+          </UiButton>
+        </div>
+        <div class="footer-group">
+          <UiButton variant="secondary" @click="cancel">{{ t('common.cancel') }}</UiButton>
+          <UiButton variant="primary" :disabled="!selectedNodeId" @click="confirm">
+            {{ t('common.ok') }}
+          </UiButton>
+        </div>
+      </div>
+    </template>
+  </UiDialog>
+
+  <!-- 嵌套「新建文件夹」对话框:UiDialog 迁移后本组件为多根,它作同级根、各自独立 Teleport 到 body
+       (后挂载者在 DOM 靠后 → 叠于树选择器之上)。 -->
+  <FolderCreateDialog
+    v-if="folderCreateDialog.isOpen"
+    :base-path="folderCreateDialog.basePath"
+    @close="folderCreateDialog.isOpen = false"
+    @created="onFolderCreated"
+  />
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { X, ChevronRight, Folder } from '@lucide/vue'
+import { ChevronRight, Folder } from '@lucide/vue'
 import { useFolderTree } from '../../composables/useFolderTree'
 import { useScanStore } from '../../stores/scanStore'
 import FolderCreateDialog from './FolderCreateDialog.vue'
+import UiDialog from '../ui/UiDialog.vue'
+import UiButton from '../ui/UiButton.vue'
 import type { DirNode } from '../../types/media'
 
 defineProps<{
@@ -114,9 +108,13 @@ const { t } = useI18n()
 const scan = useScanStore()
 const folderTree = useFolderTree()
 
+// selectedNodeId = **实体身份**:本对话框选的是「移动/复制的目标库目录」,emit 与 IPC 都要 DB id,
+// 故 null 即「未选/不可作目标」,底部按钮据此禁用。
+// 高亮判定另走 selectedNode 的 **nodeKey**(结构身份):用 id 比会踩 `null === null` 恒真——
+// 一旦树里出现无实体身份的节点(D-013),它们会全部同时高亮。今天 FS-only 不会进本对话框
+// (它只列库内目录),但「碰巧不会触发」不是不变量。
 const selectedNodeId = ref<number | null>(null)
 const selectedNode = ref<DirNode | null>(null)
-const overlayRef = ref<HTMLElement | null>(null)
 
 const folderCreateDialog = ref({
   isOpen: false,
@@ -129,15 +127,12 @@ onMounted(async () => {
   }
   await folderTree.loadRoots(scan.scanRoots)
 
-  // Auto-select the first node if nothing is selected
+  // 未选中任何节点时默认选首个
   if (!selectedNodeId.value && folderTree.nodes.value.length > 0) {
     selectedNodeId.value = folderTree.nodes.value[0].id
     selectedNode.value = folderTree.nodes.value[0]
   }
-
-  nextTick(() => {
-    overlayRef.value?.focus()
-  })
+  // 初始焦点由 UiDialog 焦点陷阱接管(无 data-autofocus 时落到首个可聚焦元素);无需再手动聚焦遮罩。
 })
 
 // 选中某节点（抽成方法——Vue 内联多语句处理器会被 Prettier semi:false 拆行破坏）。
@@ -178,71 +173,17 @@ function getNodePath(node: DirNode): string {
 }
 
 async function onFolderCreated() {
-  // refresh tree
   await scan.loadScanRoots()
   await folderTree.loadRoots(scan.scanRoots)
 }
 </script>
 
 <style scoped>
-.dialog-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  background: color-mix(in srgb, var(--color-bg-primary) 60%, transparent);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  animation: fadeIn 0.2s ease-out;
-}
-
-.dialog-content {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-  width: 100%;
-  max-width: 500px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: slideUp 0.2s ease-out;
-}
-
-.dialog-header {
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--color-border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.dialog-title {
-  margin: 0;
-  font-size: var(--font-size-lg);
-  font-weight: 600;
-  color: var(--color-text-primary);
-}
-
-.btn-close {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: none;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-
-.btn-close:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
+/* 外壳(overlay/content/header/title/关闭键/动画)由 UiDialog + 全局 Modal 基座提供;宽度 500px 经
+   max-width prop 传入(基座默认 420px)。本组件只保留树列表正文 + 定高滚动 + 分栏页脚特化。 */
+.tree-scroll {
+  height: 320px;
+  overflow-y: auto;
 }
 
 .empty-state {
@@ -261,7 +202,8 @@ async function onFolderCreated() {
   display: flex;
   align-items: center;
   width: 100%;
-  padding: 6px 12px;
+  min-height: var(--control-size-default);
+  padding: 0 var(--spacing-md);
   border: none;
   background: transparent;
   color: var(--color-text-secondary);
@@ -275,8 +217,8 @@ async function onFolderCreated() {
 }
 
 .tree-item.active {
-  background: var(--color-accent);
-  color: #fff;
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
 }
 
 .tree-arrow {
@@ -294,7 +236,7 @@ async function onFolderCreated() {
 }
 
 .tree-chevron {
-  transition: transform 0.2s;
+  transition: transform var(--transition-normal);
 }
 
 .tree-chevron.expanded {
@@ -314,7 +256,7 @@ async function onFolderCreated() {
 .tree-label {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--spacing-sm);
   font-size: var(--font-size-sm);
   color: var(--color-text-primary);
   flex: 1;
@@ -328,38 +270,25 @@ async function onFolderCreated() {
 }
 
 .tree-label .path {
-  font-size: 11px;
+  font-size: var(--font-size-2xs);
   color: var(--color-text-tertiary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  direction: rtl; /* Truncate from left if too long to keep folder name visible at end */
+  direction: rtl; /* 超长时从左侧截断,保末尾文件夹名可见 */
   text-align: left;
 }
 
-.dialog-footer {
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--color-border);
-  background: var(--color-bg-primary);
+/* 分栏页脚:UiDialog 的 .dialog-footer 为 flex + justify-end,故用 width:100% 的容器自撑 space-between。 */
+.footer-split {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  gap: var(--spacing-sm);
 }
-
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-@keyframes slideUp {
-  from {
-    opacity: 0;
-    transform: translateY(10px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
+.footer-group {
+  display: flex;
+  gap: var(--spacing-sm);
 }
 </style>

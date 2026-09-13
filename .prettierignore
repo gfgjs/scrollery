@@ -1,0 +1,12 @@
+# Prettier 忽略清单。repo-wide `npm run format` 脚本已删除(禁全仓重排,见 AGENTS.md);
+# 本清单对编辑器集成与任何手动 prettier 调用仍生效——以下目录须豁免,
+# 否则格式化会污染 vendored 第三方源码与生成物。
+
+# vendored 第三方源码(foliate-js,钉定 commit)——刻意与上游零 diff 以便升级,勿重排。
+# license 与升级手册见 src/vendor/foliate-js/VENDOR.md。
+src/vendor/
+
+# 构建产物
+dist/
+dist-ssr/
+coverage/

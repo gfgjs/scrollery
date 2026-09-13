@@ -1,13 +1,11 @@
 // src/types/exotic.ts
 // Exotic 插件平台类型定义（Part5 T11/T12，消费 Part6 后端）
-// Exotic plugin-platform type definitions (Part5 T11/T12, consuming the Part6 backend).
 //
-// 🔴 开源/闭源边界（Part0 §10）：这些类型只承载后端**已判定**的授权态；前端**不持任何验签逻辑**，
-//    授权真相由 Part6 EntitlementProvider 给出（开源 free-stub 恒 Unlicensed）。
+// 前后端职责：这些类型只承载后端**已判定**的授权态；前端**不持任何验签逻辑**，
+//    授权真相由后端对签发凭证验签得出。
 
 /**
  * 格式可用态（后端 `exotic::Availability`，serde camelCase）。**只**描述可用性；任务处理态另有其型。
- * Format availability (mirrors backend `exotic::Availability`, serde camelCase).
  */
 export type Availability =
   | 'availableUninstalled' // 有产品、未安装 → 显示购买占位
@@ -22,7 +20,6 @@ export type Availability =
 
 /**
  * 某插件的授权判定（后端 `exotic::PluginEntitlement`，来自 `get_plugin_entitlement` IPC）。
- * One plugin's entitlement verdict (mirrors backend `exotic::PluginEntitlement`).
  */
 export interface PluginEntitlement {
   pluginId: string
@@ -40,7 +37,7 @@ export interface PluginEntitlement {
 export type MediaKind = 'image' | 'video' | 'audio' | 'document'
 
 /** 能力类型（后端 `exotic::Capability`，serde 小写）。首发只交付 thumbnail。 */
-export type ExoticCapability = 'thumbnail' | 'metadata' | 'text'
+export type ExoticCapability = 'thumbnail' | 'metadata' | 'text' | 'embedding' | 'face_detect_embed' | 'enhance'
 
 /**
  * 结构化格式解析结果（后端 `exotic::FormatResolution`，来自 `get_exotic_item_state` /
@@ -51,10 +48,14 @@ export interface FormatResolution {
   mediaKind: MediaKind
   /** 提供该格式的插件 id；非 catalog 格式为 null。 */
   pluginId: string | null
+  /** 展示名（来自 Catalog；旧后端/测试夹具可能没有，前端回退 pluginId）。 */
+  displayName?: string
   capabilities: ExoticCapability[]
   availability: Availability
   storeUrl: string | null
   installedVersion: string | null
+  /** 内置能力插件(无安装包,直接走 license 门控;T11 商店用它拆分「内置能力插件」区块)。 */
+  builtin: boolean
 }
 
 /**
@@ -80,6 +81,8 @@ export type ExoticInstallState = 'installed' | 'disabled' | 'broken'
  */
 export interface ExoticRegistryEntry {
   pluginId: string
+  /** 展示名（来自 Catalog；旧后端可能没有，前端回退 pluginId）。 */
+  name?: string
   version: string
   formats: string[]
   capabilities: string[]

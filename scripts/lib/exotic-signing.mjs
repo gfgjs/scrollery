@@ -1,4 +1,3 @@
-// scripts/lib/exotic-signing.mjs
 // exotic 插件发行链共享签名/打包原语(Part8 D1 签发端的本地原型层)。
 //
 // 消费者:exotic-dev-registry.mjs(开发期 file:// 源)、exotic-internal-registry.mjs
@@ -9,8 +8,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 
-/** 与 crates/exotic-protocol frame.rs 的 PROTOCOL_VERSION 同步(worker 帧协议版本)。 */
-export const PROTOCOL_VERSION = 2;
+/**
+ * 与 crates/exotic-protocol/src/frame.rs 的 `PROTOCOL_VERSION` **手动**同步(worker 帧协议版本)。
+ * ⚠ 无自动门禁:frame.rs 升版本时必须同步改这里,否则本工具生成/发布的插件包清单会烙上旧版本号,
+ *   被 installer.rs 的启动前复核判为 protocol_mismatch 拒装(2026-07-13 事故:host=3 而此处滞留=2,
+ *   已发布 registry 的 psd 包因此永久拒装;根因是升 host 时漏改本常量)。
+ */
+export const PROTOCOL_VERSION = 3;
 
 /** Ed25519 私钥:pem 存在即复用(保证 keyset 稳定),否则生成并落盘 pkcs8 pem。 */
 export function ensureKey(pemPath) {

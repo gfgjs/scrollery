@@ -335,6 +335,10 @@ fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, InstallError> {
     for seg in rel.split('/') {
         p.push(seg);
     }
+    // 纵深防御:即便 is_safe_relative_path 已过,仍显式确认 join 结果未逃出 base。
+    if !p.starts_with(base) {
+        return Err(InstallError::UnsafeEntry(rel.to_string()));
+    }
     Ok(p)
 }
 

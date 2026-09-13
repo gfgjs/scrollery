@@ -1,15 +1,15 @@
-// src-tauri/src/ipc/proofread_commands.rs
-//! IPC for remote AI proofreading (§5.4). 远程 AI 校对的 IPC（§5.4）。
+//! 远程 AI 校对的 IPC（§5.4）。
 //!
-//! 配置（base_url / model）存 app_config；API key 存系统凭据库（keyring），不落明文 DB。
-//! 校对按文本分块由前端逐块调用 `proofread_chunk`，结果以 track-changes 呈现、接受后存为新版本（接 §5.3）。
+//! 配置（base_url / model）存 config.toml(A2 前存 app_config)；API key 存系统凭据库
+//! （keyring），不落明文 DB。校对按文本分块由前端逐块调用 `proofread_chunk`，结果以
+//! track-changes 呈现、接受后存为新版本（接 §5.3）。
 
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::State;
 
-use crate::db::queries::{get_config, set_config};
+use crate::error::{AppError, Result};
 use crate::proofread::{proofread_remote, ProofreadConfig};
 use crate::state::AppState;
 
@@ -17,11 +17,12 @@ use crate::state::AppState;
 use scrollery_plugin_api::KEYRING_SERVICE;
 const KEYRING_ACCOUNT: &str = "proofread_api_key";
 
-fn keyring_entry() -> std::result::Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|e| e.to_string())
+// keyring 是 OS 凭据库,其错误映射为 AppError::System(稳定 code=System,P1-8:此前裸 String)。
+fn keyring_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| AppError::internal("凭据库访问失败 | keyring access failed", e))
 }
 
-/// Proofread config surfaced to the UI. The key itself is never returned — only whether it's set.
 /// 暴露给 UI 的校对配置。key 本身绝不返回 —— 仅返回是否已设置。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,110 +32,95 @@ pub struct ProofreadConfigDto {
     pub has_key: bool,
 }
 
-/// Read proofread config (base_url / model / whether a key is stored) (§5.4).
 /// 读取校对配置（base_url / model / 是否已存 key）（§5.4）。
+///
+/// A2:base_url/model 均为 schema 设置类键,唯一真源已切到 `ConfigManager`(内存读);
+/// keyring 探测仍是同步系统调用,留在 spawn_blocking。
 #[tauri::command]
-pub async fn get_proofread_config(
-    state: State<'_, Arc<AppState>>,
-) -> std::result::Result<ProofreadConfigDto, String> {
-    // R1-3：DB 读 + keyring 探测（同步系统调用）一并离开 tokio worker。
-    let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> std::result::Result<ProofreadConfigDto, String> {
-        let pool = s.db_read_pool.get().map_err(|e| e.to_string())?;
-        let base_url = get_config(&pool, "proofread_base_url")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-        let model = get_config(&pool, "proofread_model")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
+pub async fn get_proofread_config(state: State<'_, Arc<AppState>>) -> Result<ProofreadConfigDto> {
+    let base_url = state.config.get("proofread_base_url").unwrap_or_default();
+    let model = state.config.get("proofread_model").unwrap_or_default();
+    let has_key = tokio::task::spawn_blocking(|| {
         // key 是否存在：能取到密码即视为已设置（NoEntry → 未设置）。
-        let has_key = keyring_entry()
+        keyring_entry()
             .ok()
             .and_then(|e| e.get_password().ok())
-            .is_some();
-        Ok(ProofreadConfigDto {
-            base_url,
-            model,
-            has_key,
-        })
+            .is_some()
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
+    Ok(ProofreadConfigDto {
+        base_url,
+        model,
+        has_key,
+    })
 }
 
-/// Persist proofread endpoint config (base_url / model) (§5.4).
 /// 持久化校对端点配置（base_url / model）（§5.4）。
+///
+/// A2:两键均为 schema 设置类,唯一真源已切到 config.toml——原 DB 写会被读侧
+/// (`get_proofread_config`/`proofread_chunk`,已改走 ConfigManager)忽略,必须同步改走
+/// `set_and_persist`。文件 IO 是阻塞操作,下沉 spawn_blocking(硬约束)。
 #[tauri::command]
 pub async fn set_proofread_config(
     base_url: String,
     model: String,
     state: State<'_, Arc<AppState>>,
-) -> std::result::Result<(), String> {
+) -> Result<()> {
     let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
-        let conn = s.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-        set_config(&conn, "proofread_base_url", &base_url).map_err(|e| e.to_string())?;
-        set_config(&conn, "proofread_model", &model).map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        s.config.set_and_persist("proofread_base_url", &base_url)?;
+        s.config.set_and_persist("proofread_model", &model)?;
         Ok(())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// Store the API key in the OS credential store (never in the DB) (§5.4).
 /// 把 API key 存入系统凭据库（绝不入 DB）（§5.4）。
 #[tauri::command]
-pub async fn set_proofread_key(key: String) -> std::result::Result<(), String> {
+pub async fn set_proofread_key(key: String) -> Result<()> {
     keyring_entry()?
         .set_password(&key)
-        .map_err(|e| e.to_string())
+        .map_err(|e| AppError::internal("写入凭据失败 | credential write failed", e))
 }
 
-/// Remove the stored API key (§5.4).
 /// 删除已存的 API key（§5.4）。
 #[tauri::command]
-pub async fn clear_proofread_key() -> std::result::Result<(), String> {
+pub async fn clear_proofread_key() -> Result<()> {
     match keyring_entry()?.delete_credential() {
         Ok(()) => Ok(()),
         // 未设置时删除视为成功（幂等）。
         Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(AppError::internal(
+            "删除凭据失败 | credential delete failed",
+            e,
+        )),
     }
 }
 
-/// Proofread one text chunk via the configured remote LLM (§5.4). The frontend chunks the
-/// document and calls this per chunk, then renders a track-changes diff before accepting.
 /// 经配置的远程 LLM 校对一段文本（§5.4）。前端分块后逐块调用，再以 track-changes 呈现差异供接受。
 #[tauri::command]
-pub async fn proofread_chunk(
-    text: String,
-    state: State<'_, Arc<AppState>>,
-) -> std::result::Result<String, String> {
-    // R1-3：DB 读 + keyring 取 key 离开 tokio worker（其后的远程调用本就是 async IO）。
-    let s = Arc::clone(&state);
-    let (base_url, model, key) = tokio::task::spawn_blocking(
-        move || -> std::result::Result<(String, String, String), String> {
-            let pool = s.db_read_pool.get().map_err(|e| e.to_string())?;
-            let b = get_config(&pool, "proofread_base_url")
-                .map_err(|e| e.to_string())?
-                .unwrap_or_default();
-            let m = get_config(&pool, "proofread_model")
-                .map_err(|e| e.to_string())?
-                .unwrap_or_default();
-            if b.trim().is_empty() {
-                return Err("未配置校对服务地址 | proofread base_url not set".into());
-            }
-            let key = keyring_entry()?
-                .get_password()
-                .map_err(|_| "未设置 API Key | proofread API key not set".to_string())?;
+pub async fn proofread_chunk(text: String, state: State<'_, Arc<AppState>>) -> Result<String> {
+    // A2:base_url/model 已迁往 config.toml(内存读);keyring 取 key 仍是同步系统调用,离开
+    // tokio worker（其后的远程调用本就是 async IO）。
+    let b = state.config.get("proofread_base_url").unwrap_or_default();
+    let m = state.config.get("proofread_model").unwrap_or_default();
+    if b.trim().is_empty() {
+        return Err(AppError::System(
+            "未配置校对服务地址 | proofread base_url not set".into(),
+        ));
+    }
+    let (base_url, model, key) =
+        tokio::task::spawn_blocking(move || -> Result<(String, String, String)> {
+            let key = keyring_entry()?.get_password().map_err(|_| {
+                AppError::System("未设置 API Key | proofread API key not set".into())
+            })?;
             Ok((b, m, key))
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())??;
+        })
+        .await
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
 
     let cfg = ProofreadConfig { base_url, model };
-    proofread_remote(&cfg, &key, &text)
-        .await
-        .map_err(|e| e.to_string())
+    proofread_remote(&cfg, &key, &text).await
 }

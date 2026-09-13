@@ -1,18 +1,12 @@
 # crates/scrollery-exotic-trust/Cargo.toml
-# 插件平台 · 开源信任根验签叶 crate（Part6 §3.9.1a 去环 ③a）。
-#
-# 自 src-tauri 迁入 VerifyingKeyset + verify_token/evaluate_token/LicensePayload（通用 ring 封装、
-# 无秘密价值，计划明定「留开源」§3.9 line 553）。下沉动机：pro 的 DirectEntitlement 需复用这套验签
-# 原语，而 pro 不能依赖 src-tauri（否则 cargo crate 依赖成环）。依赖单向无环：
-#   plugin-api（叶）← exotic-trust ← src-tauri / pro。
-#
-# 🔴 真实**生产**公钥 exotic-keyset-prod.json + builtin() 生产构造随 pro 下沉（③b）；本 crate 现内置
-#    的是**占位**公钥（openssl 生成、私钥已弃），非生产密钥，不触「生产公钥永不入公开仓」红线。
+# 插件平台共用的信任根与验签原语，依赖方向：plugin-api ← exotic-trust ← src-tauri。
+# 默认内置占位公钥；发布可经 PICASA_EXOTIC_KEYSET_FILE 注入验签公钥集，私钥不入仓。
 
 [package]
 name = "scrollery-exotic-trust"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)
 publish = false
 
 [lib]

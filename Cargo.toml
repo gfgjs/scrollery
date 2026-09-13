@@ -1,12 +1,13 @@
 # 根 workspace 清单（Part6 §3.9.1 / §8.2 C5 前置子任务）。
 #
-# 此前 src-tauri 与 crates/* 各为独立 package、无统一 workspace。为承接 §3.9 的开源/闭源 crate 拆分
-# （plugin-api 叶 crate + free-stub + 闭源 pro overlay 注入），先建 workspace 把现有 4 个 crate 纳入、
-# 保持构建/测试全绿——这是「再加 plugin-api/free-stub」的前置子任务（§8.2 C5：先纳入现有、绿、再扩）。
+# 此前 src-tauri 与 crates/* 各为独立 package、无统一 workspace。为承接 §3.9 的插件平台分层
+# （plugin-api 契约叶 crate + exotic-trust 验签叶 crate），先建 workspace 把现有 crate 纳入、
+# 保持构建/测试全绿——这是「再加叶 crate」的前置子任务（§8.2 C5：先纳入现有、绿、再扩）。
 #
 # 🔴 members 显式逐一列出，禁用 `crates/*` glob（§3.9.1 P0-5）：glob 会①命中无 Cargo.toml 的
 #    `crates/exotic-workers/` 目录致 `cargo metadata` 报错、②只展开一层、漏掉两层深的
 #    psd-worker/psd-probe（打穿 Part7 G3「psd-worker 测试可达」）。
+#    raw-worker/raw-probe 各持空 `[workspace]` 独立构建（MSVC 工具链限制，见各自 Cargo.toml）。
 # 🔴 resolver 必须显式 "2"：2021 edition 单 crate 默认用 resolver 2，但进 workspace 后根不声明会
 #    回退 "1" → feature 统一行为变化。显式 "2" 保持现状。
 [workspace]
@@ -17,19 +18,24 @@ members = [
     "crates/exotic-workers/psd-worker",
     "crates/exotic-workers/psd-probe",
     "crates/exotic-workers/ai-worker",
+    "crates/exotic-workers/enhance-worker",
+    "crates/exotic-workers/video-worker",
     "crates/scrollery-plugin-api",
-    "crates/scrollery-free-stub",
     "crates/scrollery-exotic-trust",
     "crates/scrollery-ai-core",
 ]
 
 # ── 版本锚:单一事实源(Part7-T5 / Part7 §3.2 R3)────────────────────────────────────
-# 升版只改这一处。传导链:src-tauri/free-stub `version.workspace = true` 继承 →
+# 升版只改这一处。传导链:src-tauri `version.workspace = true` 继承 →
 # tauri.conf.json 不持有 version(Tauri codegen 回退 CARGO_PKG_VERSION)→ 产物版本;
 # package.json 由 `node scripts/sync-version.mjs --write` 从此写回,CI --check + tag 一致性兜底。
 # exotic-protocol/psd-worker 等内部组件不对外,保留自有版本(§3.2)。
 [workspace.package]
 version = "0.1.0"
+# 第一方许可（2026-09-14 决议）：主程序第一方源码统一 AGPL-3.0-only，不附链接例外；商业授权单独签署、
+# 经明确授权后生效，不改变任何人依 AGPL 取得的权利（见 COMMERCIAL.md）。未来独立商业组件另定、不预承诺。
+# 各 member 经 `license.workspace = true` 继承；独立 workspace(raw-worker/raw-probe)各自声明。
+license = "AGPL-3.0-only"
 
 # ── 构建 profile（仅 workspace 根生效；member 内的 [profile.*] 会被 cargo 忽略）──────────────────
 # 自 src-tauri/Cargo.toml 迁入（连同其原注释）。
@@ -48,6 +54,13 @@ version = "0.1.0"
 [profile.dev.package.image]
 opt-level = 2
 [profile.dev.package.image-webp]
+opt-level = 2
+# webp/libwebp-sys(903a98f 引入的有损 WebP 编码主路径):libwebp 的 C 源码由 cc 按本包
+# OPT_LEVEL 编译,dev 不覆盖则以 -O0 编译——缩略图编码单张耗时暴涨约一个量级,扫描期
+# 缩略图 worker 占满核拖垮 enrich(「解析元数据」爬行,2026-07-10 真机回归)。
+[profile.dev.package.webp]
+opt-level = 2
+[profile.dev.package.libwebp-sys]
 opt-level = 2
 [profile.dev.package.zune-jpeg]
 opt-level = 2

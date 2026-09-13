@@ -6,7 +6,7 @@
         class="pr-panel__x"
         @click="emit('close')"
         :title="t('common.close')"
-        :aria-label="t('common.close')"
+
       >
         <X :size="16" />
       </button>
@@ -14,18 +14,15 @@
 
     <!-- 配置（未配置或点击设置时展开）-->
     <div v-if="showConfig" class="pr-config">
-      <label
-        >{{ t('doc.proofreadBaseUrl') }}
+      <UiField :label="t('doc.proofreadBaseUrl')">
         <input v-model="form.baseUrl" placeholder="https://api.openai.com/v1" />
-      </label>
-      <label
-        >{{ t('doc.proofreadModel') }}
+      </UiField>
+      <UiField :label="t('doc.proofreadModel')">
         <input v-model="form.model" placeholder="gpt-4o-mini" />
-      </label>
-      <label
-        >API Key {{ cfg?.hasKey ? t('doc.proofreadKeySet') : '' }}
+      </UiField>
+      <UiField :label="cfg?.hasKey ? `API Key ${t('doc.proofreadKeySet')}` : 'API Key'">
         <input v-model="form.key" type="password" placeholder="sk-..." />
-      </label>
+      </UiField>
       <div class="pr-config__row">
         <button class="pr-btn pr-btn--primary" @click="saveConfig">{{ t('doc.save') }}</button>
         <button v-if="cfg?.hasKey" class="pr-btn" @click="clearKey">
@@ -89,10 +86,12 @@
 // AI 校对面板（§5.4，远程）。配置（base_url/model/key）→ 分块逐块校对 → track-changes 预览 →
 // 接受后存为新版本（source='ai-remote'，接 §5.3）。本期为「全部接受」；逐条接受/拒绝为后续增强。
 import { ref, reactive, computed, onMounted } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { X, Settings, Sparkles } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
 import { IPC } from '../../constants/ipc'
+import { invokeIpc, ipcErrorMessage } from '../../utils/ipc'
+import { useToastStore } from '../../stores/toastStore'
+import UiField from '../ui/UiField.vue'
 
 interface DiffOp {
   tag: string
@@ -108,6 +107,7 @@ const props = defineProps<{ itemId: number; text: string; currentVersionId: numb
 const emit = defineEmits<{ (e: 'changed'): void; (e: 'close'): void }>()
 
 const { t } = useI18n()
+const toast = useToastStore()
 
 const cfg = ref<ProofreadCfg | null>(null)
 const form = reactive({ baseUrl: '', model: '', key: '' })
@@ -139,7 +139,7 @@ function chunkText(text: string): string[] {
 }
 
 async function loadCfg() {
-  cfg.value = await invoke<ProofreadCfg>(IPC.GET_PROOFREAD_CONFIG).catch(() => null)
+  cfg.value = await invokeIpc<ProofreadCfg>(IPC.GET_PROOFREAD_CONFIG).catch(() => null)
   if (cfg.value) {
     form.baseUrl = cfg.value.baseUrl
     form.model = cfg.value.model
@@ -148,18 +148,30 @@ async function loadCfg() {
 }
 
 async function saveConfig() {
-  await invoke(IPC.SET_PROOFREAD_CONFIG, { baseUrl: form.baseUrl.trim(), model: form.model.trim() })
-  if (form.key) {
-    await invoke(IPC.SET_PROOFREAD_KEY, { key: form.key })
-    form.key = ''
+  // P1-16:此前无 try/catch,配置写失败静默,用户以为已保存。
+  try {
+    await invokeIpc(IPC.SET_PROOFREAD_CONFIG, {
+      baseUrl: form.baseUrl.trim(),
+      model: form.model.trim(),
+    })
+    if (form.key) {
+      await invokeIpc(IPC.SET_PROOFREAD_KEY, { key: form.key })
+      form.key = ''
+    }
+    await loadCfg()
+    if (configured.value) showConfig.value = false
+  } catch (e) {
+    toast.addToast('error', t('doc.saveConfigFailed', { error: ipcErrorMessage(e) }))
   }
-  await loadCfg()
-  if (configured.value) showConfig.value = false
 }
 
 async function clearKey() {
-  await invoke(IPC.CLEAR_PROOFREAD_KEY)
-  await loadCfg()
+  try {
+    await invokeIpc(IPC.CLEAR_PROOFREAD_KEY)
+    await loadCfg()
+  } catch (e) {
+    toast.addToast('error', t('doc.clearKeyFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 
 async function run() {
@@ -174,11 +186,11 @@ async function run() {
   try {
     const out: string[] = []
     for (const c of chunks) {
-      out.push(await invoke<string>(IPC.PROOFREAD_CHUNK, { text: c }))
+      out.push(await invokeIpc<string>(IPC.PROOFREAD_CHUNK, { text: c }))
       progress.done++
     }
     corrected.value = out.join('')
-    diff.value = await invoke<DiffOp[]>(IPC.DIFF_TEXTS, { a: props.text, b: corrected.value })
+    diff.value = await invokeIpc<DiffOp[]>(IPC.DIFF_TEXTS, { a: props.text, b: corrected.value })
   } catch (e) {
     error.value = t('doc.proofreadFailed', { error: (e as Error)?.message ?? e })
   } finally {
@@ -188,18 +200,23 @@ async function run() {
 
 async function accept() {
   if (corrected.value == null) return
-  const newId = await invoke<number>(IPC.SAVE_VERSION, {
-    itemId: props.itemId,
-    content: corrected.value,
-    label: t('doc.proofreadVersionLabel'),
-    parentId: props.currentVersionId,
-    target: 'version',
-    source: 'ai-remote',
-  })
-  await invoke(IPC.SET_CURRENT_VERSION, { itemId: props.itemId, versionId: newId })
-  diff.value = null
-  corrected.value = null
-  emit('changed')
+  // P1-16:接受 AI 校对稿并存版本,失败须告警(否则用户以为已采纳,实则未落库)。
+  try {
+    const newId = await invokeIpc<number>(IPC.SAVE_VERSION, {
+      itemId: props.itemId,
+      content: corrected.value,
+      label: t('doc.proofreadVersionLabel'),
+      parentId: props.currentVersionId,
+      target: 'version',
+      source: 'ai-remote',
+    })
+    await invokeIpc(IPC.SET_CURRENT_VERSION, { itemId: props.itemId, versionId: newId })
+    diff.value = null
+    corrected.value = null
+    emit('changed')
+  } catch (e) {
+    toast.addToast('error', t('doc.saveVersionFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 
 function discard() {
@@ -217,13 +234,13 @@ onMounted(loadCfg)
   width: 360px;
   height: 100%;
   background: var(--color-bg-surface);
-  border-left: 1px solid var(--color-border);
+  border-left: 1px solid var(--color-divider);
 }
 .pr-panel__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 12px;
+  padding: var(--spacing-sm) var(--spacing-md);
   border-bottom: 1px solid var(--color-border);
 }
 .pr-panel__title {
@@ -239,22 +256,18 @@ onMounted(loadCfg)
 .pr-config {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md);
 }
-.pr-config label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
-}
+/* 字段 label 关联/朝向由 UiField 原语提供(原 .pr-config label 已删);label 字号统一到原语的
+   font-size-sm(原 xs,微增)。此处仅保留输入框视觉。 */
 .pr-config input {
   background: var(--color-bg-elevated);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   color: var(--color-text-primary);
-  padding: 5px 8px;
+  height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
   font-size: var(--font-size-sm);
 }
 .pr-config__row {
@@ -262,10 +275,10 @@ onMounted(loadCfg)
   gap: 8px;
 }
 .pr-hint {
-  font-size: 11px;
+  font-size: var(--font-size-2xs);
   color: var(--color-text-secondary);
   margin: 0;
-  padding: 0 12px;
+  padding: 0 var(--spacing-md);
   line-height: 1.5;
 }
 
@@ -277,8 +290,8 @@ onMounted(loadCfg)
 }
 .pr-actions {
   display: flex;
-  gap: 8px;
-  padding: 12px;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md);
 }
 .pr-error {
   /* 原 var(--color-danger, #e5484d) 引用不存在的幽灵 token,一直走 fallback(S5 修) */
@@ -290,18 +303,19 @@ onMounted(loadCfg)
 .pr-btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--spacing-xs);
   background: var(--color-bg-elevated);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   color: var(--color-text-primary);
-  padding: 6px 10px;
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
   font-size: var(--font-size-xs);
   cursor: pointer;
 }
 .pr-btn--primary {
   background: var(--color-accent);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-accent);
   border-color: transparent;
 }
 .pr-btn:disabled {
@@ -317,7 +331,7 @@ onMounted(loadCfg)
   border-top: 1px solid var(--color-border);
 }
 .pr-diff__bar {
-  padding: 6px 12px;
+  padding: var(--spacing-xs) var(--spacing-md);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
 }
@@ -325,12 +339,12 @@ onMounted(loadCfg)
   flex: 1;
   overflow: auto;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--font-size-2xs);
 }
 .pr-diff__line {
   display: flex;
-  gap: 6px;
-  padding: 0 8px;
+  gap: var(--spacing-xs);
+  padding: 0 var(--spacing-sm);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -339,10 +353,10 @@ onMounted(loadCfg)
   color: var(--color-text-secondary);
 }
 .op-insert {
-  background: color-mix(in srgb, var(--color-success) 18%, transparent);
+  background: var(--color-success-subtle);
 }
 .op-delete {
-  background: color-mix(in srgb, var(--color-error) 18%, transparent);
+  background: var(--color-error-subtle);
 }
 .op-insert .pr-diff__sign {
   color: var(--color-success);
@@ -352,8 +366,8 @@ onMounted(loadCfg)
 }
 .pr-diff__foot {
   display: flex;
-  gap: 8px;
-  padding: 10px 12px;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
   border-top: 1px solid var(--color-border);
 }
 </style>

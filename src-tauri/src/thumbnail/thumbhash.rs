@@ -1,32 +1,24 @@
 // src-tauri/src/thumbnail/thumbhash.rs
-//! ThumbHash generation from decoded pixels.
 //! 从解码后的像素生成 ThumbHash。
 //!
-//! Input: RGBA pixel buffer (any size).
 //! 输入：RGBA 像素缓冲区（任何尺寸）。
-//! Output: ~28 bytes of ThumbHash, stored as BLOB in the DB.
 //! 输出：约 28 字节的 ThumbHash，作为 BLOB 存储在数据库中。
-//! Frontend receives it as `number[]` → `Uint8Array` → renders 32×32 placeholder.
 //! 前端接收其为 `number[]` → `Uint8Array` → 渲染为 32×32 占位符。
 
 use crate::engine::traits::DecodedImage;
 use crate::error::{AppError, Result};
 
-/// Maximum dimension to scale the image before hashing (ThumbHash works well at 100×100 or smaller).
 /// 在散列之前缩放图像的最大尺寸（ThumbHash 在 100×100 或更小的尺寸下效果很好）。
 const HASH_MAX_DIM: u32 = 100;
 
-/// Generate a ThumbHash for a decoded image.
 /// 为解码后的图像生成 ThumbHash。
 pub fn generate_thumbhash(decoded: &DecodedImage) -> Result<Vec<u8>> {
-    // Scale down if needed
     // 如果需要则缩小
     let (pixels, width, height) = if decoded.width > HASH_MAX_DIM || decoded.height > HASH_MAX_DIM {
         let ratio = (HASH_MAX_DIM as f32) / (decoded.width.max(decoded.height) as f32);
         let new_w = ((decoded.width as f32) * ratio).round() as u32;
         let new_h = ((decoded.height as f32) * ratio).round() as u32;
 
-        // Use fast_image_resize v4 for downscaling
         // 使用 fast_image_resize v4 进行降采样（缩小）
         use fast_image_resize::pixels::PixelType;
         use fast_image_resize::{images::Image as FirImage, ResizeOptions, Resizer};
@@ -53,6 +45,19 @@ pub fn generate_thumbhash(decoded: &DecodedImage) -> Result<Vec<u8>> {
 
     let hash = thumbhash::rgba_to_thumb_hash(width as usize, height as usize, &pixels);
     Ok(hash)
+}
+
+/// 由 thumbhash 字节算占位平均色,返回 CSS `#rrggbb`(不足/畸形 → None)。
+///
+/// 前端 `thumbhashToAverageColor` 的后端对偶:改由布局 hydrate 时算一次(仅可视区 ~10² 项),
+/// 前端直接用——**移出渲染热路径**(原 canvas draw 每帧对每个可视格现算均色 + 每项过桥 ~28 字节
+/// thumbhash 数组作 JSON,快滚段落地时是白屏与反序列化爆发的一处源)。用 thumbhash crate 的
+/// `thumb_hash_to_average_rgba`(golden 生成器同一函数),与前端 TS 移植版在 ±2/通道内一致
+/// (前端 thumbhash.spec.ts 已锁此容差),差异不可辨。
+pub fn average_color_hex(hash: &[u8]) -> Option<String> {
+    let (r, g, b, _a) = thumbhash::thumb_hash_to_average_rgba(hash).ok()?;
+    let to255 = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some(format!("#{:02x}{:02x}{:02x}", to255(r), to255(g), to255(b)))
 }
 
 #[cfg(test)]
@@ -200,5 +205,39 @@ mod tests {
         let path = std::env::temp_dir().join("thumbhash.golden.ts");
         std::fs::write(&path, &ts).expect("write golden");
         println!("golden fixtures written to {}", path.display());
+    }
+
+    // ── average_color_hex 占位色(布局 hydrate 用)──────────────────────────────
+    // 金标 landscape_gradient 的 hash(取自 src/utils/thumbhash.golden.ts,同一 crate 版本产出),
+    // 其 avg = { r:0.47883597, g:0.49470899, b:0.5026455 } → round(×255) = 122/126/128 = #7a7e80。
+    // 锁定「后端 hydrate 算的占位色」与前端 golden 一致(前端 spec 已验 TS 移植 ≈ crate ±2)。
+    const GOLDEN_LANDSCAPE_HASH: [u8; 21] = [
+        223, 247, 9, 61, 154, 128, 135, 135, 128, 135, 136, 120, 136, 120, 136, 136, 128, 128, 8,
+        248, 119,
+    ];
+
+    #[test]
+    fn average_color_hex_matches_golden() {
+        assert_eq!(
+            super::average_color_hex(&GOLDEN_LANDSCAPE_HASH),
+            Some("#7a7e80".to_string())
+        );
+    }
+
+    #[test]
+    fn average_color_hex_rejects_malformed() {
+        // 空 / 不足 5 字节:crate 返回 Err → None(前端对偶回退占位 CSS 变量)。
+        assert_eq!(super::average_color_hex(&[]), None);
+        assert_eq!(super::average_color_hex(&[1, 2, 3, 4]), None);
+    }
+
+    #[test]
+    fn average_color_hex_is_lowercase_six_digit() {
+        let hex = super::average_color_hex(&GOLDEN_LANDSCAPE_HASH).unwrap();
+        assert_eq!(hex.len(), 7);
+        assert!(hex.starts_with('#'));
+        assert!(hex[1..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

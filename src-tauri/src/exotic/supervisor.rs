@@ -16,7 +16,6 @@
 //!   - Drop 兜底 kill + wait + join，绝不留孤儿进程或泄漏线程。
 
 use std::collections::VecDeque;
-use std::io::Read;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -28,7 +27,8 @@ use super::worker::{
     spawn_frame_reader, spawn_worker_process, RawOutcome, TaskOutcome, WorkerConfig, WorkerConn,
     WorkerLimits, WorkerSpec,
 };
-use exotic_protocol::{RequestBody, SuccessBody};
+use super::worker_log::{spawn_stderr_drain, worker_kind_label};
+use exotic_protocol::{ProgressBody, RequestBody, SuccessBody};
 
 /// 子进程句柄抽象(R2-5 测试缝):生产实现为 [`Child`] 的 1:1 机械委托。
 /// ExitStatus 被整体擦除——本模块所有调用点本就丢弃它(`let _ = wait()`、try_wait 只
@@ -53,6 +53,9 @@ impl ChildHandle for Child {
 }
 
 /// stderr 环形缓冲上限：只保留最近 64 KiB 诊断，不无限累积内存（§3.4）。
+/// worker stderr 行日志转发(日志能力重构线 阶段 3 · W4,D-310/D-313)已迁至
+/// `worker_log` 模块:字节级环形缓冲(本常量)与行级 `worker_log::LineScanner`
+/// 是两套并行机制(D-313 已裁决双写可接受),迁移/改动时**不得合并**。
 const STDERR_RING_CAP: usize = 64 * 1024;
 
 /// 已加载会话的 host 侧快照(T15,D3 §4②):记录 SessionInit 时的 model_profile 关键字段
@@ -66,6 +69,10 @@ pub struct SessionDescriptor {
     /// 选定的图像塔 batch 变体文件(同架构不同变体切换也须重 Init)。
     pub image_file: String,
     pub face_profile_id: Option<String>,
+    /// SessionInit 快照里的单批上限(2026-07-10 审查 W3):worker 端按此硬拒超限批
+    /// (terminal),host 侧 matches 必须比对——否则「先小批建会话(如搜索)→ 调大配置
+    /// → 复用旧会话派大批」会被 worker 拒到整轮打死。
+    pub batch_size: u32,
     /// SessionReady 回报的嵌入维度(EmbedBatch blob 校验用)。
     pub embed_dim: u32,
     pub face_embed_dim: Option<u32>,
@@ -106,9 +113,15 @@ impl WorkerSupervisor {
         let (tx, rx) = crossbeam_channel::unbounded();
         let reader_handle = spawn_frame_reader(stdout, tx);
 
-        // stderr → 有界环形缓冲（持续排空，防管道写满死锁）。
+        // stderr → 有界环形缓冲（持续排空，防管道写满死锁）+ 行级转发进主 tracing（W4）。
         let stderr_ring = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_RING_CAP)));
-        let stderr_handle = spawn_stderr_drain(stderr, Arc::clone(&stderr_ring));
+        let worker_kind = worker_kind_label(spec);
+        let stderr_handle = spawn_stderr_drain(
+            stderr,
+            Arc::clone(&stderr_ring),
+            STDERR_RING_CAP,
+            worker_kind,
+        );
 
         // 握手（写 Hello → 等 Ready → 校验）。失败要 kill 兜底。
         let conn = match WorkerConn::handshake(Box::new(stdin), rx, spec, cfg) {
@@ -157,10 +170,63 @@ impl WorkerSupervisor {
         timeout: Duration,
         cancelled: &dyn Fn() -> bool,
     ) -> RawOutcome {
+        self.run_request_capped(
+            req,
+            timeout,
+            crate::exotic::worker::PROGRESS_TOTAL_CAP,
+            cancelled,
+        )
+    }
+
+    /// [`Self::run_request`] 的 per-op 总上界参数化版(视频格式扩展子系统 design.md §2.4):
+    /// `timeout` 为静默限时、`total_cap` 为不可重置总上界。进程级异常同一 kill 回收语义。
+    /// video transcode 传 `max(2h, 探测时长×6)`;其余 op 由 `run_request` 传缺省 3600s。
+    pub fn run_request_capped(
+        &mut self,
+        req: &RequestBody,
+        timeout: Duration,
+        total_cap: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> RawOutcome {
+        self.run_request_observed(req, timeout, total_cap, cancelled, None)
+    }
+
+    /// 同 [`Self::run_request`],额外透传 per-tile 进度回调(深审 b)。`None` 时行为
+    /// 与 `run_request` 完全一致;委托到 [`Self::run_request_observed`] 并取缺省 total_cap。
+    pub fn run_request_with_progress(
+        &mut self,
+        req: &RequestBody,
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+        on_progress: Option<&mut dyn FnMut(&ProgressBody)>,
+    ) -> RawOutcome {
+        self.run_request_observed(
+            req,
+            timeout,
+            crate::exotic::worker::PROGRESS_TOTAL_CAP,
+            cancelled,
+            on_progress,
+        )
+    }
+
+    /// [`Self::run_request_capped`] 的进度可观察版(视频格式扩展子系统 design.md §5.3):
+    /// 镜像 `total_cap` 参数化时的转发手法——不动私有字段结构,只把观察者原样转发给
+    /// [`WorkerConn::run_request_observed`];kill 回收 / 死亡判定逻辑与
+    /// [`Self::run_request_capped`] 完全一致。
+    pub fn run_request_observed(
+        &mut self,
+        req: &RequestBody,
+        timeout: Duration,
+        total_cap: Duration,
+        cancelled: &dyn Fn() -> bool,
+        progress_observer: Option<&mut dyn FnMut(&ProgressBody)>,
+    ) -> RawOutcome {
         if !self.alive {
             return RawOutcome::Disconnected;
         }
-        let outcome = self.conn.run_request(req, timeout, cancelled);
+        let outcome =
+            self.conn
+                .run_request_observed(req, timeout, total_cap, cancelled, progress_observer);
         match &outcome {
             RawOutcome::Success { .. } | RawOutcome::Failure(_) => {}
             RawOutcome::TimedOut | RawOutcome::Disconnected | RawOutcome::Protocol(_) => {
@@ -205,6 +271,7 @@ impl WorkerSupervisor {
                         arch_id: model_profile.arch_id,
                         image_file: model_profile.image_file,
                         face_profile_id: model_profile.face_profile_id,
+                        batch_size: model_profile.batch_size,
                         embed_dim: ready.embed_dim,
                         face_embed_dim: ready.face_embed_dim,
                         caps: ready.caps.clone(),
@@ -363,30 +430,6 @@ fn raw_outcome_label(o: &RawOutcome) -> &'static str {
         RawOutcome::Disconnected => "disconnected",
         RawOutcome::Protocol(_) => "protocol_violation",
     }
-}
-
-/// stderr 排空线程：持续读，追加到有界环形缓冲（超过 64 KiB 从头丢弃）。
-fn spawn_stderr_drain<R: Read + Send + 'static>(
-    mut r: R,
-    ring: Arc<Mutex<VecDeque<u8>>>,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match r.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    let mut g = ring.lock().unwrap_or_else(|e| e.into_inner());
-                    g.extend(&buf[..n]);
-                    // 截断到最近 STDERR_RING_CAP 字节。
-                    while g.len() > STDERR_RING_CAP {
-                        g.pop_front();
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    })
 }
 
 #[cfg(test)]
@@ -738,9 +781,14 @@ mod tests {
     fn stderr_ring_keeps_last_64k() {
         let data: Vec<u8> = (0..100_000usize).map(|i| (i % 251) as u8).collect();
         let ring = Arc::new(Mutex::new(VecDeque::new()));
-        spawn_stderr_drain(std::io::Cursor::new(data.clone()), Arc::clone(&ring))
-            .join()
-            .unwrap();
+        spawn_stderr_drain(
+            std::io::Cursor::new(data.clone()),
+            Arc::clone(&ring),
+            STDERR_RING_CAP,
+            "test".to_string(),
+        )
+        .join()
+        .unwrap();
         let g = ring.lock().unwrap();
         assert_eq!(g.len(), STDERR_RING_CAP);
         let kept: Vec<u8> = g.iter().copied().collect();
@@ -753,9 +801,14 @@ mod tests {
 
         let small = b"short stderr".to_vec();
         let ring2 = Arc::new(Mutex::new(VecDeque::new()));
-        spawn_stderr_drain(std::io::Cursor::new(small.clone()), Arc::clone(&ring2))
-            .join()
-            .unwrap();
+        spawn_stderr_drain(
+            std::io::Cursor::new(small.clone()),
+            Arc::clone(&ring2),
+            STDERR_RING_CAP,
+            "test".to_string(),
+        )
+        .join()
+        .unwrap();
         assert_eq!(
             ring2.lock().unwrap().iter().copied().collect::<Vec<u8>>(),
             small
@@ -806,6 +859,7 @@ mod tests {
                 handle: ModelHandle::Path("C:/models/img.onnx".into()),
                 len: 3,
                 sha256: "ab".repeat(32),
+                model_id: None,
             }],
             model_profile: ModelProfileSnapshot {
                 arch_id: "cn-clip-vit-b16".into(),
@@ -843,6 +897,7 @@ mod tests {
         let desc = sup.session().expect("成功后应记录会话快照");
         assert_eq!(desc.session_id, 7);
         assert_eq!(desc.arch_id, "cn-clip-vit-b16");
+        assert_eq!(desc.batch_size, 16, "快照须记 SessionInit 的批上限(W3)");
         assert_eq!(desc.embed_dim, 512);
         assert_eq!(desc.face_embed_dim, Some(128));
         assert_eq!(desc.face_profile_id.as_deref(), Some("yunet-sface"));
@@ -936,6 +991,7 @@ mod tests {
             arch_id: "cn-clip-vit-b16".into(),
             image_file: "img.onnx".into(),
             face_profile_id: None,
+            batch_size: 16,
             embed_dim: 512,
             face_embed_dim: None,
             caps: vec!["embedding".into()],

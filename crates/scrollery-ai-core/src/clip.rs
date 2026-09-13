@@ -1,16 +1,14 @@
 // crates/scrollery-ai-core/src/clip.rs
-//! Chinese-CLIP inference: image preprocessing and text tokenisation.
 //! Chinese-CLIP 推理：图像预处理与文本分词。
 //!
-//! Model: eisneim/cn-clip_vit-b-16 (FP16 external-data format, ORT 1.26+)
 //! 模型：eisneim/cn-clip_vit-b-16（FP16 外部数据格式，需要 ORT 1.26+）
 //!
-//! Image encoder: RGB → Resize(shortest_edge=224, Bicubic) → CenterCrop(224)
-//!   → Normalise(CLIP mean/std) → CHW f32 tensor → "image" input
-//!   → "unnorm_image_features" [1,512] → L2 normalise → 512-d unit vector
+//! 图像编码器管线:RGB → Resize(shortest_edge=224, Bicubic) → CenterCrop(224)
+//!   → Normalise(CLIP mean/std) → CHW f32 张量 → "image" 输入
+//!   → "unnorm_image_features" [1,512] → L2 归一化 → 512 维单位向量
 //!
-//! Text encoder:  BERT tokeniser (vocab.txt, 21128 tokens) → token_ids i64[1,52]
-//!   → "text" input → "unnorm_text_features" [1,512] → L2 normalise → 512-d unit vector
+//! 文本编码器管线:BERT 分词(vocab.txt,21128 tokens)→ token_ids i64[1,52]
+//!   → "text" 输入 → "unnorm_text_features" [1,512] → L2 归一化 → 512 维单位向量
 //!
 //! # 踩坑记录 — 接入 CLIP 类多模态模型的经验总结
 //!
@@ -273,7 +271,6 @@ fn resolve_text_input_mode(available: &[String], profile: &ModelProfile) -> Resu
 // ── Image encoding ────────────────────────────────────────────────────────────
 // ── 图像编码 ────────────────────────────────────────────────────────────────
 
-/// Encode a JPEG/PNG thumbnail byte slice into a 512-d unit vector.
 /// 将 JPEG/PNG 缩略图字节切片编码为 512-d 单位向量。
 pub fn encode_image_bytes(
     session_pool: &crate::engine::SessionPool,
@@ -286,7 +283,6 @@ pub fn encode_image_bytes(
     encode_image(session_pool, &img, profile)
 }
 
-/// Encode a `DynamicImage` into an `embed_dim` unit vector.
 /// 将 `DynamicImage` 编码为 `embed_dim` 维单位向量。
 pub fn encode_image(
     session_pool: &crate::engine::SessionPool,
@@ -297,7 +293,6 @@ pub fn encode_image(
     run_image_inference(session_pool, array, profile)
 }
 
-/// Encode a pre-decoded image (RGBA u8 pixels) into a 512-d unit vector.
 /// 将预解码的图像（RGBA u8 像素）编码为 512-d 单位向量。
 ///
 /// The image should already be resized to `short_edge=224` by the `ImageEngine`.
@@ -316,9 +311,6 @@ pub fn encode_image_from_decoded(
     run_image_inference(session_pool, array, profile)
 }
 
-/// Run CLIP image encoder inference on a single preprocessed [1,3,S,S] f32 tensor (S = `image_size`).
-/// Delegates to `encode_image_batch` so the fixed-batch padding logic (固定 batch 模型补齐尾批)
-/// applies to the single-image path too — a fixed batch>1 export would otherwise reject `[1,…]`.
 /// 在单张预处理后的 [1,3,S,S] f32 张量上运行图像编码推理；委托给 `encode_image_batch`，使固定
 /// batch 模型的补齐逻辑同样覆盖单图路径（否则固定 batch>1 的导出会拒绝 `[1,…]`）。
 fn run_image_inference(
@@ -332,10 +324,6 @@ fn run_image_inference(
         .ok_or_else(|| AiError::Internal("Empty image inference output | 图像推理输出为空".into()))
 }
 
-/// Probe the image encoder's declared batch dimension on its ONNX `image` input.
-/// Returns `Some(k)` when the batch axis is a **fixed** size `k`, or `None` when it
-/// is dynamic (`-1` / symbolic, i.e. any batch size is accepted).
-///
 /// 探测图像编码器 ONNX `image` 输入声明的 batch 维度。
 /// batch 轴为**固定**大小 `k` 时返回 `Some(k)`；动态轴（`-1`/符号，接受任意批大小）返回 `None`。
 fn image_input_fixed_batch(session: &ort::session::Session, image_input: &str) -> Option<usize> {
@@ -352,7 +340,52 @@ fn image_input_fixed_batch(session: &ort::session::Session, image_input: &str) -
     }
 }
 
-/// Run CLIP image encoder inference on a batch of preprocessed tensors.
+/// 装载期契约自检(2026-07-10 审查 K1 后半):用 ONNX 元数据在**激活时**即拒错配模型,
+/// 不等运行期错切——输入须为 [N,3,S,S] 且静态 S==image_size,输出末维静态时须==embed_dim。
+/// 动态轴(≤0/符号维)不约束;运行期形状断言(encode_image_batch 内)仍是最后防线。
+pub(crate) fn verify_image_tower_contract(
+    session: &ort::session::Session,
+    profile: &ModelProfile,
+) -> Result<()> {
+    let input_names = session_input_names(session);
+    let image_input = resolve_single_input_name(&input_names, &profile.image_input, "image")?;
+    if let Some(shape) = session
+        .inputs()
+        .iter()
+        .find(|i| i.name() == image_input)
+        .and_then(|i| i.dtype().tensor_shape())
+    {
+        let dims: Vec<i64> = shape.iter().copied().collect();
+        let side_ok = dims.len() == 4
+            && dims[2..4]
+                .iter()
+                .all(|&d| d <= 0 || d == profile.image_size as i64);
+        if !side_ok {
+            return Err(AiError::Internal(format!(
+                "图像塔输入形状 {dims:?} 与 profile 不符(期望 [N,3,{0},{0}]):模型文件与 \
+                 profile 错配 | image tower input shape mismatch",
+                profile.image_size
+            )));
+        }
+    }
+    if let Some(shape) = session
+        .outputs()
+        .first()
+        .and_then(|o| o.dtype().tensor_shape())
+    {
+        if let Some(&last) = shape.last() {
+            if last > 0 && last != profile.embed_dim as i64 {
+                return Err(AiError::Internal(format!(
+                    "图像塔输出末维 {last} 与 profile.embed_dim {} 不符:模型文件与 profile \
+                     错配 | image tower output dim mismatch",
+                    profile.embed_dim
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 在一批预处理后的张量上运行 CLIP 图像编码器推理。
 pub fn encode_image_batch(
     session_pool: &crate::engine::SessionPool,
@@ -386,8 +419,6 @@ pub fn encode_image_batch(
         let end = (start + chunk).min(n_total);
         let cur = end - start;
 
-        // Materialise a contiguous [cur,3,S,S] sub-batch — slice views aren't owned Vecs,
-        // and `Tensor::from_array` needs owned flat data.
         // 物化连续的 [cur,3,S,S] 子批 —— 切片视图非拥有所有权的 Vec，而 `Tensor::from_array` 需要拥有的扁平数据。
         let sub = batch_tensor
             .slice(ndarray::s![start..end, .., .., ..])
@@ -426,7 +457,21 @@ pub fn encode_image_batch(
         let raw = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(AiError::Ort)?;
-        let (_out_shape, raw_slice) = raw;
+        let (out_shape, raw_slice) = raw;
+
+        // 输出形状断言(2026-07-10 审查 K1,全链唯一有效防线):错配模型(如 768 维模型
+        // 配 512 维 profile)时,按 profile.embed_dim 手工切行会错位串行,但**每个向量长度
+        // 恰好合法**——worker 维度红线、host blob 对账、搜索缓存长度过滤全部骗过,垃圾向量
+        // 批量入库零告警。总元素数也可能恰好整除(batch 是 2 的幂时 rows×768 必能按 512 切),
+        // 故必须断言 ORT 回报的真实形状,而非任何长度推断。
+        let dims: Vec<i64> = out_shape.iter().copied().collect();
+        if dims.len() != 2 || dims[0] != run_rows as i64 || dims[1] != dim as i64 {
+            return Err(AiError::Internal(format!(
+                "图像塔输出形状 {dims:?} 与 profile 不符(期望 [{run_rows}, {dim}]):\
+                 模型文件与激活 profile 错配?请核对导入/改名的 onnx 是否属于该架构 \
+                 | image tower output shape mismatch, model file vs profile"
+            )));
+        }
 
         for i in 0..cur {
             let off = i * dim;
@@ -441,11 +486,7 @@ pub fn encode_image_batch(
     Ok(results)
 }
 
-/// Preprocess an image to a [1, 3, 224, 224] f32 array.
 /// 将图像预处理为 [1, 3, 224, 224] f32 数组。
-///
-/// Pipeline matches official Chinese-CLIP (cn_clip):
-///   RGB → Resize(shortest_edge=224, Bicubic) → CenterCrop(224) → Normalize
 ///
 /// 流水线与官方 Chinese-CLIP (cn_clip) 一致：
 ///   RGB → 按短边缩放到224(Bicubic) → 中心裁剪224 → 归一化
@@ -457,12 +498,9 @@ pub fn preprocess_image(img: &DynamicImage, profile: &ModelProfile) -> Array4<f3
     let img_size = profile.image_size;
     let (mean, std) = (profile.mean, profile.std);
 
-    // 1. Convert to RGB
     // 1. 转换为 RGB
     let rgb = img.to_rgb8();
 
-    // 2. Resize: scale shortest edge to image_size, keep aspect ratio.
-    //    Use CatmullRom (= Bicubic interpolation, matching PIL.Image.BICUBIC).
     // 2. 按短边缩放到 image_size，保持长宽比。
     //    使用 CatmullRom（= Bicubic 插值，匹配 PIL.Image.BICUBIC）。
     let (w, h) = (rgb.width(), rgb.height());
@@ -473,13 +511,11 @@ pub fn preprocess_image(img: &DynamicImage, profile: &ModelProfile) -> Array4<f3
     let resized =
         image::imageops::resize(&rgb, new_w, new_h, image::imageops::FilterType::CatmullRom);
 
-    // 3. CenterCrop to image_size×image_size
     // 3. 中心裁剪到 image_size×image_size
     let cx = (resized.width() - img_size) / 2;
     let cy = (resized.height() - img_size) / 2;
     let cropped = image::imageops::crop_imm(&resized, cx, cy, img_size, img_size).to_image();
 
-    // 4. HWC → CHW, normalise using CLIP mean/std
     // 4. HWC → CHW，使用 CLIP 均值/标准差归一化
     //    平坦 slice 写(T18.5):ndarray 逐元素索引在 dev 构建(opt-0)是热点;
     //    算术保持逐位一致(黄金向量/双后端对拍依赖确定性),仅改寻址方式。
@@ -503,11 +539,7 @@ pub fn preprocess_image(img: &DynamicImage, profile: &ModelProfile) -> Array4<f3
     tensor
 }
 
-/// Lightweight preprocessing for a pre-resized `DecodedImage` (RGBA u8 pixels).
 /// 对预缩放的 `DecodedImage`（RGBA u8 像素）进行轻量预处理。
-///
-/// The image is expected to have `short_edge = 224` (e.g. 336×224 or 224×224).
-/// Performs: CenterCrop(224×224) → RGBA→RGB → /255 → CLIP Normalize → HWC→CHW.
 ///
 /// 图像预期 `短边 = 224`（如 336×224 或 224×224）。
 /// 执行：CenterCrop(224×224) → RGBA→RGB → /255 → CLIP 归一化 → HWC→CHW。
@@ -516,7 +548,6 @@ pub fn preprocess_decoded(decoded: &DecodedImage, profile: &ModelProfile) -> Arr
     let (w, h) = (decoded.width as usize, decoded.height as usize);
     let crop_size = profile.image_size as usize;
 
-    // CenterCrop: compute offsets (saturating to 0 for images exactly 224)
     // CenterCrop：计算偏移量（对于恰好 224 的图像饱和到 0）
     let cx = w.saturating_sub(crop_size) / 2;
     let cy = h.saturating_sub(crop_size) / 2;
@@ -532,7 +563,7 @@ pub fn preprocess_decoded(decoded: &DecodedImage, profile: &ModelProfile) -> Arr
             for x in 0..crop_size {
                 let src_x = cx + x;
                 let src_y = cy + y;
-                // RGBA stride: 4 bytes per pixel
+                // RGBA 步幅:每像素 4 字节
                 let idx = (src_y * w + src_x) * 4;
                 if idx + 2 < px.len() {
                     for c in 0..3usize {
@@ -547,17 +578,14 @@ pub fn preprocess_decoded(decoded: &DecodedImage, profile: &ModelProfile) -> Arr
     tensor
 }
 
-// ── Text encoding ─────────────────────────────────────────────────────────────
 // ── 文本编码 ─────────────────────────────────────────────────────────────────
 
-/// Simple BERT WordPiece tokeniser for Chinese-CLIP.
 /// Chinese-CLIP 的简易 BERT WordPiece 分词器。
 pub struct ClipTokenizer {
     inner: tokenizers::Tokenizer,
 }
 
 impl ClipTokenizer {
-    /// Load the tokenizer described by a `ModelProfile` from the models directory.
     /// 按 `ModelProfile` 描述从模型目录加载分词器。
     ///
     /// 目前仅支持 BERT WordPiece（cn-clip 系列）；异构分词器（BPE/SentencePiece）留第二阶段
@@ -588,19 +616,12 @@ impl ClipTokenizer {
 
         // ── Normalizer & PreTokenizer ───────────────────────────────────────
         // ── 归一化器与预分词器 ──────────────────────────────────────────────
-        // Chinese-CLIP uses BERT tokenizer which requires lowercase and CJK char handling.
+        // Chinese-CLIP 使用 BERT 分词器,须做小写化与 CJK 字符切分处理。
         tokenizer.with_normalizer(Some(BertNormalizer::new(true, true, Some(true), true)));
 
         tokenizer.with_pre_tokenizer(Some(BertPreTokenizer));
 
-        // ── Vocab sanity check ──────────────────────────────────────────────
         // ── 词表完整性检查 ──────────────────────────────────────────────────
-        //
-        // Chinese-CLIP uses bert-base-chinese vocab with 21128 tokens.
-        // The eisneim/cn-clip_vit-b-16 HuggingFace repo ships the WRONG
-        // vocab.txt (English CLIP, ~5594 tokens). If loaded, all Chinese
-        // characters become [UNK], making every query produce identical
-        // embeddings and destroying search accuracy.
         //
         // 【关键防护】Chinese-CLIP 使用 bert-base-chinese 词表（21128 个 token）。
         //   eisneim/cn-clip_vit-b-16 仓库附带的 vocab.txt 是英文 CLIP 的
@@ -626,7 +647,6 @@ impl ClipTokenizer {
             vocab_size, vocab_size
         );
 
-        // ── Post-processor: insert [CLS] at start and [SEP] at end ──────────
         // ── 后处理器：在序列前插入 [CLS]，末尾插入 [SEP] ──────────────────────
         //
         // 【关键修复·上轮】没有 TemplateProcessing，tokenizers crate 即使传
@@ -647,7 +667,6 @@ impl ClipTokenizer {
             .map_err(|e| AiError::Tokenizer(e.to_string()))?;
         tokenizer.with_post_processor(Some(post_processor));
 
-        // ── Truncation: ensure [SEP] is preserved for long text ─────────────
         // ── 截断配置：确保长文本也能保留 [SEP] ──────────────────────────────
         //
         // 【关键修复】旧代码在 encode() 中手动截断 raw_ids[..MAX_SEQ_LEN]，
@@ -662,7 +681,6 @@ impl ClipTokenizer {
             .with_truncation(Some(truncation))
             .map_err(|e| AiError::Tokenizer(e.to_string()))?;
 
-        // ── Padding: pad to MAX_SEQ_LEN with 0 (= [PAD]) ────────────────────
         // ── 填充：用 0（= [PAD]）填充到 MAX_SEQ_LEN ──────────────────────────
         tokenizer.with_padding(Some(tokenizers::PaddingParams {
             strategy: tokenizers::PaddingStrategy::Fixed(profile.max_seq_len),
@@ -674,13 +692,7 @@ impl ClipTokenizer {
         Ok(Self { inner: tokenizer })
     }
 
-    /// Tokenise text and return (input_ids, attention_mask, token_type_ids) as i64 vectors.
     /// 将文本分词，返回 (input_ids, attention_mask, token_type_ids) 的 i64 向量。
-    ///
-    /// Truncation and padding are handled by the tokenizers crate via the
-    /// TruncationParams and PaddingParams configured in `from_vocab()`.
-    /// This guarantees [CLS] and [SEP] are always present and the output
-    /// length is exactly MAX_SEQ_LEN.
     ///
     /// 截断和填充由 tokenizers crate 通过 `from_vocab()` 中配置的
     /// TruncationParams 和 PaddingParams 自动处理。
@@ -691,7 +703,6 @@ impl ClipTokenizer {
             .encode(text, true)
             .map_err(|e| AiError::Tokenizer(format!("Tokenize failed: {e}")))?;
 
-        // tokenizers crate has already truncated to MAX_SEQ_LEN and padded with [PAD](0).
         // tokenizers crate 已截断到 MAX_SEQ_LEN 并用 [PAD](0) 填充。
         let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
         let mask: Vec<i64> = encoding
@@ -705,7 +716,6 @@ impl ClipTokenizer {
     }
 }
 
-/// Encode a text query into a 512-d unit vector using the CLIP text encoder.
 /// 使用 CLIP 文本编码器将文本查询编码为 512-d 单位向量。
 pub fn encode_text(
     session_pool: &crate::engine::SessionPool,
@@ -717,7 +727,6 @@ pub fn encode_text(
 
     let (ids, mask, types) = tokenizer.encode(text)?;
 
-    // ── Diagnostic: print token IDs for debugging ───────────────────────
     // ── 诊断：打印 token IDs 用于调试 ───────────────────────────────────
     let non_pad: Vec<i64> = ids.iter().copied().filter(|&x| x != 0).collect();
     debug!(
@@ -758,7 +767,7 @@ pub fn encode_text(
         }
     };
 
-    // Output: "text_features" [1, 512]
+    // 输出:"text_features" [1, 512]
     let raw = outputs[0]
         .try_extract_tensor::<f32>()
         .map_err(AiError::Ort)?;
@@ -768,11 +777,8 @@ pub fn encode_text(
     Ok(maybe_normalize(embedding, profile))
 }
 
-// ── Vector utilities ──────────────────────────────────────────────────────────
 // ── 向量工具函数 ──────────────────────────────────────────────────────────────
 
-/// L2-normalise only when the model's output is NOT already unit-normalised (per profile).
-/// Cosine search requires unit vectors; cn-clip outputs `unnorm_*` → we normalise.
 /// 仅当模型输出非单位向量时才做 L2（由 profile 决定）。余弦搜索要求单位向量；
 /// cn-clip 输出 `unnorm_*` → 需归一化。
 fn maybe_normalize(v: Vec<f32>, profile: &ModelProfile) -> Vec<f32> {

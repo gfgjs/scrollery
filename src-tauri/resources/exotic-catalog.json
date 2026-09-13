@@ -1,7 +1,21 @@
 {
   "schema": 1,
-  "sequence": 1,
+  "sequence": 2,
   "offerings": [
+    {
+      "plugin_id": "exotic-enhance",
+      "name": "影像增强",
+      "media_kind": "image",
+      "formats": ["enhance"],
+      "capabilities": ["enhance"],
+      "license_tier": "paid",
+      "sku": "enhance-engine-2026",
+      "platforms": ["x86_64-pc-windows-msvc"],
+      "min_host_version": "0.1.0",
+      "override_common": false,
+      "store_url": "https://example.invalid/plugins/enhance",
+      "distribution": "builtin"
+    },
     {
       "plugin_id": "exotic-image-psd",
       "name": "PSD 图像引擎",
@@ -12,8 +26,52 @@
       "sku": "psd-engine-2026",
       "platforms": ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"],
       "min_host_version": "0.1.0",
+      "worker_id": "psd-worker",
+      "uses_gpu": false,
       "override_common": false,
       "store_url": "https://example.invalid/plugins/psd"
+    },
+    {
+      "plugin_id": "exotic-ocr",
+      "name": "OCR 文字提取",
+      "media_kind": "image",
+      "formats": ["ocr"],
+      "capabilities": ["text"],
+      "license_tier": "paid",
+      "sku": "ocr-engine-2026",
+      "platforms": ["x86_64-pc-windows-msvc"],
+      "min_host_version": "0.1.0",
+      "override_common": false,
+      "store_url": "https://example.invalid/plugins/ocr",
+      "distribution": "builtin"
+    },
+    {
+      "plugin_id": "exotic-image-raw",
+      "name": "RAW 图像解码",
+      "media_kind": "image",
+      "formats": ["cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef", "srw"],
+      "capabilities": ["thumbnail"],
+      "license_tier": "free",
+      "platforms": ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"],
+      "min_host_version": "0.1.0",
+      "worker_id": "raw-worker",
+      "uses_gpu": false,
+      "override_common": false,
+      "distribution": "builtin"
+    },
+    {
+      "plugin_id": "video-extended",
+      "name": "视频格式扩展",
+      "media_kind": "video",
+      "formats": ["rmvb", "vob"],
+      "capabilities": ["thumbnail"],
+      "license_tier": "free",
+      "platforms": ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"],
+      "min_host_version": "0.1.0",
+      "worker_id": "video-worker",
+      "uses_gpu": false,
+      "override_common": false,
+      "distribution": "builtin"
     }
   ]
 }

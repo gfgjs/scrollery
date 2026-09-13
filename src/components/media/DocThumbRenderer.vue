@@ -1,6 +1,6 @@
 <template>
   <!-- Hidden offscreen renderer (§3.4 Lite 路径). 无可见 DOM —— canvas 程序化创建后即弃。 -->
-  <div class="doc-thumb-renderer" aria-hidden="true"></div>
+  <div class="doc-thumb-renderer"></div>
 </template>
 
 <script setup lang="ts">
@@ -15,8 +15,9 @@
 //  - **失败即标记**：渲染失败回传空字节，后端标 status=3，避免无限重试坏文件。
 
 import { onMounted, onBeforeUnmount } from 'vue'
-import { invoke, convertFileSrc } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { convertFileSrc } from '@tauri-apps/api/core'
+import { invokeIpc, invokeIpcRaw } from '../../utils/ipc'
+import { useTauriListen } from '../../composables/useTauriListen'
 import { IPC, EVENTS } from '../../constants/ipc'
 import { getPdfjs } from '../../utils/pdfjs'
 
@@ -41,7 +42,8 @@ function canvasToPng(canvas: HTMLCanvasElement): Promise<Blob> {
 // 免为页数二次解析文档）。PDF 透明 → 先铺白底，避免黑/透明缩略图。
 async function renderPdf(url: string): Promise<{ blob: Blob; pages: number | null }> {
   const lib = await getPdfjs()
-  const doc = await lib.getDocument({ url }).promise
+  // isEvalSupported:false —— 关闭 pdf.js 字型渲染的 eval 优化路径(P1-23,配合 CSP 删 unsafe-eval)。
+  const doc = await lib.getDocument({ url, isEvalSupported: false }).promise
   try {
     const pages = doc.numPages ?? null
     const page = await doc.getPage(1)
@@ -92,8 +94,19 @@ function renderSvg(url: string): Promise<{ blob: Blob; pages: number | null }> {
 
 async function renderOne(doc: PendingDocThumb): Promise<{ blob: Blob; pages: number | null }> {
   const url = convertFileSrc(doc.absPath)
-  return doc.fileFormat === 'pdf' ? renderPdf(url) : renderSvg(url)
+  // 格式白名单:后端队列只播种 pdf/svg。未知格式防御性抛错(走失败预算),
+  // 而非落进 renderSvg 被 <img> 误渲染——那会把不支持的格式伪装成"渲染失败"甚至空白成功。
+  if (doc.fileFormat === 'pdf') return renderPdf(url)
+  if (doc.fileFormat === 'svg') return renderSvg(url)
+  throw new Error(`unsupported doc thumb format: ${doc.fileFormat}`)
 }
+
+// ── 失败预算:首败不判死,第 2 次才上报空字节(后端标 status=3 停止重试)────────────
+// pdf.js 懒加载/asset 协议偶发抖动等瞬态失败原先一击即永久裂图(空字节 → 派生 status=3,
+// 无自愈路径,只能清缓存)。给每个 item 两次机会:首败留在 pending(下轮泵重试),
+// 复败才盖棺。成功/盖棺即清计数,Map 大小受 pending 文档数约束。
+const MAX_ATTEMPTS = 2
+const failedAttempts = new Map<number, number>()
 
 // ── 主泵：可见时循环领取并处理，直到无待处理 ───────────────────────────────────
 let running = false
@@ -102,29 +115,45 @@ async function pump() {
   running = true
   try {
     // 自行播种队列：pdf/svg 为前端驱动，需在用户未启动后端派生流水线时也能工作（幂等、廉价）。
-    await invoke(IPC.ENSURE_DOC_THUMB_QUEUE).catch(() => {})
+    await invokeIpc(IPC.ENSURE_DOC_THUMB_QUEUE).catch(() => {})
     while (document.visibilityState === 'visible') {
-      const pending = await invoke<PendingDocThumb[]>(IPC.LIST_PENDING_DOC_THUMBS, { limit: BATCH })
+      const pending = await invokeIpc<PendingDocThumb[]>(IPC.LIST_PENDING_DOC_THUMBS, { limit: BATCH })
       if (!pending.length) break
+      let stored = 0
       for (const doc of pending) {
         if (document.visibilityState !== 'visible') break
         try {
           const { blob, pages } = await renderOne(doc)
-          const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
-          await invoke(IPC.STORE_DOC_THUMBNAIL, {
-            itemId: doc.itemId,
-            pngBytes: bytes,
-            pageCount: pages,
-          })
+          // raw body 直传字节(①):PNG 经 JSON 数字数组每字节膨胀 ~4 字符(300KB→1-2MB 串),
+          // Uint8Array 走 Tauri raw InvokeBody 零膨胀;元数据走自定义 headers。
+          const bytes = new Uint8Array(await blob.arrayBuffer())
+          const headers: Record<string, string> = { 'x-item-id': String(doc.itemId) }
+          if (pages !== null) headers['x-page-count'] = String(pages)
+          await invokeIpcRaw(IPC.STORE_DOC_THUMBNAIL, bytes, headers)
+          stored++
+          failedAttempts.delete(doc.itemId)
         } catch {
-          // 渲染失败 → 回传空字节，后端标错，停止无限重试。
-          await invoke(IPC.STORE_DOC_THUMBNAIL, { itemId: doc.itemId, pngBytes: [] }).catch(
-            () => {},
-          )
+          const attempts = (failedAttempts.get(doc.itemId) ?? 0) + 1
+          if (attempts >= MAX_ATTEMPTS) {
+            // 复败 → 回传空 body，后端标错，停止无限重试。
+            failedAttempts.delete(doc.itemId)
+            const reported = await invokeIpcRaw(IPC.STORE_DOC_THUMBNAIL, new Uint8Array(0), {
+              'x-item-id': String(doc.itemId),
+            })
+              .then(() => true)
+              .catch(() => false)
+            if (reported) stored++
+          } else {
+            failedAttempts.set(doc.itemId, attempts)
+          }
         }
         // 让出主线程一帧，保持窗口响应。
         await new Promise((r) => setTimeout(r, 30))
       }
+      // 无进展守卫:本轮一个都没落库(渲染全败且失败上报也没写进后端)则退出本次泵。
+      // 否则同一批 pending 会被无限重复领取——两层 catch 都吞错时曾是潜在热循环。
+      // 下次 media_enriched / 可见性变化会再触发泵重试。
+      if (stored === 0) break
     }
   } finally {
     running = false
@@ -138,19 +167,19 @@ function pumpDebounced() {
   debounceTimer = setTimeout(() => pump(), 800)
 }
 
-let unlisten: UnlistenFn | null = null
 function onVisible() {
   if (document.visibilityState === 'visible') pump()
 }
 
-onMounted(async () => {
-  unlisten = await listen(EVENTS.MEDIA_ENRICHED, pumpDebounced)
+// MEDIA_ENRICHED 监听解绑交由 useTauriListen(P1-11);onMounted 只留 DOM 监听与首泵。
+useTauriListen(EVENTS.MEDIA_ENRICHED, pumpDebounced)
+
+onMounted(() => {
   document.addEventListener('visibilitychange', onVisible)
   pump()
 })
 
 onBeforeUnmount(() => {
-  if (unlisten) unlisten()
   if (debounceTimer) clearTimeout(debounceTimer)
   document.removeEventListener('visibilitychange', onVisible)
 })

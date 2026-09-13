@@ -103,7 +103,8 @@ defineExpose({ next, prev, getScrollEl, goToPage: (p: number) => scrollToPage(p)
 onMounted(async () => {
   try {
     const lib = await getPdfjs()
-    pdfDoc = await lib.getDocument({ url: props.url }).promise
+    // isEvalSupported:false —— 关闭 pdf.js 字型渲染的 eval 优化路径(P1-23,配合 CSP 删 unsafe-eval)。
+    pdfDoc = await lib.getDocument({ url: props.url, isEvalSupported: false }).promise
     if (destroyed) return
     numPages = pdfDoc.numPages
     // 用首页比例预置所有页占位高度（aspect-ratio），减少懒渲染时的滚动跳变。

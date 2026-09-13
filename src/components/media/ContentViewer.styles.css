@@ -1,0 +1,418 @@
+/* 硬编码色豁免说明(S5,设计 §6.2):看图台 #000、人脸框青色、照片上的白字/黑纱
+   渐变、星级金色均为「媒体上的恒定浮层」语义——看图台永远黑(专业看图惯例)、
+   人脸框需在任意照片上可见、星级金全主题统一,刻意不随主题。 */
+/* 顶栏重构 P4-b:看图台迁为 shell 内路由后填充 .app-content(不再 fixed 覆盖全屏、不再 z-index
+   压过 chrome);#000 恒黑观感保留(专业看图惯例,硬编码色豁免见上)。沉浸模式(隐藏侧栏/标题栏)
+   由 P4-c 经 viewerStore 联动 AppShell,非本组件 fixed 定位。 */
+.content-viewer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  background: #000;
+}
+.content-viewer__inner {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+.detail-panel {
+  /* 信息面板停靠宽度单源:.detail-info 的 width 与本面板挤压用的 padding-right 同取此值,防漂移。 */
+  --detail-info-w: 300px;
+  /* 底部操作栏高度单源:.detail-controls 的 height 与视频 chrome 抬升量同取此值,防漂移。 */
+  --detail-controls-h: 52px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  /* 停靠挤压:padding-right 让出图片区(绝对定位的信息面板落入该空档);与信息面板 translateX 滑入
+     同用 --transition-normal → 面板左沿与内容右沿逐帧同步(两者皆 total − 300·progress),无脱节。
+     overflow:hidden 兜住滑入前信息面板 translateX(100%) 溢出面板右缘的那部分。 */
+  overflow: hidden;
+  transition: padding-right var(--transition-normal);
+}
+.detail-panel.is-info-open {
+  padding-right: var(--detail-info-w);
+}
+
+/* 沉浸模式浮动退出按钮(P4-c):右上角半透明,悬停显现,不喧宾夺主(镜像阅读器 doc-viewer 同款)。
+   硬编码豁免(S5):沉浸浮层恒深色玻璃、不随主题(与 fs-exit-hint / 视频 OSD 同语义)。 */
+.content-viewer__immersive-exit {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(20, 20, 20, 0.55);
+  color: rgba(255, 255, 255, 0.75);
+  cursor: pointer;
+  opacity: 0.5;
+  transition:
+    opacity var(--transition-fast),
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.content-viewer__immersive-exit:hover {
+  opacity: 1;
+  background: rgba(20, 20, 20, 0.8);
+  color: #fff;
+}
+
+/* ── Viewer ───────────────────────────────────────────────────────────── */
+/* ── 视图器 ───────────────────────────────────────────────────────────── */
+.detail-viewer {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+}
+.detail-viewer:active {
+  cursor: grabbing;
+}
+/* 底部操作栏可见时,给子组件(VideoPlayer chrome)下发抬升量:自定义属性穿透 scoped 继承,
+   视频控制条经 padding-bottom: calc(var(--viewer-bottom-inset) + 4px) 抬内容让出 .detail-controls
+   覆盖区(渐变底衬仍贴底连续,不与本操作栏渐变割裂出亮缝)。 */
+.detail-viewer.has-bottom-controls {
+  --viewer-bottom-inset: var(--detail-controls-h);
+}
+.detail-viewer__img {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  transform-origin: center;
+  user-select: none;
+  pointer-events: none;
+  transition: transform var(--duration-normal) cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+.detail-viewer__img--placeholder {
+  z-index: 1;
+}
+.detail-viewer__img--highres {
+  z-index: 2;
+}
+.detail-viewer__img.is-dragging {
+  transition: none;
+}
+.detail-viewer__image-loading-spinner {
+  position: absolute;
+  z-index: 3;
+  width: 26px;
+  height: 26px;
+  border: 2px solid rgba(255, 255, 255, 0.24);
+  border-top-color: rgba(255, 255, 255, 0.9);
+  border-radius: 50%;
+  opacity: 0;
+  animation:
+    detail-viewer-loading-spin 0.8s linear infinite,
+    detail-viewer-loading-reveal 0s linear 120ms forwards;
+}
+@keyframes detail-viewer-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes detail-viewer-loading-reveal {
+  to {
+    opacity: 1;
+  }
+}
+.detail-viewer__video,
+.detail-viewer__audio {
+  max-width: 90%;
+  max-height: 90%;
+}
+.detail-viewer__document {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-md);
+  color: var(--color-text-secondary);
+  font-size: 48px;
+}
+
+/* ── 不可用占位（卷离线 / 文件缺失 / 加载失败）──────────────────────────── */
+.detail-viewer__unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-sm);
+  color: var(--color-text-tertiary);
+  text-align: center;
+  padding: var(--spacing-xl);
+  user-select: none;
+}
+.detail-viewer__unavailable-title {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+.detail-viewer__unavailable-hint {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-tertiary);
+  max-width: 360px;
+  line-height: 1.5;
+}
+
+/* ── Exotic 授权 gate（居中限宽，浮于全黑视图区）─────────────────────────── */
+.detail-viewer__gate {
+  width: 100%;
+  max-width: 440px;
+  padding: var(--spacing-xl);
+  /* 视图区 cursor:grab 对 gate 无意义，恢复默认指针以免误导可拖拽。 */
+  cursor: default;
+}
+
+.detail-viewer__live-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* ── Face boxes (F6) ──────────────────────────────────────────────────── */
+.face-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none; /* 纯展示，绝不拦截缩放/拖拽 */
+  z-index: 2;
+}
+.face-box {
+  position: absolute;
+  border: 2px solid rgba(80, 200, 255, 0.9);
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+.face-box__label {
+  position: absolute;
+  left: 0;
+  bottom: 100%;
+  margin-bottom: 2px;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  color: #fff;
+  background: rgba(80, 200, 255, 0.92);
+  border-radius: 3px;
+}
+
+/* ── Controls ─────────────────────────────────────────────────────────── */
+/* ── 控制器 ─────────────────────────────────────────────────────────── */
+.detail-controls {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: var(--detail-controls-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--spacing-md);
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.75));
+  color: #fff;
+  z-index: 10;
+}
+.detail-controls__left,
+.detail-controls__right {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+}
+
+/* 关闭键与其左侧内容操作之间的分隔线：退出是**离开本视图**，与收藏/定位/信息不同类，
+   不分组就会被当成又一个开关（真机报的「找不到 ×」正是同类相混的后果）。
+   硬编码白色调同本控制条其余部分（该条恒为深色渐变浮层，不随主题，见 .detail-controls）。 */
+.detail-controls__sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: rgba(255, 255, 255, 0.25);
+  flex-shrink: 0;
+}
+.detail-controls .btn-icon {
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 14px;
+}
+.detail-controls .btn-icon:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+}
+.detail-controls .btn-icon.active {
+  color: var(--color-accent);
+}
+/* 旋转按钮当前角度角标(2026-07-18):叠在按钮右下角,不占布局(绝对定位)。硬编码白字承本控制条
+   恒深色渐变浮层语义(同 .detail-controls,不随主题)。 */
+.detail-controls__rotate {
+  position: relative;
+}
+.detail-controls__rotate-badge {
+  position: absolute;
+  right: 0;
+  bottom: 1px;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--color-accent);
+  color: #fff;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.zoom-percentage {
+  font-variant-numeric: tabular-nums; /* 等宽数字避免抖动 */
+  min-width: 48px;
+  text-align: center;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
+  transition: color 0.3s ease;
+  user-select: none;
+}
+.zoom-percentage.zoom-highlight {
+  color: #fff;
+}
+.detail-controls__center {
+  flex: 1;
+  text-align: center;
+  overflow: hidden;
+}
+.detail-controls__name {
+  font-size: var(--font-size-sm);
+  color: rgba(255, 255, 255, 0.85);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* ── Info sidebar ─────────────────────────────────────────────────────── */
+/* ── 信息侧边栏 ─────────────────────────────────────────────────────── */
+.detail-info {
+  /* 停靠列:绝对定位落在 .detail-panel 因 is-info-open 让出的 padding-right 空档里(不再覆盖图片,
+     而是与被挤压的图片区并列)。宽度取面板单源变量,与 padding-right 恒等。 */
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: var(--detail-info-w);
+  background: var(--color-bg-surface);
+  border-left: 1px solid var(--color-divider);
+  box-shadow: var(--shadow-sm);
+  overflow-y: auto;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.detail-info__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-md);
+  border-bottom: 1px solid var(--color-divider);
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+  flex-shrink: 0;
+}
+
+.info-section {
+  padding: var(--spacing-md);
+  border-bottom: 1px solid var(--color-divider);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+.info-section__title {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--color-text-tertiary);
+  margin-bottom: 4px;
+}
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+}
+.info-label {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+}
+.info-value {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+.rating-stars {
+  display: flex;
+  gap: var(--spacing-xs);
+}
+.star {
+  font-size: 20px;
+  color: var(--color-border);
+  transition: color var(--transition-fast);
+  cursor: pointer;
+}
+.star.filled {
+  color: var(--color-rating-amber);
+}
+.star:hover {
+  color: var(--color-rating-amber);
+}
+
+.clickable-path {
+  text-align: left;
+  white-space: normal;
+  word-break: break-all;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: color var(--transition-fast);
+  text-decoration: underline;
+  text-decoration-color: transparent;
+}
+.clickable-path:hover {
+  color: var(--color-accent);
+  text-decoration-color: var(--color-accent);
+}
+
+/* ── Slide transition ─────────────────────────────────────────────────── */
+/* ── 滑动过渡 ─────────────────────────────────────────────────── */
+.slide-enter-from,
+.slide-leave-to {
+  transform: translateX(100%);
+}
+.slide-enter-active,
+.slide-leave-active {
+  transition: transform var(--transition-normal);
+}

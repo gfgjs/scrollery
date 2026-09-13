@@ -84,41 +84,50 @@ pub fn thumbnail_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thumbnail::generator::THUMB_TIERS;
 
     const PID: &str = "exotic-image-psd";
     const WV: &str = "1.0.0";
 
+    /// 测试用档位：**绑 THUMB_TIERS 事实源，不硬编码数值**。
+    ///
+    /// b554aa5「档位重定」把梯从 120/240/480/960 改成 64/128/256/512/1024，却漏改了本文件
+    /// 及 sink/pipeline 里硬编码的 480 —— 三个测试自那时起一直红着没人发现（CI 因主机不稳
+    /// 冻结，本地只跑过滤子集）。绑事实源后，下次改梯这里自动跟随，不会再悄悄失配。
+    const TIER: u32 = THUMB_TIERS[3];
+    const LOWER_TIER: u32 = THUMB_TIERS[2];
+
     #[test]
     fn same_tier_different_raw_size_same_fingerprint() {
-        // 470 与 480 都吸附到 480 → 指纹相同（R5 核心：避免同档反复重做）。
-        let a = thumbnail_fingerprint(123, PID, WV, 470);
-        let b = thumbnail_fingerprint(123, PID, WV, 480);
-        assert_eq!(a.tier, 480);
-        assert_eq!(b.tier, 480);
+        // 略小于档位的原始尺寸与档位本身都吸附到同一档 → 指纹相同（R5 核心：避免同档反复重做）。
+        let a = thumbnail_fingerprint(123, PID, WV, TIER - 4);
+        let b = thumbnail_fingerprint(123, PID, WV, TIER);
+        assert_eq!(a.tier, TIER);
+        assert_eq!(b.tier, TIER);
         assert_eq!(a.fingerprint, b.fingerprint);
     }
 
     #[test]
     fn cross_tier_different_fingerprint() {
-        let a = thumbnail_fingerprint(123, PID, WV, 240);
-        let b = thumbnail_fingerprint(123, PID, WV, 480);
+        let a = thumbnail_fingerprint(123, PID, WV, LOWER_TIER);
+        let b = thumbnail_fingerprint(123, PID, WV, TIER);
         assert_ne!(a.fingerprint, b.fingerprint);
     }
 
     #[test]
     fn any_input_change_changes_fingerprint() {
-        let base = thumbnail_fingerprint(123, PID, WV, 480).fingerprint;
+        let base = thumbnail_fingerprint(123, PID, WV, TIER).fingerprint;
         // 不同 cache_key
-        assert_ne!(base, thumbnail_fingerprint(124, PID, WV, 480).fingerprint);
+        assert_ne!(base, thumbnail_fingerprint(124, PID, WV, TIER).fingerprint);
         // 不同 worker_version（Worker 升级 → 失效）
         assert_ne!(
             base,
-            thumbnail_fingerprint(123, PID, "1.0.1", 480).fingerprint
+            thumbnail_fingerprint(123, PID, "1.0.1", TIER).fingerprint
         );
         // 不同 plugin_id
         assert_ne!(
             base,
-            thumbnail_fingerprint(123, "other", WV, 480).fingerprint
+            thumbnail_fingerprint(123, "other", WV, TIER).fingerprint
         );
     }
 

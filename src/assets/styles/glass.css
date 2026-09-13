@@ -1,0 +1,239 @@
+/* 窗口玻璃模式:data-glass 由 uiStore.applyWindowMaterial 唯一写入(isWindows && window_material≠none),
+   与 Rust 侧 window_vibrancy 的 DWM 背板(Mica/Acrylic/Blur)配对生效。
+   接入手册:新增视图根若承载文字,必须在下方「内容底面 opt-in 清单」加 fill 规则,
+   否则该视图在玻璃模式裸坐在 DWM 背板上(背板回退死灰/花壁纸时整页不可读)。 */
+html[data-glass] {
+  --glass-chrome-scale: 1;
+  --glass-sticky-scale: 1;
+  --glass-surface-scale: 1;
+  --glass-control-scale: 1;
+  --glass-content-scale: 1;
+  --glass-gallery-opacity: 0%;
+  --glass-gallery-fill: color-mix(
+    in srgb,
+    var(--color-bg-canvas) var(--glass-gallery-opacity),
+    transparent
+  );
+  /* 内容底面:文字密集视图根的承重面。源 token 取 --color-bg-primary(非玻璃画布同源,
+     两态观感连续);90% 让页面底色钳制在主题色附近,不随 DWM 背板(实时模糊/回退死灰/
+     任意壁纸)漂移。内容面(90%)比 chrome(72/82%)更实——文字承重面高于装饰性 chrome。 */
+  --glass-content-fill: color-mix(
+    in srgb,
+    var(--color-bg-primary) calc(90% * var(--glass-content-scale)),
+    transparent
+  );
+}
+html[data-glass='mica'] {
+  --material-chrome: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(72% * var(--glass-chrome-scale)),
+    transparent
+  );
+  --glass-sticky-fill: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(42% * var(--glass-sticky-scale)),
+    transparent
+  );
+  --glass-sticky-hover-fill: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(52% * var(--glass-sticky-scale)),
+    transparent
+  );
+  --glass-surface-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(24% * var(--glass-surface-scale)),
+    transparent
+  );
+  --glass-surface-hover-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(34% * var(--glass-surface-scale)),
+    transparent
+  );
+  --glass-control-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(38% * var(--glass-control-scale)),
+    transparent
+  );
+  --glass-control-focus-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(48% * var(--glass-control-scale)),
+    transparent
+  );
+  --glass-control-thumb: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(68% * var(--glass-control-scale)),
+    transparent
+  );
+}
+html[data-glass='acrylic'] {
+  --material-chrome: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(82% * var(--glass-chrome-scale)),
+    transparent
+  );
+  --glass-sticky-fill: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(36% * var(--glass-sticky-scale)),
+    transparent
+  );
+  --glass-sticky-hover-fill: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(44% * var(--glass-sticky-scale)),
+    transparent
+  );
+  --glass-surface-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(20% * var(--glass-surface-scale)),
+    transparent
+  );
+  --glass-surface-hover-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(30% * var(--glass-surface-scale)),
+    transparent
+  );
+  --glass-control-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(32% * var(--glass-control-scale)),
+    transparent
+  );
+  --glass-control-focus-fill: color-mix(
+    in srgb,
+    var(--color-bg-surface) calc(42% * var(--glass-control-scale)),
+    transparent
+  );
+  --glass-control-thumb: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(62% * var(--glass-control-scale)),
+    transparent
+  );
+}
+html[data-glass] {
+  --glass-control-border: color-mix(
+    in srgb,
+    var(--color-border-strong) calc(78% * var(--glass-control-scale)),
+    transparent
+  );
+  --glass-control-highlight: color-mix(
+    in srgb,
+    var(--color-bg-secondary) calc(22% * var(--glass-control-scale)),
+    transparent
+  );
+  --glass-toggle-fill: color-mix(
+    in srgb,
+    var(--color-toggle-bg) calc(72% * var(--glass-control-scale)),
+    transparent
+  );
+  --glass-toggle-active-fill: color-mix(
+    in srgb,
+    var(--color-toggle-bg-active) calc(82% * var(--glass-control-scale)),
+    transparent
+  );
+}
+/* index.html 为了首帧启动层给 html 保留了启动底色；配置水合后必须清掉它，
+   否则即使 body/app-shell 透明，整页仍会被 html 的不透明背景盖住 DWM 背板。 */
+html[data-glass] {
+  background: transparent;
+}
+/* 窗口与页面根须透,原生背板才能露出 */
+html[data-glass] body {
+  background: transparent;
+}
+/* 玻璃模式下 app-content 只是布局容器,不能再铺一整块不透明 canvas；否则 DWM 背板只会
+   出现在 chrome 边缘,普通内容区域仍完全看不到桌面。可读性由视图根的 --glass-content-fill
+   承接(下方 opt-in 清单)。html 前缀抬高特异性,稳定压过 AppShell/SettingsView 的 scoped 规则。 */
+html[data-glass] body .app-shell {
+  background: transparent;
+}
+html[data-glass] body .app-main > .app-content {
+  background: transparent;
+}
+/* 内容底面 opt-in 清单:文字密集视图根领取 ≈90% 主题画布色,把可读性与 DWM 背板状态
+   解耦。媒体画廊(.media-grid-layout)走 --glass-gallery-fill(默认 0% 完全透出),不在此列;
+   根面自铺不透明底的媒体面板(.audio-player/.hlab)与独立窗口(.log-window)自带承重面,
+   亦不加入。 */
+html[data-glass] body .app-main > .app-content > .settings-view,
+html[data-glass] body .app-main > .app-content > .collections-view,
+html[data-glass] body .app-main > .app-content > .persons-view,
+html[data-glass] body .app-main > .app-content > .plugin-store,
+html[data-glass] body .app-main > .app-content > .doc-viewer {
+  background: var(--glass-content-fill);
+}
+/* 设置头部条此前自铺不透明 bg-primary,与下方 fill 根面形成透明/不透明拼布(真机实测的
+   割裂带);置 transparent 后由 .settings-view 根面统一承托,头部与内容区连续。 */
+html[data-glass] body .app-main > .app-content > .settings-view .settings-header {
+  background: transparent;
+}
+/* 文档阅读器工具条同款拼布修复:根面已领 fill,工具条在文档流中置 transparent,
+   正文在其下方滚动、不会从其底下穿过。 */
+html[data-glass] body .app-main > .app-content > .doc-viewer .doc-viewer__toolbar {
+  background: transparent;
+}
+/* 画廊大底面直接透出原生 DWM 材质。此处不对整块滚动视口再加 backdrop-filter：Mica/Acrylic
+   已完成模糊，重复滤镜会把 Canvas 高频重绘拖入额外合成。底色遮罩默认 0%,由设置项
+   glass_gallery_opacity 调整,不会改变非毛玻璃模式的原有画廊底色。 */
+html[data-glass] body .app-main > .app-content .media-grid-layout {
+  background: var(--glass-gallery-fill);
+}
+
+/* 三键区是 window-chrome 父表面上的交互子区,不应再次绘制同一 material token。
+   Acrylic/Mica 的 alpha 复合由此保持单层；hover/close 的按钮状态仍由组件自身绘制。 */
+html[data-glass] body .window-chrome .window-chrome__controls {
+  background-color: transparent;
+  background-image: none;
+}
+
+/* Sticky 内容必须有遮罩,否则滚动中的文字/行会穿过固定标题。此前 94% 白色遮罩在浅色
+   Mica 上等同纸片;现在以低 alpha 染色 + 小范围 blur 承担可读性。只作用于真正 sticky 的
+   标题/路径行,普通树行保持透明,避免把整个文件夹区重新铺成一张白纸。 */
+html[data-glass] body .app-sidebar .acc-header,
+html[data-glass] body .app-sidebar .sticky-item {
+  background-color: var(--glass-sticky-fill);
+  backdrop-filter: blur(12px) saturate(1.08);
+  -webkit-backdrop-filter: blur(12px) saturate(1.08);
+}
+html[data-glass] body .app-sidebar .acc-header:hover {
+  background-color: var(--glass-sticky-hover-fill);
+}
+html[data-glass] body .app-sidebar .tree-item:not(.sticky-item) {
+  background-color: transparent;
+}
+
+/* 工具卡、紧凑下拉与搜索框是玻璃上的交互表面:以低透明度填色和细边界表达可点击，
+   焦点才提升亮度。这里不用 backdrop-filter，避免多张工具卡叠加造成 GPU 合成负担。 */
+html[data-glass] body .app-sidebar .tool__card {
+  background-color: var(--glass-surface-fill);
+  border-color: var(--glass-control-border);
+  box-shadow: inset 0 1px 0 var(--glass-control-highlight);
+}
+html[data-glass] body .app-sidebar .tool__card:hover {
+  background-color: var(--glass-surface-hover-fill);
+  border-color: var(--color-border-strong);
+}
+html[data-glass] body .app-sidebar .select {
+  background-color: var(--glass-control-fill);
+  border-color: var(--glass-control-border);
+}
+html[data-glass] body .app-toolbar .toolbar__search-wrap,
+html[data-glass] body .window-chrome .toolbar__search-wrap {
+  background-color: var(--glass-control-fill);
+  border-color: var(--glass-control-border);
+  box-shadow: inset 0 1px 0 var(--glass-control-highlight);
+}
+html[data-glass] body .app-toolbar .toolbar__search-wrap.focused,
+html[data-glass] body .window-chrome .toolbar__search-wrap.focused {
+  background-color: var(--glass-control-focus-fill);
+  border-color: var(--color-accent);
+  box-shadow: var(--control-focus-ring), inset 0 1px 0 var(--glass-control-highlight);
+}
+
+/* 侧栏内的开关白色滑块从主题纯白降为半透明表面,静息态不再像漂浮的实心胶囊。 */
+html[data-glass] body .app-sidebar .toggle {
+  background-color: var(--glass-toggle-fill);
+}
+html[data-glass] body .app-sidebar .toggle__thumb {
+  background-color: var(--glass-control-thumb);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.14);
+}
+html[data-glass] body .app-sidebar .toggle:has(input:checked) {
+  background-color: var(--glass-toggle-active-fill);
+}

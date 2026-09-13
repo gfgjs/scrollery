@@ -1,29 +1,46 @@
-// src/router/index.ts
 import { watch } from 'vue'
 import { createRouter, createWebHashHistory } from 'vue-router'
 import i18n from '../i18n'
+import { loadViewerComponent } from './viewerRouteLoader'
+import GalleryRouteLayer from '../components/media/GalleryRouteLayer.vue'
 
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     {
       path: '/',
-      component: () => import('../components/media/MediaGrid.vue'),
+      component: GalleryRouteLayer,
       meta: { title: 'routes.allMedia' },
     },
     {
       path: '/folder/:id',
-      component: () => import('../components/media/MediaGrid.vue'),
+      component: GalleryRouteLayer,
       meta: { title: 'sidebar.folders' },
     },
     {
       path: '/favorites',
-      component: () => import('../components/media/MediaGrid.vue'),
+      component: GalleryRouteLayer,
       meta: { title: 'sidebar.favorites' },
+    },
+    {
+      // S2-c 视图路由化:smart-album 各占独立路径(此前 live-photos/recent 连路由壳都没有,靠 store 停在 '/')。
+      path: '/live-photos',
+      component: GalleryRouteLayer,
+      meta: { title: 'sidebar.livePhotos' },
+    },
+    {
+      path: '/recent',
+      component: GalleryRouteLayer,
+      meta: { title: 'sidebar.recentlyAdded' },
     },
     {
       path: '/collections',
       component: () => import('../views/CollectionsView.vue'),
+      meta: { title: 'sidebar.collections' },
+    },
+    {
+      path: '/collections/:id',
+      component: GalleryRouteLayer,
       meta: { title: 'sidebar.collections' },
     },
     {
@@ -33,10 +50,27 @@ const router = createRouter({
       meta: { title: 'sidebar.persons' },
     },
     {
+      path: '/persons/:id',
+      component: GalleryRouteLayer,
+      meta: { title: 'sidebar.persons' },
+    },
+    {
       // 插件商店（T11）：浏览/安装 exotic 格式插件 + 激活 + 处理进度，路由级懒加载。
       path: '/plugins',
       component: () => import('../views/PluginStoreView.vue'),
       meta: { title: 'sidebar.plugins' },
+    },
+    {
+      // 旧独立重复页退役(2026-09-02 方案 §4.3):兼容重定向进主画廊 groups 镜头,旧书签仍可达。
+      // 不设 component/meta——afterEach 以重定向后的目标路由(/)解析标题,自然走 routes.allMedia。
+      path: '/duplicates',
+      redirect: { path: '/', query: { duplicates: 'groups' } },
+    },
+    {
+      // 设置属于页面级信息架构，不再由全局 boolean 伪装成全屏 modal。
+      path: '/settings/:section?',
+      component: () => import('../views/SettingsView.vue'),
+      meta: { title: 'settings.title' },
     },
     {
       // 文档浏览器（P4, §5.1）：按格式分发 pdf.js / epub.js / 文本渲染器，路由级懒加载。
@@ -51,15 +85,23 @@ const router = createRouter({
       meta: { title: 'routes.audio' },
     },
     {
+      // 统一查看器（顶栏重构 P4-b, §5 L2）：图/视从 body 覆盖层迁为 shell 内路由。ContentViewer 按
+      // mediaType 渲染,缩放/平移/翻页/信息/exotic/人脸内核复用 useMediaDetail。?path= 为未来 OS
+      // shell 深链(外部文件直达)预留。文档/音频仍走上方专用路由(本期未合并入 /view)。
+      path: '/view/:id',
+      component: loadViewerComponent,
+      meta: { title: 'routes.view' },
+    },
+    {
       // H-Lab 横向画廊实验室:多种横向布局候选的真人调研载体,与 MediaGrid 完全平行
-      // (独立后端缓存/滚动器;plan-docs/2026-07-02-horizontal-gallery-lab.md)。
+      // (独立后端缓存/滚动器;docs/designs/2026-07-02-horizontal-gallery-lab.md)。
       path: '/hgallery-lab',
       component: () => import('../views/HGalleryLabView.vue'),
       meta: { title: 'routes.hgalleryLab' },
     },
     {
       path: '/trash',
-      component: () => import('../components/media/MediaGrid.vue'),
+      component: GalleryRouteLayer,
       meta: { title: 'sidebar.trash' },
     },
   ],

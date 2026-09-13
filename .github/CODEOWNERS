@@ -1,0 +1,11 @@
+# CODEOWNERS(由 `worklog init` stamp;方案 §4.3:治理 schema 文件与门禁挂 owner 审)
+# 用法:取消注释并把 @OWNER 换成真实 GitHub 账号/团队;配合仓库设置的
+# required reviews 才有强制力。含未知账号的活行 GitHub 会标错但不阻断。
+#
+# 治理面(schema/配置/CI 的改动须 owner 审):
+# /.worklogrc.jsonc @OWNER
+# /.github/workflows/docs-governance.yml @OWNER
+# /.github/CODEOWNERS @OWNER
+#
+# 归档区(收口台账,归档后冻结;owner 唯一收口的 review 面——E6 门咬声明一致性,这里咬「谁能批」):
+# /docs/worklogs/ @OWNER

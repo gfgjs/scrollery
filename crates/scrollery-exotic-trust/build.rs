@@ -39,7 +39,28 @@ fn main() {
             println!("cargo:warning=exotic 信任根已由构建注入: {}", p.display());
             p
         }
-        _ => default_path,
+        // dev 自取(2026-07-11 psd bad_signature 事故):无显式注入时,**debug 构建**若发现
+        // 本机内测 keyset(gitignored,仅含验签公钥)则自动采用——此前 dev 构建从未被注入,
+        // 信任根恒为 fail-closed 占位集,已装的内测签名插件在 dev 里永远 bad_signature,
+        // 且该缺口被 07-05 彩排期的运行时旁路掩蔽、cargo clean 后暴露。Release 构建、
+        // CI runner 与贡献者机(无 .internal-signing/)不受影响:仍占位集或显式注入。
+        _ => {
+            let dev_keyset = manifest_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|root| root.join(".internal-signing").join("internal-keyset.json"));
+            match dev_keyset {
+                Some(p) if env::var("PROFILE").as_deref() == Ok("debug") && p.is_file() => {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                    println!(
+                        "cargo:warning=exotic 信任根(debug 自取内测集): {}",
+                        p.display()
+                    );
+                    p
+                }
+                _ => default_path,
+            }
+        }
     };
 
     // 最小完整性哨兵:空文件/明显非 keyset 内容在编译期即失败,不等运行时 fail-closed。

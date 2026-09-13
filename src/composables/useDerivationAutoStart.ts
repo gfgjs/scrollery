@@ -17,8 +17,8 @@
 //     cancel+restart 抖动（会把在途任务恢复为待处理、白白重来）。
 
 import { onMounted, onBeforeUnmount } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { invokeIpc } from '../utils/ipc'
+import { useTauriListen } from './useTauriListen'
 import { IPC, EVENTS } from '../constants/ipc'
 
 interface DerivationStatus {
@@ -40,11 +40,11 @@ export function useDerivationAutoStart() {
     try {
       // 已在运行则不重复启动：start_derivation 会先 cancel 现有运行再重开，
       // 重复触发只会把在途任务反复恢复为待处理，徒增开销。
-      const status = await invoke<DerivationStatus>(IPC.DERIVATION_STATUS).catch(() => null)
+      const status = await invokeIpc<DerivationStatus>(IPC.DERIVATION_STATUS).catch(() => null)
       if (status?.isRunning) return
       // 不带 kind 过滤 → 处理全部派生（视频封面/关键帧、音频封面、epub 封面）。
       // 后端自行 backfill + 续传 + 让步；封面落地后会发 db:media_enriched 让画廊刷新。
-      await invoke(IPC.START_DERIVATION).catch(() => {})
+      await invokeIpc(IPC.START_DERIVATION).catch(() => {})
     } finally {
       kicking = false
     }
@@ -61,17 +61,21 @@ export function useDerivationAutoStart() {
     }, 1500)
   }
 
-  let unlisten: UnlistenFn | null = null
-  onMounted(async () => {
-    unlisten = await listen(EVENTS.MEDIA_ENRICHED, kickDebounced)
+  // MEDIA_ENRICHED 监听解绑交由 useTauriListen(P1-11);onMounted 只留启动延迟 kick。
+  useTauriListen(EVENTS.MEDIA_ENRICHED, kickDebounced)
+
+  let kickTimer: ReturnType<typeof setTimeout> | null = null
+  onMounted(() => {
     // 启动时延迟一拍再踢：让首屏扫描/缩略图先抢占（流水线本就会让步，这里只是少打一次空转）。
-    setTimeout(() => {
+    kickTimer = setTimeout(() => {
+      kickTimer = null
       void kick()
     }, 3000)
   })
 
   onBeforeUnmount(() => {
-    if (unlisten) unlisten()
+    // 补齐启动定时器清理:原实现漏清,卸载后仍会 kick 已死组件(同 P1-11 类生命周期缺口)。
+    if (kickTimer) clearTimeout(kickTimer)
     if (debounceTimer) clearTimeout(debounceTimer)
   })
 }

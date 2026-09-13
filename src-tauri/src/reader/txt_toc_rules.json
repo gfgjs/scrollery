@@ -1,0 +1,57 @@
+[
+  {
+    "name": "卷/部/篇 第X卷",
+    "pattern": "^\\s*第[\\d〇零一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟]+[卷部篇]",
+    "deny_suffix": "分门类赛游",
+    "priority": 90
+  },
+  {
+    "name": "章 第X章",
+    "pattern": "^\\s*第[\\d〇零一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟]+章",
+    "deny_suffix": "",
+    "priority": 100
+  },
+  {
+    "name": "回 第X回",
+    "pattern": "^\\s*第[\\d〇零一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟]+回",
+    "deny_suffix": "合",
+    "priority": 95
+  },
+  {
+    "name": "节 第X节",
+    "pattern": "^\\s*第[\\d〇零一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟]+节",
+    "deny_suffix": "课",
+    "priority": 80
+  },
+  {
+    "name": "集 第X集",
+    "pattern": "^\\s*第[\\d〇零一二三四五六七八九十百千万亿两壹贰叁肆伍陆柒捌玖拾佰仟]+集",
+    "deny_suffix": "合和团",
+    "priority": 70
+  },
+  {
+    "name": "特殊标题 序章/楔子/番外",
+    "pattern": "^\\s*(?:序章|序言|自序|楔子|引子|前言|后记|尾声|终章|番外|外传|上部|下部|上卷|下卷)",
+    "deny_suffix": "",
+    "priority": 60
+  },
+  {
+    "name": "英文 Chapter/Part N",
+    "pattern": "^\\s*(?i)(?:chapter|part|section|prologue|epilogue)\\b(?:\\s+(?:\\d+|[ivxlcdm]+)\\b)?",
+    "deny_suffix": "",
+    "priority": 85
+  },
+  {
+    "name": "分隔符型 1.标题",
+    "pattern": "^\\s*\\d{1,4}[.、][^\\d]",
+    "deny_suffix": "",
+    "priority": 30
+  },
+  {
+    "name": "纯数字行(默认关,易误判)",
+    "pattern": "^\\s*\\d{1,4}\\s*$",
+    "deny_suffix": "",
+    "priority": 10,
+    "enabled": false
+  }
+]

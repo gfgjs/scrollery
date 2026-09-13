@@ -1,11 +1,10 @@
 // crates/scrollery-exotic-trust/src/crypto.rs
 //! 冷门格式插件 · 信任根与 Ed25519 验签原语（v3 Part3 §5.1 / D10/D11）。
 //!
-//! 【Part6 §3.9.1a 去环 ③a】本模块自 `src-tauri/src/exotic/crypto.rs` 迁入开源叶 crate
-//! `scrollery-exotic-trust`——`VerifyingKeyset` 结构 + `verify_strict` 调用属通用 ring 封装、
-//! 无秘密价值，计划明定「留开源」（Part6 §3.9 line 553）。下沉动机：pro 的 `DirectEntitlement`
-//! 需这套验签原语，而 pro 不能依赖 src-tauri（否则成环）；验签原语落共享叶 crate 后 pro 单向依赖即可。
-//! src-tauri 侧 `crate::exotic::crypto` 退化为再导出薄壳，既有引用路径不变。
+//! 【Part6 §3.9.1a 去环 ③a】本模块自 `src-tauri/src/exotic/crypto.rs` 迁入本叶 crate——
+//! `VerifyingKeyset` 结构 + `verify_strict` 调用属通用 ring 封装、无秘密价值。下沉动机：让验签
+//! 原语脱离 `src-tauri`，供 registry / license 两用途共享同一信任根。src-tauri 侧
+//! `crate::exotic::crypto` 退化为再导出薄壳，既有引用路径不变。
 //!
 //! Host **只验签、不签名**：私钥离线/HSM，永不入二进制（§5.1）。本模块提供：
 //!   - [`VerifyingKeyset`]：编入 Host 的公钥集（key_id → 公钥 + 用途 + 状态 + 有效期窗口）。
@@ -378,6 +377,51 @@ mod tests {
         if !injected {
             assert!(ks.key_ids().any(|k| k == "release-2026-01"));
             assert!(ks.key_ids().any(|k| k == "license-2026-01"));
+        }
+    }
+
+    /// 随仓 keyset 必须同时含正名 key_id 与历史别名:已发凭证可能持旧 key_id,别名须与正名同公钥值/
+    /// 用途/状态/有效期,否则旧凭证失效。
+    /// 断言直读**资源文件**(而非 builtin()):debug 构建会自取内测集、流水线可整组注入,两者都属
+    /// 「整组替换」语义,不应要求替换集含占位别名;这里锁的是随仓发布的那一份。
+    #[test]
+    fn shipped_keyset_preserves_pro_key_id_aliases() {
+        let raw: RawKeyset = serde_json::from_str(include_str!("../resources/exotic-keyset.json"))
+            .expect("随仓 keyset JSON 必须可解析");
+        let key_of = |id: &str| {
+            raw.keys
+                .iter()
+                .find(|k| k.key_id == id)
+                .unwrap_or_else(|| panic!("随仓 keyset 缺 key_id:{id}"))
+        };
+        for (canonical, alias, purpose) in [
+            (
+                "release-2026-01",
+                "release-prod-placeholder",
+                KeyPurpose::Release,
+            ),
+            (
+                "license-2026-01",
+                "license-prod-placeholder",
+                KeyPurpose::License,
+            ),
+        ] {
+            let (c, a) = (key_of(canonical), key_of(alias));
+            assert_eq!((c.purpose, a.purpose), (purpose, purpose));
+            assert_eq!(
+                (c.status, a.status),
+                (KeyStatus::Active, KeyStatus::Active),
+                "别名与正名都须 active:{alias}"
+            );
+            assert_eq!(
+                c.public_key_b64, a.public_key_b64,
+                "别名 {alias} 与正名 {canonical} 必须同一公钥(防抄写串错)"
+            );
+            assert_eq!(
+                (c.not_before, c.not_after),
+                (a.not_before, a.not_after),
+                "别名 {alias} 的有效期须与正名一致"
+            );
         }
     }
 

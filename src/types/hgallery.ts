@@ -1,6 +1,6 @@
 // src/types/hgallery.ts
 // H-Lab 横向画廊实验类型(镜像 Rust layout/horizontal.rs 与 ipc/hgallery_commands.rs 的
-// serde camelCase 序列化;plan-docs/2026-07-02-horizontal-gallery-lab.md §4)。
+// serde camelCase 序列化;docs/designs/2026-07-02-horizontal-gallery-lab.md §4)。
 
 /** 实验项:仅缩略图渲染所需字段,x/y/w/h 为全局绝对坐标(渲染层不感知布局模式)。 */
 export interface HItem {

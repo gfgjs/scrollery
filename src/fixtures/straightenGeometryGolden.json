@@ -1,0 +1,8 @@
+[
+  { "width": 4000, "height": 3000, "angle": 0, "innerWidth": 4000, "innerHeight": 3000 },
+  { "width": 4000, "height": 3000, "angle": 30, "innerWidth": 2609, "innerHeight": 1957 },
+  { "width": 4000, "height": 3000, "angle": -30, "innerWidth": 2609, "innerHeight": 1957 },
+  { "width": 4000, "height": 3000, "angle": 45, "innerWidth": 2424, "innerHeight": 1818 },
+  { "width": 3000, "height": 4000, "angle": -45, "innerWidth": 1818, "innerHeight": 2424 },
+  { "width": 1000, "height": 1000, "angle": 45, "innerWidth": 707, "innerHeight": 707 }
+]

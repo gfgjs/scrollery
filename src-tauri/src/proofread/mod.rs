@@ -16,7 +16,6 @@ use serde_json::json;
 
 use crate::error::{AppError, Result};
 
-/// Remote endpoint config (key is fetched separately from keyring, never stored here).
 /// 远程端点配置（key 另从 keyring 取，绝不存于此）。
 pub struct ProofreadConfig {
     /// e.g. `https://api.openai.com/v1` (no trailing `/chat/completions`).
@@ -30,7 +29,6 @@ pub struct ProofreadConfig {
 const SYSTEM_PROMPT: &str = "你是专业的中文校对助手。请修正文本中的错别字、标点符号和语病，\
 保持原意、写作风格与段落格式不变。只输出修正后的完整文本，不要添加任何解释、标题或代码块标记。";
 
-/// Proofread one text chunk via an OpenAI-compatible chat completion. Returns the corrected text.
 /// 经 OpenAI 兼容 chat completion 校对一段文本，返回修正后的文本。
 pub async fn proofread_remote(cfg: &ProofreadConfig, api_key: &str, text: &str) -> Result<String> {
     // base_url 校验：仅允许 http(s)（桌面端由用户自配端点，含 localhost Ollama，故不做白名单）。
@@ -57,7 +55,16 @@ pub async fn proofread_remote(cfg: &ProofreadConfig, api_key: &str, text: &str) 
         "stream": false
     });
 
-    let client = reqwest::Client::new();
+    // 超时防线(2026-07-10 审查 B9):原裸 Client::new() 无任何超时,远端 LLM 挂起时
+    // proofread_chunk invoke 永不返回且前端无 abort 手段。连接 15s + 整体 300s
+    // (LLM 长生成留量);endpoint 为用户自配(可为局域网 http),不走 HTTPS 强制策略。
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| {
+            AppError::Internal(format!("HTTP 客户端构建失败 | client build failed: {e}"))
+        })?;
     let resp = client
         .post(&endpoint)
         .bearer_auth(api_key)

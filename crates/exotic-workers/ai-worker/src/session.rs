@@ -133,7 +133,9 @@ pub fn validate_and_resolve(
 }
 
 /// 单个模型载荷的完整性校验:Path 通道 + 归属 + 文件名 + len + sha256。
-fn verify_descriptor(
+/// `pub(crate)`(T5,OCR 会话复用):OCR 四件套(det/cls/rec/dict)与 CLIP 共享同一份
+/// Path 通道/归属/文件名/len/sha256 校验纪律,`ocr.rs::validate_ocr_init` 直接调用。
+pub(crate) fn verify_descriptor(
     desc: &ModelDescriptor,
     expected_file: &str,
     root: &Path,
@@ -180,13 +182,19 @@ fn verify_descriptor(
 }
 
 /// ort 加载段:构建 Session 池并复核「声明的角色都真正就绪」。
-/// 冷加载可达分钟级(ViT-L + DirectML 内核编译),host 侧对 SessionInit 配 300s 档(D3 §2)。
-pub fn load(resolved: ResolvedSession) -> Result<SessionState, InitError> {
-    let pool = AiEnginePool::init(
+/// 冷加载可达分钟级(ViT-L + DirectML 内核编译)。2026-07-11 加固批 A-2 起本函数在
+/// 装载线程上执行并经 `progress` 回执阶段事件(main 转译为协议 Progress 帧),宿主
+/// watchdog 相应改「静默限时」——300s 总限时的黑盒等待成为历史。
+pub fn load_with_progress(
+    resolved: ResolvedSession,
+    progress: scrollery_ai_core::engine::LoadProgress<'_>,
+) -> Result<SessionState, InitError> {
+    let pool = AiEnginePool::init_with_progress(
         &resolved.models_root,
         &resolved.profile,
         resolved.face_profile.as_ref(),
         &resolved.image_provider,
+        progress,
     )
     .map_err(|e| fail(format!("引擎初始化失败:{e}")))?;
 
@@ -245,6 +253,7 @@ mod tests {
             handle: ModelHandle::Path(p.to_string_lossy().into_owned()),
             len: content.len() as u64,
             sha256: sha256_file(&p).unwrap(),
+            model_id: None,
         }
     }
 

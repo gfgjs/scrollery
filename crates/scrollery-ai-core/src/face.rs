@@ -1,6 +1,5 @@
 // crates/scrollery-ai-core/src/face.rs
 //! 人脸检测 + 对齐 + 嵌入（F2，默认商用轨 YuNet + SFace）。
-//! Face detection + alignment + embedding (F2, default commercial track YuNet + SFace).
 //!
 //! 三步：
 //!   1. `detect_faces`：DecodedImage → letterbox → YuNet 推理 → 解码(priors/strides) + NMS
@@ -53,7 +52,6 @@ pub use crate::face_types::DetectedFace;
 // ── 检测 ────────────────────────────────────────────────────────────────────────
 
 /// 检测一张图中的所有人脸。按 `profile.detector` 分派后处理。
-/// Detect all faces in one image; post-processing dispatched on `profile.detector`.
 pub fn detect_faces(
     detect_pool: &SessionPool,
     decoded: &DecodedImage,
@@ -68,7 +66,6 @@ pub fn detect_faces(
 }
 
 /// letterbox 后的几何参数，用于把检测坐标反映射回原图。
-/// Letterbox geometry to map detection coords back to the original image.
 struct Letterbox {
     /// 等比缩放因子（new = round(orig·scale)）。
     scale: f32,

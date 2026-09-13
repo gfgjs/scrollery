@@ -1,9 +1,11 @@
 // useRequestQueue 槽位生命周期锁测试(R2-5):去重 single-flight、批容量 24、50ms 合批、
 // cancel 语义分叉(queued 释放 vs inFlight 保留)、finally 兜底、30s 停滞看门狗、released
-// 幂等、按批 slot 判定、targetSize 阶梯、scanStore 簿记(泄漏观测面)。
+// 幂等、按批 slot 判定、targetSize 阶梯、scanStore 簿记(泄漏观测面);
+// 有界退避重试(2026-08-16 阶段3):停滞/缺结果自动重排收敛、上限终拒、cancel 掐断等待期、
+// 重试挂回在途 slot。
 // node 环境,fake timers;invoke 返回测试持有的 deferred(生产代码链 .catch().finally());
-// 结果经捕获的 Channel stub 手动 onmessage 注入。魔数出处:flush 防抖 50ms(:174)、
-// STALL_MS=30000(:21)——均未导出,此处按字面量对拍。
+// 结果经捕获的 Channel stub 手动 onmessage 注入。魔数出处:flush 防抖 50ms、STALL_MS=30000、
+// THUMB_RETRY_MAX=3、THUMB_RETRY_BASE_MS=500——均未导出,此处按字面量对拍。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { DEFAULTS } from '../constants/defaults'
 import type { ThumbResult } from '../types/media'
@@ -189,42 +191,60 @@ describe('cancel 语义分叉', () => {
 })
 
 describe('结算兜底与看门狗', () => {
-  it('finally 兜底:被后端跳过的 id reject 并释放槽位(可重取)', async () => {
+  it('finally 兜底:被后端跳过的 id 经 500ms 退避重试后收敛(重试批送达即 resolve)', async () => {
     const q = useRequestQueue()
     const p1 = q.request(1)
-    const err2 = catchErr(q.request(2))
+    const p2 = q.request(2)
     await vi.advanceTimersByTimeAsync(50)
     call(0).args.onResult.onmessage(result(1))
     mockState.deferreds[0].resolve(undefined)
     await vi.advanceTimersByTimeAsync(0)
     await expect(p1).resolves.toMatchObject({ itemId: 1 })
-    expect((await err2).message).toBe('Batch finished without result')
-    expect(scanMock.autoThumbInFlight).toBe(0)
-    void q.request(2)
+    // id2 无结果 → 不再直接拒绝,500ms 退避后重排新批
+    await vi.advanceTimersByTimeAsync(500)
     await vi.advanceTimersByTimeAsync(50)
     expect(mockState.calls.length).toBe(2)
+    expect(call(1).args.itemIds).toEqual([2])
+    call(1).args.onResult.onmessage(result(2))
+    await expect(p2).resolves.toMatchObject({ itemId: 2 })
+    expect(scanMock.autoThumbInFlight).toBe(0)
   })
 
-  it('invoke 整批失败:waiter 收 Batch finished(非后端原始错误),无未捕获异常', async () => {
+  it('invoke 整批失败:3 轮退避重试耗尽后终拒(消息不变),无未捕获异常', async () => {
     const q = useRequestQueue()
     const err = catchErr(q.request(1))
     await vi.advanceTimersByTimeAsync(50)
     mockState.deferreds[0].reject(new Error('backend down'))
     await vi.advanceTimersByTimeAsync(0)
+    // 退避 500/1000/2000ms(THUMB_RETRY_MAX=3,未导出,按字面量对拍)+ 每轮 50ms 合批
+    for (let n = 0; n < 3; n++) {
+      await vi.advanceTimersByTimeAsync(500 * 2 ** n)
+      await vi.advanceTimersByTimeAsync(50)
+      mockState.deferreds[n + 1].reject(new Error('backend down'))
+      await vi.advanceTimersByTimeAsync(0)
+    }
     expect((await err).message).toBe('Batch finished without result')
+    expect(mockState.calls.length).toBe(4)
     expect(scanMock.autoThumbInFlight).toBe(0)
   })
 
-  it('STALL_MS=30000 无进展 → thumb batch stalled、槽位清零', async () => {
+  it('STALL_MS=30000 无进展 → 停滞释放并退避重试;4 次停滞后终拒', async () => {
     const q = useRequestQueue()
     const err = catchErr(q.request(1))
     await vi.advanceTimersByTimeAsync(50)
-    await vi.advanceTimersByTimeAsync(30_000)
+    for (let n = 0; n < 3; n++) {
+      await vi.advanceTimersByTimeAsync(30_000) // 本轮停滞释放,退避起表
+      await vi.advanceTimersByTimeAsync(500 * 2 ** n)
+      await vi.advanceTimersByTimeAsync(50) // 重试批 flush
+      expect(scanMock.autoThumbInFlight).toBe(1)
+    }
+    await vi.advanceTimersByTimeAsync(30_000) // 第 4 次停滞:超重试上限 → 终拒
     expect((await err).message).toBe('thumb batch stalled')
+    expect(mockState.calls.length).toBe(4)
     expect(scanMock.autoThumbInFlight).toBe(0)
   })
 
-  it('每个送达结果重置看门狗:距上次进展满 30s 才停滞', async () => {
+  it('每个送达结果重置看门狗:距上次进展满 30s 才停滞;停滞耗尽重试后终拒', async () => {
     const q = useRequestQueue()
     const p1 = q.request(1)
     const err2 = catchErr(q.request(2))
@@ -235,6 +255,11 @@ describe('结算兜底与看门狗', () => {
     await vi.advanceTimersByTimeAsync(29_999)
     expect(scanMock.autoThumbInFlight).toBe(1) // 尚未停滞(看门狗已被送达重置)
     await vi.advanceTimersByTimeAsync(1)
+    for (let n = 0; n < 3; n++) {
+      await vi.advanceTimersByTimeAsync(500 * 2 ** n)
+      await vi.advanceTimersByTimeAsync(50)
+      await vi.advanceTimersByTimeAsync(30_000)
+    }
     expect((await err2).message).toBe('thumb batch stalled')
   })
 
@@ -250,6 +275,48 @@ describe('结算兜底与看门狗', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(scanMock.autoThumbInFlight).toBe(1) // 批 B 计数未被清
     call(1).args.onResult.onmessage(result(1))
+    await expect(p2).resolves.toMatchObject({ itemId: 1 })
+  })
+})
+
+describe('有界退避重试(2026-08-16 阶段3)', () => {
+  it('停滞释放后自动重试并收敛:第二批送达 → 原 Promise resolve,调用方无需重发', async () => {
+    const q = useRequestQueue()
+    const p = q.request(1)
+    await vi.advanceTimersByTimeAsync(50)
+    await vi.advanceTimersByTimeAsync(30_000) // 批 A 停滞
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(50) // 重试批 B flush
+    expect(mockState.calls.length).toBe(2)
+    expect(call(1).args.itemIds).toEqual([1])
+    call(1).args.onResult.onmessage(result(1))
+    await expect(p).resolves.toMatchObject({ itemId: 1 })
+  })
+
+  it('cancel 掐断退避等待:不发重试批,原 Promise 拒绝 cancelled', async () => {
+    const q = useRequestQueue()
+    const err = catchErr(q.request(1))
+    await vi.advanceTimersByTimeAsync(50)
+    await vi.advanceTimersByTimeAsync(30_000) // 停滞 → 500ms 退避起表
+    q.cancel(1)
+    expect((await err).message).toBe('cancelled')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(mockState.calls.length).toBe(1) // 定时器已掐,无重试批
+    expect(scanMock.autoThumbQueueSize).toBe(0)
+  })
+
+  it('退避等待期他人的同 id 请求:重试到期挂回在途 slot,不产生第三次 invoke', async () => {
+    const q = useRequestQueue()
+    const p1 = q.request(1)
+    await vi.advanceTimersByTimeAsync(50)
+    await vi.advanceTimersByTimeAsync(30_000) // p1 停滞,退避 500ms 起表
+    const p2 = q.request(1) // 等待期新请求 → 批 B
+    await vi.advanceTimersByTimeAsync(50)
+    expect(mockState.calls.length).toBe(2)
+    await vi.advanceTimersByTimeAsync(450) // p1 退避到期,挂回批 B 的 slot
+    expect(mockState.calls.length).toBe(2)
+    call(1).args.onResult.onmessage(result(1))
+    await expect(p1).resolves.toMatchObject({ itemId: 1 })
     await expect(p2).resolves.toMatchObject({ itemId: 1 })
   })
 })
@@ -282,10 +349,10 @@ describe('按批 slot 判定', () => {
 
 describe('targetSize 阶梯(THUMB_SIZE_TIERS 首个 ≥ rowHeight,超界回退末档)', () => {
   it.each([
-    [200, 240],
-    [120, 120],
-    [480, 480],
-    [1200, 960],
+    [200, 256],
+    [64, 64],
+    [512, 512],
+    [1200, 1024],
   ])('gridRowHeight=%i → targetSize=%i', async (rowHeight, expected) => {
     uiMock.gridRowHeight = rowHeight
     const q = useRequestQueue()

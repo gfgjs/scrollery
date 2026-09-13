@@ -1,10 +1,5 @@
 // crates/scrollery-ai-core/src/profile.rs
 //! AI 模型契约（`ModelProfile`）+ 内置模型注册表。
-//! Decouples the inference path from any single model: image size, embedding dim,
-//! normalisation, tensor I/O names, tokenizer kind and download assets all come from
-//! a profile instead of hard-coded constants — so "switching models" becomes swapping
-//! DATA, not editing CODE.
-//!
 //! 把推理路径与具体模型解耦：图像尺寸、嵌入维度、归一化、张量 I/O 名、分词器类型、
 //! 下载资产全部来自 profile 而非写死常量 —— 使「换模型」变成换数据而非改代码。
 //!
@@ -16,7 +11,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Tokeniser backend a text encoder needs.
 /// 文本编码器所需的分词器后端。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -32,7 +26,6 @@ pub enum TokenizerKind {
     // 第二阶段（异构模型）预留：Bpe { merges_file, vocab_file }、SentencePiece { model_file } …
 }
 
-/// One downloadable asset (model weight header / external data / vocab).
 /// 一个可下载资产（模型权重主文件 / 外部权重 / 词表）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelAsset {
@@ -51,7 +44,6 @@ pub struct ModelAsset {
     pub sha256: Option<String>,
 }
 
-/// A complete model contract: everything the inference path needs + catalogue metadata.
 /// 完整模型契约：推理路径所需的一切 + 目录元数据。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,10 +86,8 @@ pub struct ModelProfile {
     pub assets: Vec<ModelAsset>,
 }
 
-/// Default (and historical) profile id — must keep its embeddings valid forever.
 /// 默认（且历史）profile id —— 其嵌入向量须永久有效。
 pub const DEFAULT_PROFILE_ID: &str = "cn-clip-vit-b16";
-// pub const DEFAULT_PROFILE_ID: &str = "cn-clip-vit-l14-336";
 
 const VOCAB_FILE: &str = "vocab.txt";
 
@@ -105,7 +95,6 @@ const VOCAB_FILE: &str = "vocab.txt";
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
-/// bert-base-chinese WordPiece tokenizer spec shared by ALL Chinese-CLIP sizes.
 /// 所有 Chinese-CLIP 尺寸共用的 bert-base-chinese WordPiece 分词器规格。
 fn cn_bert() -> TokenizerKind {
     TokenizerKind::BertWordPiece {
@@ -116,7 +105,6 @@ fn cn_bert() -> TokenizerKind {
     }
 }
 
-/// Build a download asset hosted on the eisneim/cn-clip_vit-b-16 HF repo (primary + hf-mirror).
 /// 构造托管在 eisneim/cn-clip_vit-b-16 HF 仓库的下载资产（主源 + hf-mirror 镜像）。
 fn cn_clip_b16_asset(file: &str, size_bytes: u64, sha256: &str) -> ModelAsset {
     const REPO: &str = "eisneim/cn-clip_vit-b-16";
@@ -129,10 +117,6 @@ fn cn_clip_b16_asset(file: &str, size_bytes: u64, sha256: &str) -> ModelAsset {
     }
 }
 
-/// Shared vocab.txt asset (OFA-Sys bert-base-chinese, 21128 token). Reused by EVERY Chinese-CLIP
-/// architecture — the self-hosted onnx repos do NOT ship vocab, and the eisneim repo's English BPE
-/// vocab must NEVER be used (see clip.rs 坑1/坑8). Small + non-LFS → size check only (sha256=None);
-/// clip.rs additionally enforces vocab_size ≥ min_vocab at runtime as a second safety net.
 /// 全族共用的 vocab.txt（OFA-Sys bert-base-chinese，21128 token）。各 onnx 仓库都不含 vocab，
 /// 且绝不可用 eisneim 仓库的英文 BPE 词表（见 clip.rs 坑1/坑8）。体积小、非 LFS → 仅按大小校验，
 /// 运行时再校验 vocab_size ≥ min_vocab 双保险。
@@ -150,11 +134,6 @@ pub fn vocab_asset() -> ModelAsset {
     }
 }
 
-/// Per-architecture static metadata that the file listing CANNOT carry (geometry, embed dim,
-/// tokenizer/vocab, normalisation), keyed by the stable architecture id (= `ai_embeddings.model_name`).
-/// The downloadable image-encoder variants + their sizes/sha256 are discovered at runtime
-/// (`remote_registry`); only the bits below are fixed knowledge.
-///
 /// 每个架构的静态元数据（文件清单里没有：几何尺寸、嵌入维度、分词器/词表、归一化），以稳定的
 /// 架构 id（= `ai_embeddings.model_name`）为键。可下载的图像编码器 batch 变体及其大小/sha256
 /// 由运行时动态发现（`remote_registry`）；这里只放固定不变的部分。
@@ -178,8 +157,6 @@ pub struct ArchMeta {
     pub fp16: bool,
 }
 
-/// All known architectures (first = default). h-14 listed proactively; it only shows up in the
-/// model library once its onnx are actually present in the repo (discovery yields no variants → hidden).
 /// 所有已知架构（第一条 = 默认）。h-14 预留登记；仅当仓库真有其 onnx 时才会出现在模型库
 /// （发现不到变体即隐藏）。
 pub fn arch_metas() -> Vec<ArchMeta> {
@@ -247,23 +224,16 @@ pub fn arch_metas() -> Vec<ArchMeta> {
     ]
 }
 
-/// Look up architecture metadata by stable id.
 /// 按稳定 id 查架构元数据。
 pub fn arch_by_id(id: &str) -> Option<ArchMeta> {
     arch_metas().into_iter().find(|a| a.id == id)
 }
 
-/// Look up architecture metadata by repo folder name.
 /// 按仓库文件夹名查架构元数据。
 pub fn arch_by_folder(folder: &str) -> Option<ArchMeta> {
     arch_metas().into_iter().find(|a| a.folder == Some(folder))
 }
 
-/// Build a full `ModelProfile` for an architecture, with `image_file` set to the chosen batch
-/// variant (or the architecture default when `None`). All cn-clip sizes share the same tokenizer /
-/// tensor names / normalisation, so only the per-arch fields vary. `assets` is left empty here —
-/// downloads build their own (variant-specific) manifest in `ai_commands`.
-///
 /// 为某架构合成完整 `ModelProfile`，`image_file` 指向选定的 batch 变体（`None` 用架构缺省）。
 /// cn-clip 各尺寸共用分词器/张量名/归一化，仅按架构变化的字段不同。`assets` 留空 —— 下载在
 /// `ai_commands` 里按变体单独构造清单。
@@ -293,21 +263,17 @@ pub fn resolve_profile(arch_id: &str, image_file: Option<&str>) -> Option<ModelP
     })
 }
 
-/// Find a profile by id (architecture default variant). Kept for call sites that only need the
-/// architecture-level contract; the active model resolves the selected variant via `resolve_profile`.
 /// 按 id 查 profile（架构缺省变体）。供只需架构级契约的调用方；激活模型经 `resolve_profile` 解析所选变体。
 pub fn find(id: &str) -> Option<ModelProfile> {
     resolve_profile(id, None)
 }
 
-/// The default profile (always present).
 /// 默认 profile（始终存在）。
 pub fn default_profile() -> ModelProfile {
     resolve_profile(DEFAULT_PROFILE_ID, None)
         .expect("default profile must exist | 默认 profile 必须存在")
 }
 
-/// Verified download manifest for the static fp16 B/16 (hosted on eisneim, NOT the new repo).
 /// 静态 fp16 B/16 的已校验下载清单（托管在 eisneim，非新仓库）。
 ///
 /// 已校验（2026-06-16 核对 HF 仓库实际文件/大小/LFS sha256）：FP16 **外部数据格式**——小 `.onnx`

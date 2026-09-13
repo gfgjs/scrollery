@@ -3,19 +3,21 @@
 
 :root {
   /* ── Spacing ───────────────────────────────────────────────── */
+  --spacing-2xs: 2px;
   --spacing-xs: 4px;
   --spacing-sm: 8px;
-  --spacing-md: 16px;
-  --spacing-lg: 24px;
-  --spacing-xl: 32px;
-  --spacing-2xl: 48px;
+  --spacing-md: 12px;
+  --spacing-lg: 16px;
+  --spacing-xl: 24px;
+  --spacing-2xl: 32px;
+  --spacing-3xl: 48px;
 
   /* ── Border Radius ─────────────────────────────────────────── */
-  --radius-xs: 2px;
-  --radius-sm: 4px;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
   --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
   --radius-full: 9999px;
 
   /* ── Typography ────────────────────────────────────────────── */
@@ -26,11 +28,11 @@
   --font-size-2xs: 11px;
   --font-size-xs: 12px;
   --font-size-sm: 13px;
-  --font-size-base: 16px;
-  --font-size-md: 17px;
-  --font-size-lg: 20px;
-  --font-size-xl: 24px;
-  --font-size-2xl: 30px;
+  --font-size-base: 13px;
+  --font-size-md: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 20px;
+  --font-size-2xl: 24px;
 
   --leading-tight: 1.2;
   --leading-normal: 1.5;
@@ -44,6 +46,8 @@
   --duration-fast: 120ms;
   --duration-normal: 200ms;
   --duration-slow: 350ms;
+  --duration-moderate: 280ms; /* 抽屉/面板/折叠滑动档 */
+  --duration-spin: 800ms; /* spinner 循环统一档 */
 
   /* Composite transitions (used by components) */
   --transition-fast: var(--duration-fast) var(--ease-out);
@@ -58,30 +62,76 @@
   --z-overlay: 200;
   --z-toast: 300;
 
+  /* ── Shared media marks ─────────────────────────────────────
+     徽章文字统一压 scrim;类别色只作为小面积点色/图标色,不随主题重复漂移。 */
+  --color-badge-scrim: rgba(0, 0, 0, 0.6);
+  --color-badge-mark-live: #ffaaaa;
+  --color-badge-mark-audio: #5dd39e;
+  --color-badge-mark-document: #ffd166;
+  --color-rating-amber: #fbbf24;
+
   /* ── Focus Ring ────────────────────────────────────────────── */
   --focus-ring-width: 2px;
   --focus-ring-offset: 2px;
 
   /* ── Layout Measurements ───────────────────────────────────── */
   --sidebar-width: 260px;
-  --toolbar-height: 48px;
-  --statusbar-height: 28px;
+  /* 合并/分离模式共用紧凑工具轨道；标题栏与页面工具栏都以 40px 对齐。 */
+  --toolbar-height: 40px;
+  --statusbar-height: 26px;
   --sidebar-min-width: 180px;
   --sidebar-max-width: 400px;
+
+  /* 自绘标题栏(顶栏重构 L1,设计文档 §3.2)。
+     --titlebar-height:与工具栏同为 40px,更近原生标题栏观感(真机可调)。
+     --titlebar-controls-inset:窗口三键 / mac 红绿灯的占位宽,供标题栏内容左右避让——
+       mac ≈78px 让红绿灯、Windows = 自绘三键宽,由 WindowChrome 运行时按平台/窗口态覆写;
+       此处 0px 默认(未挂 chrome 的降级态不留白)。 */
+  --titlebar-height: 40px;
+  --titlebar-controls-inset: 0px;
 
   /* ── Grid ──────────────────────────────────────────────────── */
   --grid-gap: 4px;
   --grid-row-height: 200px;
 
   /* ── Scrollbar ─────────────────────────────────────────────── */
-  --scrollbar-width: 6px;
+  --scrollbar-width: 8px;
 
   /* ── Form Controls ─────────────────────────────────────────── */
-  --toggle-width: 40px;
-  --toggle-height: 22px;
-  --toggle-thumb: 18px;
-  --input-height: 36px;
-  --select-height: 36px;
+  --toggle-width: 36px;
+  --toggle-height: 20px;
+  --toggle-thumb: 16px;
+  --input-height: 32px;
+  --select-height: 32px;
+
+  /* ── Component contracts ────────────────────────────────────── */
+  --control-size-compact: 28px;
+  --control-size-default: 32px;
+  --control-size-touch: 44px;
+  --control-padding-inline: 12px;
+  --control-focus-ring: 0 0 0 2px color-mix(in srgb, var(--color-accent) 22%, transparent);
+
+  --toolbar-bg: var(--color-bg-secondary);
+  --toolbar-border: var(--color-border);
+  --toolbar-gap: var(--spacing-sm);
+
+  --popover-bg: var(--color-bg-surface);
+  --popover-border: var(--color-border);
+  --popover-shadow: var(--shadow-lg);
+  --popover-max-inline-size: min(360px, calc(100vw - 16px));
+
+  --card-bg: var(--color-bg-elevated);
+  --card-border: var(--color-border);
+  --card-hover: var(--color-bg-hover);
+  --card-selected: var(--color-accent-subtle);
+
+  --selection-ring: var(--color-accent);
+  --selection-fill: var(--color-accent-subtle);
+  --danger-bg: var(--color-error-subtle);
+  --danger-text: var(--color-error);
+  --danger-hover: var(--color-error);
+  --media-overlay-bg: rgb(0 0 0 / 0.66);
+  --media-overlay-text: #fff;
 
   /* ── Opacity ───────────────────────────────────────────────── */
   --opacity-disabled: 0.4;

@@ -1,19 +1,19 @@
 <template>
-  <div class="settings-card__item">
+  <div class="settings-card__item" :data-setting-key="settingKey">
     <button
       class="pin-btn"
       :class="{ active: ui.pinnedSettings.includes(settingKey) }"
       @click="ui.togglePinnedSetting(settingKey)"
       :title="$t('settings.pinToSidebar')"
-      :aria-label="$t('settings.pinToSidebar')"
+
     >
       <Pin :size="14" />
     </button>
     <div class="settings-card__info">
-      <div class="settings-card__label">{{ $t(spec.label) }}</div>
+      <div class="settings-card__label">{{ spec ? $t(spec.label) : settingKey }}</div>
       <!-- 描述槽:特例行(可点击路径等)整体替换;默认取注册表 descKey -->
       <slot name="desc">
-        <div v-if="spec.descKey" class="settings-card__desc">{{ $t(spec.descKey) }}</div>
+        <div v-if="spec?.descKey" class="settings-card__desc">{{ $t(spec.descKey) }}</div>
       </slot>
       <!-- 描述下方附加块(如全量生成进度条) -->
       <slot name="extra" />
@@ -31,7 +31,7 @@
 import { computed } from 'vue'
 import { Pin } from '@lucide/vue'
 import { useUiStore } from '../../stores/uiStore'
-import { SETTINGS_MAP } from '../../constants/settingsMap'
+import { getSettingSpec } from '../../constants/settingsMap'
 import DynamicSettingControl from './DynamicSettingControl.vue'
 
 const props = defineProps<{
@@ -42,26 +42,32 @@ const props = defineProps<{
 }>()
 
 const ui = useUiStore()
-const spec = computed(() => SETTINGS_MAP[props.settingKey])
+// 安全检索(P1-20):spec 可能为 undefined(拼错/废弃键),模板已判空,不再 undefined.label 崩。
+const spec = computed(() => getSettingSpec(props.settingKey))
 </script>
 
 <style scoped>
 /* __item/__info/__label/__desc 基础样式在 index.css(全局);此处仅行外壳特有部分。 */
 .settings-card__item {
-  padding-left: 12px;
+  padding-left: var(--spacing-xs);
 }
 
 .pin-btn {
+  width: var(--control-size-compact);
+  min-width: var(--control-size-compact);
+  height: var(--control-size-compact);
   background: transparent;
   border: none;
   color: var(--color-text-tertiary);
   cursor: pointer;
-  padding: 4px;
-  border-radius: 4px;
+  padding: 0;
+  border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all var(--transition-fast);
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast);
 }
 .pin-btn:hover {
   background: var(--color-bg-elevated);

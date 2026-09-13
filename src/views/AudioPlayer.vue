@@ -12,7 +12,7 @@
         class="ap-btn"
         @click="openExternal"
         :title="t('common.openExternal')"
-        :aria-label="t('common.openExternal')"
+
       >
         <ExternalLink :size="16" />
       </button>
@@ -22,7 +22,7 @@
       <!-- 左：封面 + 元数据 + 播放控件 -->
       <div class="audio-player__main">
         <div class="audio-player__cover">
-          <img v-if="coverUrl" :src="coverUrl" :alt="title" />
+          <img v-if="coverUrl" :src="coverUrl" />
           <div v-else class="audio-player__cover-fallback">
             <Music :size="96" />
           </div>
@@ -56,7 +56,7 @@
               class="ap-icon"
               @click="seekBy(-10)"
               :title="t('audio.rewind10')"
-              :aria-label="t('audio.rewind10')"
+
             >
               <SkipBack :size="20" />
             </button>
@@ -64,7 +64,7 @@
               class="ap-icon ap-icon--play"
               @click="togglePlay"
               :title="playing ? t('common.pause') : t('audio.play')"
-              :aria-label="playing ? t('common.pause') : t('audio.play')"
+
             >
               <component :is="playing ? Pause : Play" :size="26" :fill="'currentColor'" />
             </button>
@@ -72,7 +72,7 @@
               class="ap-icon"
               @click="seekBy(10)"
               :title="t('audio.forward10')"
-              :aria-label="t('audio.forward10')"
+
             >
               <SkipForward :size="20" />
             </button>
@@ -124,7 +124,7 @@
             @click="seekTo(line.time)"
           >
             <template v-if="line.text">{{ line.text }}</template>
-            <Music v-else :size="12" aria-hidden="true" />
+            <Music v-else :size="12" />
           </p>
         </template>
         <pre v-else-if="detail.lyrics" class="audio-player__lyric-plain">{{ detail.lyrics }}</pre>
@@ -154,7 +154,8 @@
 import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { invoke, convertFileSrc } from '@tauri-apps/api/core'
+import { convertFileSrc } from '@tauri-apps/api/core'
+import { invokeIpc } from '../utils/ipc'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
 import {
   ChevronLeft,
@@ -169,6 +170,15 @@ import {
 import { IPC } from '../constants/ipc'
 import { formatDuration } from '../utils/format'
 import { parseLrc, activeLineIndex, type LrcLine } from '../utils/lrc'
+import {
+  useViewerStore,
+  toViewerFileInfo,
+  type ViewerApi,
+  type ActiveViewer,
+  type ViewerFileInfo,
+} from '../stores/viewerStore'
+import { resolveViewerKind } from '../utils/viewerKind'
+import type { MediaDetail } from '../types/media'
 
 interface AudioMeta {
   audioCodec?: string | null
@@ -281,19 +291,30 @@ function onTimeUpdate() {
 // 高亮行居中滚动（仅在切换时触发，避免抖动）。
 function scrollActiveIntoView() {
   const el = lineEls[activeLine.value]
-  if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  if (!el) return
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' })
 }
 
 async function load() {
   detail.value = null
+  fileInfo.value = null
   error.value = ''
   syncedLines.value = []
   activeLine.value = -1
   lineEls.length = 0
   currentTime.value = 0
   duration.value = 0
+  // 底栏文件信息:AudioDetail 载荷不含 rating/isFavorited/colorLabel 等库内标量,并行补一次
+  // get_media_detail(同 items 表单行,doc/图视页同源 IPC)。换歌竞态以 id 快照守卫;失败不阻塞
+  // 播放(fileInfo 留 null,底栏仅少标量段)。
+  const reqId = id.value
+  invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id: reqId })
+    .then((d) => {
+      if (id.value === reqId) fileInfo.value = toViewerFileInfo(d)
+    })
+    .catch(() => {})
   try {
-    const d = await invoke<AudioDetail>(IPC.GET_AUDIO_DETAIL, { id: id.value })
+    const d = await invokeIpc<AudioDetail>(IPC.GET_AUDIO_DETAIL, { id: id.value })
     detail.value = d
     if (d.lyricsSynced && d.lyrics) {
       syncedLines.value = parseLrc(d.lyrics)
@@ -307,17 +328,60 @@ async function load() {
 }
 
 function goBack() {
-  if (window.history.length > 1) router.back()
-  else router.push('/')
+  // 与 ContentViewer.close 同判据(深链直开时 window.history.length 不可靠,LOW-1 统一)。
+  if (router.options.history.state.back != null) router.back()
+  else void router.push('/')
 }
 async function openExternal() {
   if (detail.value) await shellOpen(detail.value.absPath).catch(() => {})
 }
 
+// ── activeViewer 单源 populate(顶栏重构 P5 余项)─────────────────────────────
+// 让音频也进 viewerStore, 点亮标题栏上下文工具栏(播放/±10s 命令); ViewerApi 映射到本地播放函数。
+// 与本组件内的播放控件并存(双入口, 承 P5-5「保留局部控件」决策)。populate 后 ContextualToolbar
+// 靠 when=kind 'audio' 渲染音频命令, 其 /audio/ 前缀兜底抑制随 hasActiveViewer 转真自然失效。
+const viewer = useViewerStore()
+const viewerApi: ViewerApi = {
+  togglePlay,
+  seekBy,
+  close: goBack,
+}
+let viewerToken: number | null = null
+// 底栏文件信息标量(get_media_detail 异步补齐,load() 换歌复位;见 load 内注释)。
+const fileInfo = ref<ViewerFileInfo | null>(null)
+function viewerSnapshot(): Omit<ActiveViewer, 'immersive'> {
+  const d = detail.value
+  return {
+    kind: resolveViewerKind('audio', d?.fileFormat ?? ''),
+    mediaType: 'audio',
+    fileFormat: d?.fileFormat ?? '',
+    id: Number.isFinite(id.value) ? id.value : null,
+    path: d?.absPath ?? null,
+    title: d?.fileName ?? title.value,
+    api: viewerApi,
+    fileInfo: fileInfo.value,
+  }
+}
+// detail 加载完成(每首一次)→ 首次 populate、后续换歌 patch。token 时序防御见 viewerStore。
+watch(detail, (d) => {
+  if (!d) return
+  if (viewerToken === null) {
+    viewerToken = viewer.populate({ ...viewerSnapshot(), immersive: false })
+  } else {
+    viewer.patch(viewerToken, viewerSnapshot())
+  }
+})
+// 标量补齐落地(两种到达顺序都覆盖:先于 populate → snapshot 直接带上;晚于 populate → 此处 patch)。
+watch(fileInfo, (fi) => {
+  if (fi && viewerToken !== null) viewer.patch(viewerToken, { fileInfo: fi })
+})
+
 watch(id, load, { immediate: true })
 
 onBeforeUnmount(() => {
   audioEl.value?.pause()
+  // 离开音频页:清 activeViewer 上下文(token 时序防御, 迟到 clear 不误清新查看器)。
+  if (viewerToken !== null) viewer.clear(viewerToken)
 })
 </script>
 
@@ -335,25 +399,28 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg-surface);
+  gap: var(--spacing-sm);
+  min-height: var(--toolbar-height);
+  padding: 0 var(--spacing-md);
+  border-bottom: 1px solid var(--color-divider);
+  background: var(--color-bg-primary);
 }
 .ap-btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--spacing-xs);
   background: transparent;
-  border: 1px solid var(--color-border);
-  color: var(--color-text-primary);
-  padding: 5px 10px;
-  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  color: var(--color-text-secondary);
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: var(--font-size-sm);
 }
 .ap-btn:hover {
-  background: var(--color-bg-elevated);
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
 }
 .audio-player__title {
   font-weight: 600;
@@ -378,17 +445,17 @@ onBeforeUnmount(() => {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 18px;
-  padding: 32px;
+  gap: var(--spacing-md);
+  padding: var(--spacing-xl);
   overflow-y: auto;
 }
 .audio-player__cover {
   width: min(42vh, 360px);
   height: min(42vh, 360px);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-xl);
   overflow: hidden;
-  background: var(--color-bg-elevated);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  background: var(--color-bg-surface);
+  box-shadow: var(--material-shadow-shell);
   flex: 0 0 auto;
 }
 .audio-player__cover img {
@@ -409,17 +476,17 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 .audio-player__track {
-  font-size: 1.4rem;
-  font-weight: 700;
+  font-size: var(--font-size-xl);
+  font-weight: 600;
   margin: 0;
   color: var(--color-text-primary);
 }
 .audio-player__artist {
-  margin: 6px 0 0;
+  margin: var(--spacing-xs) 0 0;
   color: var(--color-text-primary);
 }
 .audio-player__album {
-  margin: 2px 0 0;
+  margin: var(--spacing-2xs) 0 0;
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
 }
@@ -430,7 +497,7 @@ onBeforeUnmount(() => {
 .audio-player__seek {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--spacing-sm);
 }
 .audio-player__time {
   font-family: var(--font-mono);
@@ -451,8 +518,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 18px;
-  margin-top: 14px;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-sm);
 }
 .ap-icon {
   display: inline-flex;
@@ -462,34 +529,35 @@ onBeforeUnmount(() => {
   border: none;
   color: var(--color-text-primary);
   cursor: pointer;
-  padding: 6px;
+  width: var(--control-size-default);
+  height: var(--control-size-default);
+  padding: 0;
   border-radius: 50%;
 }
 .ap-icon:hover {
-  background: var(--color-bg-elevated);
+  background: var(--color-bg-hover);
 }
 .ap-icon--play {
   background: var(--color-accent);
-  color: #fff;
-  width: 52px;
-  height: 52px;
+  color: var(--color-text-on-accent);
+  width: var(--control-size-touch);
+  height: var(--control-size-touch);
 }
 .ap-icon--play:hover {
-  background: var(--color-accent);
-  filter: brightness(1.08);
+  background: var(--color-accent-hover);
 }
 .audio-player__volume {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--spacing-xs);
   color: var(--color-text-secondary);
-  margin-left: 8px;
+  margin-left: var(--spacing-xs);
 }
 
 .audio-player__meta {
   display: grid;
   grid-template-columns: auto auto;
-  gap: 4px 14px;
+  gap: var(--spacing-xs) var(--spacing-md);
   margin: 0;
   font-size: var(--font-size-sm);
 }
@@ -506,26 +574,27 @@ onBeforeUnmount(() => {
   flex: 0 0 38%;
   max-width: 460px;
   min-width: 280px;
-  border-left: 1px solid var(--color-border);
+  border-left: 1px solid var(--color-divider);
   overflow-y: auto;
-  padding: 40px 28px;
-  background: var(--color-bg-surface);
+  padding: var(--spacing-2xl) var(--spacing-xl);
+  background: var(--color-bg-secondary);
 }
 .audio-player__lyric-line {
   margin: 0;
-  padding: 8px 0;
+  padding: var(--spacing-sm) 0;
   text-align: center;
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
   cursor: pointer;
   transition:
-    color 0.2s,
-    transform 0.2s;
+    color var(--transition-fast),
+    background-color var(--transition-fast);
 }
 .audio-player__lyric-line.is-active {
-  color: var(--color-accent);
-  font-weight: 700;
-  transform: scale(1.05);
+  color: var(--color-accent-text);
+  font-weight: 600;
+  background: var(--color-accent-subtle);
+  border-radius: var(--radius-sm);
 }
 .audio-player__lyric-plain {
   white-space: pre-wrap;
@@ -539,7 +608,7 @@ onBeforeUnmount(() => {
 .audio-player__no-lyrics {
   color: var(--color-text-secondary);
   text-align: center;
-  margin-top: 40px;
+  margin-top: var(--spacing-2xl);
   font-size: var(--font-size-sm);
 }
 .audio-player__error {

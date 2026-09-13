@@ -1,185 +1,120 @@
 <template>
-  <!-- Shared promise-based confirm dialog. Mounted once; driven by useConfirm(). -->
-  <!-- 共享的、基于 Promise 的确认对话框。仅挂载一次；由 useConfirm() 驱动。 -->
-  <Teleport to="body">
-    <div
-      v-if="state.isOpen"
-      ref="overlayEl"
-      class="dialog-overlay"
-      @click.self="close(false)"
-      @keydown.esc.stop="close(false)"
-      tabindex="-1"
-    >
-      <!-- R1-8 可访问性底线:dialog 语义 + aria-modal;焦点陷阱见 script 的 useFocusTrap。 -->
-      <div
-        class="dialog-content"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
-        aria-describedby="confirm-dialog-message"
-      >
-        <header class="dialog-header">
-          <h2 id="confirm-dialog-title" class="dialog-title">{{ state.title }}</h2>
-          <button
-            class="btn-close"
-            :title="state.cancelText"
-            :aria-label="state.cancelText"
-            @click="close(false)"
-          >
-            <X :size="18" />
-          </button>
-        </header>
+  <!-- 共享的、基于 Promise 的确认对话框。仅挂载一次;由 useConfirm() 驱动。
+       外壳(Teleport/遮罩/标题栏/关闭键/焦点陷阱/Escape/点遮罩关闭)已收敛进 UiDialog 原语。 -->
+  <UiDialog
+    :open="state.isOpen"
+    :title="state.title"
+    :close-label="state.cancelText"
+    float-surface
+    @close="close(false)"
+  >
+    <p id="confirm-dialog-message" class="dialog-message">{{ state.message }}</p>
 
-        <main class="dialog-body">
-          <p id="confirm-dialog-message" class="dialog-message">{{ state.message }}</p>
+    <UiCheckbox
+      v-if="state.showCheckbox"
+      v-model="state.checkboxValue"
+      :label="state.checkboxLabel"
+    />
 
-          <label v-if="state.showCheckbox" class="remember-checkbox">
-            <input type="checkbox" v-model="state.checkboxValue" />
-            <span>{{ state.checkboxLabel }}</span>
-          </label>
-        </main>
-
-        <footer class="dialog-footer">
-          <!-- 初始焦点落在「取消」(最不具破坏性的选项),避免键盘用户误触确认。 -->
-          <button class="btn btn-secondary" data-autofocus @click="close(false)">
-            {{ state.cancelText }}
-          </button>
-          <button class="btn btn-primary" @click="close(true)">{{ state.confirmText }}</button>
-        </footer>
-      </div>
+    <!-- 输入确认强门:极度危险且不可恢复的操作(如清库),须原样键入指定文本才启用确认按钮,
+         杜绝反射式点击/键盘穿透。data-autofocus 落此输入(在正文、DOM 序早于页脚,焦点陷阱优先命中)。 -->
+    <div v-if="state.requireText" class="confirm-require">
+      <label :for="requireInputId" class="confirm-require__hint">
+        {{ t('common.typeToConfirm', { word: state.requireText }) }}
+      </label>
+      <input
+        :id="requireInputId"
+        v-model="typed"
+        type="text"
+        class="confirm-require__input"
+        autocomplete="off"
+        autocorrect="off"
+        spellcheck="false"
+        :placeholder="state.requireText"
+        data-autofocus
+      />
     </div>
-  </Teleport>
+
+    <template #footer>
+      <!-- 初始焦点落在「取消」(最不具破坏性的选项),避免键盘用户误触确认;
+           requireText 场景下焦点改落输入框(见上 data-autofocus)。
+           data-autofocus 由 UiDialog 的焦点陷阱跨插槽命中(useFocusTrap querySelector)。 -->
+      <button class="btn btn-secondary" data-autofocus @click="close(false)">
+        {{ state.cancelText }}
+      </button>
+      <button
+        class="btn"
+        :class="state.danger ? 'btn-danger' : 'btn-primary'"
+        :disabled="confirmDisabled"
+        @click="close(true)"
+      >
+        {{ state.confirmText }}
+      </button>
+    </template>
+  </UiDialog>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
-import { X } from '@lucide/vue'
+import { ref, computed, watch, useId } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useConfirmDialogState } from '../../composables/useConfirm'
-import { useFocusTrap } from '../../composables/useFocusTrap'
+import UiDialog from '../ui/UiDialog.vue'
+import UiCheckbox from '../ui/UiCheckbox.vue'
 
 const { state, close } = useConfirmDialogState()
+const { t } = useI18n()
 
-// 焦点陷阱:打开时焦点入框(data-autofocus),Tab 循环,关闭归还原焦点(R1-8)。
-const overlayEl = ref<HTMLElement | null>(null)
-useFocusTrap(overlayEl, () => state.isOpen)
+const requireInputId = useId()
+// 输入确认门的当前键入值;每次打开对话框都重置(上次残留不得延续放行)。
+const typed = ref('')
+watch(
+  () => state.isOpen,
+  (open) => {
+    if (open) typed.value = ''
+  },
+)
+
+// requireText 非空时,须精确键入该文本才启用确认按钮;否则(普通/danger 确认)恒启用。
+const confirmDisabled = computed(() => !!state.requireText && typed.value !== state.requireText)
 </script>
 
 <style scoped>
-.dialog-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 10000;
-  background: color-mix(in srgb, var(--color-bg-primary) 60%, transparent);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  animation: fadeIn 0.2s ease-out;
-}
-
-.dialog-content {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-  width: 100%;
-  max-width: 420px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: slideUp 0.2s ease-out;
-}
-
-.dialog-header {
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--color-border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.dialog-title {
-  margin: 0;
-  font-size: var(--font-size-lg);
-  font-weight: 600;
-  color: var(--color-text-primary);
-}
-
-.btn-close {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: none;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-.btn-close:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
-}
-
-.dialog-body {
-  padding: var(--spacing-lg);
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-md);
-}
-
+/* 对话框外壳样式已迁至 UiDialog(header/title/关闭键/body/footer)+ 全局基座(overlay/content/keyframes);
+   「记住选择」复选框已迁 UiCheckbox 原语;此处仅保留本对话框正文特有的消息段(保留 \n 换行)与输入确认门。
+   注:该选择器作用于 UiDialog 的插槽内容,但插槽在本组件渲染作用域内编译、带本组件 data-v,scoped 依旧命中。 */
 .dialog-message {
   margin: 0;
   font-size: var(--font-size-base);
   color: var(--color-text-secondary);
   line-height: 1.5;
-  white-space: pre-line; /* honour \n in confirm messages | 保留确认信息中的换行 */
+  white-space: pre-line; /* 保留确认信息中的换行 */
 }
 
-.remember-checkbox {
+/* 输入确认门:提示 + 文本框(危险操作强确认)。 */
+.confirm-require {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  margin-top: var(--spacing-md);
+}
+.confirm-require__hint {
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
-  cursor: pointer;
-  user-select: none;
 }
-.remember-checkbox input[type='checkbox'] {
-  width: 16px;
-  height: 16px;
-  cursor: pointer;
-  accent-color: var(--color-accent);
+.confirm-require__input {
+  width: 100%;
+  height: var(--control-size-default);
+  min-height: var(--control-size-default);
+  padding: 0 var(--control-padding-inline);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-input-bg);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
 }
-
-.dialog-footer {
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--color-border);
-  background: var(--color-bg-primary);
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--spacing-sm);
-}
-
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-@keyframes slideUp {
-  from {
-    opacity: 0;
-    transform: translateY(10px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
+.confirm-require__input:focus {
+  outline: none;
+  border-color: var(--color-input-border-focus);
+  box-shadow: var(--control-focus-ring);
 }
 </style>

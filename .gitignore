@@ -1,7 +1,4 @@
-!.models/*.py
-whale-windows-amd64.exe
-codewhale-tui-windows-x64.exe
-models
+/models/
 # Logs
 logs
 *.log
@@ -14,6 +11,8 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+!public/vditor/dist/
+!public/vditor/dist/**
 *.local
 
 # Editor directories and files
@@ -49,10 +48,9 @@ reasonix.toml
 # 冷门格式插件：worker / probe crates 的 Cargo 构建产物。
 crates/**/target/
 
-# 🔴 闭源 pro crate（Part6 §3.9）：本仓已为**私有 canonical 超集**，pro 作为一等 member 被跟踪于此
-# （其 target/ 由上面 crates/**/target/ 覆盖忽略）。**公开镜像**由 Copybara 经 origin_files glob 排除
-# crates/scrollery-pro/**（见 Part6_3c 草稿），故 pro 永不入公开仓；此处不再整目录忽略，以便私有仓
-# 正常提交 pro（避免整目录忽略后新增 pro 文件被静默漏跟踪 → 违「绝不丢失」）。
+# raw-worker(gnu-only sidecar)编译暂存目录:build:raw-worker 脚本把 gnu 产物复制到此供 tauri
+# externalBin 打包(binaries/raw-worker-<target-triple>.exe)。可再生,不入库。
+src-tauri/binaries/
 
 # 插件商店 dev registry 产物(含 dev 私钥,仅本机;scripts/exotic-dev-registry.mjs 生成)
 .dev-registry/
@@ -61,7 +59,37 @@ crates/**/target/
 # 私钥丢失 = 既发 token 与内测 registry 全部作废,重建即可——内测信任根本就允许随时重铸)
 .internal-signing/
 
+# 生产信任根 ceremony 产物目录(scripts/exotic-prod-ceremony.mjs 默认 --out ./prod-signing)。含
+# prod-release.pem / prod-license.pem 私钥,绝不入仓;签发机换目录时此处唯一作用是兜住默认落点,
+# 防并行会话 add -A 误收私钥。
+/prod-signing/
+
 # updater 签名密钥(Part7-T8,tauri signer generate 产物;私钥仅本机/CI secrets,绝不入仓。
 # 当前为 dev 密钥,首发前轮换或转正——公钥已内嵌 tauri.conf.json plugins.updater.pubkey,
 # 换密钥须同步换公钥并使既有安装版无法再收更新,故转正决策须在首个公开发布前定死)
 .release-keys/
+
+# planning-with-files skill 的长任务工作记忆(task_plan/findings/progress)与并行任务目录 .planning/。
+# 根锚定(前导 /):只忽略仓根 legacy 三件套与 .planning/,不波及归档进 docs/worklogs/ 的同名文件。
+# 动机:① 防内部审计发现(如 findings.md 的弱点清单)被 copybara 投影进公开镜像——排除面键在
+#       docs/** 前缀,而这三个文件在仓根、不在排除面内;② 免疫共享 git index 的暂存竞态
+#       (add→commit 窗口被并行会话收割)。注意:本忽略只解决「入库/泄漏」,不影响 skill 的
+#       PreToolUse 注入开销(hook 查文件系统存在性而非 git 跟踪状态)。
+/task_plan.md
+/findings.md
+/progress.md
+/.planning/
+
+# Claude Code 本机局部设置(权限缓存等),防并行会话 add -A 误收
+.claude/settings.local.json
+
+# S7 主题视觉矩阵截图(scripts/capture-theme-matrix.mjs 产物)。
+# 有意不入库:一次 18 张 ~9MB 的**可再生**证据,脚本才是耐久资产;入库等于用仓库体积换一份
+# 立刻过期的快照(且它不是基线——本仓有意不做 pixel-diff 门,理由见脚本顶部注释)。
+.screenshots/
+# worklog-kit 生成物不入库(C-3)
+.worklog/generated/
+
+# 仅本机的调研/临时工作区(会话产物,可随时删除)。
+# 双重防线:此处不入库(故 git archive 也取不到),scripts/publish-oss.ps1 的排除表另有一份。
+.research-tmp/

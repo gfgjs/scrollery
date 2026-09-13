@@ -6,7 +6,6 @@ pub mod metadata;
 pub mod volume_probe;
 pub mod volume_watch;
 pub mod walker;
-// pub mod watcher; // Phase 3
 // pub mod watcher; // 阶段 3
 
 pub use enricher::run_enrichment;

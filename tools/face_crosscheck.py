@@ -69,7 +69,7 @@ if len(feats) >= 2:
 
 # ── 与 Rust(face_smoke) 嵌入对拍：判正铁律 cosine >= 0.99 ──────────────────────
 import os
-rp = r"D:/photoapp/scrollery/src-tauri/target/rust_emb.txt"
+rp = r"C:/workspace/scrollery/src-tauri/target/rust_emb.txt"
 if os.path.exists(rp):
     rust = [np.array([float(x) for x in ln.split(",")]) for ln in open(rp) if ln.strip()]
     print(f"\n=== Rust vs OpenCV cosine (脸数 rust={len(rust)} opencv={len(feats)}) ===")

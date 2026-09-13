@@ -1,4 +1,3 @@
-// src-tauri/src/thumbnail/router.rs
 //! 主缩略图路由（v3 §6.2 / Part1 §2.2 / 勘误 R3）。
 //!
 //! 纯判定函数：决定一个缩略图请求走「现有缓存 / 主 generator / 冷门让路」哪条路。
@@ -76,10 +75,12 @@ mod tests {
             format: "psd".into(),
             media_kind: MediaKind::Image,
             plugin_id: Some("exotic-image-psd".into()),
+            display_name: "PSD 图像引擎".into(),
             capabilities: vec![Capability::Thumbnail],
             availability,
             store_url: None,
             installed_version: None,
+            builtin: false,
         }
     }
 

@@ -96,19 +96,27 @@ fn now_unix() -> i64 {
 /// 锁纪律：每轮「取写锁 → 对账 → 立即释放」，`sleep` 在锁外（std::sync::Mutex 绝不跨 `.await`）。
 pub fn spawn(app: AppHandle, state: Arc<AppState>) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        let prober = PathProber;
         // 冷启动让步：避开初次扫描的锁竞争，但仍尽早对账（捕获「关机期间掉线的卷」）。
+        // PathProber 是零大小无状态类型,每轮在 blocking 闭包内就地构造(见 R7 下沉)。
         tokio::time::sleep(STARTUP_DELAY).await;
 
         loop {
             // 取写锁 → 对账 → 锁随该块结束即释放（result 仅持 Vec，不持 guard）。
-            let result = match state.db_writer.lock() {
-                Ok(conn) => run_once(&conn, &prober, now_unix()),
+            // 2026-07-06 审查 R7:对账含整卷 UPDATE(bulk_set_availability,可达百万行)且 lock()
+            // 会等在途扫描批写释放——整段下沉 spawn_blocking,不占 runtime 线程(rusqlite 硬化条款)。
+            let state_c = Arc::clone(&state);
+            let result = tokio::task::spawn_blocking(move || match state_c.db_writer.lock() {
+                Ok(conn) => run_once(&conn, &PathProber, now_unix()),
                 Err(_) => {
                     tracing::warn!("volume_watch: db_writer 锁毒化，跳过本轮");
                     Ok(Vec::new())
                 }
-            };
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("volume_watch: blocking 任务异常: {e}");
+                Ok(Vec::new())
+            });
 
             match result {
                 Ok(changes) if !changes.is_empty() => {

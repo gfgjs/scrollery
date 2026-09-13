@@ -1,0 +1,80 @@
+/* 简约浅色：纸白底、石墨文字与安静的中性控件。底色 wash token(bg 五层/canvas 三件/doc-paper 两件)与文字 ramp(text 四件)是 color-mix 浓度表达式,分别受 --theme-tint-scale/--theme-text-scale 缩放(机制见 src/themes/strength.ts)。 */
+[data-theme='minimal-light'] {
+  color-scheme: light;
+
+  --color-bg-primary: color-mix(in oklch, #f1f3f5 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-bg-secondary: color-mix(in oklch, #f8f9fa calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-bg-surface: color-mix(in oklch, #ffffff calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-bg-elevated: color-mix(in oklch, #ffffff calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-bg-inset: color-mix(in oklch, #e9ecef calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-bg-overlay: rgba(24, 24, 27, 0.4);
+  --color-bg-hover: rgba(24, 24, 27, 0.05);
+  --color-bg-active: var(--color-accent-subtle);
+
+  --color-bg-canvas: color-mix(in oklch, #f1f3f5 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-bg-canvas-placeholder: color-mix(in oklch, #dee2e6 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-bg-canvas-gap: color-mix(in oklch, #f1f3f5 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-thumb-outline: rgba(24, 24, 27, 0.08);
+
+  --color-text-primary: color-mix(in oklch, #18181b calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+  --color-text-secondary: color-mix(in oklch, #52525b calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+  --color-text-tertiary: color-mix(in oklch, #71717a calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+  --color-text-inverse: #ffffff;
+  --color-text-placeholder: color-mix(in oklch, #71717a calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+
+  --color-accent: #27272a;
+  --color-accent-hover: #18181b;
+  --color-accent-subtle: rgba(39, 39, 42, 0.1);
+  --color-accent-text: #27272a;
+  --color-text-on-accent: #ffffff;
+
+  --color-border: rgba(24, 24, 27, 0.09);
+  --color-border-strong: rgba(24, 24, 27, 0.16);
+  --color-border-subtle: rgba(24, 24, 27, 0.05);
+  --color-divider: rgba(24, 24, 27, 0.06);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05), 0 1px 1px rgba(0, 0, 0, 0.025);
+  --shadow-md: 0 4px 12px -2px rgba(0, 0, 0, 0.07), 0 2px 5px -1px rgba(0, 0, 0, 0.035);
+  --shadow-lg: 0 10px 28px -4px rgba(0, 0, 0, 0.1), 0 4px 10px -2px rgba(0, 0, 0, 0.045);
+  --shadow-xl: 0 20px 40px -6px rgba(0, 0, 0, 0.14), 0 8px 16px -3px rgba(0, 0, 0, 0.06);
+
+  --color-scrollbar-thumb: rgba(24, 24, 27, 0.15);
+  --color-scrollbar-thumb-hover: rgba(24, 24, 27, 0.28);
+  --color-scrollbar-track: transparent;
+
+  --color-success: #18702f;
+  --color-success-subtle: rgba(24, 112, 47, 0.08);
+  --color-text-on-success: #ffffff;
+  --color-warning: #a14705;
+  --color-warning-subtle: rgba(161, 71, 5, 0.08);
+  --color-text-on-warning: #ffffff;
+  --color-error: #b21f26;
+  --color-error-subtle: rgba(178, 31, 38, 0.08);
+  --color-text-on-error: #ffffff;
+  --color-info: #0959a4;
+  --color-info-subtle: rgba(9, 89, 164, 0.08);
+  --color-text-on-info: #ffffff;
+
+  --color-sidebar-active-bg: var(--color-accent-subtle);
+  --color-sidebar-active-text: #27272a;
+  --color-sidebar-hover-bg: rgba(24, 24, 27, 0.05);
+
+  --color-badge-doc-word: #2b579a;
+  --color-badge-doc-excel: #217346;
+  --color-badge-doc-ppt: #c43e1c;
+  --color-badge-doc-md: #4b8bf4;
+  --color-badge-doc-generic: #6b7280;
+
+  --color-doc-paper: color-mix(in oklch, #fcfcfd calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --color-doc-paper-line: color-mix(in oklch, #dee2e6 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+  --texture-chrome: none;
+
+  --color-focus-ring: rgba(39, 39, 42, 0.42);
+
+  --color-input-bg: rgba(24, 24, 27, 0.03);
+  --color-input-border: rgba(24, 24, 27, 0.14);
+  --color-input-border-focus: var(--color-accent);
+  --color-toggle-bg: rgba(24, 24, 27, 0.16);
+  --color-toggle-bg-active: var(--color-accent);
+  --color-toggle-thumb: #ffffff;
+}

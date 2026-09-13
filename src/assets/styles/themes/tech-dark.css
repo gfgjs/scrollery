@@ -1,0 +1,80 @@
+/* 科技深色：深海蓝底与清晰冰蓝控件。底色 wash token(bg 五层/canvas 三件/doc-paper 两件)与文字 ramp(text 四件)是 color-mix 浓度表达式,分别受 --theme-tint-scale/--theme-text-scale 缩放(机制见 src/themes/strength.ts)。 */
+[data-theme='tech-dark'] {
+  color-scheme: dark;
+
+  --color-bg-primary: color-mix(in oklch, #0e131b calc(var(--theme-tint-scale, 1) * 100%), oklch(from #0e131b l 0 h));
+  --color-bg-secondary: color-mix(in oklch, #141b26 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #141b26 l 0 h));
+  --color-bg-surface: color-mix(in oklch, #1a2330 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #1a2330 l 0 h));
+  --color-bg-elevated: color-mix(in oklch, #222d3d calc(var(--theme-tint-scale, 1) * 100%), oklch(from #222d3d l 0 h));
+  --color-bg-inset: color-mix(in oklch, #090d13 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #090d13 l 0 h));
+  --color-bg-overlay: rgba(3, 10, 20, 0.62);
+  --color-bg-hover: rgba(255, 255, 255, 0.06);
+  --color-bg-active: var(--color-accent-subtle);
+
+  --color-bg-canvas: color-mix(in oklch, #111721 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #111721 l 0 h));
+  --color-bg-canvas-placeholder: color-mix(in oklch, #263345 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #263345 l 0 h));
+  --color-bg-canvas-gap: color-mix(in oklch, #111721 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #111721 l 0 h));
+  --color-thumb-outline: rgba(255, 255, 255, 0.08);
+
+  --color-text-primary: color-mix(in oklch, #eff4fc calc(var(--theme-text-scale, 1) * 100%), oklch(from #eff4fc l 0 h));
+  --color-text-secondary: color-mix(in oklch, #a2b4cf calc(var(--theme-text-scale, 1) * 100%), oklch(from #a2b4cf l 0 h));
+  --color-text-tertiary: color-mix(in oklch, #768aa8 calc(var(--theme-text-scale, 1) * 100%), oklch(from #768aa8 l 0 h));
+  --color-text-inverse: #0e131b;
+  --color-text-placeholder: color-mix(in oklch, #889cb8 calc(var(--theme-text-scale, 1) * 100%), oklch(from #889cb8 l 0 h));
+
+  --color-accent: #60a5fa;
+  --color-accent-hover: #93c5fd;
+  --color-accent-subtle: rgba(96, 165, 250, 0.14);
+  --color-accent-text: #60a5fa;
+  --color-text-on-accent: #0b192e;
+
+  --color-border: rgba(255, 255, 255, 0.08);
+  --color-border-strong: rgba(255, 255, 255, 0.16);
+  --color-border-subtle: rgba(255, 255, 255, 0.04);
+  --color-divider: rgba(255, 255, 255, 0.06);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.24);
+  --shadow-md: 0 4px 14px -2px rgba(0, 0, 0, 0.48), 0 2px 6px -1px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 12px 32px -4px rgba(0, 0, 0, 0.58), 0 4px 12px -2px rgba(0, 0, 0, 0.38);
+  --shadow-xl: 0 20px 48px -6px rgba(0, 0, 0, 0.7), 0 8px 20px -3px rgba(0, 0, 0, 0.48);
+
+  --color-scrollbar-thumb: rgba(255, 255, 255, 0.16);
+  --color-scrollbar-thumb-hover: rgba(255, 255, 255, 0.28);
+  --color-scrollbar-track: transparent;
+
+  --color-success: #34c759;
+  --color-success-subtle: rgba(52, 199, 89, 0.08);
+  --color-text-on-success: #0e131b;
+  --color-warning: #ff9f0a;
+  --color-warning-subtle: rgba(255, 159, 10, 0.08);
+  --color-text-on-warning: #0e131b;
+  --color-error: #ff665d;
+  --color-error-subtle: rgba(255, 102, 93, 0.08);
+  --color-text-on-error: #0e131b;
+  --color-info: #64d2ff;
+  --color-info-subtle: rgba(100, 210, 255, 0.08);
+  --color-text-on-info: #0e131b;
+
+  --color-sidebar-active-bg: var(--color-accent-subtle);
+  --color-sidebar-active-text: #60a5fa;
+  --color-sidebar-hover-bg: rgba(255, 255, 255, 0.06);
+
+  --color-badge-doc-word: #2b579a;
+  --color-badge-doc-excel: #217346;
+  --color-badge-doc-ppt: #c43e1c;
+  --color-badge-doc-md: #4b8bf4;
+  --color-badge-doc-generic: #6b7280;
+
+  --color-doc-paper: color-mix(in oklch, #18212e calc(var(--theme-tint-scale, 1) * 100%), oklch(from #18212e l 0 h));
+  --color-doc-paper-line: color-mix(in oklch, #2e3e54 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #2e3e54 l 0 h));
+  --texture-chrome: none;
+
+  --color-focus-ring: rgba(96, 165, 250, 0.46);
+
+  --color-input-bg: rgba(255, 255, 255, 0.05);
+  --color-input-border: rgba(255, 255, 255, 0.12);
+  --color-input-border-focus: var(--color-accent);
+  --color-toggle-bg: rgba(255, 255, 255, 0.24);
+  --color-toggle-bg-active: var(--color-accent);
+  --color-toggle-thumb: #0e131b;
+}

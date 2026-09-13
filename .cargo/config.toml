@@ -16,5 +16,9 @@
 #   路径无效仅在真正发起推理时报 ModelLoadFailed,不影响构建与测试)。
 # - 打包产物不受影响:安装版无此变量,走 lib.rs 优先级 2(exe 旁 onnxruntime.dll,
 #   由未来的 AI 插件包/worker 分发落位,Part8)。
+# - CI 红线(2026-07-23 裁决 J16):ci.yml 的 rust/rust-linux 两 job 不跑 npm 步骤,
+#   本相对路径在 CI 上无 node_modules 可指——真加载 ORT(load_session_pool 类)的测试
+#   必须 #[ignore] 手跑;日后若要进 CI,须同一变更给两 job 补 npm ci(或单包
+#   materialize)步骤,否则 ModelLoadFailed 假故障。ci.yml 侧有对称注释。
 [env]
 ORT_DYLIB_PATH = { value = "node_modules/onnxruntime-node/bin/napi-v6/win32/x64/onnxruntime.dll", relative = true }

@@ -1,6 +1,10 @@
 // src-tauri/src/lib.rs
-//! Library entry point — module declarations and Tauri app builder.
 //! 库入口点 — 模块声明和 Tauri 应用程序构建器。
+//!
+//! D-450:`setup` 闭包已按域拆成各模块的 boot/bootstrap 函数,本文件退化为**编排壳**——
+//! 只留模块声明、feature 守卫、`run()` 的调用链与致命启动错误出口。启动顺序不变量见
+//! `docs/planning/2026-07-25-超长文件拆分方案/analysis/lib-rs.md` §3.1(共 9 条),
+//! 各 boot 函数的文档注释里也复述了与自己相关的那几条——**调整调用顺序前必读**。
 
 // ── 渠道 feature 互斥守卫(Part7-T10 / Part7 §3.6.1)─────────────────────────────────
 // Cargo feature 是叠加语义:`--features channel-msstore` 不会关掉 default 里的
@@ -24,21 +28,46 @@ compile_error!("必须恰好开启一个 channel:channel-direct / channel-msstor
 
 pub mod ai;
 pub mod audio;
+pub mod backup;
+/// 配置文件子系统:设置类键唯一真源在 `<app_data_dir>/config.toml`(A1 建模块+单测,A2 接线
+/// 启动/IPC/watcher——见 `config::boot` 与 `config::watcher`、`ipc::config_commands`)。
+pub mod config;
 pub mod db;
+/// 精确内容去重：与常规扫描的 change fingerprint 分离的摘要与逻辑单元身份。
+pub mod dedup;
 pub mod derive;
 pub mod download;
+pub mod editing;
 pub mod engine;
+pub mod enhance;
 pub mod error;
 pub mod exotic;
+pub mod export;
+/// 已注册格式的运行时并集(内置表 ∪ exotic Catalog)与 UI 投影。
+/// 独立成模块因 `utils::format` 不能引 `exotic::catalog`(反向依赖已存在,放一起成环)。
+pub mod formats;
 pub mod ipc;
 pub mod layout;
+/// 应用生命周期回调:窗口事件拦截 + `RunEvent`(退出 WAL checkpoint / 后台任务优雅停止)。
+pub mod lifecycle;
+pub mod logging;
 pub mod proofread;
+pub mod reader;
 pub mod scanner;
 pub mod state;
 pub mod storage;
+/// 启动期后台任务聚合装配(5 个常驻任务 + 句柄池)。
+pub mod tasks;
 pub mod thumbnail;
+/// 系统托盘装配。
+pub mod tray;
+/// 文件树的文件系统数据源(「所有文件」两态);DB 模式仍走 db::queries 快路径。
+pub mod tree;
 pub mod utils;
 pub mod video;
+pub mod viewer_color;
+/// 窗口材质(毛玻璃,window_material 配置键):DWM 背板 mica/acrylic/none 的应用器。
+pub mod window_material;
 
 /// Compile-time build variant marker (§1.4.4) — "lite" (default) or "perf".
 /// Surfaced to the UI/telemetry so the app can show a variant badge and gate
@@ -53,15 +82,32 @@ pub const BUILD_VARIANT: &str = if cfg!(feature = "perf") {
 
 use std::sync::Arc;
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tauri_plugin_window_state::StateFlags;
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::db::migration::run_migrations;
-use crate::db::queries::get_config;
-use crate::db::{create_read_pool, create_write_connection};
 use crate::state::AppState;
+
+/// 启动期致命失败的域无关载体:各 boot 函数只上抛「人可读上下文 + 明细」,由 `run()`
+/// 编排层统一交给 [`fatal_startup_error`]——域模块因此**不反向依赖** `tauri::AppHandle`
+/// 与 dialog 插件(拆分方案 §2.1 原则 4)。
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {detail}")]
+pub struct StartupFailure {
+    /// 双语上下文短语,直接进 stderr / 原生对话框标题行。
+    pub context: &'static str,
+    /// 可诊断明细(通常是底层错误的 `Display`)。
+    pub detail: String,
+}
+
+impl StartupFailure {
+    pub fn new(context: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            context,
+            detail: detail.to_string(),
+        }
+    }
+}
 
 /// T13 渠道占位(Part6 §8.4):Steam 构建的启动自检桩——Part8 接入 steamworks 后实装
 /// `SteamAPI_RestartAppIfNecessary`(非 Steam 拉起时经 Steam 重启并退出);现仅日志,
@@ -76,24 +122,28 @@ pub fn run() {
     #[cfg(feature = "channel-steam")]
     steam_restart_if_necessary_stub();
     let builder = tauri::Builder::default()
-        // ── Plugins ───────────────────────────────────────────────────────
         // ── 插件 ───────────────────────────────────────────────────────
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 // Only persist geometry — never persist VISIBLE state.
-                // If VISIBLE were saved, the plugin would restore main window as
-                // visible on the NEXT launch (overriding visible:false in config),
-                // causing it to flash before setup() can hide it.
+                // The main window starts with visible:false so setup() can first
+                // remove the platform title bar (where needed), then show the
+                // restored full-size window with the static startup layer.
                 //
                 // 只持久化窗口几何信息，绝不持久化 VISIBLE 状态。
-                // 否则插件会在下次启动时恢复 visible:true，导致主窗口在
-                // splashscreen 出现前闪烁（setup() 来不及 hide() 它）。
+                // 主窗口以 visible:false 创建，setup() 先完成平台标题栏修正，
+                // 再显示带静态启动层的恢复后完整窗口。
                 .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
-                .skip_initial_state("splashscreen")
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
+        // os:前端平台探测(自绘标题栏 mac/windows 分叉,顶栏重构 L0)。仅暴露 os:default
+        // 只读查询面(platform/arch/type 等),无写能力。
+        .plugin(tauri_plugin_os::init())
+        // 2026-07-06 审查 P1-22:移除 tauri-plugin-fs——前端零使用(所有文件操作走自定义 Rust
+        // command),而 fs:read-all/write-all 授予 webview 读写 $APPDATA(含 scrollery.db 与
+        // 已装 exotic worker exe)的能力,构成「webview 沦陷 → 改写 worker 二进制 → 本地执行」
+        // 升级链。删权限 + 摘插件 + 去依赖,零功能损失。
         .plugin(tauri_plugin_shell::init());
     // T7/T9(Part7 §3.5):updater 仅 direct 渠道编入+注册(msstore/steam 物理排除——
     // Store 政策禁「下载-执行」自更新;dep 经 channel-direct feature 绑定)。更新检查走
@@ -107,6 +157,9 @@ pub fn run() {
     // 插件 init 对缺配置是硬失败(Config.pubkey 必填),dev/无 overlay 构建不带块 → 不注册,
     // tauri dev 与普通 build 不受影响;正式 direct 发布走 tauri:build:direct-release。
     let tauri_context = tauri::generate_context!();
+    // 启动计时锚(2026-07-13 排查热启动变慢):RunEvent::Ready 读它算 Rust boot→Ready 总耗时,
+    // 用于一刀切分「后端 setup 耗时」与「前端 Vite/WebView2/Vue 挂载耗时」。
+    let _ = lifecycle::BOOT_INSTANT.set(std::time::Instant::now());
     #[cfg(feature = "channel-direct")]
     let builder = if tauri_context.config().plugins.0.contains_key("updater") {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
@@ -114,9 +167,21 @@ pub fn run() {
         builder
     };
     builder
-        // ── App setup ─────────────────────────────────────────────────────
         // ── 应用程序设置 ─────────────────────────────────────────────────────
+        // 各段落已下沉到域内 boot 函数,本闭包只做调用编排 + 局部变量传递。**调用顺序即
+        // 启动顺序不变量**(拆分方案 §3.1 九条),不得重排/合并。
         .setup(|app| {
+            // 自绘标题栏(顶栏重构 L1):非 macOS 平台去掉原生装饰(frameless),窗口三键改由前端
+            // WindowChrome 自绘;macOS 保留原生装饰(config decorations:true)+ titleBarStyle:Overlay。
+            // 先修正隐藏窗口的装饰；必须等 AppState 可供前端 IPC 使用后才显示，避免 WebView
+            // 抢跑调用 get_startup_config 导致主题/材质水合失败。
+            if let Some(main_win) = app.get_webview_window("main") {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = main_win.set_decorations(false);
+                }
+            }
+
             let app_data_dir = match app.path().app_data_dir() {
                 Ok(d) => d,
                 Err(e) => fatal_startup_error(
@@ -133,143 +198,25 @@ pub fn run() {
                 );
             }
 
-            let db_path = app_data_dir.join("scrollery.db");
+            // ORT 动态库路径解析(纯环境变量,与 DB/日志无先后依赖)。
+            ai::engine_boot::resolve_ort_dylib_path();
 
-            // ── ORT DLL 路径解析 ──────────────────────────────────────────────
-            // 【踩坑1】WebView2 在 Windows 上可能在我们加载之前就把 System32 里的
-            //   onnxruntime.dll（通常是 ORT 1.17）加载进进程空间。
-            //   设置 ORT_DYLIB_PATH 强制 ort crate 从指定路径加载，绕过系统版本。
-            //
-            // 【踩坑2】`load-dynamic` 与 `download-binaries` 互斥：
-            //   load-dynamic 激活 ort-sys/disable-linking，build.rs 提前退出，
-            //   download-binaries 完全不运行。必须手动管理 DLL。
-            //
-            // 【踩坑3】ORT 版本要求：
-            //   - ONNX IR v10（PyTorch 2.11 导出）要求 ORT >= 1.19
-            //   - eisneim FP16 外部数据格式模型要求 ORT >= 1.26
-            //   - 使用 onnxruntime-node@1.26.0 自带的 DLL（bin/napi-v6/win32/x64/）
-            //
-            // 优先级：
-            //   1. ORT_DYLIB_PATH 已设置（.cargo/config.toml 或环境变量）→ 保留，不覆盖
-            //   2. 可执行文件旁边的 onnxruntime.dll（生产/打包版本）→ 使用
-            //   3. 都没有 → ORT 自行搜索（可能加载到错误版本）
-            if std::env::var("ORT_DYLIB_PATH").is_err() {
-                // Only set it ourselves if NOT already configured by the build system
-                // 只有在构建系统未配置时才自行设置
-                if let Ok(exe_path) = std::env::current_exe() {
-                    if let Some(exe_dir) = exe_path.parent() {
-                        let ort_dylib = exe_dir.join("onnxruntime.dll");
-                        if ort_dylib.exists() {
-                            std::env::set_var(
-                                "ORT_DYLIB_PATH",
-                                ort_dylib.to_string_lossy().as_ref(),
-                            );
-                            info!("Set ORT_DYLIB_PATH to exe-relative path (production mode): {:?}", ort_dylib);
-                        } else {
-                            info!("onnxruntime.dll not found next to exe, ORT will search system PATH");
-                        }
-                    }
-                }
-            } else {
-                info!("ORT_DYLIB_PATH already set (by build system): {}", std::env::var("ORT_DYLIB_PATH").unwrap_or_default());
-            }
+            // 恢复交换 → 写连接 + 迁移(含回滚分支)→ 恢复收尾 → 读池(§3.1 不变量 1/3)。
+            let db_boot = db::boot::init(&app_data_dir)
+                .unwrap_or_else(|f| fatal_startup_error(app.handle(), f.context, &f.detail));
 
+            // 配置文件初始化 + 启动期键读取。**必须在 DB 迁移之后**(§3.1 不变量 2)。
+            let cfg = config::boot::init(&app_data_dir, &db_boot.writer);
 
+            // 保存首帧材质值；窗口仍保持隐藏，待 AppState manage 完成后同步应用并显示。
+            let startup_material = cfg
+                .manager
+                .get("window_material")
+                .unwrap_or_else(|| "mica".to_string());
 
-            // ── Write connection + migrations ─────────────────────────────
-            // ── 写入连接 + 迁移 ─────────────────────────────
-            let db_writer = match create_write_connection(&db_path) {
-                Ok(w) => w,
-                Err(e) => fatal_startup_error(
-                    app.handle(),
-                    "无法打开数据库写入连接 / cannot open DB write connection",
-                    &e.to_string(),
-                ),
-            };
-
-            {
-                let conn = db_writer.lock().unwrap();
-                if let Err(e) = run_migrations(&conn) {
-                    // 迁移已事务化：失败整块回滚、版本号不前进，重启可安全重跑。
-                    // 仍失败多为 DB 损坏 / 磁盘 / 权限 → 给可诊断提示而非裸 panic。
-                    fatal_startup_error(
-                        app.handle(),
-                        "数据库迁移失败 / database migration failed",
-                        &format!("{e}（数据库 / db: {}）", db_path.display()),
-                    );
-                }
-            }
-
-            // ── Read pool (desktop) ───────────────────────────────────────
-            // 8 connections: the foreground interleaves compute_layout + viewport meta +
-            // thumbnail batches while background derivation/AI also read — 4 left those queuing
-            // (布局被后台读饿死的次因). WAL makes extra read connections cheap.
-            // ── 读取池（桌面端） ─────────────────────────────────────
-            // 8 个连接：前台会交错 compute_layout + 可视区元数据 + 缩略图批，同时后台派生/AI 也在读
-            // —— 4 个会让它们排队（布局被后台读饿死的次因）。WAL 下额外读连接开销很低。
-            let db_read_pool = match create_read_pool(&db_path, 8) {
-                Ok(p) => p,
-                Err(e) => fatal_startup_error(
-                    app.handle(),
-                    "无法创建数据库读取连接池 / cannot create DB read pool",
-                    &e.to_string(),
-                ),
-            };
-
-            // ── Read persisted config ─────────────────────────────────────
-            // ── 读取持久化配置 ─────────────────────────────────────
-            let (thumb_size, thumb_skip_max_kb, thumb_strategy, gpu_engine, custom_cache_dir, log_level, custom_log_dir, thumb_cache_max_mb, ai_hq_cache) = {
-                let pool = match db_read_pool.get() {
-                    Ok(p) => p,
-                    Err(e) => fatal_startup_error(
-                        app.handle(),
-                        "无法从读取池取连接 / cannot acquire read-pool connection",
-                        &e.to_string(),
-                    ),
-                };
-                let size: u32 = get_config(&pool, "thumb_size")
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(480);
-                let skip: u64 = get_config(&pool, "thumb_skip_max_kb")
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(200);
-                let strategy: String = get_config(&pool, "thumb_strategy")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "cpu".to_string());
-                let gpu_eng: String = get_config(&pool, "gpu_engine")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "wic".to_string());
-                let cache_dir: Option<String> = get_config(&pool, "thumb_cache_dir")
-                    .ok()
-                    .flatten();
-                let lvl: String = get_config(&pool, "log_level")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "debug".to_string());
-                let l_dir: Option<String> = get_config(&pool, "log_dir")
-                    .ok()
-                    .flatten();
-                let max_mb: u64 = get_config(&pool, "thumb_cache_max_mb")
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1024);
-                // AI 高清缓存开关（opt-in，默认关）；驱动缩略图流水线是否顺带产出 AI 缓存。
-                let ai_hq: bool = get_config(&pool, "ai_hq_cache_enabled")
-                    .ok()
-                    .flatten()
-                    .map(|v| v == "true")
-                    .unwrap_or(false);
-                (size, skip, strategy, gpu_eng, cache_dir, lvl, l_dir, max_mb, ai_hq)
-            };
-
-            let cache_dir = custom_cache_dir
+            let cache_dir = cfg
+                .custom_cache_dir
+                .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| app_data_dir.join("cache"));
             std::fs::create_dir_all(&cache_dir).unwrap_or_default();
@@ -283,85 +230,76 @@ pub fn run() {
             {
                 let scope = app.asset_protocol_scope();
                 if let Err(e) = scope.allow_directory(&cache_dir, true) {
-                    tracing::warn!("Failed to allow cache_dir in asset scope | 缓存目录授权失败: {}", e);
+                    // §3.4/§9.2 高敏调用点结构化改造(S2):路径不再插值进 message,
+                    // 脱敏 Layer(未来)只能拦结构化字段,烧进 message 的内容无法事后过滤。
+                    tracing::warn!(path = %cache_dir.display(), error = %e, "Failed to allow cache_dir in asset scope");
                 }
-                if let Ok(pool) = db_read_pool.get() {
+                if let Ok(pool) = db_boot.read_pool.get() {
                     if let Ok(roots) = crate::db::queries::list_scan_roots(&pool) {
                         for r in &roots {
                             if let Err(e) = scope.allow_directory(&r.path, true) {
-                                tracing::warn!("Failed to allow scan root {} in asset scope | 扫描根授权失败: {}", r.path, e);
+                                tracing::warn!(path = %r.path, error = %e, "Failed to allow scan root in asset scope");
                             }
                         }
-                        info!("Asset scope granted for {} scan root(s) + cache dir | 已为 {} 个扫描根 + 缓存目录授予 asset 权限", roots.len(), roots.len());
+                        info!(scan_root_count = roots.len(), "Asset scope granted for scan root(s) + cache dir");
                     }
                 }
             }
 
-            // ── Logging ───────────────────────────────────────────────────────────
             // ── 日志记录 ───────────────────────────────────────────────────────────
-            let log_dir = custom_log_dir
+            let log_dir = cfg
+                .custom_log_dir
+                .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| app_data_dir.join("logs"));
             std::fs::create_dir_all(&log_dir).unwrap_or_default();
 
-            // Custom writer to ensure real-time NTFS metadata updates on Windows | 自定义写入器以确保在 Windows 上实时更新 NTFS 元数据
-            #[derive(Clone)]
-            struct RealTimeDailyAppender {
-                log_dir: std::path::PathBuf,
+            let logging_boot =
+                logging::init_subscriber(&log_dir, &cfg.manager, &cfg.log_level)
+                    .unwrap_or_else(|f| fatal_startup_error(app.handle(), f.context, &f.detail));
+            // guard 交 Tauri 托管(而非 Box::leak),退出时正常 flush。
+            app.manage(logging_boot.guard);
+
+            info!("Scrollery starting up, database path: {:?} | Scrollery 正在启动，数据库路径: {:?}", db_boot.db_path, db_boot.db_path);
+            // session_id 已由 EnvelopeFormat 无条件挂在信封顶层,此处不再重复当字段传——
+            // 否则 FieldCollector 会把它当普通字段塞进 attributes,顶层+attributes 各出现一份。
+            info!("Log level set to: {} | 日志级别已设置为: {}", cfg.log_level, cfg.log_level);
+            if logging_boot.purge_summary.purged_files > 0 {
+                info!(
+                    purged_files = logging_boot.purge_summary.purged_files,
+                    freed_bytes = logging_boot.purge_summary.freed_bytes,
+                    "Log directory size budget exceeded at startup, oldest files purged | 启动时日志目录超出大小兜底,已清理最旧文件"
+                );
             }
-            impl std::io::Write for RealTimeDailyAppender {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                    let path = self.log_dir.join(format!("scrollery.{}.log", today));
-                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                        let res = file.write(buf);
-                        let _ = file.sync_data(); // Force OS to flush metadata (size) to disk | 强制操作系统将元数据（大小）刷新到磁盘
-                        res
-                    } else {
-                        Ok(buf.len()) // Silently drop if we can't write to avoid crashing | 如果无法写入则静默丢弃，避免崩溃
-                    }
+
+            // 启动期 WAL 截断 + 三项自愈:**须在 tracing 就绪后、派生管线拉起前**
+            // (§3.1 不变量 4/5),故调用点在此而非 db::boot::init 内。
+            db::boot::run_startup_reconciliation(&db_boot.writer, &db_boot.db_path, &cache_dir);
+
+            // P0-1 目录移动半完成收尾（审查 §7.1-B）：启动期只做可证的短收敛——已发布行的
+            // 索引重放 + 目标存在性检查（见 dir_move::reconcile_at_startup 的文档）。不删源、
+            // 不做整树摘要校验、不做大拷贝；仍在 intent 阶段的行（可能含 GB 级拷贝）留给用户
+            // 显式重试。调用点位于启动路径上：管线尚未拉起、无并发写者，故此处是受控阻塞。
+            match crate::ipc::dir_move::reconcile_at_startup(
+                crate::ipc::dir_move::MoveDb::Writer(&db_boot.writer),
+                &cache_dir,
+            ) {
+                Ok(reports) if reports.is_empty() => {}
+                Ok(reports) => {
+                    let retry_needed = reports.iter().filter(|r| r.needs_retry).count();
+                    info!(
+                        "目录移动收尾 {} 条，仍需重试 {} 条 | directory move recovery: {} handled, {} still pending",
+                        reports.len(),
+                        retry_needed,
+                        reports.len(),
+                        retry_needed
+                    );
                 }
-                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+                Err(e) => tracing::warn!(
+                    "[Startup] 目录移动收尾失败（不致命） | directory move recovery failed: {e}"
+                ),
             }
 
-            // Use non_blocking to offload writes and flushes to a background thread | 使用 non_blocking 将写入和刷新转移到后台线程
-            let appender = RealTimeDailyAppender { log_dir: log_dir.clone() };
-            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-            Box::leak(Box::new(guard));
-
-            let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
-            let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
-            let _ = crate::ipc::config_commands::LOG_RELOAD.set(reload_handle);
-
-            // Use Local time for log statements | 使用本地时间格式化日志
-            let timer = tracing_subscriber::fmt::time::ChronoLocal::rfc_3339();
-
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_timer(timer.clone())
-                        .with_ansi(true)
-                )
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_timer(timer)
-                        .with_writer(non_blocking)
-                        .with_ansi(false)
-                )
-                .init();
-
-            info!("Scrollery starting up, database path: {:?} | Scrollery 正在启动，数据库路径: {:?}", db_path, db_path);
-            info!("Log level set to: {} | 日志级别已设置为: {}", log_level, log_level);
-
-            // 启动期 WAL 截断（S3.6/S3.7）：必须在 tracing 就绪后执行（否则日志静默丢弃）、
-            // 管线拉起前执行（无并发读者,TRUNCATE 可截干净）。
-            {
-                let conn = db_writer.lock().unwrap();
-                crate::db::connection::checkpoint_wal_at_boot(&conn, &db_path);
-            }
-
-            // ── Build AppState ─────────────────────────────────────────────
             // ── 构建 AppState ─────────────────────────────────────────────
             // 内置冷门格式能力目录（编译期嵌入）。解析失败不致命：降级为空目录并告警，
             // 主功能不受影响（仅 exotic 识别失效）。
@@ -374,18 +312,34 @@ pub fn run() {
                 }),
             );
 
-            let cache_dir_for_task = cache_dir.clone();
+            // 视频可播产物独立池启动清扫(§5.4/§9.6):清 {cache_dir}/video/*.tmp 残留
+            // (转码中途崩溃/应用退出遗留);终名 .mp4 产物保留。noop 若池未建。
+            if let Err(e) = crate::video::playable_cache::sweep_tmp(&cache_dir) {
+                tracing::warn!(
+                    "[Startup] 视频池 .tmp 残留清扫失败（不致命） | video pool .tmp sweep failed: {}",
+                    e
+                );
+            }
+
+            let cache_dir_for_tasks = cache_dir.clone();
+            let config_manager_for_watcher = cfg.manager.clone();
+            let log_ring_for_tasks = logging_boot.log_ring.clone();
             let app_state = Arc::new(AppState::new(
-                db_writer,
-                db_read_pool,
+                db_boot.writer,
+                db_boot.read_pool,
+                cfg.manager,
                 cache_dir,
                 log_dir,
+                logging_boot.log_ring,
+                logging_boot.dropped_counter,
+                app_data_dir.clone(),
                 app_data_dir.join("exotic"),
-                thumb_size,
-                thumb_skip_max_kb,
-                thumb_strategy,
-                gpu_engine,
-                ai_hq_cache,
+                cfg.thumb_size,
+                cfg.thumb_skip_max_kb,
+                cfg.thumb_strategy,
+                cfg.gpu_engine,
+                cfg.ai_hq_cache,
+                cfg.thumb_webp_quality,
                 exotic_catalog,
             ));
 
@@ -401,440 +355,64 @@ pub fn run() {
             // 每次调用可节省约 50-100ms。
             drop(app_state.db_read_pool.get());
 
-            let app_state_for_task = app_state.clone();
-            let app_state_for_coord = app_state.clone();
-            let app_state_for_volwatch = app_state.clone();
-            let db_pool_for_gc = app_state.db_read_pool.clone(); // 缓存治理周期任务(下方 h2)用
-            app.manage(app_state);
+            // §3.1 不变量 7:manage 必须先于下方 coordinator / video service / 后台任务 /
+            // watcher 挂载(它们或持 clone、或经 try_state 取用)。
+            app.manage(app_state.clone());
             info!("AppState initialised | 应用状态 (AppState) 初始化完成");
 
-            // ── exotic（冷门格式插件）Coordinator（Part2 §4.1）──────────────────────
-            // 单一调度器：接扫描/安装/激活/配置/重试事件，幂等唤醒唯一 Pipeline。Part2 无真实
-            // License → 默认门控为不可领取（除 dev fixture）；有 Worker + 授权时自动出图。
-            {
-                // 运行期 Host：catalog + 只读连接池安装真相 + keyring 授权真相（Part3 §5）。
-                let host = std::sync::Arc::new(app_state_for_coord.exotic_host());
-                let coord = crate::exotic::coordinator::ExoticCoordinator::start(
-                    app.handle().clone(),
-                    app_state_for_coord.clone(),
-                    host,
-                );
-                app_state_for_coord.set_exotic_coordinator(coord);
-                // 启动 wake：恢复上次遗留的就绪任务（孤儿恢复 + backfill 后的待处理）。
-                app_state_for_coord.wake_exotic(crate::exotic::coordinator::WakeReason::Startup);
-                info!("exotic Coordinator 已启动 | exotic Coordinator started");
-            }
-
-            // ── Background Tasks ──────────────────────────────────────────
-            // ── 后台任务 ──────────────────────────────────────────
-            let handles_pool: Arc<std::sync::Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-            app.manage(handles_pool.clone());
-
-            // 卷插拔监听（Part2 T2 / C5 Piece B）：冷启动延迟后每 15s 对账已知卷在线态，
-            // 实时维护 availability(online↔offline)，拔盘/插回 ≤15s 反映到画廊。
-            let volwatch_handle = crate::scanner::volume_watch::spawn(
-                app.handle().clone(),
-                app_state_for_volwatch,
-            );
-            handles_pool.lock().unwrap().push(volwatch_handle);
-
-            let h1 = tauri::async_runtime::spawn(async move {
-                // Delay first run by 3 minutes so it doesn't block cold start | 延迟 3 分钟执行，避免影响冷启动
-                tokio::time::sleep(std::time::Duration::from_secs(3 * 60)).await;
-                loop {
-                    tracing::info!("Running PRAGMA optimize for database | 正在执行数据库碎片优化");
-                    if let Ok(conn) = app_state_for_task.db_writer.lock() {
-                        if let Err(e) = conn.execute_batch("PRAGMA optimize;") {
-                            tracing::warn!("Failed to run PRAGMA optimize | 执行数据库碎片优化失败: {}", e);
-                        }
-                    } else {
-                        tracing::warn!("Failed to lock db_writer for PRAGMA optimize | 无法获取写入锁进行碎片优化");
-                    }
-                    // Run every 24 hours | 每 24 小时执行一次
-                    tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
-                }
-            });
-            handles_pool.lock().unwrap().push(h1);
-
-            let cache_dir_clone = cache_dir_for_task;
-            // 缓存治理周期任务(Part3-T6 / §3.3):对账 GC(删 DB 无主孤儿)→ LRU 上限收敛。
-            // 节奏:启动后 5 分钟首跑(错开上方 3 分钟的 PRAGMA optimize,避开冷启动高峰),
-            // 此后每 24h 一轮;「全量重建完成后即时触发」为 T6 余项,暂未接事件。
-            // epoch 护栏:GC 只删早于进程启动时刻的文件——本会话新写的产物可能尚未落
-            // DB 行(写文件与写行之间有窗口),留到下次会话收敛,见 reconcile_orphan_gc。
-            let gc_epoch = std::time::SystemTime::now();
-            let h2 = tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
-                loop {
-                    let pool = db_pool_for_gc.clone();
-                    let cache_dir = cache_dir_clone.clone();
-                    let joined = tauri::async_runtime::spawn_blocking(move || {
-                        // 取 key 全集后连接随作用域即还池,不跨磁盘扫描持有池连接。
-                        let live_keys = match pool.get() {
-                            Ok(conn) => match crate::db::queries::all_cache_keys(&conn) {
-                                Ok(keys) => keys,
-                                Err(e) => {
-                                    tracing::warn!("对账 GC 读取 cache_key 全集失败,本轮跳过 | orphan GC key query failed: {e}");
-                                    return;
-                                }
-                            },
-                            Err(e) => {
-                                tracing::warn!("对账 GC 获取读连接失败,本轮跳过 | orphan GC pool get failed: {e}");
-                                return;
-                            }
-                        };
-                        crate::thumbnail::cache::reconcile_orphan_gc(
-                            &cache_dir, &live_keys, gc_epoch,
-                        );
-                        crate::thumbnail::cache::enforce_cache_limit(&cache_dir, thumb_cache_max_mb);
-                    })
-                    .await;
-                    if let Err(e) = joined {
-                        tracing::warn!("缓存治理任务 join 失败 | cache governance task join failed: {e}");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
-                }
-            });
-            handles_pool.lock().unwrap().push(h2);
-
-            // Force-hide the main window regardless of what tauri-plugin-window-state
-            // may have restored from the previous session (it saves visible:true after
-            // close_splashscreen shows the window). The splashscreen is visible:true by
-            // default; main window will be revealed only when close_splashscreen is invoked
-            // by the frontend after App.vue onMounted completes.
-            //
-            // 强制隐藏主窗口，覆盖 tauri-plugin-window-state 可能恢复的上次 visible:true 状态。
-            // 主窗口仅在前端 App.vue onMounted 完成并调用 close_splashscreen 后才显示。
+            // 主窗口必须在 AppState 就绪后才显示，否则 WebView 可能在 setup 完成前发起
+            // IPC，导致 startupConfigPromise 失败、html[data-glass] 未写入。材质先同步挂载，
+            // 再显示同一个完整尺寸的静态启动层，避免透明窗口闪过；show 后再异步重挂一次，
+            // 覆盖 tauri#12854 的可见性重置行为。
             if let Some(main_win) = app.get_webview_window("main") {
-                let _ = main_win.hide();
+                crate::window_material::apply_now(&main_win, &startup_material);
+                let _ = main_win.show();
+                let _ = main_win.set_focus();
+                crate::window_material::apply(app.handle(), &startup_material);
             }
 
-            // ── System Tray ──────────────────────────────────────────────────
-            // ── 系统托盘 ──────────────────────────────────────────────────
-            use tauri::menu::{Menu, MenuItem};
-            use tauri::tray::{TrayIconBuilder, MouseButton, TrayIconEvent};
+            // ── 自动备份调度器（方案 B §7）────────────────────────────────────────
+            // 启动后 idle ~2min 首检、此后每小时复检。dormant until 用户开启 backup_auto_enabled（B-1）。
+            crate::ipc::backup_commands::start_auto_backup_scheduler(
+                app.handle().clone(),
+                app_state.clone(),
+            );
 
-            let show_i = MenuItem::with_id(app, "show", "显示主界面 | Show Window", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "退出应用 | Exit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+            crate::exotic::coordinator::bootstrap(app.handle().clone(), app_state.clone());
+            crate::video::worker_service::bootstrap(app_state.clone());
 
-            let mut tray_builder = TrayIconBuilder::new()
-                .menu(&menu)
-                .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "quit" => {
-                            tracing::info!("Quit clicked from tray menu | 用户从托盘菜单点击了退出");
-                            app.exit(0);
-                        }
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: tauri::tray::MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                });
+            // ── 后台任务(§3.1 不变量 8:句柄池在内部创建后立即 manage)──────────────
+            tasks::spawn_all(
+                app,
+                &app_state,
+                log_ring_for_tasks,
+                cache_dir_for_tasks,
+                cfg.thumb_cache_max_mb,
+            );
 
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
+            tray::build(app)?;
+
+            // ── config.toml 文件监听(A2)────────────────────────────────────────
+            // 置于 setup 末尾:AppState 此刻已 `app.manage()`(watcher 回调内 `try_state`
+            // 需要它,§3.1 不变量 9),挂载失败(如平台监听器初始化失败)只降级为
+            // 「热更新不可用」,不阻断启动。
+            if let Some(watcher) = crate::config::watcher::spawn_config_file_watcher(
+                app.handle(),
+                cfg.path,
+                config_manager_for_watcher,
+            ) {
+                app.manage(watcher);
             }
-            let _tray = tray_builder.build(app)?;
 
             Ok(())
         })
-        // ── IPC command handlers ───────────────────────────────────────────
         // ── IPC 命令处理器 ───────────────────────────────────────────
-        .invoke_handler(tauri::generate_handler![
-            // scan
-            // scan
-            ipc::scan_commands::add_scan_root,
-            ipc::scan_commands::remove_scan_root,
-            ipc::scan_commands::remove_scan_root_with_options,
-            ipc::scan_commands::check_folder_overlap,
-            ipc::scan_commands::list_scan_roots,
-            ipc::scan_commands::start_scan,
-            ipc::scan_commands::stop_scan,
-            ipc::scan_commands::clear_database,
-            ipc::scan_commands::clear_settings,
-            // layout
-            // layout
-            ipc::layout_commands::compute_layout,
-            ipc::layout_commands::get_view_ids, // T14.5/T18：按布局序的视图全集 id（Part5 选区前置）
-            ipc::layout_commands::get_layout_rows,
-            ipc::layout_commands::get_layout_rows_by_y,
-            ipc::layout_commands::get_bucket_rows, // T16 方案B:bucket 段精确取行(B0)
-            ipc::layout_commands::get_separator_y_by_group_id,
-            ipc::layout_commands::get_item_y_by_id,
-            ipc::layout_commands::get_subtree_scroll_target,
-            // H-Lab 横向画廊实验(独立缓存,与生产布局命令平行)
-            ipc::hgallery_commands::compute_h_layout,
-            ipc::hgallery_commands::get_h_blocks_by_x,
-            // media
-            // media
-            ipc::media_commands::get_media_detail,
-            ipc::media_commands::get_meta_for_viewport,
-            ipc::media_commands::get_adjacent_media,
-            ipc::media_commands::get_companion_video_url,
-            ipc::media_commands::get_keyframe_sprite,
-            // audio player (需求6, §3.6)
-            // 音频播放器（需求6, §3.6）
-            ipc::audio_commands::get_audio_detail,
-            ipc::media_commands::toggle_favorite,
-            ipc::media_commands::batch_toggle_favorite,
-            ipc::media_commands::set_rating,
-            ipc::media_commands::batch_set_rating,
-            ipc::media_commands::set_color_label,
-            ipc::media_commands::batch_set_color_label,
-            ipc::media_commands::soft_delete_items,
-            ipc::media_commands::restore_items,
-            ipc::media_commands::resolve_selection, // Part5 S4：选择描述符 → id 列表（按视图布局序）
-            ipc::media_commands::count_selection,   // Part5 S4：选择描述符精确计数（SelectAll 走 COUNT(*)）
-            ipc::media_commands::get_trash,
-            ipc::media_commands::get_stats,
-            ipc::media_commands::get_directory_tree,
-            ipc::media_commands::get_directory_children,
-            ipc::media_commands::get_directory_ancestors,
-            ipc::media_commands::list_directory_files,
-            ipc::media_commands::prioritize_dimensions,
-            // thumbnails
-            // thumbnails
-            ipc::thumbnail_commands::batch_request_thumbnails,
-            ipc::thumbnail_commands::start_full_thumbnail_generation,
-            ipc::thumbnail_commands::stop_full_thumbnail_generation,
-            ipc::thumbnail_commands::cancel_thumbnail_request,
-            ipc::thumbnail_commands::clear_all_thumbnails,
-            // exotic（冷门格式插件）查询命令（Part1 §2.3）
-            ipc::exotic_commands::list_exotic_format_resolutions,
-            ipc::exotic_commands::get_exotic_item_state,
-            ipc::exotic_commands::list_installed_exotic_plugins,
-            ipc::exotic_commands::get_plugin_entitlement,
-            // exotic 处理控制命令（Part2 §4.5）
-            ipc::exotic_commands::start_exotic_processing,
-            ipc::exotic_commands::pause_exotic_processing,
-            ipc::exotic_commands::stop_exotic_processing,
-            ipc::exotic_commands::get_exotic_processing_status,
-            ipc::exotic_commands::list_exotic_task_details,
-            ipc::exotic_commands::retry_exotic_task,
-            ipc::exotic_commands::retry_exotic_plugin_failures,
-            // exotic 激活 / 移除授权命令（Part3 §6.6）
-            ipc::exotic_commands::activate_exotic_plugin,
-            ipc::exotic_commands::deactivate_exotic_plugin,
-            // exotic 安装 / 卸载 / 修复 / 回滚 / Registry 命令（Part3 §6.4-6.6）
-            ipc::exotic_commands::fetch_exotic_registry,
-            ipc::exotic_commands::list_exotic_registry,
-            ipc::exotic_commands::install_exotic_plugin,
-            ipc::exotic_commands::repair_exotic_plugin,
-            ipc::exotic_commands::rollback_exotic_plugin,
-            ipc::exotic_commands::uninstall_exotic_plugin,
-            // volume（已知卷面板，T13 离线 UX）
-            // volume
-            ipc::volume_commands::list_volumes,
-            ipc::volume_commands::rename_volume,
-            ipc::volume_commands::forget_volume,
-            // search
-            // search
-            ipc::search_commands::search_media,
-            // config
-            // config
-            ipc::config_commands::get_app_config,
-            ipc::config_commands::get_startup_config,
-            ipc::config_commands::set_app_config,
-            ipc::config_commands::get_thumb_cache_dir,
-            ipc::config_commands::get_log_dir,
-            ipc::config_commands::get_cache_stats,
-            ipc::config_commands::clear_cache,
-            // system
-            // system
-            ipc::system_commands::show_in_explorer,
-            ipc::system_commands::open_directory,
-            ipc::system_commands::move_to_trash,
-            ipc::system_commands::close_splashscreen,
-            ipc::system_commands::set_window_theme,
-            ipc::system_commands::clear_logs,
-            // AI
-            // AI
-            ipc::ai_commands::detect_ai_provider,
-            ipc::ai_commands::get_ai_status,
-            ipc::ai_commands::semantic_search_cmd,
-            ipc::ai_commands::start_ai_analysis,
-            ipc::ai_commands::restart_ai_analysis,
-            ipc::ai_commands::pause_ai_analysis,
-            ipc::ai_commands::stop_ai_analysis,
-            ipc::ai_commands::rebuild_embeddings,
-            ipc::ai_commands::list_ai_models,
-            ipc::ai_commands::import_ai_model,
-            ipc::ai_commands::reload_ai_engine,
-            ipc::ai_commands::list_model_registry,
-            ipc::ai_commands::set_active_model,
-            ipc::ai_commands::download_model,
-            // Face recognition (F5)
-            // 人脸识别（F5）
-            ipc::face_commands::get_face_status,
-            ipc::face_commands::start_face_analysis,
-            ipc::face_commands::restart_face_analysis,
-            ipc::face_commands::pause_face_analysis,
-            ipc::face_commands::stop_face_analysis,
-            ipc::face_commands::list_face_persons,
-            ipc::face_commands::get_item_faces,
-            ipc::face_commands::rename_face_person,
-            ipc::face_commands::set_face_person_hidden,
-            ipc::face_commands::merge_face_persons,
-            ipc::face_commands::recluster_faces,
-            // 批量审批（Part4 T3 / §3.5.1）
-            ipc::face_commands::confirm_faces,
-            ipc::face_commands::reassign_faces,
-            ipc::face_commands::unassign_faces,
-            ipc::face_commands::reject_faces,
-            ipc::face_commands::create_person,
-            ipc::face_commands::list_likely_face_matches,
-            ipc::face_commands::list_face_model_registry,
-            ipc::face_commands::download_face_model,
-            ipc::face_commands::set_active_face_model,
-            // derivation pipeline (video cover/keyframes, doc thumb, audio cover/meta)
-            // 派生流水线（视频封面/关键帧、文档缩略图、音频封面/元数据）
-            ipc::derive_commands::start_derivation,
-            ipc::derive_commands::pause_derivation,
-            ipc::derive_commands::stop_derivation,
-            ipc::derive_commands::derivation_status,
-            // documents (P4): doc thumbnail frontend-render loop (§3.4)
-            // 文档（P4）：文档缩略图前端渲染回环（§3.4）
-            ipc::doc_commands::ensure_doc_thumb_queue,
-            ipc::doc_commands::list_pending_doc_thumbs,
-            ipc::doc_commands::store_doc_thumbnail,
-            ipc::doc_commands::get_reading_progress,
-            ipc::doc_commands::set_reading_progress,
-            ipc::doc_commands::list_replacements,
-            ipc::doc_commands::get_effective_replacements,
-            ipc::doc_commands::upsert_replacement,
-            ipc::doc_commands::delete_replacement,
-            ipc::doc_commands::list_versions,
-            ipc::doc_commands::get_current_version,
-            ipc::doc_commands::get_document_text,
-            ipc::doc_commands::get_version_content,
-            ipc::doc_commands::save_version,
-            ipc::doc_commands::set_current_version,
-            ipc::doc_commands::delete_version,
-            ipc::doc_commands::diff_versions,
-            ipc::doc_commands::diff_texts,
-            // documents (P4): remote AI proofreading (§5.4)
-            // 文档（P4）：远程 AI 校对（§5.4）
-            ipc::proofread_commands::get_proofread_config,
-            ipc::proofread_commands::set_proofread_config,
-            ipc::proofread_commands::set_proofread_key,
-            ipc::proofread_commands::clear_proofread_key,
-            ipc::proofread_commands::proofread_chunk,
-            // collections / favorites (需求7)
-            // 收藏夹（需求7）
-            ipc::collection_commands::list_collections,
-            ipc::collection_commands::recent_collections,
-            ipc::collection_commands::create_collection,
-            ipc::collection_commands::delete_collection,
-            ipc::collection_commands::rename_collection,
-            ipc::collection_commands::add_to_collection,
-            ipc::collection_commands::remove_from_collection,
-            // storage backends (network drives, 需求8 8B, §3.8)
-            // 存储后端（网络盘, 需求8 8B, §3.8）
-            ipc::storage_commands::list_backends,
-            ipc::storage_commands::add_backend,
-            ipc::storage_commands::test_backend,
-            ipc::storage_commands::remove_backend,
-            ipc::system_commands::exit_app,
-            ipc::system_commands::hide_window,
-            ipc::system_commands::set_as_wallpaper,
-            ipc::system_commands::copy_image_to_clipboard,
-            // file ops
-            ipc::file_ops_commands::create_physical_folder,
-            ipc::file_ops_commands::move_media_items,
-            ipc::file_ops_commands::copy_media_items,
-            ipc::file_ops_commands::relocate_media_items,
-            ipc::file_ops_commands::copy_media_items_db,
-            ipc::file_ops_commands::remove_media_items_hard,
-            ipc::file_ops_commands::move_directory,
-            ipc::file_ops_commands::copy_directory,
-            ipc::file_ops_commands::delete_directory_to_trash,
-        ])
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    // Prevent the default window close behavior
-                    // 阻止默认的窗口关闭物理行为
-                    api.prevent_close();
-                    // Emit an event to the frontend to handle it according to user settings
-                    // 向前端发送事件，由前端根据用户设置处理（最小化到托盘、退出或询问）
-                    if let Err(e) = window.emit("window-close-requested", ()) {
-                        tracing::warn!("Failed to emit window-close-requested event: {}", e);
-                    }
-                }
-            }
-        })
+        // 命令清单已下沉 ipc/registry.rs(U-P1-a):新增命令只碰 registry + 命令文件。
+        .invoke_handler(ipc::registry::handler())
+        .on_window_event(lifecycle::on_window_event)
         .build(tauri_context)
         .expect("Error while building Tauri application")
-        .run(|app_handle, event| {
-            match event {
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                    info!("Application exiting — checkpointing WAL before termination | 退出前检查点 WAL");
-                    // Truncate the WAL so it doesn't grow unbounded across sessions.
-                    // `process::exit` skips Drop, so we must checkpoint explicitly here.
-                    // 截断 WAL，避免跨会话无限增长。process::exit 会跳过 Drop，
-                    // 因此必须在此显式检查点。
-                    if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
-                        if let Ok(conn) = state.db_writer.lock() {
-                            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                                tracing::warn!("WAL checkpoint on exit failed | 退出时 WAL 检查点失败: {}", e);
-                            }
-                        }
-                    }
-
-                    if let Some(handles_pool) = app_handle.try_state::<Arc<std::sync::Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>>>() {
-                        if let Ok(mut lock) = handles_pool.lock() {
-                            let handles: Vec<_> = lock.drain(..).collect();
-                            for h in &handles {
-                                h.abort();
-                            }
-                            tauri::async_runtime::block_on(async move {
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(3),
-                                    async {
-                                        for h in handles {
-                                            let _ = h.await;
-                                        }
-                                    }
-                                ).await;
-                            });
-                            info!("Background tasks gracefully stopped | 后台任务已优雅停止");
-                        }
-                    }
-
-                    std::process::exit(0);
-                }
-                tauri::RunEvent::Ready
-                    // 开机冒烟测试：设 PICASA_SMOKE_TEST 时，应用一旦「启动就绪」即退出 0。
-                    // CI headless 启动构建产物 + 断言退出码非 101 → 把「开机 panic」
-                    //（coordinator 无 reactor / 迁移失败 等）挡在合并前，而非等 run dev 才发现。
-                    if std::env::var_os("PICASA_SMOKE_TEST").is_some() => {
-                        eprintln!(
-                            "[smoke] boot reached RunEvent::Ready — startup OK | 开机就绪，冒烟测试通过"
-                        );
-                        app_handle.exit(0);
-                    }
-                _ => {}
-            }
-        });
+        .run(lifecycle::on_run_event);
 }
 
 /// 致命启动错误的统一出口：取代裸 `.expect()` 的不可读 panic。

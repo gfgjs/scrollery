@@ -1,0 +1,62 @@
+/* src/assets/styles/material.css */
+/* 宿主材质适配层：既有语义 token → material 角色 → 新消费者。
+   旧 token 不反向引用本层，确保首批迁移可逐项回退且不会形成别名环。 */
+
+/* 零特异性默认值：即使主题文件先导入，其 [data-theme] 参数仍可按主题覆盖。 */
+:where(:root) {
+  /* ── 角色：只从现有主题/组件契约派生 ───────────────────────── */
+  --material-canvas: var(--color-bg-primary);
+  --material-chrome: var(--color-bg-secondary);
+  --material-surface: var(--color-bg-surface, var(--card-bg));
+  --material-surface-strong: var(--card-bg, var(--color-bg-elevated));
+  --material-surface-muted: var(--color-bg-inset);
+  --material-float: var(--card-bg, var(--popover-bg, var(--color-bg-elevated)));
+  --material-border: var(--color-border);
+  --material-border-strong: var(--color-border-strong);
+  --material-shadow-shell: var(--shadow-sm);
+  --material-shadow-float: var(--popover-shadow, var(--shadow-lg));
+  --material-glaze: none;
+  --material-blur-float: 0px;
+  --material-noise: var(--texture-chrome, none);
+
+  /* ── Recipe：按 CSS 属性消费，并保留旧 token 的实色/零效果回退 ───── */
+  --material-recipe-canvas-background-color: var(--material-canvas, var(--color-bg-primary));
+  --material-recipe-chrome-background-color: var(--material-chrome, var(--color-bg-secondary));
+  --material-recipe-chrome-background-image:
+    var(--material-glaze, none), var(--material-noise, none);
+  --material-recipe-chrome-border-color: var(--material-border, var(--color-border));
+
+  --material-recipe-surface-background-color: var(--material-surface, var(--color-bg-surface));
+  --material-recipe-surface-border-color: var(
+    --color-border-subtle,
+    var(--material-border, var(--color-border))
+  );
+  /* Surface 是普通容器：层级由明度阶梯和发丝线承担，不叠加高光/阴影。 */
+  --material-recipe-surface-box-shadow: none;
+
+  --material-recipe-elevated-background-color: var(
+    --material-surface-strong,
+    var(--card-bg, var(--color-bg-elevated))
+  );
+  --material-recipe-elevated-border-color: var(
+    --material-border-strong,
+    var(--color-border-strong)
+  );
+  /* Elevated 只保留 raised/sticky 的微托举档，不把普通卡片升级成浮层。 */
+  --material-recipe-elevated-box-shadow: var(--material-shadow-shell, var(--shadow-sm));
+
+  --material-recipe-float-background-color: var(
+    --material-float,
+    var(--popover-bg, var(--color-bg-elevated))
+  );
+  --material-recipe-float-border-color: var(
+    --material-border-strong,
+    var(--popover-border, var(--color-border-strong))
+  );
+  /* Float/modal 才使用空间阴影；高光属于玻璃语言，交给 glass.css 显式覆写。 */
+  --material-recipe-float-box-shadow: var(
+    --material-shadow-float,
+    var(--popover-shadow, var(--shadow-lg))
+  );
+  --material-recipe-float-backdrop-filter: blur(var(--material-blur-float, 0px));
+}

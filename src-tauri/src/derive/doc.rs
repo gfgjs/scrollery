@@ -1,5 +1,4 @@
 // src-tauri/src/derive/doc.rs
-//! Document thumbnail derivation (§3.4).
 //! 文档缩略图派生（§3.4）。
 //!
 //! P4 落点（Lite 路径）——文档缩略图按子类型分两条路：
@@ -20,9 +19,8 @@ use quick_xml::Reader;
 
 use crate::derive::kind::{DerivationContext, DerivationOutput};
 use crate::error::{AppError, Result};
-use crate::thumbnail::generator::{encode_media_step, snap_to_tier, ThumbConfig};
+use crate::thumbnail::generator::{encode_media_step_with_snapshot, snap_to_tier, ThumbConfig};
 
-/// Produce a first-page/cover thumbnail for a document (P4).
 /// 为文档生成首页/封面缩略图（P4）。
 ///
 /// 仅处理 epub（后端 zip 取封面）；pdf/svg 由前端离屏渲染并经 `store_doc_thumbnail` 回传，
@@ -49,6 +47,7 @@ pub fn run_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
         pixels: rgba.into_raw(),
         width: w,
         height: h,
+        icc: None, // epub 封面无 ICC 来源,按 sRGB 假定
     };
 
     let cfg = ThumbConfig {
@@ -58,8 +57,16 @@ pub fn run_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
         strategy: String::new(),
         gpu_engine: String::new(),
         ai_hq_cache: false, // 文档封面非 CLIP 分析对象，不产 AI 缓存
+        webp_quality: ctx.webp_quality,
+        ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
     };
-    let res = encode_media_step(ctx.item_id, ctx.cache_key, decoded, &cfg)?;
+    let res = encode_media_step_with_snapshot(
+        ctx.item_id,
+        ctx.source_revision,
+        ctx.cache_key,
+        decoded,
+        &cfg,
+    )?;
 
     Ok(DerivationOutput {
         payload_path: res.thumb_path,
@@ -135,7 +142,6 @@ fn count_epub_spine(opf: &str) -> Option<i64> {
     (count > 0).then_some(count)
 }
 
-/// Read one attribute value (unescaped) from a start/empty tag by its (unprefixed) key.
 /// 按（无前缀）键名读取起始/空标签的一个属性值（已反转义）。
 fn attr(e: &BytesStart, key: &[u8]) -> Option<String> {
     e.attributes()
@@ -244,7 +250,6 @@ fn normalize_zip_path(dir: &str, href: &str) -> String {
     parts.join("/")
 }
 
-/// Minimal percent-decoding for hrefs (e.g. `%20` → space); epub hrefs may be URL-encoded.
 /// href 的最小化百分号解码（如 `%20` → 空格）；epub href 可能被 URL 编码。
 fn percent_decode(s: &str) -> String {
     fn hex(b: u8) -> Option<u8> {

@@ -50,7 +50,7 @@ pub(crate) fn run_pipeline_worker_blocking(
     token: &CancellationToken,
 ) -> crate::error::Result<()> {
     // 活跃 profile 纯由配置解析(不触进程内引擎——worker 模式全程零 ort)。
-    let profile = crate::ipc::ai_commands::active_profile(state);
+    let profile = crate::ai::runtime_config::active_profile(state);
     let spec = build_session_spec(state, profile.clone(), None);
 
     recover_orphaned_ai_items(state);
@@ -98,7 +98,7 @@ pub(crate) fn run_pipeline_worker_blocking(
 
     // provider 回声落库(T16:探测发生在 worker 侧,写回配置供状态栏读取)——
     // 须在 close_session 之前(快照随 close 清空)。
-    crate::ipc::ai_commands::persist_provider_echo(state);
+    crate::ai::runtime_config::persist_provider_echo(state);
     // 结束即卸会话(自然完成/取消皆是;对齐进程内旧行为的 VRAM 语义)。
     state
         .ai_worker
@@ -107,7 +107,10 @@ pub(crate) fn run_pipeline_worker_blocking(
         .close_session();
 
     match fatal.into_inner().unwrap_or_else(|p| p.into_inner()) {
-        Some(e) => Err(AppError::System(format!("AI worker 派发终止:{e}"))),
+        Some(e) => Err(AppError::internal(
+            "AI worker 派发终止 | dispatch failed",
+            e,
+        )),
         None => Ok(()),
     }
 }
@@ -184,7 +187,10 @@ fn dispatch_batch(
     // host **现场派生**(解原图短边 336 → 原子写,与派生管线共用 generate_ai_cache)——
     // 功能正确、首跑性能次优;新导入项由缩略图流水线顺带产出/派生侧预产覆盖(快路径)。
     // cache_key 含 mtime(xxh3 键),兼作陈旧防护指纹。
-    let cache_dir = state.thumb_config.read().unwrap().cache_dir.clone();
+    let (cache_dir, ai_cache_short_edge) = {
+        let cfg = state.thumb_config.read().unwrap_or_else(|e| e.into_inner());
+        (cfg.cache_dir.clone(), cfg.ai_cache_short_edge)
+    };
 
     // 缺缓存的现场派生**并行化**(T18.5;rayon 全局池,与进程内预处理的并行语义对齐——
     // 进程内路径同样在全局池上解码,CPU permit 保持「1 批=1 槽」记账)。取消检查在
@@ -196,11 +202,20 @@ fn dispatch_batch(
             if token.is_cancelled() {
                 return None;
             }
-            crate::derive::image::generate_ai_cache(
-                &cache_dir,
-                t.cache_key,
-                &t.file_format,
-                &t.source_path,
+            // panic 拦截伞(与 derive/pipeline.rs kind::run 同款防线):worker 端 rayon
+            // par_iter 内裸跑第三方解码,单个畸形文件 panic 会中止整批,需转为 Err
+            // 落入既有 derive_failed 失败路径(标 Error,不连坐整批)。
+            crate::thumbnail::generator::panic_guard(
+                &format!("ai_worker:generate_ai_cache item {}", t.item_id),
+                || {
+                    crate::derive::image::generate_ai_cache(
+                        &cache_dir,
+                        t.cache_key,
+                        &t.file_format,
+                        &t.source_path,
+                        ai_cache_short_edge,
+                    )
+                },
             )
             .err()
             .map(|e| {
@@ -215,11 +230,13 @@ fn dispatch_batch(
     }
 
     let mut items: Vec<EmbedItem> = Vec::with_capacity(tasks.len());
-    let mut item_ids: Vec<i64> = Vec::with_capacity(tasks.len());
+    // (item_id, cache_key 快照):cache_key 随结果传给 Writer 做 X1 条件写。
+    let mut item_keys: Vec<(i64, i64)> = Vec::with_capacity(tasks.len());
     for t in &tasks {
         if derive_failed.contains(&t.item_id) {
             let _ = result_tx.send(AiResult {
                 item_id: t.item_id,
+                cache_key: t.cache_key,
                 embedding: None,
             });
             continue;
@@ -230,7 +247,7 @@ fn dispatch_batch(
             cache_key: hex.clone(),
             fingerprint: hex,
         });
-        item_ids.push(t.item_id);
+        item_keys.push((t.item_id, t.cache_key));
     }
     if items.is_empty() {
         return Ok(());
@@ -252,12 +269,13 @@ fn dispatch_batch(
         }
     };
 
-    for (item_id, outcome) in item_ids.into_iter().zip(outcomes) {
+    for ((item_id, cache_key), outcome) in item_keys.into_iter().zip(outcomes) {
         match outcome {
             EmbedItemOutcome::Ok(embedding) => {
                 let bytes = crate::ai::clip::embedding_to_bytes(&embedding);
                 let _ = result_tx.send(AiResult {
                     item_id,
+                    cache_key,
                     embedding: Some(bytes),
                 });
             }
@@ -270,6 +288,7 @@ fn dispatch_batch(
                 warn!("item {item_id} 嵌入失败[{}](terminal)", code.as_str());
                 let _ = result_tx.send(AiResult {
                     item_id,
+                    cache_key,
                     embedding: None,
                 });
             }

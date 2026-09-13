@@ -1,4 +1,3 @@
-// src-tauri/src/ipc/collection_commands.rs
 //! IPC commands for collections / favorites (需求7, §3.7).
 //! 收藏夹 IPC 命令（需求7, §3.7）。
 //!
@@ -18,11 +17,16 @@ use crate::db::queries as q;
 use crate::error::Result;
 use crate::state::AppState;
 
-/// List all collections: 4 system type folders first, then user folders.
 /// 列出所有收藏夹：4 个系统类型夹在前，用户夹在后。
 #[tauri::command]
 pub async fn list_collections(state: State<'_, Arc<AppState>>) -> Result<Vec<Collection>> {
     read_blocking(&state, q::list_collections).await
+}
+
+/// 列出已软删除的用户收藏夹（最近删除在前），供收藏夹页的「已删除」捞回入口；恢复走 `restore_collection`。
+#[tauri::command]
+pub async fn list_deleted_collections(state: State<'_, Arc<AppState>>) -> Result<Vec<Collection>> {
+    read_blocking(&state, q::list_deleted_collections).await
 }
 
 /// Recently-used user collections (for the "加入收藏夹" toast chips). Defaults to 5.
@@ -38,7 +42,6 @@ pub async fn recent_collections(
     .await
 }
 
-/// Create a new user collection. Returns its new id.
 /// 新建一个用户收藏夹。返回其新 id。
 #[tauri::command]
 pub async fn create_collection(
@@ -52,8 +55,9 @@ pub async fn create_collection(
     .await
 }
 
-/// Delete a user collection (system folders are protected by the query).
-/// 删除一个用户收藏夹（系统夹由查询层保护）。
+/// Soft-delete a user collection (system folders are protected by the query). Undoable via
+/// `restore_collection`; the row and its `album_items` survive with `deleted_at` set.
+/// 软删除一个用户收藏夹（系统夹由查询层保护）。可经 `restore_collection` 撤销，行与成员保留。
 #[tauri::command]
 pub async fn delete_collection(album_id: i64, state: State<'_, Arc<AppState>>) -> Result<()> {
     write_blocking(&state, move |c| q::delete_collection(c, album_id)).await?;
@@ -62,7 +66,16 @@ pub async fn delete_collection(album_id: i64, state: State<'_, Arc<AppState>>) -
     Ok(())
 }
 
-/// Rename a user collection (system folders are protected by the query).
+/// Restore a soft-deleted user collection (承接删除 undo)。清 `deleted_at`，夹重新出现。
+/// 系统夹由查询层保护、为空操作。
+#[tauri::command]
+pub async fn restore_collection(album_id: i64, state: State<'_, Arc<AppState>>) -> Result<()> {
+    write_blocking(&state, move |c| q::restore_collection(c, album_id)).await?;
+    // S1：albumId 视图成员随收藏夹恢复而变 → bump。
+    state.bump_data_version();
+    Ok(())
+}
+
 /// 重命名一个用户收藏夹（系统夹由查询层保护）。
 #[tauri::command]
 pub async fn rename_collection(
@@ -73,7 +86,6 @@ pub async fn rename_collection(
     write_blocking(&state, move |c| q::rename_collection(c, album_id, &name)).await
 }
 
-/// Add items to a user collection. Returns rows inserted (deduped).
 /// 向用户收藏夹添加项。返回插入行数（已去重）。
 #[tauri::command]
 pub async fn add_to_collection(
@@ -90,7 +102,6 @@ pub async fn add_to_collection(
     Ok(n)
 }
 
-/// Remove items from a collection. Returns rows deleted.
 /// 从收藏夹移除项。返回删除行数。
 #[tauri::command]
 pub async fn remove_from_collection(

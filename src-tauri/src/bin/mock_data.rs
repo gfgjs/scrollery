@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection};
+use scrollery_lib::utils::path::encode_tree_sort_key;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -301,12 +302,15 @@ fn ensure_sub_directories(
     {
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO directories
-                (root_id, parent_id, rel_path, name, depth, media_count, created_at)
-             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5)",
+                (root_id, parent_id, rel_path, name, depth, media_count, created_at, tree_sort_key)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6)",
         )?;
         for i in 0..opts.dirs {
             let name = format!("folder_{i:04}");
-            stmt.execute(params![root_id, root_dir_id, name, name, now])?;
+            // 单段 rel_path=name;算 tree_sort_key(方案 B),否则 perf 库上 folder 键全空、
+            // 排序退化按 d.id,恰好测不出持久列特性。根目录(rel_path='')经列 DEFAULT X'' 取空键。
+            let key = encode_tree_sort_key(&name);
+            stmt.execute(params![root_id, root_dir_id, name, name, now, key])?;
         }
     }
     tx.commit()?;

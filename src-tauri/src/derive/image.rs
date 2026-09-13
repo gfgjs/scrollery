@@ -1,4 +1,3 @@
-// src-tauri/src/derive/image.rs
 //! Image derivation: the AI-analysis cache (§ AI pipeline). A pure `run(ctx) -> Result<Output>`;
 //! the generic pipeline handles scheduling / resume / yield / orphan recovery.
 //!
@@ -22,8 +21,7 @@ use crate::engine::image_rs::ImageRsEngine;
 use crate::engine::traits::{DecodedImage, ImageEngine, ResizeHint};
 use crate::error::{AppError, Result};
 use crate::thumbnail::cache::{
-    ai_cache_db_path, ai_cache_path, ensure_ai_cache_dir, face_cache_path, AI_CACHE_SHORT_EDGE,
-    FACE_CACHE_SHORT_EDGE,
+    ai_cache_db_path, ai_cache_path, ensure_ai_cache_dir, face_cache_path, FACE_CACHE_SHORT_EDGE,
 };
 
 /// Decode the source at short-edge 336 (WIC GPU path, CPU `image` crate fallback), encode a
@@ -39,6 +37,7 @@ pub fn run_ai_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
         ctx.cache_key,
         &ctx.file_format,
         &ctx.abs_path,
+        ctx.ai_cache_short_edge,
     )?;
     Ok(DerivationOutput {
         payload_path: Some(ai_cache_db_path(ctx.cache_key)),
@@ -57,6 +56,7 @@ pub(crate) fn generate_ai_cache(
     cache_key: i64,
     file_format: &str,
     abs_path: &std::path::Path,
+    short_edge: u32,
 ) -> Result<()> {
     if ai_cache_path(cache_dir, cache_key).exists() {
         return Ok(());
@@ -66,7 +66,7 @@ pub(crate) fn generate_ai_cache(
         &ai_cache_path(cache_dir, cache_key),
         file_format,
         abs_path,
-        AI_CACHE_SHORT_EDGE,
+        short_edge,
     )
 }
 
@@ -104,13 +104,17 @@ fn write_short_edge_webp(
         AppError::Internal("AI cache buffer size mismatch | AI 缓存缓冲尺寸不符".into())
     })?;
 
-    // Reuse the thumbnail WebP/JPEG encoders (same quality knobs as display thumbnails).
-    // 复用缩略图的 WebP/JPEG 编码器（与显示缩略图同质量参数）。
-    let bytes = crate::thumbnail::exif_thumb::encode_as_webp(&rgba, w, h)
-        .or_else(|_| crate::thumbnail::exif_thumb::encode_as_jpeg(&rgba))
-        .map_err(|_| {
-            AppError::Internal("AI cache WebP encode failed | AI 缓存 WebP 编码失败".into())
-        })?;
+    // Reuse the thumbnail WebP/JPEG encoders. Analysis caches (AI/face) keep the fixed
+    // default quality — decoupled from the user-facing display-quality setting.
+    // 复用缩略图的 WebP/JPEG 编码器。分析缓存(AI/人脸)恒用默认质量,与显示质量设置解耦。
+    let bytes = crate::thumbnail::exif_thumb::encode_as_webp(
+        &rgba,
+        crate::thumbnail::exif_thumb::DEFAULT_WEBP_QUALITY,
+    )
+    .or_else(|_| crate::thumbnail::exif_thumb::encode_as_jpeg(&rgba))
+    .map_err(|_| {
+        AppError::Internal("AI cache WebP encode failed | AI 缓存 WebP 编码失败".into())
+    })?;
 
     crate::thumbnail::generator::write_atomic(disk, &bytes).map_err(AppError::from)
 }
@@ -131,9 +135,12 @@ fn decode_short_edge(
         if gpu.can_handle(file_format) {
             match gpu.decode(path, hint) {
                 Ok(d) => return Ok(d),
+                // reviewer 深审修正:这条服务 AI/人脸分析缓存生成(见本函数调用方 generate_ai_cache
+                // /generate_face_cache),与视频派生无关,不应挂 video target(按 ai 过滤会漏看)。
                 Err(e) => tracing::debug!(
-                    "AI cache GPU decode failed, falling back to CPU | AI 缓存 GPU 解码失败，回退 CPU: {}",
-                    e
+                    target: "scrollery::pipeline::ai",
+                    error = %e,
+                    "AI cache GPU decode failed, falling back to CPU"
                 ),
             }
         }
@@ -148,6 +155,7 @@ fn decode_short_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thumbnail::cache::AI_CACHE_SHORT_EDGE;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let d =
@@ -166,7 +174,7 @@ mod tests {
             .unwrap();
 
         let key: i64 = 0x1234_5678_9abc_def0u64 as i64;
-        generate_ai_cache(&dir, key, "png", &src).unwrap();
+        generate_ai_cache(&dir, key, "png", &src, AI_CACHE_SHORT_EDGE).unwrap();
 
         let out = ai_cache_path(&dir, key);
         assert!(out.exists(), "缓存文件应已落盘");
@@ -182,7 +190,7 @@ mod tests {
             .expect("产物应为可解码 WebP");
 
         // 幂等:再次调用不重写(内容逐字节不变)。
-        generate_ai_cache(&dir, key, "png", &src).unwrap();
+        generate_ai_cache(&dir, key, "png", &src, AI_CACHE_SHORT_EDGE).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), bytes);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -192,7 +200,13 @@ mod tests {
     #[test]
     fn generate_ai_cache_missing_source_errors() {
         let dir = temp_dir("miss");
-        let e = generate_ai_cache(&dir, 42, "png", &dir.join("nonexistent.png"));
+        let e = generate_ai_cache(
+            &dir,
+            42,
+            "png",
+            &dir.join("nonexistent.png"),
+            AI_CACHE_SHORT_EDGE,
+        );
         assert!(e.is_err());
         assert!(!ai_cache_path(&dir, 42).exists(), "失败不得留下缓存文件");
         let _ = std::fs::remove_dir_all(&dir);

@@ -5,44 +5,55 @@
 //! Media Foundation 视频后端（§3.2 / §3.3）—— 基于 `windows` crate 的 Windows 原生、零捆绑解码
 //! （无 FFmpeg / 无外部二进制）。Lite 与 Perf 两变体都使用。
 //!
-//! 关键设计：
-//!  - 用 `IMFSourceReader` + `MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING`，让 MF 内置视频处理器
-//!    把任意输入像素格式转换为 **RGB32**（内存字节序 B,G,R,X）后输出到系统内存。
-//!  - MF 内部会在可用时自动走硬件解码器（DXVA）；我们只需系统内存里的 RGBA 像素来编码缩略图/雪碧图，
-//!    故无需 D3D manager 回读纹理 —— 对本用途「GPU 回读」收益甚微（见 §3.3「GPU 收益主要在批量」）。
-//!  - **旋转**：读取 `MF_MT_VIDEO_ROTATION`，对解码帧做正立旋转（手机竖拍视频否则会躺倒，§3.2）。
+//! 关键设计（2026-07-17 性能线重构后）：
+//!  - 用 `IMFSourceReader` + `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING`，由 XVP
+//!    （视频处理器 MFT）把任意输入像素格式转成 **RGB32**（内存字节序 B,G,R,X），并**在 XVP 内
+//!    直接缩放到目标输出尺寸**（封面=缩略图 tier、雪碧格=200px 高）——此前按原生分辨率直出，
+//!    4K 单帧 33MB 要在 CPU 上做 4-5 趟全尺寸拷贝，是本后端最大的性能浪费。
+//!  - **DXVA/D3D11 硬解（原「可选动作 A」，现已接）**：能拿到 `video::d3d` 硬解槽位时给
+//!    SourceReader 挂 `MF_SOURCE_READER_D3D_MANAGER`，解码走 GPU 视频引擎、XVP 转换/缩放上
+//!    GPU，CPU 只 readback 小图；拿不到槽位或初始化失败即回退软解（正确性不依赖 GPU）。
+//!  - **旋转**：ADVANCED 管线下 XVP 会按 `MF_MT_VIDEO_ROTATION` **自动转正**,且实测
+//!    （Win11 + rot90 基准片）转正后输出类型的 rotation 属性并不清零 —— 属性不可作判据,
+//!    曾与 CPU 侧 apply_rotation 叠成双旋转。定案:协商后枚举变换链,经
+//!    `IMFVideoProcessorControl::SetRotation(ROTATION_NONE)` **强制关掉** XVP 自动转正,
+//!    旋转权威唯一归 CPU `apply_rotation`（legacy 管线无该控制接口 = 本就不转,两路归一;
+//!    90/180/270/方形全覆盖）。尺寸请求相应固定在**解码坐标系**（旋转前）。
+//!    （防回归断言见 examples/video_bench.rs 的 --rotation-check。）
 //!  - **负 stride**：RGB32 常以 bottom-up（负 stride）交付，按 `MF_MT_DEFAULT_STRIDE` 符号翻转行序。
+//!  - **单会话复用**：封面时间戳选择所需的时长在同一 reader 会话内读取，不再为 probe 单开
+//!    一个 reader;音频流反选,省掉音频解码器初始化。
 
+use std::mem::ManuallyDrop;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Once};
+use std::time::{Duration, Instant};
 
-use windows::core::{GUID, HSTRING, PROPVARIANT};
+use windows::core::{implement, Interface, GUID, HRESULT, HSTRING, PROPVARIANT};
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::StructuredStorage::PropVariantToInt64;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use crate::engine::traits::DecodedImage;
 use crate::error::{AppError, Result};
 use crate::video::{VideoBackend, VideoInfo};
 
-/// Containers Media Foundation can typically demux/decode with the OS-installed codecs.
-/// mkv/webm/flv/ogv are intentionally excluded — those need FFmpeg (Perf variant, §9).
+// 属性/编解码器辅助（尾段拆出，零 unsafe 耦合，见超长文件拆分方案 tierB-3）。
+use super::mf_attrs::{attr_ratio, attr_size, codec_label, normalize_rotation, read_duration_ms};
+// 帧后处理（尾段拆出，全程不碰 `IMFSourceReader`，见超长文件拆分方案 tierB-3）。
+use super::frame_post::{apply_rotation, copy_bgr32_to_rgba, is_too_dark, resize_rgba};
+
 /// MF 一般能用系统已装编解码器处理的容器。mkv/webm/flv/ogv 有意排除（需 FFmpeg / Perf，§9）。
 const MF_VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "wmv", "avi", "3gp", "3g2", "ts", "mts", "m2ts", "asf", "mpg", "mpeg",
 ];
 
-/// Sprite cell height (px) for keyframe scrub frames (§3.3). Width derives from the video's
-/// display aspect, uniform across all frames so the frontend can scrub by `background-position`.
-/// 关键帧 scrub 帧的格高（像素，§3.3）。格宽按视频显示比例推导，所有帧统一，
-/// 使前端可用 `background-position` 进行 scrub。
-const SPRITE_CELL_H: u32 = 200;
-
-/// Stream selectors (typed `u32` sentinels in the MF SDK).
 /// 流选择子（MF SDK 中的 `u32` 哨兵值）。
 const FIRST_VIDEO_STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 const FIRST_AUDIO_STREAM: u32 = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
-const MEDIASOURCE: u32 = MF_SOURCE_READER_MEDIASOURCE.0 as u32;
+const ALL_STREAMS: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
+/// `pub(super)`：`mf_attrs::read_duration_ms`（video 模块内的兄弟文件）需要引用此哨兵值。
+pub(super) const MEDIASOURCE: u32 = MF_SOURCE_READER_MEDIASOURCE.0 as u32;
 
 pub struct MediaFoundationBackend;
 
@@ -59,12 +70,15 @@ impl VideoBackend for MediaFoundationBackend {
         ensure_mf();
         init_com();
         unsafe {
-            let reader = open_reader(path)?;
-            // Read geometry/rotation/fps from the NATIVE type (pre-conversion) for accuracy.
+            // 探测不解码帧,无需硬解/尺寸协商,开个裸 reader 读原生属性即可。
+            // （异步回调已挂上但 probe 从不 ReadSample,故回调永不触发；仅取元数据同步方法。）
+            // 批量导入会把单文件探测失败汇总到富化日志；这里不逐项写 ERROR，避免损坏/不兼容
+            // 容器在大批量导入时制造错误风暴。
+            let (reader, _cb) = open_reader(path, None, false)?;
             // 从 NATIVE 类型（转换前）读取几何/旋转/帧率，更准确。
             let native = reader
                 .GetNativeMediaType(FIRST_VIDEO_STREAM, 0)
-                .map_err(mf_err)?;
+                .map_err(mf_probe_err)?;
 
             let (nw, nh) = attr_size(&native, &MF_MT_FRAME_SIZE).unwrap_or((0, 0));
             let rotation = normalize_rotation(native.GetUINT32(&MF_MT_VIDEO_ROTATION).unwrap_or(0));
@@ -97,32 +111,29 @@ impl VideoBackend for MediaFoundationBackend {
         }
     }
 
-    fn cover(&self, path: &Path, t_ms: u64) -> Result<DecodedImage> {
+    fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage> {
         ensure_mf();
         init_com();
         unsafe {
-            let reader = open_reader(path)?;
-            let rotation = normalize_rotation(
-                reader
-                    .GetNativeMediaType(FIRST_VIDEO_STREAM, 0)
-                    .ok()
-                    .and_then(|t| t.GetUINT32(&MF_MT_VIDEO_ROTATION).ok())
-                    .unwrap_or(0),
-            );
-            configure_rgb32(&reader)?;
-            let geom = output_geometry(&reader)?;
+            let s = open_session(path, SizePolicy::FitLongEdge(max_long_edge))?;
 
-            // Avoid the first frame (often black). Try a few timestamps and pick the first
-            // sufficiently-bright frame; accept whatever we have on the last attempt.
+            // 封面时间戳 = min(1s, 时长 10%)，避开常为黑帧的最初一帧;时长未知回退 1s。
+            // 时长来自本会话（read_duration_ms），免掉旧实现里独立 probe() 的一次 reader open。
+            let t_ms = if s.duration_ms > 0 {
+                1000u64.min(s.duration_ms / 10)
+            } else {
+                1000
+            };
+
             // 避开第 0 帧（常为黑帧）。尝试几个时间戳，取首个足够亮的帧；最后一次尝试则照单全收。
             let mut t_100ns = (t_ms as i64) * 10_000;
             let mut last: Option<DecodedImage> = None;
             for attempt in 0..5 {
-                match read_frame_at(&reader, t_100ns, &geom) {
+                match read_frame_at(&s.reader, &s.cb, t_100ns, &s.geom, path) {
                     Ok(img) => {
                         let dark = is_too_dark(&img);
                         if !dark || attempt == 4 {
-                            return Ok(apply_rotation(img, rotation));
+                            return Ok(apply_rotation(img, s.rotation));
                         }
                         last = Some(img);
                     }
@@ -132,48 +143,24 @@ impl VideoBackend for MediaFoundationBackend {
             }
             // 全部偏暗或读取在末尾失败：用最后拿到的一帧，否则回退到第 0 帧。
             if let Some(img) = last {
-                return Ok(apply_rotation(img, rotation));
+                return Ok(apply_rotation(img, s.rotation));
             }
-            let img = read_frame_at(&reader, 0, &geom)?;
-            Ok(apply_rotation(img, rotation))
+            let img = read_frame_at(&s.reader, &s.cb, 0, &s.geom, path)?;
+            Ok(apply_rotation(img, s.rotation))
         }
     }
 
-    fn keyframes(&self, path: &Path, n: usize) -> Result<Vec<DecodedImage>> {
+    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>> {
         ensure_mf();
         init_com();
         let n = n.max(1);
         unsafe {
-            let reader = open_reader(path)?;
-            let rotation = normalize_rotation(
-                reader
-                    .GetNativeMediaType(FIRST_VIDEO_STREAM, 0)
-                    .ok()
-                    .and_then(|t| t.GetUINT32(&MF_MT_VIDEO_ROTATION).ok())
-                    .unwrap_or(0),
-            );
-            let duration_ms = read_duration_ms(&reader);
-            configure_rgb32(&reader)?;
-            let geom = output_geometry(&reader)?;
-
-            // Uniform cell size from the display aspect so the sprite is a clean horizontal strip.
+            let s = open_session(path, SizePolicy::CellHeight(cell_height))?;
             // 由显示比例推导统一格尺寸，使雪碧图为整齐的水平条带。
-            let (disp_w, disp_h) = if rotation == 90 || rotation == 270 {
-                (geom.height, geom.width)
-            } else {
-                (geom.width, geom.height)
-            };
-            let aspect = if disp_h > 0 {
-                disp_w as f32 / disp_h as f32
-            } else {
-                16.0 / 9.0
-            };
-            let cell_h = SPRITE_CELL_H;
-            let cell_w = ((cell_h as f32 * aspect).round() as u32).max(1);
+            let (cell_w, cell_h) = sprite_cell(s.display_w, s.display_h, cell_height);
 
-            // Sample within [5%, 95%] to skip intro/outro black frames.
             // 在 [5%, 95%] 区间采样，跳过片头/片尾黑帧。
-            let dur = duration_ms.max(1) as f64;
+            let dur = s.duration_ms.max(1) as f64;
             let mut frames = Vec::with_capacity(n);
             for i in 0..n {
                 let frac = if n == 1 {
@@ -182,9 +169,10 @@ impl VideoBackend for MediaFoundationBackend {
                     0.05 + 0.90 * (i as f64 / (n - 1) as f64)
                 };
                 let t_100ns = (dur * frac * 10_000.0) as i64;
-                if let Ok(img) = read_frame_at(&reader, t_100ns, &geom) {
-                    let upright = apply_rotation(img, rotation);
-                    frames.push(resize_rgba(&upright, cell_w, cell_h));
+                if let Ok(img) = read_frame_at(&s.reader, &s.cb, t_100ns, &s.geom, path) {
+                    let upright = apply_rotation(img, s.rotation);
+                    // XVP 已按格尺寸出图时为等尺寸直通（zero-copy）;原生回退路径下做真缩放。
+                    frames.push(resize_rgba(upright, cell_w, cell_h));
                 }
             }
             if frames.is_empty() {
@@ -200,12 +188,10 @@ impl VideoBackend for MediaFoundationBackend {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 // ── 生命周期 ─────────────────────────────────────────────────────────────────
 
-/// Start the MF platform exactly once for the process lifetime. We intentionally never call
-/// `MFShutdown` — leaking one startup is the standard pattern for long-running apps and avoids
-/// fragile per-task balancing across the rayon derivation pool.
 /// 进程生命周期内只启动一次 MF 平台。有意不调用 `MFShutdown` —— 长期运行应用的标准做法，
 /// 避免在 rayon 派生池中逐任务配平的脆弱性。
-fn ensure_mf() {
+/// （pub(crate)：`video::d3d` 创建 DXGI device manager 前也须保证 MF 已启动。）
+pub(crate) fn ensure_mf() {
     static MF_INIT: Once = Once::new();
     MF_INIT.call_once(|| unsafe {
         // MF_VERSION = (SDK<<16)|API = (0x0002<<16)|0x0070；MFSTARTUP_FULL = 0。
@@ -223,42 +209,430 @@ fn init_com() {
     }
 }
 
-// ── Source reader setup ─────────────────────────────────────────────────────────
+// ── Decode session ──────────────────────────────────────────────────────────────
+// ── 解码会话 ────────────────────────────────────────────────────────────────────
 
-unsafe fn open_reader(path: &Path) -> Result<IMFSourceReader> {
-    let url = HSTRING::from(path.as_os_str());
-    // Enable the built-in video processor so we can request RGB32 output from any input format.
-    // 启用内置视频处理器，使我们可对任意输入格式请求 RGB32 输出。
-    let mut attrs: Option<IMFAttributes> = None;
-    MFCreateAttributes(&mut attrs, 1).map_err(mf_err)?;
-    let attrs =
-        attrs.ok_or_else(|| AppError::Internal("MFCreateAttributes returned null".into()))?;
-    attrs
-        .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
-        .map_err(mf_err)?;
-    MFCreateSourceReaderFromURL(&url, &attrs).map_err(mf_err)
+/// 输出尺寸策略。请求值最终换算到**解码坐标系**（旋转前）交给 XVP。
+enum SizePolicy {
+    /// 正立后长边 ≤ n（**不上采样**;0 = 保持原生）。封面用，与缩略图 tier 对齐，
+    /// 使 encode_media_step 的 resize 成为直通。
+    FitLongEdge(u32),
+    /// 正立后格高恒为 h、格宽按显示比例（小视频**允许上采样**，保证雪碧格统一）。雪碧图用。
+    CellHeight(u32),
 }
 
-/// Force the first video stream's output type to RGB32 (BGRA in memory).
-/// 将首个视频流的输出类型设为 RGB32（内存中为 BGRA）。
-unsafe fn configure_rgb32(reader: &IMFSourceReader) -> Result<()> {
-    let mt = MFCreateMediaType().map_err(mf_err)?;
-    mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+/// 一次打开、配置完毕的解码会话:reader + 协商后的输出几何 + 元数据。
+struct Session {
+    /// `ManuallyDrop`:读超时后 reader 可能卡在 MF 共享工作队列,`Release()`/`Drop` 会与
+    /// `ReadSample` 同样死等永不返回 —— 届时由 `Drop for Session` 泄漏隔离(见下)。
+    reader: ManuallyDrop<IMFSourceReader>,
+    /// 异步读的回调共享态(样本交接槽 + 超时/僵死标记)。
+    cb: Arc<CallbackShared>,
+    geom: Geometry,
+    /// **残余**旋转:XVP 已自动转正时为 0;legacy 管线透传原值,由 CPU `apply_rotation` 补旋。
+    rotation: i32,
+    duration_ms: u64,
+    /// 正立（显示）尺寸，来自 NATIVE 类型 + rotation（与 probe 口径一致）。
+    display_w: u32,
+    display_h: u32,
+    /// 硬解槽位（RAII，Drop 归还并发额度;None = 软解）。仅作所有权锚。
+    _hw: Option<crate::video::d3d::HwSlot>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.cb.timed_out.load(Ordering::Acquire) {
+            // 曾读超时 = reader 已卡在 MF 进程级共享工作队列;此时 `Release()`/`Drop` 极可能
+            // 与 `ReadSample` 一样死等永不返回。泄漏隔离:**不析构 reader**(相当于 mem::forget),
+            // 连同硬解槽一并弃掉(该槽可能仍被 GPU 占用)。callback COM 对象经泄漏的 reader 保活,
+            // 迟到的 `OnReadSample`(30s 后终于返回时)仍有合法共享态可写,不会 use-after-free。
+            if self._hw.is_some() {
+                // 硬解槽随 reader 一并被永久占用(其 Drop 的额度归还被 forget 跳过)。累计泄漏
+                // 会逐步耗尽有限的硬解额度,故留一条 warn 使「多毒文件耗尽额度」在日志可见。
+                // 读快照须在 forget 之前——此刻该槽仍计入 SLOTS_IN_USE(此后永久停留在此值)。
+                let (used, total) = crate::video::d3d::slots_snapshot();
+                tracing::warn!(
+                    slots_used = used,
+                    slots_total = total,
+                    "硬解槽因读帧超时被永久占用(泄漏隔离),已用/总量={used}/{total} | \
+                     hw decode slot permanently leaked due to read timeout"
+                );
+            }
+            std::mem::forget(self._hw.take());
+            // 注:此处刻意不调用 `ManuallyDrop::drop(&mut self.reader)` —— 即泄漏 reader。
+        } else {
+            // 正常路径:reader 仅此一处析构。
+            // SAFETY: `drop` 只跑一次,之后 `self.reader` 不再被访问。
+            unsafe { ManuallyDrop::drop(&mut self.reader) }
+        }
+    }
+}
+
+/// 打开解码会话:硬解优先（拿到槽位才试），open/协商失败回退软解 —— GPU 缺失/驱动异常
+/// 只影响速度，不影响正确性。
+unsafe fn open_session(path: &Path, policy: SizePolicy) -> Result<Session> {
+    if let Some(slot) = crate::video::d3d::try_acquire() {
+        match open_session_inner(path, &policy, Some(&slot)) {
+            Ok(mut s) => {
+                s._hw = Some(slot);
+                return Ok(s);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "hw video session failed, falling back to software | 硬解会话失败，回退软解: {e}"
+                );
+            }
+        }
+    }
+    open_session_inner(path, &policy, None)
+}
+
+unsafe fn open_session_inner(
+    path: &Path,
+    policy: &SizePolicy,
+    hw: Option<&crate::video::d3d::HwSlot>,
+) -> Result<Session> {
+    let (reader, cb) = open_reader(path, hw, true)?;
+    select_video_only(&reader);
+
+    let native = reader
+        .GetNativeMediaType(FIRST_VIDEO_STREAM, 0)
         .map_err(mf_err)?;
-    mt.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-        .map_err(mf_err)?;
+    let raw_rot = native.GetUINT32(&MF_MT_VIDEO_ROTATION).unwrap_or(0);
+    let native_rotation = normalize_rotation(raw_rot);
+    let (nw, nh) = attr_size(&native, &MF_MT_FRAME_SIZE).unwrap_or((0, 0));
+    let (display_w, display_h) = if native_rotation == 90 || native_rotation == 270 {
+        (nh, nw)
+    } else {
+        (nw, nh)
+    };
+    let duration_ms = read_duration_ms(&reader);
+
+    // 请求尺寸:策略按显示坐标系计算,再换算回**解码坐标系**(旋转前)交给 XVP ——
+    // 下面会把 XVP 自动转正关掉,解码输出恒为未旋转朝向,CPU apply_rotation 统一转正。
+    let request = request_size(display_w, display_h, policy).map(|(w, h)| {
+        if native_rotation == 90 || native_rotation == 270 {
+            (h, w)
+        } else {
+            (w, h)
+        }
+    });
+    configure_rgb32(&reader, request, raw_rot, (nw, nh))?;
+    // 双保险:变换链组建后再对实现 IMFVideoProcessorControl 的 MFT 显式 SetRotation(NONE)。
+    pin_no_xvp_rotation(&reader);
+    let geom = output_geometry(&reader)?;
+
+    Ok(Session {
+        reader: ManuallyDrop::new(reader),
+        cb,
+        geom,
+        rotation: native_rotation,
+        duration_ms,
+        display_w,
+        display_h,
+        _hw: None,
+    })
+}
+
+/// 强制关闭源 reader 变换链内 XVP 的自动转正(ADVANCED 管线下 XVP 会按 MF_MT_VIDEO_ROTATION
+/// 自动旋转,与 CPU 侧 apply_rotation 叠成双旋转 —— rot90 基准片实测抓获;且转正后输出类型的
+/// rotation 属性不清零,无法作判据)。枚举链上全部 MFT,对实现 IMFVideoProcessorControl 的
+/// 调 SetRotation(ROTATION_NONE)。legacy 管线取不到该接口 = 本就不自动旋转,失败静默。
+unsafe fn pin_no_xvp_rotation(reader: &IMFSourceReader) {
+    let Ok(ex) = reader.cast::<IMFSourceReaderEx>() else {
+        return;
+    };
+    for idx in 0..8 {
+        let mut category = GUID::zeroed();
+        let mut transform: Option<IMFTransform> = None;
+        if ex
+            .GetTransformForStream(FIRST_VIDEO_STREAM, idx, Some(&mut category), &mut transform)
+            .is_err()
+        {
+            break; // 链枚举尽
+        }
+        if let Some(t) = transform {
+            if let Ok(ctrl) = t.cast::<IMFVideoProcessorControl>() {
+                let _ = ctrl.SetRotation(ROTATION_NONE);
+            }
+        }
+    }
+}
+
+/// 统一的雪碧格尺寸推导（与 request_size 的 CellHeight 分支**必须同算式**，
+/// 否则协商输出与目标格差 1px，逐帧空跑一次缩放）。
+fn sprite_cell(display_w: u32, display_h: u32, cell_h: u32) -> (u32, u32) {
+    let aspect = if display_h > 0 {
+        display_w as f32 / display_h as f32
+    } else {
+        16.0 / 9.0
+    };
+    ((((cell_h as f32) * aspect).round() as u32).max(1), cell_h)
+}
+
+/// 按策略算向 XVP 请求的输出尺寸（**显示坐标系**，正立后）。None = 保持原生。
+/// 坐标系与残余旋转的耦合（90/270 时按管线行为换算/重协商）在 `open_session_inner` 处理。
+fn request_size(display_w: u32, display_h: u32, policy: &SizePolicy) -> Option<(u32, u32)> {
+    if display_w == 0 || display_h == 0 {
+        return None;
+    }
+    let (dw, dh) = (display_w, display_h);
+    match *policy {
+        SizePolicy::FitLongEdge(max) => {
+            let long = dw.max(dh);
+            if max == 0 || long <= max {
+                return None; // 不上采样：小于目标直接原生直出
+            }
+            let r = max as f32 / long as f32;
+            let mut tw = ((dw as f32 * r).round() as u32).max(1);
+            let mut th = ((dh as f32 * r).round() as u32).max(1);
+            // 长边钉死为 max，消除浮点回绕(保证 encode 侧 `w<=target && h<=target` 直通)。
+            if dw >= dh {
+                tw = max;
+            } else {
+                th = max;
+            }
+            Some((tw, th))
+        }
+        SizePolicy::CellHeight(cell_h) => Some(sprite_cell(dw, dh, cell_h)),
+    }
+}
+
+// ── Async ReadSample:回调交接 + 超时护栏 ─────────────────────────────────────────
+// 同步 `IMFSourceReader::ReadSample` 对个别损坏/不支持字节流的容器会死等 MF 内部事件永不
+// 返回(MF_E_UNSUPPORTED_BYTESTREAM_TYPE 错误路径丢事件),且僵死 reader 会占住 MF **进程级**
+// 共享工作队列并扩散到后续所有 reader,rayon 派生池被逐个占满 → 整条派生流水线挂死。
+// 对策:reader 挂 `MF_SOURCE_READER_ASYNC_CALLBACK` 异步回调发起读,结果经 Mutex+Condvar 交回
+// 发起线程;`READ_SAMPLE_TIMEOUT` 内无回调即返回结构化 Err,并置位 `timed_out`——`Drop for Session`
+// 据此**泄漏隔离**僵死 reader(僵死态下 `Release`/`Drop` 可能同样死等)。
+
+/// 读样本超时。取 30s——远大于任何正常单帧解码(4K HEVC 硬解实测 < 数百 ms),又能在派生池
+/// 被逐个拖垮前止损。命中即判定 reader 僵死并弃用。
+const READ_SAMPLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 一次 `OnReadSample` 交付的结果。`sample` 已 AddRef(`.cloned()`),回调返回、MF 释放其自身
+/// 引用后仍有效。
+#[derive(Debug)]
+struct ReadOutcome {
+    hr: HRESULT,
+    stream_flags: u32,
+    sample: Option<IMFSample>,
+}
+
+// SAFETY(跨线程移动 IMFSample):`OnReadSample` 在 MF 工作队列线程写槽、rayon 派生线程读取并
+// 消费,确跨线程。依据:① MF Source Reader 异步回调对象(reader/样本)在 MTA 中为 agile /
+// free-threaded——可在任意 MTA 线程调用而无需 marshaling;回调线程与消费线程都经
+// `CoInitializeEx(MULTITHREADED)`(init_com)进入同一 MTA。② windows-rs 的 `IMFSample` 仅是
+// `NonNull` 指针包装,其 `!Send` 纯因 `NonNull` 保守默认,并非真实线程约束。使用面亦极窄:
+// 单写(回调,同一 reader 的 ReadSample 串行、至多一个在途)+ 单读(消费方 `slot.take()` 恰一次),
+// 全程经 `slot` 的 `Mutex` 保护建立 happens-before;`sample` 已 AddRef、消费后恰释放一次。
+// 仅 `Send` 即足:`Mutex<Option<ReadOutcome>>` 在内层 `Send` 下自带 `Sync`,连带 `CallbackShared`
+// 得 `Send + Sync`,`Arc<CallbackShared>` 遂可跨线程(消除 clippy::arc_with_non_send_sync)。
+unsafe impl Send for ReadOutcome {}
+
+/// 发起线程与 MF 回调线程之间的样本交接槽。
+/// 锁纪律:回调与等待方都只在**持锁瞬间**读写 `slot`,绝不在持锁期间调用任何 COM / 阻塞;
+/// 本文件为纯阻塞上下文(无 `.await`),`std::sync::Mutex` 合规。
+struct CallbackShared {
+    slot: Mutex<Option<ReadOutcome>>,
+    ready: Condvar,
+    /// 置位 = 曾发生读超时。`Drop for Session` 据此泄漏 reader(避免 `Release` 二次挂死),
+    /// 且 `read_frame_at` 据此对已弃用 reader 快速失败,不再发起注定挂死的读。
+    timed_out: AtomicBool,
+}
+
+impl CallbackShared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(None),
+            ready: Condvar::new(),
+            timed_out: AtomicBool::new(false),
+        })
+    }
+}
+
+/// `IMFSourceReaderCallback` 实现:把每次 `OnReadSample` 结果塞入共享槽并唤醒等待线程。
+/// `OnFlush`/`OnEvent` 最小实现(seek 经 `SetCurrentPosition` 内部完成、不产生我们关心的事件;
+/// 亦不订阅源事件)。
+#[implement(IMFSourceReaderCallback)]
+struct ReaderCallback {
+    shared: Arc<CallbackShared>,
+}
+
+impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
+    fn OnReadSample(
+        &self,
+        hrstatus: HRESULT,
+        _dwstreamindex: u32,
+        dwstreamflags: u32,
+        _lltimestamp: i64,
+        psample: Option<&IMFSample>,
+    ) -> windows::core::Result<()> {
+        // 只在持锁瞬间写槽,随即释放锁再唤醒 —— 不持锁跨任何调用。
+        {
+            let mut slot = self.shared.slot.lock().unwrap();
+            *slot = Some(ReadOutcome {
+                hr: hrstatus,
+                stream_flags: dwstreamflags,
+                // AddRef 保活:回调返回后 MF 会释放它自己那份引用。
+                sample: psample.cloned(),
+            });
+        }
+        self.shared.ready.notify_one();
+        Ok(())
+    }
+
+    fn OnFlush(&self, _dwstreamindex: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnEvent(
+        &self,
+        _dwstreamindex: u32,
+        _pevent: Option<&IMFMediaEvent>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+/// 等待 `OnReadSample` 交付结果:命中返回样本;`timeout` 内无回调则置 `timed_out` 并返回结构化
+/// Err(信息含 "read sample timeout" 与 seek 流位置,不泄底层原始串)。纯等待逻辑、不碰真实 MF
+/// —— 便于单测「事件永不 signal → 超时 Err」(见本文件 tests)。
+fn wait_sample_or_timeout(
+    shared: &CallbackShared,
+    timeout: Duration,
+    seek_100ns: i64,
+) -> Result<ReadOutcome> {
+    let deadline = Instant::now() + timeout;
+    let mut slot = shared.slot.lock().unwrap();
+    loop {
+        if let Some(outcome) = slot.take() {
+            return Ok(outcome);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            drop(slot);
+            shared.timed_out.store(true, Ordering::Release);
+            return Err(AppError::Os(format!(
+                "Media Foundation: read sample timeout after {}s (seek={seek_100ns} in 100ns units) | 读样本超时",
+                timeout.as_secs()
+            )));
+        }
+        // `wait_timeout` 释放锁并挂起,返回时重新持锁;spurious wakeup 由外层 loop 复检。
+        let (next, _) = shared.ready.wait_timeout(slot, deadline - now).unwrap();
+        slot = next;
+    }
+}
+
+// ── Source reader setup ─────────────────────────────────────────────────────────
+
+/// 打开一个挂了异步回调的 SourceReader。返回 reader 与其回调共享态(等待/超时/僵死交接)。
+unsafe fn open_reader(
+    path: &Path,
+    hw: Option<&crate::video::d3d::HwSlot>,
+    emit_errors: bool,
+) -> Result<(IMFSourceReader, Arc<CallbackShared>)> {
+    let url = HSTRING::from(path.as_os_str());
+    let mut attrs: Option<IMFAttributes> = None;
+    // 属性数(容量提示):ADVANCED + ASYNC_CALLBACK(+ 可选 D3D_MANAGER)。
+    MFCreateAttributes(&mut attrs, 3).map_err(|e| mf_err_with_mode(e, emit_errors))?;
+    let attrs =
+        attrs.ok_or_else(|| AppError::Internal("MFCreateAttributes returned null".into()))?;
+    // ADVANCED 处理器（XVP）：任意输入格式 → RGB32，且支持**输出尺寸协商**（缩放在 XVP 内完成，
+    // 挂 D3D manager 时上 GPU）。旧式 ENABLE_VIDEO_PROCESSING 只能原生尺寸直出，已弃用。
+    attrs
+        .SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)
+        .map_err(|e| mf_err_with_mode(e, emit_errors))?;
+    // 异步回调:读帧改为「发起 + 回调交付」,配 30s 超时护栏(见 read_frame_at)。reader 会持有
+    // 该回调 COM 对象的引用直至自身释放 —— 超时泄漏 reader 时,回调对象随之保活。
+    let shared = CallbackShared::new();
+    let callback: IMFSourceReaderCallback = ReaderCallback {
+        shared: shared.clone(),
+    }
+    .into();
+    attrs
+        .SetUnknown(&MF_SOURCE_READER_ASYNC_CALLBACK, &callback)
+        .map_err(|e| mf_err_with_mode(e, emit_errors))?;
+    if let Some(slot) = hw {
+        attrs
+            .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, slot.manager())
+            .map_err(|e| mf_err_with_mode(e, emit_errors))?;
+    }
+    let reader =
+        MFCreateSourceReaderFromURL(&url, &attrs).map_err(|e| mf_err_with_mode(e, emit_errors))?;
+    Ok((reader, shared))
+}
+
+/// 只保留首个视频流：反选全部流再单独选回视频，省掉音频解码器初始化与无谓 demux（T1b）。
+/// 个别源不支持流选择 —— 失败不致命，照常全选跑。
+/// (审查 F-07:第二步失败必须回滚重开全部流——旧实现两步都 `let _`,首步成功+次步失败会留下
+/// 「全流禁用」的 reader,后续 ReadSample 必失败,与上行承诺相反。)
+unsafe fn select_video_only(reader: &IMFSourceReader) {
+    if reader.SetStreamSelection(ALL_STREAMS, false).is_err() {
+        // 反选都不支持 → 什么都没改,保持默认全选。
+        return;
+    }
+    if reader.SetStreamSelection(FIRST_VIDEO_STREAM, true).is_err() {
+        // 单流选回失败 → 回滚全选,兑现「失败照常全选跑」。回滚自身失败无计可施,
+        // 后续 ReadSample 报错走既有错误路径(不比旧行为更差)。
+        let _ = reader.SetStreamSelection(ALL_STREAMS, true);
+    }
+}
+
+/// 将首个视频流输出定为 RGB32（内存中 BGRA），可选地请求 XVP 缩放到 `request`（解码坐标系宽高）。
+/// 返回后调用方一律以 `output_geometry`（当前类型实读）为准，故带尺寸协商被拒时静默回退原生。
+///
+/// `raw_rot`：源流的 `MF_MT_VIDEO_ROTATION` 原值。把它**原样声明在输出类型上** =
+/// 「输出仍携带该旋转、由下游（我们的 apply_rotation）补偿」，XVP 据此不自动转内容。
+/// `native`：解码坐标系原生宽高。**输出 FRAME_SIZE 恒显式钉死**（无缩放请求时钉原生）——
+/// 只声明旋转不钉尺寸时,MF 仍会把默认输出尺寸定成旋后宽高,XVP 于是把未旋内容**信箱式**
+/// 塞进转置画幅(四角黑边,rot90 基准片 diag 实证);双属性一起钉才得到未旋、满幅的输出。
+unsafe fn configure_rgb32(
+    reader: &IMFSourceReader,
+    request: Option<(u32, u32)>,
+    raw_rot: u32,
+    native: (u32, u32),
+) -> Result<()> {
+    let make_type = |size: (u32, u32)| -> Result<IMFMediaType> {
+        let mt = MFCreateMediaType().map_err(mf_err)?;
+        mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+            .map_err(mf_err)?;
+        mt.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
+            .map_err(mf_err)?;
+        if raw_rot != 0 {
+            mt.SetUINT32(&MF_MT_VIDEO_ROTATION, raw_rot)
+                .map_err(mf_err)?;
+        }
+        if size.0 > 0 && size.1 > 0 {
+            mt.SetUINT64(&MF_MT_FRAME_SIZE, ((size.0 as u64) << 32) | size.1 as u64)
+                .map_err(mf_err)?;
+        }
+        Ok(mt)
+    };
+    if let Some(req) = request {
+        let mt = make_type(req)?;
+        if reader
+            .SetCurrentMediaType(FIRST_VIDEO_STREAM, None, &mt)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // 个别管线/驱动拒绝带尺寸的协商：退回原生尺寸 RGB32，CPU resize 兜底（慢但正确）。
+        tracing::debug!(
+            "XVP sized negotiation rejected, falling back to native | 尺寸协商被拒，回退原生"
+        );
+    }
+    let mt = make_type(native)?;
     reader
         .SetCurrentMediaType(FIRST_VIDEO_STREAM, None, &mt)
         .map_err(mf_err)?;
     Ok(())
 }
 
-/// Output frame geometry after RGB32 negotiation: width/height + signed row stride.
 /// RGB32 协商后的输出帧几何：宽/高 + 带符号行 stride。
 struct Geometry {
     width: u32,
     height: u32,
-    /// Signed stride: negative ⇒ bottom-up rows.
     /// 带符号 stride：负值 ⇒ 行为 bottom-up。
     stride: i32,
 }
@@ -269,7 +643,6 @@ unsafe fn output_geometry(reader: &IMFSourceReader) -> Result<Geometry> {
         .map_err(mf_err)?;
     let (width, height) = attr_size(&mt, &MF_MT_FRAME_SIZE)
         .ok_or_else(|| AppError::Internal("MF: missing frame size | 缺少帧尺寸".into()))?;
-    // Default stride is stored as a u32 but is semantically i32 (sign = orientation).
     // 默认 stride 以 u32 存储，但语义为 i32（符号 = 朝向）。
     let stride = mt
         .GetUINT32(&MF_MT_DEFAULT_STRIDE)
@@ -284,42 +657,65 @@ unsafe fn output_geometry(reader: &IMFSourceReader) -> Result<Geometry> {
 
 // ── Frame reading ───────────────────────────────────────────────────────────────
 
-/// Seek to `t_100ns` (100-ns units) and read one decoded RGBA frame.
 /// 跳转到 `t_100ns`（100 纳秒单位）并读取一帧解码后的 RGBA。
+///
+/// 异步模式:每次读经 `ReadSample`(输出参数全 None)发起,结果由 `OnReadSample` 回调经
+/// `shared` 交回,配 `READ_SAMPLE_TIMEOUT` 超时。正常路径行为与旧同步实现等价(含 seek 后的
+/// 读帧序列;async 下 `SetCurrentPosition` 仍同步返回,下一次 `ReadSample` 从新位置起始)。
 unsafe fn read_frame_at(
     reader: &IMFSourceReader,
+    shared: &CallbackShared,
     t_100ns: i64,
     geom: &Geometry,
+    path: &Path,
 ) -> Result<DecodedImage> {
+    // 该 reader 已因先前读超时被判僵死:不再发起注定挂死的 `ReadSample`,直接快速失败
+    // (否则封面回退读 / 关键帧后续格会各自再等一个 30s 超时)。
+    if shared.timed_out.load(Ordering::Acquire) {
+        return Err(AppError::Internal(
+            "MF: reader abandoned after prior read timeout | reader 已因先前超时弃用".into(),
+        ));
+    }
     if t_100ns > 0 {
         // GUID_NULL time format = 100-ns reference time. `PROPVARIANT::from(i64)` → VT_I8.
         // GUID_NULL 时间格式 = 100 纳秒参考时间。`PROPVARIANT::from(i64)` → VT_I8。
+        //
+        // ⚠ 已知边界:超时护栏只覆盖 `ReadSample`。现有挂死栈证据仅指向 `ReadSample`,而
+        // `SetCurrentPosition`(seek)走同步返回、不经异步回调,故此处不设护栏——理论上 seek
+        // 亦可能死等(至今未观测到)。彻底解归二期 video-worker 进程隔离(F-029):届时整条
+        // MF 会话可被父进程外部超时终止,无需逐调用护栏。
         let pos = PROPVARIANT::from(t_100ns);
         let _ = reader.SetCurrentPosition(&GUID::zeroed(), &pos);
     }
-    // Read up to a few samples — null samples (stream ticks / gaps) are skipped.
     // 读取至多数个样本 —— null 样本（流 tick / 间隙）跳过。
     for _ in 0..16 {
-        let mut flags: u32 = 0;
-        let mut timestamp: i64 = 0;
-        let mut sample: Option<IMFSample> = None;
+        // 异步发起:async 模式下输出参数必须全 None,结果经 `OnReadSample` 回调交付。
         reader
-            .ReadSample(
-                FIRST_VIDEO_STREAM,
-                0,
-                None,
-                Some(&mut flags),
-                Some(&mut timestamp),
-                Some(&mut sample),
-            )
+            .ReadSample(FIRST_VIDEO_STREAM, 0, None, None, None, None)
             .map_err(mf_err)?;
+        let outcome = match wait_sample_or_timeout(shared, READ_SAMPLE_TIMEOUT, t_100ns) {
+            Ok(o) => o,
+            Err(e) => {
+                // reader 已置 timed_out(见 wait_sample_or_timeout)。泄漏隔离在 Drop for Session。
+                tracing::warn!(
+                    path = %path.display(),
+                    timeout_secs = READ_SAMPLE_TIMEOUT.as_secs(),
+                    "MF ReadSample timed out; abandoning reader to isolate hung MF work queue | \
+                     MF 读样本超时,弃用并泄漏 reader 隔离僵死工作队列"
+                );
+                return Err(e);
+            }
+        };
 
-        if (flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
+        // 回调携带的 HRESULT 先行传播(读失败时 sample 为空,如 MF_E_UNSUPPORTED_BYTESTREAM_TYPE
+        // 经回调如实上报而非挂死 —— 走既有错误路径 → 派生行 status=3)。
+        outcome.hr.ok().map_err(mf_err)?;
+        if (outcome.stream_flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             return Err(AppError::Internal(
                 "MF: end of stream before a frame | 帧前已到流尾".into(),
             ));
         }
-        if let Some(sample) = sample {
+        if let Some(sample) = outcome.sample {
             return sample_to_rgba(&sample, geom);
         }
         // null sample → continue reading
@@ -330,9 +726,11 @@ unsafe fn read_frame_at(
 }
 
 /// Convert an `IMFSample` (RGB32, memory order B,G,R,X) into a top-down RGBA `DecodedImage`,
-/// honouring the (possibly negative) stride.
+/// honouring the (possibly negative) stride. On the D3D path this Lock performs the GPU→CPU
+/// readback — by then the frame is already XVP-downscaled, so the copy is small.
 /// 将 `IMFSample`（RGB32，内存序 B,G,R,X）转换为 top-down 的 RGBA `DecodedImage`，
-/// 并尊重（可能为负的）stride。
+/// 并尊重（可能为负的）stride。D3D 路径下此处 Lock 即 GPU→CPU readback —— 帧已被 XVP
+/// 缩小，拷贝量小。
 unsafe fn sample_to_rgba(sample: &IMFSample, geom: &Geometry) -> Result<DecodedImage> {
     let buffer = sample.ConvertToContiguousBuffer().map_err(mf_err)?;
     let mut data: *mut u8 = std::ptr::null_mut();
@@ -348,7 +746,7 @@ unsafe fn sample_to_rgba(sample: &IMFSample, geom: &Geometry) -> Result<DecodedI
         }
         let cur = cur_len as usize;
         // SAFETY: `data` 已校验非空；MF 的 Lock 契约保证 locked 缓冲区自 `data` 起至少
-        // `cur` 字节有效。转成切片后下方逐像素拷贝走安全索引（守卫保证不越界）。
+        // `cur` 字节有效。转成切片后下方拷贝走安全索引（守卫保证不越界）。
         let src = std::slice::from_raw_parts(data, cur);
         let out = copy_bgr32_to_rgba(
             src,
@@ -361,6 +759,7 @@ unsafe fn sample_to_rgba(sample: &IMFSample, geom: &Geometry) -> Result<DecodedI
             pixels: out,
             width: geom.width,
             height: geom.height,
+            icc: None, // 视频帧无 ICC 来源,按 sRGB 假定
         })
     })();
 
@@ -368,272 +767,183 @@ unsafe fn sample_to_rgba(sample: &IMFSample, geom: &Geometry) -> Result<DecodedI
     result
 }
 
-/// 把 MF 输出的 RGB32（内存序 B,G,R,X，每像素 4B，可能 bottom-up + stride 对齐填充）
-/// 转成 top-down 的紧凑 RGBA。抽成纯函数（输入 `src` 切片）以便对边界单测。
-///
-/// 🔴 边界守卫（Part3 Q16 / §3.8.1）：行内对像素 `x` 的最大访问下标是 `s+2`（R 通道），
-/// 故仅当 `s + 3 > cur`（即 `s+2 >= cur`，下一个像素已越界）才 break。
-/// 旧实现用 `s + 3 >= cur`，在 `s + 3 == cur`（恰好最后一个合法像素，`s+2 == cur-1` 仍有效）
-/// 时即提前 break，导致宽幅/紧凑对齐视频帧的尾像素被静默填黑。
-fn copy_bgr32_to_rgba(
-    src: &[u8],
-    w: usize,
-    h: usize,
-    abs_stride: usize,
-    bottom_up: bool,
-) -> Vec<u8> {
-    let cur = src.len();
-    let mut out = vec![0u8; w * h * 4];
-    for row in 0..h {
-        // For bottom-up frames, image row 0 (top) is the last row in memory.
-        // bottom-up 帧：图像第 0 行（顶部）是内存中的最后一行。
-        let mem_row = if bottom_up { h - 1 - row } else { row };
-        let src_off = mem_row * abs_stride;
-        let dst_off = row * w * 4;
-        for x in 0..w {
-            let s = src_off + x * 4;
-            if s + 3 > cur {
-                break;
-            }
-            let d = dst_off + x * 4;
-            out[d] = src[s + 2]; // R ← byte[2]
-            out[d + 1] = src[s + 1]; // G ← byte[1]
-            out[d + 2] = src[s]; // B ← byte[0]
-            out[d + 3] = 255; // A (RGB32 has no alpha)
-        }
-    }
-    out
-}
+// ── Attribute helpers / frame post-processing ────────────────────────────────
+// 迁至 `super::mf_attrs` / `super::frame_post`（见文件顶部 use，超长文件拆分方案 tierB-3）。
 
-// ── Attribute helpers ─────────────────────────────────────────────────────────
-
-/// Read a packed (width, height) attribute (e.g. `MF_MT_FRAME_SIZE`).
-/// 读取打包的 (宽, 高) 属性（如 `MF_MT_FRAME_SIZE`）。
-unsafe fn attr_size(mt: &IMFMediaType, key: &GUID) -> Option<(u32, u32)> {
-    // Frame size is a u64 attribute: high 32 bits = width, low 32 bits = height.
-    // 帧尺寸为 u64 属性：高 32 位 = 宽，低 32 位 = 高。
-    let packed = mt.GetUINT64(key).ok()?;
-    Some(((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32))
-}
-
-/// Read a packed (numerator, denominator) ratio attribute (e.g. `MF_MT_FRAME_RATE`).
-/// 读取打包的 (分子, 分母) 比率属性（如 `MF_MT_FRAME_RATE`）。
-unsafe fn attr_ratio(mt: &IMFMediaType, key: &GUID) -> Option<(u32, u32)> {
-    let packed = mt.GetUINT64(key).ok()?;
-    Some(((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32))
-}
-
-/// Total duration in ms via the media source's `MF_PD_DURATION` (a 100-ns VT_UI8 PROPVARIANT).
-/// 通过媒体源的 `MF_PD_DURATION`（100 纳秒 VT_UI8 PROPVARIANT）取总时长（毫秒）。
-unsafe fn read_duration_ms(reader: &IMFSourceReader) -> u64 {
-    match reader.GetPresentationAttribute(MEDIASOURCE, &MF_PD_DURATION) {
-        Ok(pv) => {
-            let v = PropVariantToInt64(&pv).unwrap_or(0);
-            if v > 0 {
-                (v as u64) / 10_000
-            } else {
-                0
-            }
-        }
-        Err(_) => 0,
-    }
-}
-
-/// Map a video subtype GUID to a short codec label, best-effort.
-/// 尽力将视频子类型 GUID 映射为简短编解码标签。
-fn codec_label(subtype: GUID) -> Option<String> {
-    let name = if subtype == MFVideoFormat_H264 {
-        "H264"
-    } else if subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_HEVC_ES {
-        "HEVC"
-    } else if subtype == MFVideoFormat_MPEG2 {
-        "MPEG2"
-    } else if subtype == MFVideoFormat_MP4V {
-        "MPEG4"
-    } else if subtype == MFVideoFormat_WMV3 {
-        "WMV3"
-    } else if subtype == MFVideoFormat_WVC1 {
-        "VC1"
-    } else {
-        return None;
-    };
-    Some(name.to_string())
-}
-
-/// Clamp the raw `MF_MT_VIDEO_ROTATION` to {0, 90, 180, 270}.
-/// 将原始 `MF_MT_VIDEO_ROTATION` 归一到 {0, 90, 180, 270}。
-fn normalize_rotation(raw: u32) -> i32 {
-    match raw {
-        90 => 90,
-        180 => 180,
-        270 => 270,
-        _ => 0,
-    }
-}
-
-// ── Image post-processing (image crate) ─────────────────────────────────────────
-
-/// Rotate a decoded frame to upright per `rotation` degrees (clockwise), swapping w/h for 90/270.
-/// 按 `rotation` 度（顺时针）把解码帧旋转正立，90/270 时交换宽高。
-fn apply_rotation(img: DecodedImage, rotation: i32) -> DecodedImage {
-    if rotation == 0 {
-        return img;
-    }
-    let Some(rgba) = image::RgbaImage::from_raw(img.width, img.height, img.pixels) else {
-        // 缓冲尺寸不符（理论上不会）：原样返回，避免 panic。
-        return DecodedImage {
-            pixels: Vec::new(),
-            width: 0,
-            height: 0,
-        };
-    };
-    let dyn_img = image::DynamicImage::ImageRgba8(rgba);
-    let rotated = match rotation {
-        90 => dyn_img.rotate90(),
-        180 => dyn_img.rotate180(),
-        270 => dyn_img.rotate270(),
-        _ => dyn_img,
-    };
-    let out = rotated.to_rgba8();
-    let (w, h) = (out.width(), out.height());
-    DecodedImage {
-        pixels: out.into_raw(),
-        width: w,
-        height: h,
-    }
-}
-
-/// Downscale a decoded frame to `tw × th` (used for uniform sprite cells).
-/// 将解码帧缩放到 `tw × th`（用于统一的雪碧图格）。
-fn resize_rgba(img: &DecodedImage, tw: u32, th: u32) -> DecodedImage {
-    if img.width == tw && img.height == th {
-        return DecodedImage {
-            pixels: img.pixels.clone(),
-            width: tw,
-            height: th,
-        };
-    }
-    use fast_image_resize::images::Image as FirImage;
-    use fast_image_resize::pixels::PixelType;
-    use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
-
-    // Bind the clone to a local so the borrow outlives `from_slice_u8` (no temporary drop).
-    // 将克隆绑定到局部变量，使借用比 `from_slice_u8` 活得更久（避免临时值被释放）。
-    let mut src_buf = img.pixels.clone();
-    let src = match FirImage::from_slice_u8(
-        img.width.max(1),
-        img.height.max(1),
-        &mut src_buf,
-        PixelType::U8x4,
-    ) {
-        Ok(s) => s,
-        Err(_) => {
-            return DecodedImage {
-                pixels: img.pixels.clone(),
-                width: img.width,
-                height: img.height,
-            }
-        }
-    };
-    let mut dst = FirImage::new(tw.max(1), th.max(1), PixelType::U8x4);
-    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
-    let mut resizer = Resizer::new();
-    if resizer.resize(&src, &mut dst, &opts).is_err() {
-        return DecodedImage {
-            pixels: img.pixels.clone(),
-            width: img.width,
-            height: img.height,
-        };
-    }
-    DecodedImage {
-        pixels: dst.into_vec(),
-        width: tw,
-        height: th,
-    }
-}
-
-/// Cheap "is this frame ~black" check (skip leading black frames for covers).
-/// 廉价的「该帧是否接近全黑」判断（封面跳过片头黑帧）。
-fn is_too_dark(img: &DecodedImage) -> bool {
-    if img.pixels.len() < 4 {
-        return true;
-    }
-    // Sample every 64th pixel's luma; cheap and good enough.
-    // 每隔 64 个像素采样其亮度；廉价且足够。
-    let mut sum: u64 = 0;
-    let mut count: u64 = 0;
-    let mut i = 0;
-    while i + 3 < img.pixels.len() {
-        let r = img.pixels[i] as u64;
-        let g = img.pixels[i + 1] as u64;
-        let b = img.pixels[i + 2] as u64;
-        sum += (r * 299 + g * 587 + b * 114) / 1000;
-        count += 1;
-        i += 4 * 64;
-    }
-    if count == 0 {
-        return true;
-    }
-    (sum / count) < 16 // 平均亮度 < 16（0-255）视为黑帧
-}
-
-/// Map a Windows COM error into our `AppError`.
 /// 将 Windows COM 错误映射为我们的 `AppError`。
 fn mf_err(e: windows::core::Error) -> AppError {
-    AppError::Os(format!("Media Foundation: {e}"))
+    AppError::os(
+        "Media Foundation 操作失败 | Media Foundation operation failed",
+        e,
+    )
+}
+
+/// 批量探测的失败由扫描器按格式汇总；不在底层构造 `AppError` 时逐项写错误日志。
+fn mf_probe_err(_e: windows::core::Error) -> AppError {
+    AppError::Os("Media Foundation 探测失败 | Media Foundation probe failed".into())
+}
+
+fn mf_err_with_mode(e: windows::core::Error, emit_errors: bool) -> AppError {
+    if emit_errors {
+        mf_err(e)
+    } else {
+        mf_probe_err(e)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::copy_bgr32_to_rgba;
+    use super::{request_size, sprite_cell, SizePolicy};
+    use super::{wait_sample_or_timeout, CallbackShared, ReadOutcome};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
-    /// 🔴 回归：紧凑对齐（stride==w*4）下，缓冲区恰好覆盖到最后一个像素的 R 通道
-    /// （`s+3 == cur`）时，尾像素必须被拷贝、不得填黑。旧 `>=` 守卫会丢这一像素。
+    /// 临时诊断(#[ignore],手动跑):VIDEO_DIAG=<path> cargo test -p scrollery --lib \
+    ///   video::media_foundation::tests::diag_pipeline_env -- --ignored --nocapture
+    /// 打印 native/协商类型的尺寸与 rotation 属性、stride、解码首帧的角点像素,
+    /// 用于查 XVP 自动转正/几何错位类问题。
     #[test]
-    fn tail_pixel_copied_when_buffer_ends_exactly() {
-        // w=2,h=1：像素0 用字节[0..3]，像素1 用字节[4..6]（B,G,R）。
-        // cur=7 → 像素1 的 s=4，s+3=7==cur：新守卫 7>7=false 仍拷贝；旧守卫 7>=7=true 会丢。
-        let src = [10u8, 11, 12, 99, 40, 50, 60]; // 7 字节
-        let out = copy_bgr32_to_rgba(&src, 2, 1, 8, false);
-        // 像素0：R=src[2],G=src[1],B=src[0]
-        assert_eq!(&out[0..4], &[12, 11, 10, 255]);
-        // 像素1（尾像素）：R=src[6],G=src[5],B=src[4] —— 不得为黑
-        assert_eq!(&out[4..8], &[60, 50, 40, 255]);
+    #[ignore]
+    fn diag_pipeline_env() {
+        let Some(p) = std::env::var_os("VIDEO_DIAG") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(p);
+        super::ensure_mf();
+        super::init_com();
+        unsafe {
+            let (reader, cb) = super::open_reader(&path, None, true).expect("open");
+            super::select_video_only(&reader);
+            let native = reader
+                .GetNativeMediaType(super::FIRST_VIDEO_STREAM, 0)
+                .expect("native");
+            let raw_rot = native
+                .GetUINT32(&windows::Win32::Media::MediaFoundation::MF_MT_VIDEO_ROTATION)
+                .unwrap_or(999);
+            let (nw, nh) = super::attr_size(
+                &native,
+                &windows::Win32::Media::MediaFoundation::MF_MT_FRAME_SIZE,
+            )
+            .unwrap_or((0, 0));
+            println!("native: {nw}x{nh} rot_attr={raw_rot}");
+
+            super::configure_rgb32(
+                &reader,
+                None,
+                if raw_rot == 999 { 0 } else { raw_rot },
+                (nw, nh),
+            )
+            .expect("configure");
+            super::pin_no_xvp_rotation(&reader);
+            let cur = reader
+                .GetCurrentMediaType(super::FIRST_VIDEO_STREAM)
+                .expect("current");
+            let (cw, ch) = super::attr_size(
+                &cur,
+                &windows::Win32::Media::MediaFoundation::MF_MT_FRAME_SIZE,
+            )
+            .unwrap_or((0, 0));
+            let cur_rot = cur
+                .GetUINT32(&windows::Win32::Media::MediaFoundation::MF_MT_VIDEO_ROTATION)
+                .map(|v| v as i64)
+                .unwrap_or(-1);
+            let geom = super::output_geometry(&reader).expect("geom");
+            println!(
+                "negotiated: {cw}x{ch} rot_attr={cur_rot} geom={}x{} stride={}",
+                geom.width, geom.height, geom.stride
+            );
+
+            let img = super::read_frame_at(&reader, &cb, 10_000_000, &geom, &path).expect("frame");
+            let px = |x: u32, y: u32| -> (u8, u8, u8) {
+                let i = ((y * img.width + x) * 4) as usize;
+                (img.pixels[i], img.pixels[i + 1], img.pixels[i + 2])
+            };
+            let (w, h) = (img.width, img.height);
+            println!(
+                "frame {}x{} TL={:?} TR={:?} BL={:?} BR={:?} C={:?}",
+                w,
+                h,
+                px(w / 8, h / 8),
+                px(w - 1 - w / 8, h / 8),
+                px(w / 8, h - 1 - h / 8),
+                px(w - 1 - w / 8, h - 1 - h / 8),
+                px(w / 2, h / 2),
+            );
+        }
     }
 
-    /// bottom-up 帧（stride<0 → 此处 bottom_up=true）：图像第 0 行取自内存最后一行。
+    // 🔴 copy_bgr32_to_rgba 尾像素/bottom-up/padding/截断四单测已随函数迁至
+    // `video::frame_post::tests`（见超长文件拆分方案 tierB-3）。
+
+    /// 尺寸协商（显示坐标系）：FitLongEdge 不上采样、长边钉死为 max（保证 encode 侧直通）;
+    /// CellHeight 与 sprite_cell 同算式（差 1px 都会让逐帧缩放空跑）。
+    /// 旋转坐标系换算/重协商在 open_session_inner（依赖 COM,由 bench --rotation-check 钉住）。
     #[test]
-    fn bottom_up_reverses_row_order() {
-        // w=1,h=2,stride=4：内存行0=[1,2,3,0]，内存行1=[4,5,6,0]。
-        let src = [1u8, 2, 3, 0, 4, 5, 6, 0];
-        let out = copy_bgr32_to_rgba(&src, 1, 2, 4, true);
-        // 图像行0 = 内存行1：R=6,G=5,B=4
-        assert_eq!(&out[0..4], &[6, 5, 4, 255]);
-        // 图像行1 = 内存行0：R=3,G=2,B=1
-        assert_eq!(&out[4..8], &[3, 2, 1, 255]);
+    fn request_size_policies() {
+        // 横 4K,长边限 512:长边钉 512,短边按比例。
+        assert_eq!(
+            request_size(3840, 2160, &SizePolicy::FitLongEdge(512)),
+            Some((512, 288))
+        );
+        // 竖幅(显示尺寸已正立):长边=高。
+        assert_eq!(
+            request_size(1080, 1920, &SizePolicy::FitLongEdge(512)),
+            Some((288, 512))
+        );
+        // 小于目标:不上采样,原生直出。
+        assert_eq!(request_size(320, 240, &SizePolicy::FitLongEdge(512)), None);
+        // 0 = 不限制(原生)。
+        assert_eq!(request_size(3840, 2160, &SizePolicy::FitLongEdge(0)), None);
+        // 雪碧格:与 sprite_cell 完全一致。
+        assert_eq!(
+            request_size(1920, 1080, &SizePolicy::CellHeight(200)),
+            Some(sprite_cell(1920, 1080, 200))
+        );
+        // 小视频雪碧格允许上采样(保证格统一)。
+        assert_eq!(
+            request_size(160, 120, &SizePolicy::CellHeight(200)),
+            Some(sprite_cell(160, 120, 200))
+        );
+        // 零尺寸防御。
+        assert_eq!(request_size(0, 0, &SizePolicy::FitLongEdge(512)), None);
     }
 
-    /// stride 含填充（abs_stride > w*4）：每行尾部 padding 字节被跳过，不污染输出。
+    /// 🔴 超时护栏:模拟「`OnReadSample` 事件永不 signal」——不往交接槽写任何东西,断言在
+    /// `timeout` 后返回结构化 Err(含 "read sample timeout" 与 seek 流位置)且置位 `timed_out`
+    /// (`Drop for Session` 据此泄漏隔离僵死 reader)。纯等待逻辑,不触碰真实 MF。
     #[test]
-    fn padded_stride_skips_alignment_bytes() {
-        // w=1,h=2,abs_stride=8（4 像素数据 + 4 填充）。
-        let src = [9u8, 8, 7, 0, 0xAA, 0xBB, 0xCC, 0xDD, 6, 5, 4, 0, 0, 0, 0, 0];
-        let out = copy_bgr32_to_rgba(&src, 1, 2, 8, false);
-        assert_eq!(&out[0..4], &[7, 8, 9, 255]); // 行0 像素：R=7,G=8,B=9
-        assert_eq!(&out[4..8], &[4, 5, 6, 255]); // 行1 像素：R=4,G=5,B=6
+    fn wait_times_out_when_callback_never_signals() {
+        let shared = CallbackShared::new();
+        let err = wait_sample_or_timeout(&shared, Duration::from_millis(40), 1_234_567)
+            .expect_err("无信号且超时须返回 Err");
+        let msg = format!("{err}");
+        assert!(msg.contains("read sample timeout"), "err msg = {msg}");
+        assert!(msg.contains("1234567"), "err msg 须含 seek 流位置: {msg}");
+        assert!(
+            shared.timed_out.load(Ordering::Acquire),
+            "超时须置位 timed_out"
+        );
     }
 
-    /// 损坏/截断缓冲区（cur 远小于 w*h*4）：守卫保证不 panic，未覆盖区域留零（黑），
-    /// 已覆盖的前缀像素仍正确拷贝。
+    /// 交接槽已有结果时立即返回 Ok、不误判超时、不置 `timed_out`。等待方唤醒后复检 `slot.take()`
+    /// 走的正是这条取值路径(此处不构造真 IMFSample,sample=None,只验交接语义)。
     #[test]
-    fn truncated_buffer_does_not_panic() {
-        // 声称 2×2，但只给 6 字节（不足 1.5 像素）。
-        let src = [10u8, 20, 30, 0, 40, 50];
-        let out = copy_bgr32_to_rgba(&src, 2, 2, 8, false);
-        assert_eq!(out.len(), 2 * 2 * 4);
-        // 像素(0,0)：s=0，s+3=3<=6 → 拷贝 R=30,G=20,B=10
-        assert_eq!(&out[0..4], &[30, 20, 10, 255]);
-        // 像素(0,1)：s=4，s+3=7>6 → break，留零
-        assert_eq!(&out[4..8], &[0, 0, 0, 0]);
+    fn wait_returns_outcome_when_slot_filled() {
+        let shared = CallbackShared::new();
+        {
+            let mut slot = shared.slot.lock().unwrap();
+            *slot = Some(ReadOutcome {
+                hr: windows::core::HRESULT(0),
+                stream_flags: 0xABCD,
+                sample: None,
+            });
+        }
+        let out = wait_sample_or_timeout(&shared, Duration::from_secs(5), 0)
+            .expect("已填充交接槽须返回 Ok");
+        assert_eq!(out.stream_flags, 0xABCD);
+        assert!(
+            !shared.timed_out.load(Ordering::Acquire),
+            "命中不应置 timed_out"
+        );
     }
 }

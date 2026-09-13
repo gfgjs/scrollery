@@ -24,8 +24,13 @@ jobs:
   #    三个重 job 迁本机 dev-box-win(D:\actions-runner,self-hosted 分钟不计费不受配额限制);
   #    rust-linux 留 ubuntu-latest(本机无 WSL/Docker,job 轻量,月免费额度可承载)。
   #    回迁只需把 runs-on 改回 windows-latest;勿把本 runner 挂到公开仓(fork PR 可在 runner 上执行任意代码)。
+  # 🔴 全部 job 加仓库 guard(2026-07-06,随自托管切换):本文件随投影进公开仓,但 self-hosted 标签
+  #    在公开仓无 runner 可领(且安全铁律禁止给公开仓挂自托管)→ 不 guard 则公开 main 每次提升都留一个
+  #    24h 超时的僵尸 queued run。公开树的编译/测试把关由 oss-gate 承担(sync-staging 上跑,托管免费);
+  #    未来接受外部 PR 时再议公开 CI 形态(须回托管标签+fork 安全审)。
   rust:
     name: Rust Check & Clippy & Test
+    if: github.repository == 'gfgjs/scrollery-private'
     runs-on: [self-hosted, Windows, X64]
     defaults:
       run:
@@ -38,6 +43,9 @@ jobs:
         with:
           components: clippy
 
+      - name: 补装 raw-worker 依赖 target
+        run: rustup target add x86_64-pc-windows-gnu
+
       # 编译缓存:仅托管 runner 需要(冷机);自托管 _work 目录本身持久,再走 GitHub cache 纯网络往返浪费,
       # 且 restore 会用陈旧缓存覆盖更新的本地 target(runner.environment 是 GitHub 内置上下文)。
       - name: Rust 编译缓存
@@ -45,10 +53,21 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # ③ 见文件头:原「npm ci 材料化 ONNX 资源」步骤已随 Part7-T6 撤销(资源声明已删)。
+      # ⚠ 推理测试红线(2026-07-23 裁决 J16):rust/rust-linux 两 job 均无 npm 步骤,
+      #   .cargo/config.toml 的 ORT_DYLIB_PATH 相对指向 node_modules 在 CI 上落空——
+      #   一切真加载 ORT(load_session_pool 类)的测试必须 #[ignore] 手跑;若日后要让此类
+      #   测试进 CI,须同一变更给两 job 补 npm ci(或单包 materialize)步骤,否则报
+      #   ModelLoadFailed 假故障。.cargo/config.toml 侧有对称注释。
 
       # ④ 见文件头:generate_context! 编译期校验 frontendDist("../dist")存在。
       - name: 占位 dist(generate_context 校验 frontendDist)
         run: mkdir -p dist
+
+      # fmt 门(2026-07-10 审查 B17):AGENTS.md 规定 rustfmt+clippy 双工具,此前只有 clippy
+      # 在把门,fmt 漂移全靠提交自觉。--check 零编译,秒级;单跑 Windows 主 job 即可(fmt 与
+      # 平台无关,rust-linux 不重复)。
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: cargo check --workspace
         run: cargo check --workspace --locked
@@ -96,6 +115,7 @@ jobs:
   rust-linux:
     name: Rust Check & Test (Linux 编译面)
     # phase-2(2026-07-06):迁 WSL2 自托管 dev-box-wsl——托管 ubuntu 受配额/账单钳制,本 job 曾是唯一必红位。
+    if: github.repository == 'gfgjs/scrollery-private'
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
@@ -121,12 +141,14 @@ jobs:
       - name: cargo check --workspace
         run: cargo check --workspace --locked
 
+      # ⚠ 无 npm 步骤=无 ORT DLL,推理测试须 #[ignore](J16,详见 rust job 同名注释)。
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
   frontend:
     name: Frontend Typecheck & Test
     # 自托管(见 rust job 注):node 脚本与 npm 命令均跨平台,Windows 本机可跑;默认 pwsh 即可(无 bash 语法步骤)。
+    if: github.repository == 'gfgjs/scrollery-private'
     runs-on: [self-hosted, Windows, X64]
     steps:
       - uses: actions/checkout@v4
@@ -147,9 +169,37 @@ jobs:
         run: node scripts/sync-version.mjs --check
 
       # Part8-D10 改名门禁(就绪态):rename-gate.json active=false 期间仅 selftest+skip(秒级);
-      # 改名施工第 7 步翻 true 后,品牌旧词根回流即红(豁免面=plan-docs 历史文档+PICASA_ env 缓改族)。
+      # 改名施工第 7 步翻 true 后,品牌旧词根回流即红(豁免面=docs 历史文档+PICASA_ env 缓改族)。
       - name: 改名门禁(check-rename-gate)
         run: node scripts/check-rename-gate.mjs
+
+      # 2026-07-19 评审整改B5(旧五套 docs/closeout/index/skill 治理门已删,迁入 worklog-kit
+      # docs-governance.yml——避免与新门双重收税):原文档门禁(check_docs)、canonical 门禁
+      # (check_plan_canonical)、skill 安装器自检、收口契约自检(check_docs --selftest-closeout)、
+      # 文档索引新鲜度门(check_docs_index + 自检)六步整段移除。与文档治理无关的门禁不动。
+
+      # 2026-07-11 加固批 A-5(事故防复发):嵌套 cargo config + 配置文件盘符绝对路径拦截。
+      # 起因=src-tauri/.cargo/config.toml 死路径就近劫持 tauri dev(experience.md §5),纯静态秒级。
+      - name: 路径卫生门禁(check-path-hygiene)
+        run: node scripts/check-path-hygiene.mjs
+
+      # exotic 协议版本跨语言同步门(2026-07-13 事故防复发):Rust frame.rs 与 JS exotic-signing.mjs
+      # 的 PROTOCOL_VERSION 必须相等——升 host 漏改 JS 会令打包器把旧版本号烙进插件清单被 installer
+      # 启动前复核判 protocol_mismatch 拒装(psd 插件根因)。纯静态读两文件,秒级;先跑 selftest 防退化。
+      - name: exotic 协议版本同步自检(--selftest)
+        run: node scripts/check-exotic-protocol-sync.mjs --selftest
+
+      - name: exotic 协议版本同步门(check-exotic-protocol-sync)
+        run: node scripts/check-exotic-protocol-sync.mjs
+
+      # 主题对比度门(2026-07-10 审查 B17 后半):a44436b 扩到 21 组的 WCAG 硬门槛此前只有
+      # 手跑路径,主题 CSS 回归可静默入库(「门禁落地须接门控」纪律)。纯静态读 CSS,秒级。
+      - name: 主题对比度门禁(check-theme-contrast)
+        run: node scripts/check-theme-contrast.mjs
+
+      # B1:主题中性层/accent/status 由静态锚点生成,防止六份 CSS 手改后派生角色漂移。
+      - name: 主题色板锚点门禁(check-theme-palette)
+        run: node scripts/generate-theme-palette.mjs --check
 
       # R2-3:存量 33 lint 错清零后开硬门(含 R1-7 的 vue/no-bare-strings-in-template i18n 防回潮规则)。
       - name: ESLint
@@ -180,7 +230,7 @@ jobs:
   # T16/T17 commercial/oss 双流水线建成后,本 job 迁入其中(§3.1.6 的最终归宿)。
   smoke:
     name: 开机冒烟(build 产物断言)
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: github.repository == 'gfgjs/scrollery-private' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, Windows, X64] # 自托管(见 rust job 注);tauri build 本机温缓存快一个量级
     defaults:
       run:
@@ -212,8 +262,38 @@ jobs:
       - name: tauri build --no-bundle(release exe)
         run: npx tauri build --no-bundle
 
+      # 发货闭包 staging 断言(F-001 候选落地,2026-08-11):--no-bundle 无安装包,
+      # 本步只验 staging 文件 + conf 接线;安装包载荷级断言在 release.yml 拆包硬验。
+      - name: 发货闭包断言(staging + conf)
+        run: node scripts/verify-bundle-content.mjs
+
       - name: 开机冒烟断言(PICASA_SMOKE_TEST=1 → exit 0)
         timeout-minutes: 5
         run: |
           PICASA_SMOKE_TEST=1 ./target/release/scrollery.exe
           echo "冒烟通过:应用达 RunEvent::Ready 并 exit(0)"
+
+  # ── RAW 独立 workspace 验证(P1-2,2026-09-12)──────────────────────────────────
+  # raw-worker 刻意脱离根 workspace(rsraw 的 build.rs 在 MSVC 下硬 panic),只能 gnu target 单独编译;
+  # 它因此天然落在 `cargo test --workspace`(rust/rust-linux 两 job)之外,回归长期无人把守。本 job
+  # 用 scripts/acceptance/raw-worker-test.mjs 一条命令固化:结构守卫(仍在 workspace 外 + 未进根
+  # lockfile)+ fmt + test --locked --target gnu + 产物存在性。
+  raw-worker:
+    name: RAW Worker(gnu 独立 workspace)
+    if: github.repository == 'gfgjs/scrollery-private'
+    runs-on: [self-hosted, Windows, X64]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 与 rust job 同款前置:gnu target 缺失时 cargo 只报难读的 linker 错,先补 target 再测。
+      - name: 补装 raw-worker 依赖 target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: RAW 独立验证(结构守卫 + fmt + test + 产物)
+        run: node scripts/acceptance/raw-worker-test.mjs --expect-binary

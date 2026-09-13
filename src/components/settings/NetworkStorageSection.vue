@@ -23,7 +23,7 @@
           class="ns-btn ns-btn--danger"
           @click="remove(b.id)"
           :title="$t('settings.nsRemove')"
-          :aria-label="$t('settings.nsRemove')"
+
         >
           <Trash2 :size="15" />
         </button>
@@ -34,53 +34,46 @@
     <!-- 添加表单 -->
     <div class="ns-form">
       <div class="ns-row">
-        <label class="ns-field ns-field--kind">
-          <span>{{ $t('settings.nsType') }}</span>
+        <UiField :label="$t('settings.nsType')" class="ns-field--kind">
           <select v-model="form.kind">
             <option value="webdav">WebDAV</option>
             <option value="smb">{{ $t('settings.nsTypeSmb') }}</option>
             <option value="local">{{ $t('settings.nsTypeLocal') }}</option>
           </select>
-        </label>
-        <label class="ns-field ns-field--grow">
-          <span>{{ $t('settings.nsName') }}</span>
+        </UiField>
+        <UiField :label="$t('settings.nsName')" class="ns-field--grow">
           <input v-model="form.name" type="text" :placeholder="$t('settings.nsNamePlaceholder')" />
-        </label>
+        </UiField>
       </div>
 
-      <label v-if="form.kind === 'webdav'" class="ns-field">
-        <span>{{ $t('settings.nsAddress') }}</span>
+      <UiField v-if="form.kind === 'webdav'" :label="$t('settings.nsAddress')">
         <input
           v-model="form.host"
           type="text"
           placeholder="https://dav.example.com/remote.php/dav/files/me"
         />
-      </label>
-      <label v-else class="ns-field">
-        <span>{{ $t('settings.nsPath') }}</span>
+      </UiField>
+      <UiField v-else :label="$t('settings.nsPath')">
         <input
           v-model="form.basePath"
           type="text"
           :placeholder="form.kind === 'smb' ? '\\\\NAS\\media' : 'D:\\Media'"
         />
-      </label>
+      </UiField>
 
       <div v-if="form.kind === 'webdav'" class="ns-row">
-        <label class="ns-field ns-field--grow">
-          <span>{{ $t('settings.nsSubPath') }}</span>
+        <UiField :label="$t('settings.nsSubPath')" class="ns-field--grow">
           <input v-model="form.basePath" type="text" placeholder="photos" />
-        </label>
+        </UiField>
       </div>
 
       <div v-if="form.kind === 'webdav'" class="ns-row">
-        <label class="ns-field ns-field--grow">
-          <span>{{ $t('settings.nsUsername') }}</span>
+        <UiField :label="$t('settings.nsUsername')" class="ns-field--grow">
           <input v-model="form.username" type="text" autocomplete="off" />
-        </label>
-        <label class="ns-field ns-field--grow">
-          <span>{{ $t('settings.nsPassword') }}</span>
+        </UiField>
+        <UiField :label="$t('settings.nsPassword')" class="ns-field--grow">
           <input v-model="form.password" type="password" autocomplete="new-password" />
-        </label>
+        </UiField>
       </div>
 
       <div class="ns-actions">
@@ -100,10 +93,11 @@
 // 网络存储后端管理（需求8 8B, §3.8）：列出 / 测试 / 添加 / 移除 WebDAV（及 SMB/本地）后端。
 // 密码经后端存入系统 keyring，不落库（前端永不回显密码）。
 import { ref, reactive, computed, onMounted } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { invokeIpc } from '../../utils/ipc'
 import { HardDrive, Server, FolderOpen, Trash2, Plug, Plus, Lock } from '@lucide/vue'
 import { IPC } from '../../constants/ipc'
 import CollapsibleCard from './CollapsibleCard.vue'
+import UiField from '../ui/UiField.vue'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -151,7 +145,7 @@ function setMessage(text: string, kind: 'ok' | 'err') {
 
 async function loadBackends() {
   try {
-    backends.value = await invoke<BackendInfo[]>(IPC.LIST_BACKENDS)
+    backends.value = await invokeIpc<BackendInfo[]>(IPC.LIST_BACKENDS)
   } catch (e) {
     setMessage(t('settings.nsLoadFailed', { error: (e as Error)?.message ?? e }), 'err')
   }
@@ -174,7 +168,7 @@ async function test() {
   busy.value = true
   setMessage(t('settings.nsTesting'), 'ok')
   try {
-    const count = await invoke<number>(IPC.TEST_BACKEND, payload())
+    const count = await invokeIpc<number>(IPC.TEST_BACKEND, payload())
     setMessage(t('settings.nsTestSuccess', { count }), 'ok')
   } catch (e) {
     setMessage(t('settings.nsTestFailed', { error: (e as Error)?.message ?? e }), 'err')
@@ -186,7 +180,7 @@ async function test() {
 async function save() {
   busy.value = true
   try {
-    await invoke<BackendInfo>(IPC.ADD_BACKEND, payload())
+    await invokeIpc<BackendInfo>(IPC.ADD_BACKEND, payload())
     setMessage(t('settings.nsAdded'), 'ok')
     form.name = ''
     form.host = ''
@@ -203,7 +197,7 @@ async function save() {
 
 async function remove(id: number) {
   try {
-    await invoke(IPC.REMOVE_BACKEND, { id })
+    await invokeIpc(IPC.REMOVE_BACKEND, { id })
     await loadBackends()
   } catch (e) {
     setMessage(t('settings.nsRemoveFailed', { error: (e as Error)?.message ?? e }), 'err')
@@ -214,19 +208,12 @@ onMounted(loadBackends)
 </script>
 
 <style scoped>
-.settings-card {
-  background: var(--color-bg-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  margin-bottom: 16px;
-  overflow: hidden;
-}
-.settings-card__header {
-  padding: 12px 16px;
-  font-weight: 600;
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-bg-elevated);
-}
+/* 注:此处曾有一份自绘 `.settings-card` / `.settings-card__header`(CollapsibleCard 迁移前的遗留)。
+   本节根节点已是 <CollapsibleCard>,卡片外观归全局 .settings-card(index.css)统一,故两块删除。
+   删因不是「重复」而是**它盖掉了全局卡**:scoped CSS 的 data-v 会打在子组件根节点上,那条
+   `.settings-card` 因而命中 CollapsibleCard 的根 div,让本卡在六套主题下都取 bg-surface 而非
+   --card-bg(=bg-elevated)、圆角 md 而非 lg、外加 16px 下边距 —— 全设置页 9 张卡里唯独这张不同。
+   (`.settings-card__header` 则相反:CollapsibleCard 内部 DOM 拿不到本组件 data-v,是死代码。) */
 .ns-intro {
   padding: 12px 16px;
   font-size: var(--font-size-xs);
@@ -275,7 +262,7 @@ onMounted(loadBackends)
 }
 .ns-badge {
   background: var(--color-accent);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-accent);
   font-size: 10px;
   padding: 1px 6px;
   border-radius: 8px;
@@ -299,25 +286,17 @@ onMounted(loadBackends)
   display: flex;
   gap: 10px;
 }
-.ns-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  flex: 1;
-  min-width: 0;
-}
+/* 字段 label 关联/朝向/caption 由 UiField 原语提供（原 .ns-field 基座 + > span 已删）；行内布局用的
+   --grow/--kind 修饰类经 class passthrough 落到 UiField 根（仍命中：子根带父 data-v）。输入框视觉从
+   `.ns-field 后代`重锚到不变的 `.ns-form 后代`（迁移后 .ns-field 类消失，原选择器会失配）。 */
 .ns-field--grow {
   flex: 1;
 }
 .ns-field--kind {
   flex: 0 0 180px;
 }
-.ns-field > span {
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
-}
-.ns-field input,
-.ns-field select {
+.ns-form input,
+.ns-form select {
   background: var(--color-bg-elevated);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -354,7 +333,7 @@ onMounted(loadBackends)
 }
 .ns-btn--primary {
   background: var(--color-accent);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-accent);
   border-color: transparent;
 }
 .ns-btn--danger {

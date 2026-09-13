@@ -1,6 +1,6 @@
-// useBucketVirtualScroll(T16 方案B B1.5:等高算术分段 + 单飞取数管线)单测:
+// useBucketVirtualScroll(T16 方案B B1.5:等高算术分段 + 有界最新优先取数管线)单测:
 //   1) desiredSegmentRange 纯函数——愿望窗口的段区间数学(边距/边界/钳制);
-//   2) 取数管线——单飞、视口中心优先、飞掠丢弃(反幽灵挂载)、换代作废、开关清空。
+//   2) 取数管线——常态单飞、陈旧旁路、视口中心优先、飞掠丢弃、换代作废、开关清空。
 // node 环境,无 DOM:容器用普通对象伪造;composable 在组件外调用时 onMounted/
 // onBeforeUnmount 为 no-op(仅 [Vue warn],ResizeObserver 永不构造),与方案 A spec 同法。
 // 真机四根因(2026-07-04 诊断)在此的对应锁定:根因 A→「远跳后终点段最先取」;
@@ -10,10 +10,13 @@ import { ref, nextTick } from 'vue'
 import {
   useBucketVirtualScroll,
   desiredSegmentRange,
+  clampSegmentPx,
   SEGMENT_PX,
+  ROWS_PER_SEGMENT,
   PRELOAD_MARGIN_PX,
   BUCKET_NATIVE_MAX,
 } from './useBucketVirtualScroll'
+import { canvasPrefetchCoveragePx } from '../utils/galleryPrefetchWindow'
 import type { LayoutRow } from '../types/layout'
 
 beforeEach(() => {
@@ -73,6 +76,32 @@ describe('desiredSegmentRange', () => {
   })
 })
 
+// ── clampSegmentPx:自适应段高(小行高→小段,遏制跨段挂载爆帧) ──────────────────
+
+describe('clampSegmentPx', () => {
+  it('默认行高 200 → 4000(= SEGMENT_PX,零回归锚点)', () => {
+    expect(clampSegmentPx(200)).toBe(SEGMENT_PX)
+    expect(clampSegmentPx(200)).toBe(200 * ROWS_PER_SEGMENT)
+  })
+
+  it('大行高封顶 SEGMENT_PX(≥200px 维持历史值)', () => {
+    expect(clampSegmentPx(240)).toBe(4000)
+    expect(clampSegmentPx(450)).toBe(4000)
+  })
+
+  it('小行高按行高线性缩小(60px → 1200,~1/3 段项)', () => {
+    expect(clampSegmentPx(120)).toBe(2400)
+    expect(clampSegmentPx(100)).toBe(2000)
+    expect(clampSegmentPx(60)).toBe(1200)
+  })
+
+  it('极小行高钳到下限 1000(防段过碎)', () => {
+    expect(clampSegmentPx(50)).toBe(1000) // 50×20=1000 恰下限
+    expect(clampSegmentPx(30)).toBe(1000) // 30×20=600 < 1000 → 钳
+    expect(clampSegmentPx(1)).toBe(1000)
+  })
+})
+
 // ── 取数管线 ─────────────────────────────────────────────────────────────────
 
 type Deferred<T> = { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void }
@@ -100,13 +129,20 @@ function makeHarness(init?: {
   scrollTop?: number
   deferred?: boolean
   rows?: LayoutRow[]
+  /// 默认 200 → clampSegmentPx(200)=4000=SEGMENT_PX,保持既有段边界(全部历史用例零改)。
+  rowHeight?: number
+  /// Canvas 渲染模式开关(§4.3 S3):true 时愿望窗口至少覆盖面图预取的几何范围。
+  canvasMode?: boolean
+  /// 视口高(px):默认 1000(既有用例);高视口用例传 2160。
+  viewportHeight?: number
 }) {
   const enabled = ref(true)
   const version = ref(1)
   const totalHeight = ref(init?.totalHeight ?? 15_000)
+  const canvas = ref(init?.canvasMode ?? false)
   const container = {
     scrollTop: init?.scrollTop ?? 0,
-    clientHeight: 1000,
+    clientHeight: init?.viewportHeight ?? 1000,
     // scrollToLogicalY 的局部/非映射路径经 el.scrollTo 落位(behavior 在 node 无意义)。
     scrollTo(o: { top: number }) {
       container.scrollTop = o.top
@@ -131,12 +167,14 @@ function makeHarness(init?: {
       return Promise.resolve(state.rowsToReturn)
     },
     containerRef: () => container as unknown as HTMLElement,
+    rowHeight: () => init?.rowHeight ?? 200, // 200 → segPx=4000(既有段边界)
+    canvasMode: () => canvas.value,
   })
 
-  return { bs, enabled, version, totalHeight, container, fetchCalls, pendingFetches, state }
+  return { bs, enabled, version, totalHeight, container, fetchCalls, pendingFetches, state, canvas }
 }
 
-describe('useBucketVirtualScroll:单飞/优先/丢弃/换代', () => {
+describe('useBucketVirtualScroll:有界最新优先/丢弃/换代', () => {
   it('构造即按初始视口建段并取数;应答落地 → ready', async () => {
     const h = makeHarness({ rows: [normalRow(0, 200), normalRow(200, 200)] })
     expect(h.fetchCalls).toEqual([[0, 4000]]) // 窗口 [0,2000) 只触段 0
@@ -144,6 +182,13 @@ describe('useBucketVirtualScroll:单飞/优先/丢弃/换代', () => {
     expect(h.bs.segments.value.length).toBe(1)
     expect(h.bs.segments.value[0].state).toBe('ready')
     expect(h.bs.mountedRows().length).toBe(2)
+  })
+
+  it('自适应段高:小行高 → 小段(rowHeight=60 → segPx=1200,取数边界随之变小)', async () => {
+    const h = makeHarness({ rowHeight: 60, rows: [normalRow(0, 60)] })
+    // segPx=clamp(60×20,1000,4000)=1200;泵先取距视口中心(500)近的段 0 →
+    // 首个取数边界 [0,1200)(而非固定 4000px 段的 [0,4000)),证明自适应段高贯通到取数管线。
+    expect(h.fetchCalls[0]).toEqual([0, 1200])
   })
 
   it('单飞:窗口含两段时串行取数,不并发', async () => {
@@ -167,6 +212,12 @@ describe('useBucketVirtualScroll:单飞/优先/丢弃/换代', () => {
     h.container.scrollTop = 12_000
     h.bs.onScroll()
     expect(h.bs.segments.value.map((s) => s.index)).toEqual([2, 3])
+    // 段 0 已离开愿望集，最新视口段立即占旁路第 2 槽，不等陈旧 IPC 返回。
+    expect(h.fetchCalls).toEqual([
+      [0, 4000],
+      [12_000, 15_000],
+    ])
+    expect(h.pendingFetches.length).toBe(2)
 
     // 陈旧应答落地 → 复核失败被丢弃:段表无 index 0、无行
     h.pendingFetches[0].resolve([normalRow(0, 100)])
@@ -181,6 +232,26 @@ describe('useBucketVirtualScroll:单飞/优先/丢弃/换代', () => {
     expect(h.fetchCalls[2]).toEqual([8000, 12_000])
   })
 
+  it('连续远跳最多两个 IPC 在途，槽位释放后只追最新视口', async () => {
+    const h = makeHarness({ totalHeight: 40_000, deferred: true })
+    expect(h.fetchCalls).toEqual([[0, 4000]])
+
+    h.container.scrollTop = 12_000
+    h.bs.onScroll()
+    expect(h.fetchCalls[1]).toEqual([12_000, 16_000])
+
+    // 两个请求都已陈旧，但硬上限为 2；第三个目标先登记愿望，不继续扩并发。
+    h.container.scrollTop = 24_000
+    h.bs.onScroll()
+    expect(h.fetchCalls.length).toBe(2)
+
+    h.pendingFetches[0].resolve([normalRow(0, 100)])
+    await flush()
+    // 任一陈旧槽释放后重新按当前中心挑选，只追 24k 所在最新段。
+    expect(h.fetchCalls[2]).toEqual([24_000, 28_000])
+    expect(h.fetchCalls.length).toBe(3)
+  })
+
   it('布局换代:段表重建,在途应答按代+对象双重丢弃,新代重取', async () => {
     const h = makeHarness({ deferred: true })
     h.version.value = 2
@@ -190,6 +261,24 @@ describe('useBucketVirtualScroll:单飞/优先/丢弃/换代', () => {
     // 旧应答未落地;新代已为段 0 重新发起取数
     expect(h.fetchCalls.length).toBe(2)
     h.pendingFetches[1].resolve([normalRow(0, 100), normalRow(100, 100)])
+    await flush()
+    expect(h.bs.segments.value[0].state).toBe('ready')
+    expect(h.bs.mountedRows().length).toBe(2)
+  })
+
+  it('布局换代:新段取数期间保留上一代行,新应答到达后再替换', async () => {
+    const h = makeHarness({ rows: [normalRow(0, 100)] })
+    await flush()
+    expect(h.bs.mountedRows().length).toBe(1)
+
+    h.state.useDeferred = true
+    h.version.value = 2
+    await nextTick()
+
+    expect(h.bs.segments.value[0].state).toBe('loading')
+    expect(h.bs.mountedRows().length).toBe(1)
+
+    h.pendingFetches[0].resolve([normalRow(0, 100), normalRow(100, 100)])
     await flush()
     expect(h.bs.segments.value[0].state).toBe('ready')
     expect(h.bs.mountedRows().length).toBe(2)
@@ -249,6 +338,114 @@ describe('useBucketVirtualScroll:单飞/优先/丢弃/换代', () => {
     expect(h.fetchCalls).toEqual([[12_000, 15_000]])
     await flush()
     expect(h.bs.segments.value[0].end).toBe(15_000)
+  })
+
+  it('onScroll:程序化落点自触发事件返回 true 且只消费一次(F1 闸门豁免信号)', async () => {
+    const h = makeHarness({ totalHeight: 40_000_000, deferred: true }) // 超 cap → 映射态
+    await h.bs.scrollToLogicalY(20_000_000) // 远跳:直写 scrollTop,置 internalScroll
+    expect(h.bs.onScroll()).toBe(true) // 落点自触发事件被引擎消费 → 宿主速度采样应豁免
+    expect(h.bs.onScroll()).toBe(false) // 后续真实事件正常分类
+  })
+
+  it('onScroll:普通用户滚动事件返回 false(非映射态)', async () => {
+    const h = makeHarness()
+    await flush()
+    h.container.scrollTop = 500
+    expect(h.bs.onScroll()).toBe(false)
+  })
+})
+
+// ── Canvas 取行窗契约(§4.3 S3):愿望集至少覆盖位图预取几何 ───────────────────
+// 位图预取只枚举已就绪的挂载行,故行数据窗口必须先到位;否则高视口下
+// 「图片想预取 1.25 屏、行数据只给 1000px」,视口抵达时无行可枚举。
+
+describe('canvas 取行窗(§4.3 S3)', () => {
+  const VIEW_H = 2160 // 4K 全屏 CSS 视口(非面板分辨率)
+  const ROW_H = 64 // 极密行高 → segPx=1280
+
+  function coveredEnd(h: ReturnType<typeof makeHarness>): number {
+    return h.bs.segments.value.reduce((max, s) => Math.max(max, s.end), 0)
+  }
+
+  it('高视口 + 64px 行高:段表覆盖视口 + 1.25 屏 + 一行', async () => {
+    const h = makeHarness({
+      totalHeight: 300_000,
+      rowHeight: ROW_H,
+      viewportHeight: VIEW_H,
+      canvasMode: true,
+    })
+    await flush()
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    expect(coveredEnd(h)).toBeGreaterThanOrEqual(VIEW_H + cover.aheadPx)
+    expect(cover.aheadPx).toBeGreaterThan(PRELOAD_MARGIN_PX) // 缺口本就大于旧基线
+  })
+
+  it('DOM 路径(canvasMode=false)保持既有边距语义,不为此抬窗', async () => {
+    const h = makeHarness({ totalHeight: 300_000, rowHeight: ROW_H, viewportHeight: VIEW_H })
+    await flush()
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    expect(coveredEnd(h)).toBeLessThan(VIEW_H + cover.aheadPx)
+    // 既有语义:视口 + 基线边距 1000,按段取整(半开区间 → bottom-1 所在段)
+    expect(h.fetchCalls[0]).toEqual([0, 1280])
+  })
+
+  it('段边界相位:窗口起点落在段内任意处都满足前向覆盖', async () => {
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    for (const scrollTop of [0, 100, 640, 1279, 1280, 1281, 5119, 5120, 77_777]) {
+      const h = makeHarness({
+        totalHeight: 300_000,
+        rowHeight: ROW_H,
+        viewportHeight: VIEW_H,
+        scrollTop,
+        canvasMode: true,
+      })
+      await flush()
+      expect(coveredEnd(h)).toBeGreaterThanOrEqual(scrollTop + VIEW_H + cover.aheadPx)
+    }
+  })
+
+  it('方向反转:后方同时留有 ≥ 0.5 屏(反向后即为新的前方)', async () => {
+    const scrollTop = 100_000
+    const h = makeHarness({
+      totalHeight: 300_000,
+      rowHeight: ROW_H,
+      viewportHeight: VIEW_H,
+      scrollTop,
+      canvasMode: true,
+    })
+    await flush()
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    const start = h.bs.segments.value[0].start
+    expect(start).toBeLessThanOrEqual(scrollTop - cover.behindPx)
+  })
+
+  it('有上限:高视口下段数由 segPx 与 1.25 屏共同界定,不随总高增长', async () => {
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    const segPx = clampSegmentPx(ROW_H)
+    const h = makeHarness({
+      totalHeight: 300_000,
+      rowHeight: ROW_H,
+      viewportHeight: VIEW_H,
+      canvasMode: true,
+    })
+    await flush()
+    // 窗宽 = 视口 + 两侧覆盖;段数 ≤ 窗宽/段高 + 取整余量
+    const spanPx = VIEW_H + 2 * cover.aheadPx
+    expect(h.bs.segments.value.length).toBeLessThanOrEqual(Math.ceil(spanPx / segPx) + 1)
+  })
+
+  it('运行时切到 Canvas:按新窗即时重取(不等下一次滚动);切回 DOM 收窗', async () => {
+    const h = makeHarness({ totalHeight: 300_000, rowHeight: ROW_H, viewportHeight: VIEW_H })
+    await flush()
+    const domSegments = h.bs.segments.value.length
+    h.canvas.value = true
+    await nextTick()
+    await flush()
+    expect(h.bs.segments.value.length).toBeGreaterThan(domSegments)
+
+    h.canvas.value = false
+    await nextTick()
+    expect(h.bs.segments.value.length).toBe(domSegments)
   })
 })
 

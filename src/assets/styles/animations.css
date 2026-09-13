@@ -69,34 +69,6 @@ html.disable-hover-scale .media-card:hover {
   animation: fav-spring 300ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
-/* ── Toast slide-in ────────────────────────────────────────────────────── */
-@keyframes toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-@keyframes toast-out {
-  from {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  to {
-    opacity: 0;
-    transform: translateY(-8px);
-  }
-}
-.toast-enter {
-  animation: toast-in 200ms ease forwards;
-}
-.toast-leave {
-  animation: toast-out 200ms ease forwards;
-}
-
 /* ── LIVE badge glow ────────────────────────────────────────────────────── */
 @keyframes live-glow {
   0%,
@@ -124,7 +96,7 @@ html.disable-hover-scale .media-card:hover {
   border: 2px solid var(--color-border);
   border-top-color: var(--color-accent);
   border-radius: 50%;
-  animation: spin 600ms linear infinite;
+  animation: spin var(--duration-spin) linear infinite;
 }
 
 /* ── Progress bar shimmer ───────────────────────────────────────────────── */
@@ -158,44 +130,4 @@ html.disable-hover-scale .media-card:hover {
   background-size: 200% 100%;
   animation: shimmer 1.5s ease-in-out infinite;
   border-radius: var(--radius-sm);
-}
-
-/* ── Modal overlay fade ─────────────────────────────────────────────────── */
-@keyframes overlay-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-.overlay-enter {
-  animation: overlay-in 150ms ease forwards;
-}
-
-/* ── Reduced motion(S5):系统级「减少动态效果」全局压制 ─────────────────────── */
-/* 用近零时长而非 animation:none——Vue <Transition> 依赖 transitionend/animationend
-   事件收尾,置 none 会让 leave 态卡死;0.01ms 既无可感知运动又保事件照发。
-   注意与文件头「勿给 * 加 transition」不冲突:此块只改已存在动效的时长,
-   且仅在用户开启减少动效时激活。 */
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
-
-  /* 必要动效豁免:加载指示是状态信息,静止的 spinner 会被误读为卡死 */
-  .spinner {
-    animation-duration: 600ms !important;
-    animation-iteration-count: infinite !important;
-  }
-
-  /* 悬停缩放属装饰性位移,减少动效下彻底关闭(瞬时突变同样扰动) */
-  .media-card:hover {
-    transform: none;
-  }
 }

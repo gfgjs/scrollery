@@ -8,6 +8,7 @@
 name = "psd-probe"
 version = "0.0.0"
 edition = "2021"
+license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)
 publish = false
 
 [[bin]]

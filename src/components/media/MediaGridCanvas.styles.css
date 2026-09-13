@@ -1,0 +1,144 @@
+.mgc-wrap {
+  position: relative;
+  width: 100%;
+}
+/* sticky 让 canvas 钉在滚动容器视口顶部:内容(高占位)滚动,canvas 不动、每帧重绘。
+   canvas 是主交互元素:点击/右键/pointerdown 走算术命中(零逐格 DOM);
+   悬停命中格上方浮单例悬停卡(.mgc-hover-card)承载 hover 交互。 */
+.mgc-canvas {
+  position: sticky;
+  top: 0;
+  display: block;
+  width: 100%;
+}
+.mgc-canvas:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+/* 悬停卡层:同 canvas sticky 钉视口、零高不占流(canvas 的流内位置不受影响),
+   overflow 可见让卡探出;z-index 抬到 canvas(DOM 后序)之上。 */
+.mgc-hover-layer {
+  position: sticky;
+  top: 0;
+  height: 0;
+  overflow: visible;
+  z-index: 3;
+}
+/* 悬停卡:DOM .media-card:hover 的等价物。文字/控件按终态排版保持清晰。这是画布上的
+   单例浮动卡,与 DOM 侧统一消费 float recipe;真实照片本身仍由媒体内容规则负责渲染,
+   不把普通网格单元普遍升级成浮层。 */
+.mgc-hover-card {
+  position: absolute;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transform-origin: var(--mgc-origin-x, 50%) var(--mgc-origin-y, 50%);
+}
+/* 放大态(scale0≠1)才动效:transform 从 --mgc-scale0(=格原尺寸)轻回弹到 1(=目标尺寸),
+   时长/缓动与 DOM .media-card:hover 同款,跨渲染模式手感一致;变换基点钉在原格中心
+   (--mgc-origin-*)——贴边钳位后矩形中心≠格中心,以格中心为 origin 才保证动画起点与
+   画格逐像素重合。关闭放大(scale0=1)时**不挂任何动画/will-change**:scale(1)→scale(1)
+   空转动画白付合成开销,且合成层按设备像素对齐栅格化,与 canvas 亚像素抗锯齿绘制有
+   ±半设备像素落点差——图片整帧替换瞬间会因此产生一次可感的静态跳变;内联绘制与
+   canvas 同为亚像素精度,落点最贴近。 */
+.mgc-hover-card--zoom {
+  animation: mgc-hover-enter 220ms cubic-bezier(0.34, 1.18, 0.64, 1) both;
+  will-change: transform;
+}
+@keyframes mgc-hover-enter {
+  from {
+    transform: scale(var(--mgc-scale0, 1));
+  }
+  to {
+    transform: scale(1);
+  }
+}
+/* 浮层装饰独立到 ::after,不占布局:
+   ① 卡体不能整体淡入——半透明卡叠在 canvas 原格上,动画期两份错位图缘互相透底=重影;
+   ② 描边不能是卡的真实 border——border 内缩内容区 1px,MediaThumb 按目标尺寸显式定宽高,
+   会整体右下位移 1px,换 ::after 后卡内容与画格零偏移;
+   ③ 装饰层淡入走 opacity 合成器路径;若把 box-shadow 放进 keyframes 逐帧插值,
+   则是逐帧重绘+重模糊的昂贵路径,禁止。
+   阴影:所有悬停态都有,220ms ease 对齐 DOM .media-card:hover 的 box-shadow 过渡;
+   描边:仅放大态——关闭放大时卡与格完全重合,格外已有同位 1px 内描边(canvas strokeRect),
+   再淡入一圈描边是 DOM 模式没有的多余动态事件。z-index 7 盖过缩略图自身内描边(6),
+   让位卡内覆盖层(≥10)。 */
+.mgc-hover-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  border-radius: inherit;
+  box-shadow: var(--material-recipe-float-box-shadow);
+  animation: mgc-hover-fade 220ms ease both;
+  pointer-events: none;
+}
+.mgc-hover-card--zoom::after {
+  border: 1px solid var(--material-recipe-float-border-color);
+}
+@keyframes mgc-hover-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+/* 选择模式:抑制放大与阴影(对齐 DOM .media-card--selection-mode:hover),卡仍承载交互。 */
+.mgc-hover-card--static {
+  animation: none;
+}
+.mgc-hover-card--static::after {
+  animation: none;
+  box-shadow: none;
+}
+/* 防闪(真机问题1):卡内不透明占位层延迟 150ms 显形——预解码后图片通常首帧即出,
+   占位永不露脸;真未出图(status 0/在途)时 150ms 后照常显占位,且其色与 canvas 底层
+   同源(平均色),渐显无感。根底色一并透明,避免 --color-bg-elevated 抢先盖住底层图。 */
+.mgc-hover-card :deep(.media-thumb) {
+  background: transparent;
+}
+/* 卡内图片禁用 thumb-appear 渐显:悬停卡骑在 canvas 已绘同图上,而 DOM <img>
+   (object-fit: cover 浮点裁剪 + 合成层设备像素对齐)与 canvas 位图(解码期整数化裁剪 +
+   桶高度预缩放)亚像素级不同源——若做 200ms 交叉淡化,两份微错位图互相透底,
+   观感即「移入后图片轻微位移」。改为渐显缺省、就绪即整帧替换:单帧 ±亚像素差异
+   无运动过程,不可感。 */
+.mgc-hover-card :deep(.thumb-loaded) {
+  animation: none;
+}
+.mgc-hover-card :deep(.media-thumb__placeholder),
+.mgc-hover-card :deep(.media-thumb__textcard) {
+  animation: mgc-delayed-reveal 0s 150ms both;
+}
+@keyframes mgc-delayed-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+/* 无缩略图格(--bare):占位/文本卡即内容本身,免延迟直接显形——延迟只对「图片将至」的格有意义。 */
+.mgc-hover-card--bare :deep(.media-thumb__placeholder),
+.mgc-hover-card--bare :deep(.media-thumb__textcard) {
+  animation: none;
+}
+/* 卡内回退色占位(无平均色,.is-fallback):!important 盖过内联 elevated,改用画格同源色,
+   弹卡不色跳;网格常态(卡外)仍是 elevated 的 chrome 画风,暗灰只存在于骑在画格上的这张卡。 */
+.mgc-hover-card :deep(.media-thumb__placeholder.is-fallback) {
+  background-color: var(--color-bg-canvas-placeholder) !important;
+}
+/* 画布镜像态(--mirror:未放大且格有图源):卡内不铺任何图像面,直接透出下方画布已绘的
+   同一张位图。悬停卡若用 <img> 重新渲染这张图,就是第二条解码管线——object-fit 浮点
+   cover 裁剪 + 布局盒设备像素吸附,与 canvas 管线(解码期整数化裁剪 + 桶高度预缩放 +
+   亚像素抗锯齿)必有亚像素相位/落点差,图片整帧替换瞬间即「移入轻微位移」;此前修掉的
+   边框内缩/渐显交叉淡化/空转合成动画都只是这个错位的放大器。透出画布 = 换源归零,
+   悬停前后像素逐位不变。该格 canvas 侧 chrome 同步停画(cellRenderer.mirrorCellId),
+   由卡内 DOM 重绘,防两引擎双重成像。--bare(无图源)与 --zoom(内容有意重缩)不镜像,
+   仍走卡内自绘。display:none 而非 visibility:<img> 仍要加载解码,驱动 isLoaded 门控的
+   信息浮窗;卡下画布像素即所见,加载完成也无换面动作。 */
+.mgc-hover-card--mirror :deep(.media-thumb__img),
+.mgc-hover-card--mirror :deep(.media-thumb__placeholder),
+.mgc-hover-card--mirror :deep(.media-thumb__textcard) {
+  display: none;
+}

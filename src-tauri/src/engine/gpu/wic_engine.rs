@@ -1,6 +1,8 @@
 // src-tauri/src/engine/gpu/wic_engine.rs
-//! WIC (Windows Imaging Component) Engine.
-//! Leverages OS-native codecs for extremely fast decoding, often with hardware acceleration (e.g., for JPEG/HEIC).
+//! 用 OS 原生编解码器解码 + `IWICBitmapScaler` 缩放，**全程 CPU 软件路径**——WIC 静态图解码/缩放
+//! 不走 GPU/NPP/CUDA。唯一可能沾硬件的是 HEIC/HEVC：解码交给系统 HEVC 解码器，装了硬件解码器的
+//! 机器上该步或由 GPU 承担；JPEG/PNG/… 一律 CPU 软解。故 strategy="gpu" 命中本引擎时实为
+//! 「OS 原生 CPU 解码」而非 GPU 图像解码（真 GPU 引擎 nvjpeg/dxva 尚未实现，见 engine/gpu/mod.rs）。
 
 use std::path::Path;
 use windows::core::{Interface, HSTRING};
@@ -43,7 +45,7 @@ impl ImageEngine for WicEngine {
                 None,
                 windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
             )
-            .map_err(|e| AppError::Os(format!("Failed to create WIC factory: {}", e)))?;
+            .map_err(|e| AppError::os("WIC 初始化失败 | WIC initialization failed", e))?;
 
             // Create Decoder
             let decoder = factory
@@ -53,26 +55,25 @@ impl ImageEngine for WicEngine {
                     GENERIC_READ,
                     WICDecodeMetadataCacheOnDemand,
                 )
-                .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
 
             // Get first frame
             let frame = decoder
                 .GetFrame(0)
-                .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
 
             // Get dimensions
             let mut width = 0;
             let mut height = 0;
             frame
                 .GetSize(&mut width, &mut height)
-                .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
 
             // Convert to 32bppRGBA
             let converter = factory
                 .CreateFormatConverter()
-                .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
 
-            // Calculate target dimensions based on ResizeHint
             // 根据 ResizeHint 计算目标尺寸
             let (mut scaled_width, mut scaled_height) = (width, height);
             let needs_resize = match resize {
@@ -89,8 +90,11 @@ impl ImageEngine for WicEngine {
                     true
                 }
                 Some(ResizeHint::ShortEdge(target)) => {
+                    // 只下采样(2026-07-06 审查 R2):ShortEdge 唯一消费方是 AI/face 缓存
+                    // (derive::image::decode_short_edge),契约「分析只下采样…绝不上采样」——
+                    // 小图放大只会浪费磁盘并给 CLIP/YuNet 喂插值像素。short<target 时原尺寸解码。
                     let short = width.min(height);
-                    if short != target {
+                    if short > target {
                         let scale = target as f32 / short as f32;
                         scaled_width = (width as f32 * scale).round() as u32;
                         scaled_height = (height as f32 * scale).round() as u32;
@@ -105,7 +109,7 @@ impl ImageEngine for WicEngine {
             let source: IWICBitmapSource = if needs_resize {
                 let scaler = factory
                     .CreateBitmapScaler()
-                    .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                    .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
                 scaler
                     .Initialize(
                         &frame,
@@ -113,15 +117,15 @@ impl ImageEngine for WicEngine {
                         scaled_height,
                         WICBitmapInterpolationModeCubic,
                     )
-                    .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                    .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
 
                 scaler
                     .cast()
-                    .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?
+                    .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?
             } else {
                 frame
                     .cast()
-                    .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?
+                    .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?
             };
 
             converter
@@ -133,7 +137,7 @@ impl ImageEngine for WicEngine {
                     0.0,
                     WICBitmapPaletteTypeCustom,
                 )
-                .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
 
             // Copy pixels
             let stride = scaled_width * 4;
@@ -142,7 +146,7 @@ impl ImageEngine for WicEngine {
 
             converter
                 .CopyPixels(std::ptr::null(), stride, &mut pixels)
-                .map_err(|e| AppError::Os(format!("WIC error: {}", e)))?;
+                .map_err(|e| AppError::os("WIC 图像处理失败 | WIC operation failed", e))?;
 
             // Apply EXIF orientation if needed (since WIC sometimes doesn't automatically apply it based on codec)
             let ext = file_path
@@ -174,6 +178,7 @@ impl ImageEngine for WicEngine {
                             pixels: rgba.into_raw(),
                             width: img.width(),
                             height: img.height(),
+                            icc: None, // D-417:WIC v1 不出 ICC,heic/avif 色偏留 A2 后续
                         });
                     }
                 }
@@ -183,6 +188,7 @@ impl ImageEngine for WicEngine {
                 pixels,
                 width: scaled_width,
                 height: scaled_height,
+                icc: None, // D-417:WIC v1 不出 ICC,heic/avif 色偏留 A2 后续
             })
         }
     }

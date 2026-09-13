@@ -84,6 +84,128 @@ pub enum RequestBody {
     /// tokenizer 接受任意字符串),任一失败即整批 Failure,不做逐项 Ok/Err。
     /// 不新增 capability:文本塔与 CLIP 图像塔同属 `embedding` 会话,凡会话就绪即可服务。
     EncodeText { texts: Vec<String> },
+    /// OCR 会话装载(v2 additive):独立于 CLIP 会话(D-OCR-1),worker 双槽并存。
+    /// 响应 = Success + SuccessBody.ocr_session。
+    /// v2 additive:不动 PROTOCOL_VERSION;旧 worker 收到新 op 会 JSON 解析失败回 internal_error(main.rs 兜底),两端同仓同步分发,无实际混版窗口。
+    OcrSessionInit {
+        session_id: u64,
+        /// 角色 OcrDet/OcrCls/OcrRec/OcrDict 四件套,逐件 len+sha256(同 D1 §3)。
+        models: Vec<ModelDescriptor>,
+        /// worker 按 profile_id 从 scrollery-ai-core::ocr_profile 内建注册表取几何/阈值/文件名契约。
+        ocr_profile_id: String,
+        models_root: String,
+    },
+    /// OcrSessionClose 兼容性同 OcrSessionInit。
+    OcrSessionClose { session_id: u64 },
+    /// OCR 批(交互一次一图为主,批口面向未来)。响应 = Success + SuccessBody.ocr,blob 恒空(D-OCR-4)。
+    /// v2 additive:不动 PROTOCOL_VERSION;旧 worker 收到新 op 会 JSON 解析失败回 internal_error(main.rs 兜底),两端同仓同步分发,无实际混版窗口。
+    OcrBatch { items: Vec<OcrItem> },
+    /// 影像增强会话装载(v2 additive,降噪/超分子系统 design.md §G):独立于 CLIP/OCR
+    /// 会话(D-OCR-1 同型 worker 独立 worker 进程),models 逐件走 validate_and_resolve
+    /// 前缀/字节数/sha256 校验(与 SessionInit 同款)。响应 = Success 帧(无专属就绪体,
+    /// 增强会话就绪即可直接派 EnhanceRun)。
+    EnhanceSessionInit {
+        session_id: u64,
+        /// 本会话可用模型集合(ModelRole::Enhance);具体档位由 EnhanceStep.model_id 寻址。
+        models: Vec<ModelDescriptor>,
+        /// `ModelHandle::Path` 的归属校验根:worker 侧 canonicalize 后须以此为前缀,
+        /// 越界回 `ModelLoadFailed`(与 `SessionInit.models_root` 同型语义;D1 §3,
+        /// 防宿主被劫持后诱导任意读)。
+        models_root: String,
+        /// worker 输出白名单前缀:后续 `EnhanceRun.output_tmp_path` 经 canonicalize 后
+        /// 必须位于本目录 canonicalize 结果之下,越界即拒(与 OCR `cache_key` 越界拒绝同型,
+        /// 防宿主被劫持后诱导 worker 向任意路径写文件)。host 侧 `{work_dir}/{job}.tmp` 落盘根。
+        work_dir: String,
+    },
+    /// EnhanceSessionClose 兼容性同 SessionClose。
+    EnhanceSessionClose { session_id: u64 },
+    /// 影像增强执行(design.md §D/§E):worker 按 `steps` 顺序逐步跑(host 保证已排好
+    /// 降噪→去伪影→超分序,worker 不再重排)。输出组装全图后编码写 host 指定的
+    /// `output_tmp_path`(路径前缀白名单校验同 cache_key 越界拒绝先例)。
+    /// 响应 = Success + SuccessBody.enhance;per-tile Progress 心跳(帧型复用既有
+    /// ProgressBody,不新增)。
+    EnhanceRun {
+        session_id: u64,
+        source_path: String,
+        /// worker 写入的输出路径(host 侧 `.tmp` 同卷 rename 前的临时文件)。
+        output_tmp_path: String,
+        /// 输出编码格式:`"jpeg"` | `"png"`。
+        output_format: String,
+        /// 执行链,严格按序执行(host 负责排序:降噪→去伪影→超分)。
+        steps: Vec<EnhanceStep>,
+    },
+    /// 视频会话装载(v2 additive,视频格式扩展子系统 design.md §2.3):worker 校验
+    /// `ffmpeg_exe_path` 存在 + sha256 相符(防换包),运行 `ffmpeg -version` 读取版本与
+    /// configuration 行,发现 `--enable-gpl` 立即回 terminal 失败(许可运行时保险丝,§3.4)。
+    VideoSessionInit {
+        session_id: u64,
+        ffmpeg_exe_path: String,
+        ffmpeg_sha256: String,
+        /// worker 输出白名单前缀:后续 `output_tmp_path` 经 canonicalize 后必须位于
+        /// 本目录 canonicalize 结果之下,越界即拒(与 `EnhanceSessionInit.work_dir`
+        /// 完全同型语义;`message.rs` 既有 Enhance 会话字段注)。
+        work_dir: String,
+    },
+    /// VideoSessionClose 兼容性同 EnhanceSessionClose。
+    VideoSessionClose { session_id: u64 },
+    /// 流事实探测(design.md §2.3):worker 用 ffprobe 输出流事实,不做判定;
+    /// 判定表在 host(「host 不信任 worker」+ 策略集中)。响应 = Success +
+    /// `SuccessBody.video_probe`。
+    VideoProbe {
+        session_id: u64,
+        source_path: String,
+        input_fingerprint: String,
+    },
+    /// 容器改封(design.md §2.3):`-c:v copy`,`audio_transcode=false` 时 `-c:a copy`、
+    /// true 时 `-c:a aac`;输出 `-movflags +faststart` 的 MP4。字幕轨一律 `-sn` 丢弃。
+    /// 每 ≤2s 发一帧 Progress(`stage="remux"`)。响应 = Success + `SuccessBody.video_out`。
+    VideoRemux {
+        session_id: u64,
+        source_path: String,
+        output_tmp_path: String,
+        audio_transcode: bool,
+        audio_track_index: Option<u32>,
+    },
+    /// 一次性全转码(design.md §2.3):`encoder_ladder` 由 host 下发(如
+    /// `["h264_nvenc","h264_qsv","h264_amf","h264_mf"]`),worker 逐个试起、首个成功者
+    /// 用之;Progress 同 [`RequestBody::VideoRemux`](`stage="transcode"`)。响应同
+    /// `video_out`。host 可同时下发 `crf`/`bitrate_kbps` 两者;worker 按 `encoder_ladder`
+    /// 胜出的编码器的率控模型取用其一(硬编码率控编码器优先质量模式用 `crf`,
+    /// `h264_mf` 等固定码率编码器用 `bitrate_kbps`;两者皆 None 时 worker 用所选
+    /// encoder 的默认率控)。
+    VideoTranscode {
+        session_id: u64,
+        source_path: String,
+        output_tmp_path: String,
+        encoder_ladder: Vec<String>,
+        crf: Option<u8>,
+        bitrate_kbps: Option<u32>,
+        max_long_edge: Option<u32>,
+        audio_track_index: Option<u32>,
+        hw_decode: bool,
+    },
+    /// 缩略图后端取帧(design.md §2.3):`mode = Cover` → 响应 Success + blob 单帧 WebP,
+    /// `video_frames` 不填;`mode = Keyframes` → 响应 Success + blob 雪碧条 WebP +
+    /// `SuccessBody.video_frames`(切格元数据 `{cell_width, cell_height, n}`)。
+    VideoFrames {
+        session_id: u64,
+        source_path: String,
+        input_fingerprint: String,
+        mode: VideoFramesMode,
+    },
+}
+
+/// [`RequestBody::VideoFrames`] 的取帧模式(design.md §2.3)。
+/// tag 用 `"kind"` 而非 `"mode"`:避免与载体字段 `RequestBody::VideoFrames.mode` 同名
+/// 造成双层同名嵌套(`{"mode":{"mode":"cover",...}}`),沿用 [`ModelHandle`] 的
+/// `tag = "kind"` 惯例。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VideoFramesMode {
+    /// 单帧封面,`max_long_edge` 语义同缩略图档位吸附。
+    Cover { max_long_edge: u32 },
+    /// n 格关键帧雪碧条,`cell_height` 为单格高度(宽度由源宽高比推得)。
+    Keyframes { n: u32, cell_height: u32 },
 }
 
 impl RequestBody {
@@ -98,7 +220,19 @@ impl RequestBody {
             | RequestBody::SessionClose { .. }
             | RequestBody::EmbedBatch { .. }
             | RequestBody::FaceDetectEmbed { .. }
-            | RequestBody::EncodeText { .. } => None,
+            | RequestBody::EncodeText { .. }
+            | RequestBody::OcrSessionInit { .. }
+            | RequestBody::OcrSessionClose { .. }
+            | RequestBody::OcrBatch { .. }
+            | RequestBody::EnhanceSessionInit { .. }
+            | RequestBody::EnhanceSessionClose { .. }
+            | RequestBody::EnhanceRun { .. }
+            | RequestBody::VideoSessionInit { .. }
+            | RequestBody::VideoSessionClose { .. }
+            | RequestBody::VideoProbe { .. }
+            | RequestBody::VideoRemux { .. }
+            | RequestBody::VideoTranscode { .. }
+            | RequestBody::VideoFrames { .. } => None,
         }
     }
 
@@ -115,7 +249,19 @@ impl RequestBody {
             | RequestBody::SessionClose { .. }
             | RequestBody::EmbedBatch { .. }
             | RequestBody::FaceDetectEmbed { .. }
-            | RequestBody::EncodeText { .. } => None,
+            | RequestBody::EncodeText { .. }
+            | RequestBody::OcrSessionInit { .. }
+            | RequestBody::OcrSessionClose { .. }
+            | RequestBody::OcrBatch { .. }
+            | RequestBody::EnhanceSessionInit { .. }
+            | RequestBody::EnhanceSessionClose { .. }
+            | RequestBody::EnhanceRun { .. }
+            | RequestBody::VideoSessionInit { .. }
+            | RequestBody::VideoSessionClose { .. }
+            | RequestBody::VideoProbe { .. }
+            | RequestBody::VideoRemux { .. }
+            | RequestBody::VideoTranscode { .. }
+            | RequestBody::VideoFrames { .. } => None,
         }
     }
 }
@@ -143,6 +289,14 @@ pub enum ModelRole {
     TextEncoder,
     FaceDetect,
     FaceRecog,
+    OcrDet,
+    OcrCls,
+    OcrRec,
+    OcrDict,
+    /// 影像增强模型(降噪/超分子系统 design.md §G):单角色,一次会话可装载多个
+    /// 同角色档位(降噪/去伪影/超分各选一,或同任务多档),worker 侧模型间的
+    /// 二次寻址细节归 P0 批 2(推理模块)实现。
+    Enhance,
 }
 
 /// 单个模型载荷描述:role→handle 寻址(§3.2.1a)+ 逐模型完整性字段(D1 §3)。
@@ -156,6 +310,12 @@ pub struct ModelDescriptor {
     pub len: u64,
     /// 明文 sha256(64 位小写 hex,不带算法前缀)。
     pub sha256: String,
+    /// 影像增强会话(`EnhanceSessionInit.models`)必填:worker 靠它把
+    /// `EnhanceStep.model_id` 映射到本描述符对应的具体模型——不得靠
+    /// `ModelHandle::Path` 的文件名反查(`ModelHandle::Named` 时无文件名可反查,
+    /// 会断)。CLIP/Face/OCR 等既有角色不需要多档寻址,恒为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 /// 模型 profile 快照(Part4 §8.6 / Part6 §8.3):worker 侧预/后处理按 `arch_id` 从
@@ -192,6 +352,39 @@ pub struct FaceItem {
     pub fingerprint: String,
 }
 
+/// OcrBatch 单项:语义同 [`FaceItem`]——`cache_key`/`source_path` 至少给一。
+/// OCR 一期忽略 `cache_key`(ai 缓存 ≤640 级分辨率不足以识字),host 恒传
+/// `source_path`;`cache_key` 字段面向未来批量场景保留。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OcrItem {
+    pub item_id: i64,
+    pub cache_key: Option<String>,
+    pub source_path: Option<String>,
+    pub fingerprint: String,
+}
+
+/// 影像增强任务种类(降噪/超分子系统 design.md §D 三任务;与
+/// `scrollery_ai_core::enhance_profile::EnhanceTaskKind` 语义一一对应,两 crate
+/// 独立定义、不互相依赖)。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnhanceTask {
+    Denoise,
+    DejpegArtifact,
+    Upscale,
+}
+
+/// `EnhanceRun.steps` 单步:任务 + 模型档位 + 可选强度。`strength` 为原生量纲
+/// (DRUNet σ、FBCNN QF);host 负责把 UI 滑杆值换算到此;`None` = 用模型默认参数。
+/// host 保证 `steps` 已排好执行序(降噪→去伪影→超分),worker 严格按序跑,不重排。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnhanceStep {
+    pub task: EnhanceTask,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f32>,
+}
+
 /// 能力名标准字符串:Ready.capabilities / SessionReadyBody.caps / DB
 /// `exotic_tasks.capability` 共用,与 host 侧 `catalog::Capability::as_str` 一一对应,
 /// 防两端字面量漂移(G5:embedding/face_detect_embed 为 v2 新增)。
@@ -200,6 +393,21 @@ pub mod capability {
     pub const METADATA: &str = "metadata";
     pub const EMBEDDING: &str = "embedding";
     pub const FACE_DETECT_EMBED: &str = "face_detect_embed";
+    /// 注:worker 能力通告用;OCR builtin 路径不进 exotic 任务化(D-OCR-7),catalog::Capability 无对应变体,豁免本 mod 头注的一一对应承诺。
+    pub const OCR_TEXT: &str = "ocr_text";
+    /// 影像增强(降噪/超分子系统 design.md §A/§C):同 OCR 一样不进 exotic 任务化调度
+    /// (host 侧 EnhanceService 直持 supervisor+worker client),豁免同上。
+    pub const ENHANCE: &str = "enhance";
+    /// 视频流事实探测(视频格式扩展子系统 design.md §2.2):同 OCR/Enhance 一样不进
+    /// exotic 任务化调度(host 侧 VideoWorkerService 直持 supervisor+worker client),
+    /// 与 catalog offering capabilities 不一一对应,豁免同上。
+    pub const VIDEO_PROBE: &str = "video_probe";
+    /// 视频容器改封(fmp4/faststart,含仅音轨转码档),豁免同上。
+    pub const VIDEO_REMUX: &str = "video_remux";
+    /// 视频一次性全转码(H.264/AAC MP4),豁免同上。
+    pub const VIDEO_TRANSCODE: &str = "video_transcode";
+    /// 视频封面帧+关键帧雪碧图(缩略图后端),豁免同上。
+    pub const VIDEO_FRAMES: &str = "video_frames";
 }
 
 /// Worker→Host 成功（Success 帧 + 同帧 blob）。
@@ -229,6 +437,27 @@ pub struct SuccessBody {
     /// EncodeText 的应答(向量本体在同帧 blob;v2 additive,T17)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_embed: Option<TextEmbedSuccess>,
+    /// OcrSessionInit 的就绪应答(v2 additive,D-OCR-1)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_session: Option<OcrSessionReadyBody>,
+    /// OcrBatch 的逐项结果(blob 恒空,D-OCR-4)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr: Option<OcrBatchSuccess>,
+    /// EnhanceRun 的完成回执(v2 additive,降噪/超分子系统)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhance: Option<EnhanceDone>,
+    /// VideoSessionInit 的就绪应答(v2 additive,视频格式扩展子系统 design.md §2.3)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_session: Option<VideoSessionInfo>,
+    /// VideoProbe 的流事实结果(v2 additive,同上)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_probe: Option<VideoProbeInfo>,
+    /// VideoRemux/VideoTranscode 的产物统计(v2 additive,同上)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_out: Option<VideoOutInfo>,
+    /// VideoFrames 的 Keyframes 雪碧条切格元数据(v2 additive,同上);Cover 模式不填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_frames: Option<VideoFramesInfo>,
 }
 
 /// SessionInit 成功应答体(经 `SuccessBody.session` 携带)。
@@ -248,6 +477,23 @@ pub struct SessionReadyBody {
     /// GPU 显示名回声(CPU 时为空串;语义同 provider,写回 `ai_gpu_name`)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_name: Option<String>,
+}
+
+/// EnhanceRun 完成回执(经 `SuccessBody.enhance` 携带,design.md §E 输出统计)。
+/// 输出尺寸/tile 数供 host 落日志与前端展示;像素/字节本体走 `output_tmp_path`
+/// 落盘文件,不进协议帧。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnhanceDone {
+    pub out_width: u32,
+    pub out_height: u32,
+    pub tiles_total: u32,
+}
+
+/// OcrSessionInit 成功应答体(经 `SuccessBody.ocr_session` 携带)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OcrSessionReadyBody {
+    /// 本会话实际可服务的能力,恒含 `capability::OCR_TEXT`。
+    pub caps: Vec<String>,
 }
 
 /// EncodeText 成功应答体(经 `SuccessBody.text_embed` 携带)。全批原子,无逐项结构;
@@ -331,6 +577,104 @@ pub enum FaceItemResult {
     },
 }
 
+/// OcrBatch 逐项结果,同序同长/逐项核对语义同 [`EmbedBatchSuccess`]。blob 恒空(D-OCR-4)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrBatchSuccess {
+    pub results: Vec<OcrItemResult>,
+}
+
+/// 单项 OCR 结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum OcrItemResult {
+    Ok {
+        item_id: i64,
+        fingerprint: String,
+        lines: Vec<OcrLine>,
+        /// 解码图实际宽高(quad 坐标系)。
+        width: u32,
+        height: u32,
+    },
+    Err {
+        item_id: i64,
+        fingerprint: String,
+        code: WorkerErrorCode,
+    },
+}
+
+/// 单行识别结果。quad = 四点框,解码图像素坐标系——尺度即 OcrItemResult::Ok 的 width/height(实际解码尺寸),不是 DB 原生尺寸;二期叠框须按此调和。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrLine {
+    pub text: String,
+    pub quad: [[f32; 2]; 4],
+    pub confidence: f32,
+}
+
+/// VideoSessionInit 成功应答体(经 `SuccessBody.video_session` 携带,视频格式扩展
+/// 子系统 design.md §2.3)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoSessionInfo {
+    /// 本会话实际可服务的能力(如 `["video_probe","video_remux","video_transcode","video_frames"]`)。
+    pub caps: Vec<String>,
+    /// `ffmpeg -version` 首行版本号回声,供 host 日志/诊断展示。
+    pub ffmpeg_version: String,
+}
+
+/// VideoProbe 的流事实结果(经 `SuccessBody.video_probe` 携带,design.md §2.3)。
+/// worker 只出**流事实**,不做任何可播性判定——判定表在 host(「host 不信任 worker」+
+/// 策略集中)。数值型字段用 `Option` 包裹可缺失项(容器解析不出的字段)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VideoProbeInfo {
+    /// 容器格式名(ffprobe `format_name`,如 `"matroska,webm"`)。
+    pub container: String,
+    pub duration_ms: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// 显示旋转角度(0/90/180/270,来自旋转矩阵/`rotate` tag)。
+    pub rotation: Option<i32>,
+    pub fps: Option<f32>,
+    /// 总码率(bit/s)。
+    pub bitrate: Option<u64>,
+    pub video_codec: String,
+    pub video_profile: Option<String>,
+    pub bit_depth: Option<u8>,
+    pub pixel_format: Option<String>,
+    pub audio_tracks: Vec<VideoAudioTrack>,
+    pub has_subtitles: bool,
+    pub has_hdr_metadata: bool,
+}
+
+/// [`VideoProbeInfo::audio_tracks`] 单项。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoAudioTrack {
+    pub index: u32,
+    pub codec: String,
+    pub channels: Option<u32>,
+    pub language: Option<String>,
+    pub is_default: bool,
+}
+
+/// VideoRemux/VideoTranscode 的产物统计(经 `SuccessBody.video_out` 携带,
+/// design.md §2.3);host 据此做验收(时长±容差、faststart 标志)后再 `*.tmp` 同卷 rename。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoOutInfo {
+    pub out_bytes: u64,
+    pub out_duration_ms: u64,
+    /// 视频轨是否走 `-c:v copy`(remux 恒 true;transcode 恒 false)。
+    pub video_copied: bool,
+    /// 音轨是否走 `-c:a copy`(remux 视 `audio_transcode` 而定;transcode 恒 false)。
+    pub audio_copied: bool,
+}
+
+/// Keyframes 雪碧条切格元数据(经 `SuccessBody.video_frames` 携带,design.md §2.3)。
+/// Cover 模式不填(单帧 WebP 无需切格信息)。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoFramesInfo {
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub n: u32,
+}
+
 /// 稳定错误码（v3 Part2 §3.3）。整数语义跨版本固定，serde 用 snake_case 字符串。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -354,6 +698,21 @@ pub enum WorkerErrorCode {
     ModelLoadFailed,
     /// 嵌入维度与 profile 声明不符(v2,G6)→ terminal:数据完整性红线。
     EmbedDimMismatch,
+    /// ORT 动态库不可解析(v3,加固批 A):ORT_DYLIB_PATH 指向不存在文件,或未设 env 且
+    /// exe 旁无 onnxruntime 库 → terminal。此码把「死路径无限阻塞」变为秒级明确报错;
+    /// 修复靠环境(补 DLL/纠 env),重试同一 worker 无意义。
+    OrtDylibUnavailable,
+    /// ORT 运行时初始化超时(v3,加固批 A):dylib 存在但装载/环境创建卡死(如 System32
+    /// 旧版 1.17 无限阻塞、损坏的 DLL)→ terminal。区别于模型级装载失败,病灶在运行时本体。
+    OrtRuntimeInitTimeout,
+    /// 单段模型装载超时(v3,加固批 A):ort 运行时已就绪,但某段 Session 构建超出
+    /// 单段预算(如 DirectML shader 编译卡死)→ terminal;message 含卡死段名。
+    SessionLoadTimeout,
+    /// FFmpeg 不可用(视频格式扩展子系统 design.md §2.3/§3.4):`ffmpeg_exe_path` 路径
+    /// 缺失/sha256 不符(防换包)、`-version` 起不来、或 configuration 行检出
+    /// `--enable-gpl`(许可运行时保险丝)→ terminal,镜像 `OrtDylibUnavailable` 先例;
+    /// host 收到即标记工具待重下载。
+    FfmpegUnavailable,
 }
 
 impl WorkerErrorCode {
@@ -369,6 +728,10 @@ impl WorkerErrorCode {
             WorkerErrorCode::SessionExpired => "session_expired",
             WorkerErrorCode::ModelLoadFailed => "model_load_failed",
             WorkerErrorCode::EmbedDimMismatch => "embed_dim_mismatch",
+            WorkerErrorCode::OrtDylibUnavailable => "ort_dylib_unavailable",
+            WorkerErrorCode::OrtRuntimeInitTimeout => "ort_runtime_init_timeout",
+            WorkerErrorCode::SessionLoadTimeout => "session_load_timeout",
+            WorkerErrorCode::FfmpegUnavailable => "ffmpeg_unavailable",
         }
     }
 
@@ -384,6 +747,21 @@ impl WorkerErrorCode {
     }
 }
 
+/// Worker→Host 阶段回执/心跳（Progress 帧,v3 加固批 A）。**非终态**:Host 消费后
+/// 重置静默计时并继续等待同 request_id 的 Success/Failure。两种来源:
+/// ① 阶段转换(装载进入新段,`stage` 变化);② 周期心跳(段内仍在装载,`stage` 不变)。
+/// 语义 = 「worker 活着且仍在干这件事」;宿主 watchdog 据此把「猜总时长」换成「静默限时」。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgressBody {
+    /// 当前阶段标识(如 `ort_runtime_init` / `clip_image_load` / `face_embed_load`)。
+    pub stage: String,
+    /// 可选补充(provider 名/池容量等诊断信息;不得含完整绝对路径)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// 自请求开始的耗时(毫秒)——宿主日志可直读「卡在哪段多久」。
+    pub elapsed_ms: u64,
+}
+
 /// Worker→Host 失败（Failure 帧）。`retryable` 由 Worker 给出，Host 据错误码 + 该位决定重试/终态。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FailureBody {
@@ -397,229 +775,4 @@ pub struct FailureBody {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_tagged_roundtrip() {
-        let req = RequestBody::Thumbnail {
-            item_id: 42,
-            source_path: "a.psd".into(),
-            target_long_edge: 480,
-            input_fingerprint: "fp".into(),
-        };
-        let s = serde_json::to_string(&req).unwrap();
-        assert!(s.contains(r#""op":"thumbnail""#));
-        let back: RequestBody = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, req);
-        assert_eq!(back.item_id(), Some(42));
-        assert_eq!(back.input_fingerprint(), Some("fp"));
-    }
-
-    #[test]
-    fn error_code_serde_and_retryable() {
-        assert_eq!(
-            serde_json::to_string(&WorkerErrorCode::UnsupportedVariant).unwrap(),
-            r#""unsupported_variant""#
-        );
-        assert!(!WorkerErrorCode::UnsupportedVariant.default_retryable());
-        assert!(WorkerErrorCode::IoError.default_retryable());
-        assert!(WorkerErrorCode::InternalError.default_retryable());
-        assert!(!WorkerErrorCode::MalformedInput.default_retryable());
-    }
-
-    #[test]
-    fn session_init_roundtrip_and_tags() {
-        let req = RequestBody::SessionInit {
-            session_id: 7,
-            models: vec![
-                ModelDescriptor {
-                    role: ModelRole::ImageEncoder,
-                    handle: ModelHandle::Path("C:/models/img.onnx".into()),
-                    len: 10,
-                    sha256: "ab".repeat(32),
-                },
-                ModelDescriptor {
-                    role: ModelRole::FaceRecog,
-                    handle: ModelHandle::Named("pn-0011223344556677-ff".into()),
-                    len: 20,
-                    sha256: "cd".repeat(32),
-                },
-            ],
-            model_profile: ModelProfileSnapshot {
-                arch_id: "clip-vit".into(),
-                image_file: "img.onnx".into(),
-                text_file: "txt.onnx".into(),
-                batch_size: 32,
-                face_profile_id: Some("yunet-sface".into()),
-            },
-            models_root: "C:/models".into(),
-            ai_cache_dir: "C:/cache/ai".into(),
-            image_provider: "directml".into(),
-        };
-        let s = serde_json::to_string(&req).unwrap();
-        assert!(s.contains(r#""op":"session_init""#));
-        assert!(s.contains(r#""kind":"path""#));
-        assert!(s.contains(r#""kind":"named""#));
-        assert!(s.contains(r#""role":"image_encoder""#));
-        let back: RequestBody = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, req);
-        // 会话 op 无单项语义。
-        assert_eq!(back.item_id(), None);
-        assert_eq!(back.input_fingerprint(), None);
-    }
-
-    #[test]
-    fn batch_ops_roundtrip_and_tags() {
-        let embed = RequestBody::EmbedBatch {
-            items: vec![EmbedItem {
-                item_id: 1,
-                cache_key: "aabbcc".into(),
-                fingerprint: "fp1".into(),
-            }],
-        };
-        let s = serde_json::to_string(&embed).unwrap();
-        assert!(s.contains(r#""op":"embed_batch""#));
-        assert_eq!(serde_json::from_str::<RequestBody>(&s).unwrap(), embed);
-        assert_eq!(embed.item_id(), None);
-
-        let face = RequestBody::FaceDetectEmbed {
-            items: vec![FaceItem {
-                item_id: 2,
-                cache_key: None,
-                source_path: Some("D:/photos/a.jpg".into()),
-                fingerprint: "fp2".into(),
-            }],
-            det_score_thresh: 0.9,
-        };
-        let s = serde_json::to_string(&face).unwrap();
-        assert!(s.contains(r#""op":"face_detect_embed""#));
-        assert_eq!(serde_json::from_str::<RequestBody>(&s).unwrap(), face);
-
-        let close = RequestBody::SessionClose { session_id: 9 };
-        let s = serde_json::to_string(&close).unwrap();
-        assert!(s.contains(r#""op":"session_close""#));
-        assert_eq!(serde_json::from_str::<RequestBody>(&s).unwrap(), close);
-
-        // EncodeText(T17 additive):无单项语义;应答体 count 往返一致。
-        let enc = RequestBody::EncodeText {
-            texts: vec!["海边日落".into(), "cat".into()],
-        };
-        let s = serde_json::to_string(&enc).unwrap();
-        assert!(s.contains(r#""op":"encode_text""#));
-        assert_eq!(serde_json::from_str::<RequestBody>(&s).unwrap(), enc);
-        assert_eq!(enc.item_id(), None);
-        assert_eq!(enc.input_fingerprint(), None);
-        let te = TextEmbedSuccess { count: 2 };
-        let s = serde_json::to_string(&te).unwrap();
-        assert_eq!(serde_json::from_str::<TextEmbedSuccess>(&s).unwrap(), te);
-    }
-
-    #[test]
-    fn face_item_result_dims_roundtrip_and_legacy_default() {
-        // face 波 additive:Ok 补 width/height,往返一致。
-        let ok = FaceItemResult::Ok {
-            item_id: 7,
-            fingerprint: "fp7".into(),
-            faces: vec![],
-            width: 800,
-            height: 600,
-        };
-        let s = serde_json::to_string(&ok).unwrap();
-        assert_eq!(serde_json::from_str::<FaceItemResult>(&s).unwrap(), ok);
-        // 旧帧(无 width/height)仍可解析,serde default 落 0——host 校验层负责拒收 0。
-        let legacy = r#"{"status":"ok","item_id":7,"fingerprint":"fp7","faces":[]}"#;
-        match serde_json::from_str::<FaceItemResult>(legacy).unwrap() {
-            FaceItemResult::Ok { width, height, .. } => assert_eq!((width, height), (0, 0)),
-            _ => panic!("期望 Ok"),
-        }
-    }
-
-    #[test]
-    fn success_body_thumbnail_wire_shape_unchanged() {
-        // v1 时代 thumbnail Success 的线上形状在 v2 下不变:新增三字段 None 时不序列化。
-        let body = SuccessBody {
-            item_id: Some(1),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: Some(10),
-            height: Some(20),
-            metadata: None,
-            session: None,
-            embed: None,
-            face: None,
-            text_embed: None,
-        };
-        let s = serde_json::to_string(&body).unwrap();
-        assert!(!s.contains("session"));
-        assert!(!s.contains("embed"));
-        assert!(!s.contains("face"));
-        assert!(!s.contains("text_embed"));
-        assert!(s.contains(r#""item_id":1"#));
-        // v1 形状 JSON(无新字段)仍可解析。
-        let legacy = r#"{"item_id":2,"input_fingerprint":"f","mime":null,"width":null,"height":null,"metadata":null}"#;
-        let back: SuccessBody = serde_json::from_str(legacy).unwrap();
-        assert_eq!(back.item_id, Some(2));
-        assert!(back.session.is_none() && back.embed.is_none() && back.face.is_none());
-        assert!(back.text_embed.is_none());
-    }
-
-    #[test]
-    fn embed_result_status_tags() {
-        let ok = EmbedResult::Ok {
-            item_id: 1,
-            fingerprint: "f1".into(),
-        };
-        let err = EmbedResult::Err {
-            item_id: 2,
-            fingerprint: "f2".into(),
-            code: WorkerErrorCode::GpuUnavailable,
-        };
-        let s = serde_json::to_string(&vec![ok.clone(), err.clone()]).unwrap();
-        assert!(s.contains(r#""status":"ok""#));
-        assert!(s.contains(r#""status":"err""#));
-        assert!(s.contains(r#""code":"gpu_unavailable""#));
-        let back: Vec<EmbedResult> = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, vec![ok, err]);
-    }
-
-    #[test]
-    fn v2_error_codes_serde_and_retryable() {
-        assert_eq!(WorkerErrorCode::GpuUnavailable.as_str(), "gpu_unavailable");
-        assert_eq!(WorkerErrorCode::SessionExpired.as_str(), "session_expired");
-        assert_eq!(
-            WorkerErrorCode::ModelLoadFailed.as_str(),
-            "model_load_failed"
-        );
-        assert_eq!(
-            WorkerErrorCode::EmbedDimMismatch.as_str(),
-            "embed_dim_mismatch"
-        );
-        assert!(WorkerErrorCode::GpuUnavailable.default_retryable());
-        assert!(WorkerErrorCode::SessionExpired.default_retryable());
-        assert!(!WorkerErrorCode::ModelLoadFailed.default_retryable());
-        assert!(!WorkerErrorCode::EmbedDimMismatch.default_retryable());
-        assert_eq!(
-            serde_json::to_string(&WorkerErrorCode::SessionExpired).unwrap(),
-            r#""session_expired""#
-        );
-    }
-
-    #[test]
-    fn failure_body_optional_item_fields() {
-        // 整批失败:无单项字段;缺省字段可解析(Option 特化)。
-        let legacy = r#"{"code":"session_expired","retryable":true,"message":"m"}"#;
-        let back: FailureBody = serde_json::from_str(legacy).unwrap();
-        assert_eq!(back.item_id, None);
-        assert_eq!(back.input_fingerprint, None);
-        assert_eq!(back.code, WorkerErrorCode::SessionExpired);
-    }
-
-    #[test]
-    fn capability_names_stable() {
-        assert_eq!(capability::THUMBNAIL, "thumbnail");
-        assert_eq!(capability::METADATA, "metadata");
-        assert_eq!(capability::EMBEDDING, "embedding");
-        assert_eq!(capability::FACE_DETECT_EMBED, "face_detect_embed");
-    }
-}
+mod tests;

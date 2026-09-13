@@ -1,8 +1,7 @@
 // src/composables/usePluginEntitlement.ts
 // 插件授权态 composable（Part5 T12，消费 Part6 get_plugin_entitlement）。
-// Plugin-entitlement composable (Part5 T12), consuming the Part6 `get_plugin_entitlement` IPC.
 //
-// 🔴 开源/闭源边界（Part0 §10）：本 composable **只**向后端取授权态并映射为 UI 展示判定
+// 前后端职责：本 composable **只**向后端取授权态并映射为 UI 展示判定
 //    （是否显 gate / 购买引导），**不持任何验签逻辑**——授权真相全在后端 EntitlementProvider。
 
 import { ref, computed } from 'vue'

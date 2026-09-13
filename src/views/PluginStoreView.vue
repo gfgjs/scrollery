@@ -1,8 +1,6 @@
-<!-- src/views/PluginStoreView.vue -->
 <!-- 插件商店（Part5 T11）：浏览签名 Registry 可安装条目 + 安装生命周期 + 处理进度。 -->
-<!-- Plugin store (Part5 T11): browse signed registry, install lifecycle, processing progress. -->
 <!--
-  🔴 开源/闭源边界（Part0 §10）：本视图只调后端命令（列表 / 安装 / 激活 / 进度），
+  前后端职责：本视图只调后端命令（列表 / 安装 / 激活 / 进度），
      验签 / 防回滚 / 完整性校验全在后端；命令只传已校验 pluginId，不碰下载坐标，不持验签逻辑。
   数据/动作经 useExoticStore；激活复用 ExoticActivateDialog。
 -->
@@ -22,6 +20,11 @@
     <!-- 目录过期横幅：仍可展示但不允许新装。 -->
     <div v-if="anyExpired" class="ps-banner ps-banner--warn">
       {{ $t('exotic.storeExpiredHint') }}
+    </div>
+
+    <!-- 加载/刷新失败横幅：避免静默空列表。 -->
+    <div v-if="store.error.value" class="ps-banner ps-banner--error">
+      {{ storeErrorText }}
     </div>
 
     <!-- 处理进度：有 exotic 任务时才显（进度条 + 计数 + 控制）。 -->
@@ -122,7 +125,7 @@
     </section>
 
     <!-- 首次加载占位:骨架卡片(S5),替代空转 spinner。 -->
-    <div v-if="store.loading.value && rows.length === 0" class="ps-skeleton" role="status">
+    <div v-if="store.loading.value && rows.length === 0" class="ps-skeleton">
       <div v-for="i in 3" :key="i" class="skeleton-block ps-skeleton__card" />
     </div>
 
@@ -136,11 +139,11 @@
     <!-- 插件列表。 -->
     <div v-else class="ps-list">
       <div v-for="row in rows" :key="row.pluginId" class="ps-card">
-        <div class="ps-card__icon" aria-hidden="true"><Puzzle :size="22" /></div>
+        <div class="ps-card__icon"><Puzzle :size="22" /></div>
 
         <div class="ps-card__body">
           <div class="ps-card__title-row">
-            <span class="ps-card__name">{{ row.pluginId }}</span>
+            <span class="ps-card__name">{{ row.name || row.pluginId }}</span>
             <span class="ps-badge" :class="'ps-badge--' + statusKey(row)">{{
               statusLabel(row)
             }}</span>
@@ -220,6 +223,81 @@
       </div>
     </div>
 
+    <!-- 内置能力插件（T11：D-OCR-5——无安装包，直接走 license 门控，如 OCR）。 -->
+    <section v-if="store.builtinOfferings.value.length" class="ps-builtin">
+      <h3 class="ps-builtin__title">{{ $t('store.builtinTitle') }}</h3>
+      <div class="ps-list">
+        <div
+          v-for="off in store.builtinOfferings.value"
+          :key="off.format"
+          class="ps-card"
+        >
+          <div class="ps-card__icon"><Puzzle :size="22" /></div>
+          <div class="ps-card__body">
+            <div class="ps-card__title-row">
+              <span class="ps-card__name">{{ off.displayName || off.pluginId }}</span>
+              <span
+                v-if="off.availability === 'authorized'"
+                class="ps-badge ps-badge--installed"
+                >{{ $t('exotic.activated') }}</span
+              >
+            </div>
+            <p v-if="off.availability === 'authorized'" class="ps-builtin__hint">
+              {{ $t('store.builtinNoInstall') }}
+            </p>
+            <!-- 视频格式扩展子系统(design.md §3.4):FFmpeg 是进程边界外的独立可执行文件,不链接
+                 进本应用(全链路无链接,连 LGPL 动态链接义务都不触发),但仍按 LGPL 精神展示声明 +
+                 源码获取渠道。仅本插件卡片显示(硬编 pluginId 判断,数据驱动的 catalog 无 description
+                 字段可扩,见 findings)。 -->
+            <!-- 源码链钉死到具体 release tag(V7 项11),与 tools.rs BTBN_RELEASE_TAG 同步改——
+                 该常量升级时须同时改这里的 href,否则用户点开的源码页与实际内置版本不一致。 -->
+            <p v-if="off.pluginId === 'video-extended'" class="ps-builtin__ffmpeg-notice">
+              {{ $t('store.videoExtendedFfmpegNotice') }}
+              <a
+                class="ps-builtin__ffmpeg-link"
+                href="https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-07-24-13-32"
+                target="_blank"
+                rel="noopener noreferrer"
+                >{{ $t('store.videoExtendedSourceLink') }}</a
+              >
+            </p>
+          </div>
+          <div class="ps-card__actions">
+            <span v-if="off.pluginId ? busy[off.pluginId] : false" class="ps-busy">
+              <RefreshCw :size="14" class="spin-anim" />
+            </span>
+            <template v-else>
+              <span v-if="off.availability === 'authorized'" class="ps-activated">
+                <CheckCircle2 :size="14" /> {{ $t('exotic.activated') }}
+              </span>
+              <template
+                v-else-if="off.availability === 'availableUninstalled' || off.availability === 'licenseExpired'"
+              >
+                <button
+                  v-if="off.pluginId"
+                  class="btn btn-ghost btn-sm"
+                  @click="activateTarget = off.pluginId"
+                >
+                  <KeyRound :size="14" /> {{ $t('exotic.activateAction') }}
+                </button>
+                <a
+                  v-if="off.storeUrl"
+                  class="btn btn-ghost btn-sm"
+                  :href="off.storeUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ $t('exotic.gateBuy') }}
+                </a>
+              </template>
+              <!-- 兜底态(平台不支持/版本不兼容/已禁用等):禁用态徽章,不留空白操作区。 -->
+              <span v-else class="ps-badge ps-badge--disabled">{{ $t('exotic.stateDisabled') }}</span>
+            </template>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- 激活对话框：由某行「激活」触发。 -->
     <ExoticActivateDialog
       :open="activateTarget !== null"
@@ -233,7 +311,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { useTauriListen } from '../composables/useTauriListen'
 import {
   RefreshCw,
   Puzzle,
@@ -255,7 +333,8 @@ import { useI18n } from 'vue-i18n'
 
 import ExoticActivateDialog from '../components/exotic/ExoticActivateDialog.vue'
 import { useExoticStore, mergeStorePlugins, type StorePluginRow } from '../composables/useExoticStore'
-import { useUiStore } from '../stores/uiStore'
+import { resetOcrStatusCache } from '../composables/useOcr'
+import { useToastStore } from '../stores/toastStore'
 import { useConfirm } from '../composables/useConfirm'
 import { IPC, EVENTS } from '../constants/ipc'
 import type {
@@ -269,7 +348,7 @@ import { invokeIpc, type IpcError } from '../utils/ipc'
 
 const { t } = useI18n()
 const store = useExoticStore()
-const ui = useUiStore()
+const toast = useToastStore()
 const { confirm } = useConfirm()
 
 // 合并 registry × installed 为展示行（纯函数，见 useExoticStore）。
@@ -277,6 +356,13 @@ const rows = computed<StorePluginRow[]>(() =>
   mergeStorePlugins(store.registry.value, store.installed.value),
 )
 const anyExpired = computed(() => rows.value.some((r) => r.registryExpired))
+
+// 加载/刷新失败展示文案：优先后端 message，其次稳定 code，最后 i18n 兜底。
+const storeErrorText = computed(() => {
+  const e = store.error.value
+  if (!e) return ''
+  return (e as IpcError)?.message || (e as IpcError)?.code || t('exotic.storeLoadFailed')
+})
 
 // 处理进度（可能为 null=未取到）。
 const proc = computed(() => store.status.value)
@@ -406,13 +492,27 @@ function refreshStatusThrottled() {
   }, 500)
 }
 
-let unlistenStatus: UnlistenFn | null = null
-onMounted(async () => {
-  void store.loadAll()
-  unlistenStatus = await listen(EVENTS.EXOTIC_STATUS_CHANGED, refreshStatusThrottled)
+// EXOTIC_STATUS_CHANGED 监听解绑交由 useTauriListen(P1-11);onMounted 只留 loadAll。
+useTauriListen(EVENTS.EXOTIC_STATUS_CHANGED, refreshStatusThrottled)
+
+onMounted(() => {
+  void (async () => {
+    await store.loadAll()
+    // 全新设备/缓存为空或目录已过期时，自动尝试拉取一次远程 Registry；
+    // 失败不弹 toast，由顶部错误横幅展示，避免“空列表无提示”。
+    const shouldAutoRefresh =
+      store.registry.value.length === 0 || store.registry.value.some((r) => r.registryExpired)
+    if (shouldAutoRefresh && !store.error.value) {
+      try {
+        await store.refreshRegistry()
+        await store.loadAll()
+      } catch (e) {
+        store.error.value = e as IpcError
+      }
+    }
+  })()
 })
 onBeforeUnmount(() => {
-  if (unlistenStatus) unlistenStatus()
   if (statusTimer) clearTimeout(statusTimer)
 })
 
@@ -434,9 +534,9 @@ async function run(pluginId: string, fn: () => Promise<void>, okKey: string) {
   busy[pluginId] = true
   try {
     await fn()
-    ui.addToast('success', t(okKey))
+    toast.addToast('success', t(okKey))
   } catch (e) {
-    ui.addToast('error', t('exotic.opFailed', { code: (e as IpcError)?.code ?? 'unknown' }))
+    toast.addToast('error', t('exotic.opFailed', { code: (e as IpcError)?.code ?? 'unknown' }))
   } finally {
     busy[pluginId] = false
   }
@@ -462,10 +562,13 @@ async function onUninstall(pluginId: string) {
   void run(pluginId, () => store.uninstall(pluginId, checkboxValue), 'exotic.uninstalledOk')
 }
 
-// 激活成功 → 刷新已装/进度（授权态变化可能解阻处理）。
+// 激活成功 → 刷新已装/进度（授权态变化可能解阻处理）+ 内置能力区（T11）；
+// resetOcrStatusCache 清 useOcr 的 60s 状态缓存，激活后立即反映新授权态。
 function onActivated() {
   void store.loadInstalled()
   void store.loadStatus()
+  void store.loadBuiltin()
+  resetOcrStatusCache()
 }
 
 // ── 目录刷新 ────────────────────────────────────────────────────────────────
@@ -474,9 +577,11 @@ async function onRefresh() {
   refreshing.value = true
   try {
     const summary = await store.refreshRegistry()
-    ui.addToast('success', t('exotic.storeRefreshed', { count: summary.pluginCount }))
+    store.error.value = null
+    toast.addToast('success', t('exotic.storeRefreshed', { count: summary.pluginCount }))
   } catch (e) {
-    ui.addToast('error', t('exotic.storeRefreshFailed', { code: (e as IpcError)?.code ?? e }))
+    store.error.value = e as IpcError
+    toast.addToast('error', t('exotic.storeRefreshFailed', { code: (e as IpcError)?.code ?? e }))
   } finally {
     refreshing.value = false
   }
@@ -489,7 +594,7 @@ async function ctrl(fn: () => Promise<void>) {
   try {
     await fn()
   } catch (e) {
-    ui.addToast('error', t('exotic.opFailed', { code: (e as IpcError)?.code ?? 'unknown' }))
+    toast.addToast('error', t('exotic.opFailed', { code: (e as IpcError)?.code ?? 'unknown' }))
   } finally {
     procBusy.value = false
   }
@@ -500,7 +605,7 @@ async function ctrl(fn: () => Promise<void>) {
 .plugin-store {
   height: 100%;
   overflow-y: auto;
-  padding: var(--spacing-lg) var(--spacing-xl);
+  padding: var(--spacing-xl);
 }
 
 /* ── Header ───────────────────────────────────────────────────────────────── */
@@ -509,7 +614,7 @@ async function ctrl(fn: () => Promise<void>) {
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--spacing-md);
-  margin-bottom: var(--spacing-lg);
+  margin-bottom: var(--spacing-xl);
 }
 .ps-header__text {
   min-width: 0;
@@ -529,22 +634,27 @@ async function ctrl(fn: () => Promise<void>) {
 .ps-banner {
   margin-bottom: var(--spacing-md);
   padding: var(--spacing-sm) var(--spacing-md);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
   line-height: 1.5;
 }
 .ps-banner--warn {
-  background: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  background: var(--color-warning-subtle);
   color: var(--color-warning);
+}
+
+.ps-banner--error {
+  background: var(--color-error-subtle);
+  color: var(--color-error);
 }
 
 /* ── Processing ───────────────────────────────────────────────────────────── */
 .ps-proc {
   margin-bottom: var(--spacing-lg);
   padding: var(--spacing-md);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-lg);
-  background: var(--color-bg-elevated);
+  background: var(--color-bg-surface);
 }
 .ps-proc__head {
   display: flex;
@@ -569,12 +679,12 @@ async function ctrl(fn: () => Promise<void>) {
 .ps-proc__bar-fill {
   height: 100%;
   background: var(--color-accent);
-  transition: width 200ms linear;
+  transition: width var(--duration-fast) linear;
 }
 .ps-proc__meta {
   display: flex;
   gap: var(--spacing-md);
-  margin-top: 6px;
+  margin-top: var(--spacing-xs);
   font-size: var(--font-size-xs);
   color: var(--color-text-tertiary);
 }
@@ -584,15 +694,15 @@ async function ctrl(fn: () => Promise<void>) {
 .ps-proc__err {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: var(--spacing-2xs);
   color: var(--color-error);
 }
 .ps-proc__toggle {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: var(--spacing-2xs);
   margin-left: auto;
-  padding: 2px 6px;
+  padding: var(--spacing-2xs) var(--spacing-xs);
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -620,9 +730,10 @@ async function ctrl(fn: () => Promise<void>) {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 3px 9px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-full);
+  min-height: 24px;
+  padding: 0 var(--spacing-sm);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   background: transparent;
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
@@ -632,8 +743,8 @@ async function ctrl(fn: () => Promise<void>) {
   background: var(--color-bg-hover);
 }
 .ps-filter--active {
-  border-color: var(--color-accent);
-  color: var(--color-accent);
+  border-color: transparent;
+  color: var(--color-accent-text);
   background: var(--color-accent-subtle);
 }
 .ps-filter__n {
@@ -651,7 +762,7 @@ async function ctrl(fn: () => Promise<void>) {
   display: flex;
   align-items: center;
   gap: var(--spacing-sm);
-  padding: 4px 2px;
+  padding: var(--spacing-xs) var(--spacing-2xs);
   font-size: var(--font-size-xs);
   border-bottom: 1px solid color-mix(in srgb, var(--color-border) 45%, transparent);
 }
@@ -686,11 +797,11 @@ async function ctrl(fn: () => Promise<void>) {
 }
 .ps-task__fmt {
   flex-shrink: 0;
-  font-size: 10px;
-  font-weight: 700;
+  font-size: var(--font-size-2xs);
+  font-weight: 600;
   letter-spacing: 0.04em;
-  padding: 1px 5px;
-  border-radius: var(--radius-sm);
+  padding: 1px var(--spacing-xs);
+  border-radius: var(--radius-xs);
   background: var(--color-bg-hover);
   color: var(--color-text-secondary);
 }
@@ -755,6 +866,33 @@ async function ctrl(fn: () => Promise<void>) {
   border-radius: var(--radius-md);
 }
 
+/* ── 内置能力插件区（T11）─────────────────────────────────────────────────── */
+.ps-builtin {
+  margin-top: var(--spacing-lg);
+}
+.ps-builtin__title {
+  margin: 0 0 var(--spacing-sm);
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.ps-builtin__hint {
+  margin: var(--spacing-xs) 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+}
+/* 视频格式扩展 FFmpeg/LGPL 声明(design.md §3.4):比 hint 更弱化的脚注语气,链接内联。 */
+.ps-builtin__ffmpeg-notice {
+  margin: var(--spacing-xs) 0 0;
+  font-size: var(--font-size-2xs);
+  line-height: 1.5;
+  color: var(--color-text-tertiary);
+}
+.ps-builtin__ffmpeg-link {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+
 /* ── Plugin cards ─────────────────────────────────────────────────────────── */
 .ps-list {
   display: flex;
@@ -765,7 +903,7 @@ async function ctrl(fn: () => Promise<void>) {
   display: flex;
   gap: var(--spacing-md);
   padding: var(--spacing-md);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-lg);
   background: var(--color-bg-surface);
 }
@@ -774,8 +912,8 @@ async function ctrl(fn: () => Promise<void>) {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
   border-radius: var(--radius-md);
   background: var(--color-accent-subtle);
   color: var(--color-accent);
@@ -798,15 +936,15 @@ async function ctrl(fn: () => Promise<void>) {
 .ps-card__formats {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 6px;
+  gap: var(--spacing-xs);
+  margin-top: var(--spacing-xs);
 }
 .ps-chip {
-  font-size: 10px;
-  font-weight: 700;
+  font-size: var(--font-size-2xs);
+  font-weight: 600;
   letter-spacing: 0.04em;
-  padding: 2px 6px;
-  border-radius: var(--radius-sm);
+  padding: var(--spacing-2xs) var(--spacing-xs);
+  border-radius: var(--radius-xs);
   background: var(--color-bg-hover);
   color: var(--color-text-secondary);
 }
@@ -814,7 +952,7 @@ async function ctrl(fn: () => Promise<void>) {
   display: flex;
   flex-wrap: wrap;
   gap: var(--spacing-md);
-  margin-top: 6px;
+  margin-top: var(--spacing-xs);
   font-size: var(--font-size-xs);
   color: var(--color-text-tertiary);
 }
@@ -823,10 +961,10 @@ async function ctrl(fn: () => Promise<void>) {
 }
 
 .ps-badge {
-  font-size: 10px;
-  font-weight: 700;
+  font-size: var(--font-size-2xs);
+  font-weight: 600;
   line-height: 1;
-  padding: 3px 7px;
+  padding: var(--spacing-2xs) var(--spacing-xs);
   border-radius: var(--radius-full);
 }
 .ps-badge--installable {
@@ -834,19 +972,19 @@ async function ctrl(fn: () => Promise<void>) {
   color: var(--color-text-secondary);
 }
 .ps-badge--installed {
-  background: color-mix(in srgb, var(--color-success) 18%, transparent);
+  background: var(--color-success-subtle);
   color: var(--color-success);
 }
 .ps-badge--upgradable {
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-on-accent);
 }
 .ps-badge--disabled {
   background: var(--color-bg-hover);
   color: var(--color-text-tertiary);
 }
 .ps-badge--broken {
-  background: color-mix(in srgb, var(--color-error) 18%, transparent);
+  background: var(--color-error-subtle);
   color: var(--color-error);
 }
 
@@ -857,14 +995,19 @@ async function ctrl(fn: () => Promise<void>) {
   gap: var(--spacing-xs);
 }
 .btn-sm {
-  padding: 4px 10px;
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
+  border-radius: var(--radius-sm);
   font-size: var(--font-size-xs);
 }
 .ps-activated {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 10px;
+  gap: var(--spacing-xs);
+  min-height: 24px;
+  padding: 0 var(--spacing-sm);
+  border-radius: var(--radius-full);
+  background: var(--color-success-subtle);
   font-size: var(--font-size-xs);
   font-weight: 600;
   color: var(--color-success);
@@ -882,7 +1025,7 @@ async function ctrl(fn: () => Promise<void>) {
 }
 
 .spin-anim {
-  animation: spin 1s linear infinite;
+  animation: spin var(--duration-spin) linear infinite;
 }
 @keyframes spin {
   to {

@@ -1,163 +1,171 @@
 <template>
   <!-- 人脸批量审批面板（Part5 T10, §3.6.2）：消费 list_likely_face_matches 的 likely-match 分组，
        用户对整组/选中脸一次性 确认 / 拒绝 / 建新人物 / 移出。默认全选 → 「确认」一键接受整组建议。
-       视觉沿用项目模态范式（.dialog-overlay + 设计 token）。 -->
-  <div class="dialog-overlay approval-overlay" @click.self="$emit('close')">
-    <div class="dialog-content approval-card">
+       外壳迁 UiDialog(此前无 Teleport/无焦点陷阱,原位流内块)。自定义头部(标题+副标题+关闭键)走 #header;
+       分组列表为可滚正文,故 max-height='84vh' 封顶 + 正文滚动。范式② v-if 挂载,open 恒 true。 -->
+  <UiDialog
+    :open="true"
+    :title="t('faces.approvalTitle')"
+    max-width="680px"
+    max-height="84vh"
+    :show-close="false"
+    @close="$emit('close')"
+  >
+    <template #header>
       <header class="approval-header">
         <div>
-          <h2 class="approval-title">{{ t('faces.approvalTitle') }}</h2>
+          <h2 id="face-approval-title" class="approval-title">{{ t('faces.approvalTitle') }}</h2>
           <p class="approval-subtitle">{{ t('faces.approvalSubtitle') }}</p>
         </div>
         <button
           class="btn-close"
           :title="t('common.close')"
-          :aria-label="t('common.close')"
+
           @click="$emit('close')"
         >
           <X :size="18" />
         </button>
       </header>
+    </template>
 
-      <main class="approval-body">
-        <div v-if="loading" class="approval-state">{{ t('common.loading') }}</div>
-        <div v-else-if="error" class="approval-state approval-state--error">{{ error }}</div>
-        <div v-else-if="groups.length === 0" class="approval-state">
-          <PartyPopper :size="28" />
-          <span>{{ t('faces.approvalEmpty') }}</span>
-        </div>
-
-        <div v-else class="group-list">
-          <section v-for="g in groups" :key="g.personId" class="group-card">
-            <div class="group-head">
-              <div class="group-id">
-                <span class="group-name" :class="{ 'is-unnamed': !g.personName }">
-                  {{ g.personName || t('persons.unnamedPerson') }}
-                </span>
-                <span class="group-meta">
-                  {{
-                    t('faces.groupMeta', {
-                      id: g.personId,
-                      pct: confidencePct(g),
-                      count: g.candidateFaces.length,
-                    })
-                  }}
-                </span>
-              </div>
-              <button class="link-btn" @click="toggleAll(g)">
-                {{ allSelected(g) ? t('common.deselectAll') : t('common.selectAll') }}
-              </button>
-            </div>
-
-            <div class="face-grid">
-              <button
-                v-for="f in g.candidateFaces"
-                :key="f.faceId"
-                type="button"
-                class="face-cell"
-                :class="{ selected: selected.has(f.faceId) }"
-                :title="t('faces.similarityTitle', { pct: Math.round(f.similarity * 100) })"
-                :aria-label="t('faces.similarityTitle', { pct: Math.round(f.similarity * 100) })"
-                @click="toggleFace(f.faceId)"
-              >
-                <FaceAvatar
-                  :thumb-path="f.thumbPath"
-                  :thumb-status="f.thumbStatus"
-                  :bbox="f.bbox"
-                  :cache-dir="store.cacheDir"
-                  :size="64"
-                />
-                <Check v-if="selected.has(f.faceId)" :size="14" class="face-check" />
-              </button>
-            </div>
-
-            <div class="group-actions">
-              <button
-                class="btn btn-primary"
-                :disabled="busy || countIn(g) === 0"
-                @click="act('confirm', g)"
-              >
-                <Check :size="14" /> {{ t('faces.confirmCount', { count: countIn(g) }) }}
-              </button>
-              <button
-                class="btn btn-secondary"
-                :disabled="busy || countIn(g) === 0"
-                @click="act('reject', g)"
-              >
-                <X :size="14" /> {{ t('faces.notThisPerson') }}
-              </button>
-              <button
-                class="btn btn-secondary"
-                :disabled="busy || countIn(g) === 0"
-                @click="openReassign(g)"
-              >
-                <ArrowRightLeft :size="14" /> {{ t('faces.reassignTo') }}
-              </button>
-              <button
-                class="btn btn-secondary"
-                :disabled="busy || countIn(g) === 0"
-                @click="act('create', g)"
-              >
-                <UserPlus :size="14" /> {{ t('faces.createPerson') }}
-              </button>
-              <button
-                class="btn btn-secondary action-danger"
-                :disabled="busy || countIn(g) === 0"
-                @click="act('unassign', g)"
-              >
-                <Ban :size="14" /> {{ t('faces.unassign') }}
-              </button>
-            </div>
-
-            <!-- 改派选择器（内联展开）：把选中脸改归另一个现有人物。搜索过滤,排除本组候选自身。 -->
-            <div v-if="reassignFor === g.personId" class="reassign-picker">
-              <input
-                v-model="reassignQuery"
-                class="reassign-search"
-                :placeholder="t('faces.reassignPlaceholder')"
-              />
-              <div class="reassign-list">
-                <button
-                  v-for="p in reassignCandidates"
-                  :key="p.id"
-                  type="button"
-                  class="reassign-item"
-                  :disabled="busy"
-                  @click="doReassign(g, p.id)"
-                >
-                  <span :class="{ 'is-unnamed': !p.isNamed }">
-                    {{ p.name || t('persons.unnamedPerson') }}
-                  </span>
-                  <span class="reassign-count">
-                    {{ t('persons.faceCount', { count: p.faceCount }) }}
-                  </span>
-                </button>
-                <div v-if="reassignCandidates.length === 0" class="reassign-empty">
-                  {{ t('faces.noMatch') }}
-                </div>
-              </div>
-            </div>
-          </section>
-        </div>
-      </main>
+    <div v-if="loading" class="approval-state">{{ t('common.loading') }}</div>
+    <div v-else-if="error" class="approval-state approval-state--error">{{ error }}</div>
+    <div v-else-if="groups.length === 0" class="approval-state">
+      <PartyPopper :size="28" />
+      <span>{{ t('faces.approvalEmpty') }}</span>
     </div>
-  </div>
+
+    <div v-else class="group-list">
+      <section v-for="g in groups" :key="g.personId" class="group-card">
+        <div class="group-head">
+          <div class="group-id">
+            <span class="group-name" :class="{ 'is-unnamed': !g.personName }">
+              {{ g.personName || t('persons.unnamedPerson') }}
+            </span>
+            <span class="group-meta">
+              {{
+                t('faces.groupMeta', {
+                  id: g.personId,
+                  pct: confidencePct(g),
+                  count: g.candidateFaces.length,
+                })
+              }}
+            </span>
+          </div>
+          <button class="link-btn" @click="toggleAll(g)">
+            {{ allSelected(g) ? t('common.deselectAll') : t('common.selectAll') }}
+          </button>
+        </div>
+
+        <div class="face-grid">
+          <button
+            v-for="f in g.candidateFaces"
+            :key="f.faceId"
+            type="button"
+            class="face-cell"
+            :class="{ selected: selected.has(f.faceId) }"
+            :title="t('faces.similarityTitle', { pct: Math.round(f.similarity * 100) })"
+
+            @click="toggleFace(f.faceId)"
+          >
+            <FaceAvatar
+              :thumb-path="f.thumbPath"
+              :thumb-status="f.thumbStatus"
+              :bbox="f.bbox"
+              :cache-dir="store.cacheDir"
+              :size="64"
+            />
+            <Check v-if="selected.has(f.faceId)" :size="14" class="face-check" />
+          </button>
+        </div>
+
+        <div class="group-actions">
+          <button
+            class="btn btn-primary"
+            :disabled="busy || countIn(g) === 0"
+            @click="act('confirm', g)"
+          >
+            <Check :size="14" /> {{ t('faces.confirmCount', { count: countIn(g) }) }}
+          </button>
+          <button
+            class="btn btn-secondary"
+            :disabled="busy || countIn(g) === 0"
+            @click="act('reject', g)"
+          >
+            <X :size="14" /> {{ t('faces.notThisPerson') }}
+          </button>
+          <button
+            class="btn btn-secondary"
+            :disabled="busy || countIn(g) === 0"
+            @click="openReassign(g)"
+          >
+            <ArrowRightLeft :size="14" /> {{ t('faces.reassignTo') }}
+          </button>
+          <button
+            class="btn btn-secondary"
+            :disabled="busy || countIn(g) === 0"
+            @click="act('create', g)"
+          >
+            <UserPlus :size="14" /> {{ t('faces.createPerson') }}
+          </button>
+          <button
+            class="btn btn-secondary action-danger"
+            :disabled="busy || countIn(g) === 0"
+            @click="act('unassign', g)"
+          >
+            <Ban :size="14" /> {{ t('faces.unassign') }}
+          </button>
+        </div>
+
+        <!-- 改派选择器（内联展开）：把选中脸改归另一个现有人物。搜索过滤,排除本组候选自身。 -->
+        <div v-if="reassignFor === g.personId" class="reassign-picker">
+          <input
+            v-model="reassignQuery"
+            class="reassign-search"
+            :placeholder="t('faces.reassignPlaceholder')"
+          />
+          <div class="reassign-list">
+            <button
+              v-for="p in reassignCandidates"
+              :key="p.id"
+              type="button"
+              class="reassign-item"
+              :disabled="busy"
+              @click="doReassign(g, p.id)"
+            >
+              <span :class="{ 'is-unnamed': !p.isNamed }">
+                {{ p.name || t('persons.unnamedPerson') }}
+              </span>
+              <span class="reassign-count">
+                {{ t('persons.faceCount', { count: p.faceCount }) }}
+              </span>
+            </button>
+            <div v-if="reassignCandidates.length === 0" class="reassign-empty">
+              {{ t('faces.noMatch') }}
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </UiDialog>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { X, Check, UserPlus, Ban, PartyPopper, ArrowRightLeft } from '@lucide/vue'
+import UiDialog from '../ui/UiDialog.vue'
 import FaceAvatar from '../common/FaceAvatar.vue'
 import { usePersonStore } from '../../stores/personStore'
-import { useUiStore } from '../../stores/uiStore'
+import { useToastStore } from '../../stores/toastStore'
+import { ipcErrorMessage } from '../../utils/ipc'
 import type { LikelyMatchGroup } from '../../types/person'
 
 defineEmits<{ (e: 'close'): void }>()
 
 const { t } = useI18n()
 const store = usePersonStore()
-const ui = useUiStore()
+const toast = useToastStore()
 
 const loading = ref(true)
 const error = ref('')
@@ -176,7 +184,8 @@ onMounted(async () => {
     for (const g of store.likelyMatches) for (const f of g.candidateFaces) all.add(f.faceId)
     selected.value = all
   } catch (e) {
-    error.value = t('faces.loadFailed', { error: String(e) })
+    // 文案统一走 ipcErrorMessage(2026-07-10 审查 U7):String(e) 带 "IpcError: " 前缀。
+    error.value = t('faces.loadFailed', { error: ipcErrorMessage(e) })
   } finally {
     loading.value = false
   }
@@ -237,13 +246,13 @@ async function doReassign(g: LikelyMatchGroup, targetId: number) {
   busy.value = true
   try {
     await store.reassignFaces(ids, targetId)
-    ui.addToast('success', t('faces.reassignedToast', { count: ids.length }))
+    toast.addToast('success', t('faces.reassignedToast', { count: ids.length }))
     const s = new Set(selected.value)
     for (const id of ids) s.delete(id)
     selected.value = s
     reassignFor.value = null
   } catch (e) {
-    ui.addToast('error', String(e))
+    toast.addToast('error', ipcErrorMessage(e))
   } finally {
     busy.value = false
   }
@@ -260,22 +269,22 @@ async function act(action: Action, g: LikelyMatchGroup) {
   try {
     if (action === 'confirm') {
       await store.confirmFaces(ids)
-      ui.addToast('success', t('faces.confirmedToast', { count: ids.length }))
+      toast.addToast('success', t('faces.confirmedToast', { count: ids.length }))
     } else if (action === 'reject') {
       await store.rejectFaces(ids, g.personId)
-      ui.addToast('success', t('faces.rejectedToast', { count: ids.length }))
+      toast.addToast('success', t('faces.rejectedToast', { count: ids.length }))
     } else if (action === 'create') {
       await store.createPerson(ids)
-      ui.addToast('success', t('faces.createdToast', { count: ids.length }))
+      toast.addToast('success', t('faces.createdToast', { count: ids.length }))
     } else {
       await store.unassignFaces(ids)
-      ui.addToast('success', t('faces.unassignedToast', { count: ids.length }))
+      toast.addToast('success', t('faces.unassignedToast', { count: ids.length }))
     }
     const s = new Set(selected.value)
     for (const id of ids) s.delete(id)
     selected.value = s
   } catch (e) {
-    ui.addToast('error', String(e))
+    toast.addToast('error', ipcErrorMessage(e))
   } finally {
     busy.value = false
   }
@@ -283,23 +292,16 @@ async function act(action: Action, g: LikelyMatchGroup) {
 </script>
 
 <style scoped>
-/* 复用全局 .dialog-overlay / .dialog-content（见 CloseConfirmDialog），此处做审批特化。 */
-.approval-overlay {
-  z-index: 9998;
-}
-.approval-card {
-  max-width: 680px;
-  width: 92%;
-  max-height: 84vh;
-}
-
+/* 外壳(overlay/content/动画)由 UiDialog + 全局 Modal 基座提供;宽度 680px 走 max-width prop、
+   封顶高度 84vh 走 max-height prop(触发 --capped:正文可滚、头固定)。本组件保留头部/分组列表特化。 */
 .approval-header {
   padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-divider);
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--spacing-md);
+  flex-shrink: 0; /* --capped 布局下头部不随正文收缩,保持固定;正文(UiDialog .dialog-body)独占滚动 */
 }
 .approval-title {
   margin: 0;
@@ -308,14 +310,14 @@ async function act(action: Action, g: LikelyMatchGroup) {
   color: var(--color-text-primary);
 }
 .approval-subtitle {
-  margin: 4px 0 0;
+  margin: var(--spacing-xs) 0 0;
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
 }
 .btn-close {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
+  width: var(--control-size-compact);
+  height: var(--control-size-compact);
+  border-radius: var(--radius-full);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -324,22 +326,26 @@ async function act(action: Action, g: LikelyMatchGroup) {
   color: var(--color-text-secondary);
   cursor: pointer;
   flex-shrink: 0;
-  transition: all var(--transition-fast);
+  /* 显式列举过渡属性(勿 transition:all,S1 机械批) */
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast),
+    box-shadow var(--transition-fast);
 }
 .btn-close:hover {
   background: var(--color-bg-hover);
   color: var(--color-text-primary);
 }
-
-.approval-body {
-  padding: var(--spacing-lg);
-  overflow-y: auto;
+.btn-close:focus-visible {
+  outline: none;
+  box-shadow: var(--control-focus-ring);
 }
+
 .approval-state {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
+  gap: var(--spacing-sm);
   padding: var(--spacing-lg);
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
@@ -354,8 +360,8 @@ async function act(action: Action, g: LikelyMatchGroup) {
   gap: var(--spacing-md);
 }
 .group-card {
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
   padding: var(--spacing-md);
   background: var(--color-bg-surface);
 }
@@ -368,7 +374,7 @@ async function act(action: Action, g: LikelyMatchGroup) {
 .group-id {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--spacing-2xs);
 }
 .group-name {
   font-size: var(--font-size-base);
@@ -396,7 +402,7 @@ async function act(action: Action, g: LikelyMatchGroup) {
 .face-grid {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: var(--spacing-sm);
   margin-bottom: var(--spacing-md);
 }
 .face-cell {
@@ -422,10 +428,10 @@ async function act(action: Action, g: LikelyMatchGroup) {
   position: absolute;
   right: 0;
   bottom: 0;
-  color: #fff;
+  color: var(--color-text-on-accent);
   background: var(--color-accent);
   border-radius: 50%;
-  padding: 2px;
+  padding: var(--spacing-2xs);
 }
 
 .group-actions {
@@ -437,7 +443,7 @@ async function act(action: Action, g: LikelyMatchGroup) {
 .btn-secondary {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--spacing-xs);
 }
 .btn:disabled {
   opacity: 0.5;
@@ -448,23 +454,24 @@ async function act(action: Action, g: LikelyMatchGroup) {
   color: var(--color-error);
 }
 .action-danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+  background: var(--color-error-subtle);
 }
 
 /* 改派选择器：内联展开于动作行下方。 */
 .reassign-picker {
   margin-top: var(--spacing-md);
   padding: var(--spacing-sm);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-inset);
 }
 .reassign-search {
   width: 100%;
-  padding: 6px 10px;
-  border: 1px solid var(--color-border);
+  height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
+  border: 1px solid var(--color-input-border);
   border-radius: var(--radius-sm);
-  background: var(--color-bg-surface);
+  background: var(--color-input-bg);
   color: var(--color-text-primary);
   font-size: var(--font-size-sm);
   outline: none;
@@ -484,7 +491,8 @@ async function act(action: Action, g: LikelyMatchGroup) {
   align-items: center;
   justify-content: space-between;
   gap: var(--spacing-md);
-  padding: 7px 10px;
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -507,7 +515,7 @@ async function act(action: Action, g: LikelyMatchGroup) {
   flex-shrink: 0;
 }
 .reassign-empty {
-  padding: 10px;
+  padding: var(--spacing-sm);
   text-align: center;
   font-size: var(--font-size-sm);
   color: var(--color-text-tertiary);

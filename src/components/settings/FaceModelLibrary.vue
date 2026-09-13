@@ -65,6 +65,7 @@
 import { ref, reactive, onMounted } from 'vue'
 import CollapsibleCard from './CollapsibleCard.vue'
 import { useFaceStore } from '../../stores/faceStore'
+import { ipcErrorMessage } from '../../utils/ipc'
 import type { FaceModelInfo } from '../../types/face'
 
 const face = useFaceStore()
@@ -96,7 +97,8 @@ async function download(m: FaceModelInfo) {
     })
     await refresh() // 下载完成 → installed 翻绿
   } catch (e) {
-    errors[m.id] = String(e)
+    // 文案统一走 ipcErrorMessage(2026-07-10 审查 U7):String(e) 带 "IpcError: " 前缀。
+    errors[m.id] = ipcErrorMessage(e)
   } finally {
     downloading[m.id] = false
   }
@@ -109,7 +111,10 @@ onMounted(refresh)
 .face-models__hint {
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
+  /* 横向内缩 --spacing-lg,与卡片头 padding、上方 ModelLibrary 内容同一左缘对齐;
+     此前内容贴 0px 左缘,比卡片头标题/AI 模型库内容更靠左,整段错位。 */
   margin: 0 0 var(--spacing-md);
+  padding: 0 var(--spacing-lg);
   line-height: 1.6;
 }
 .face-models__warn {
@@ -119,7 +124,8 @@ onMounted(refresh)
   padding: var(--spacing-md);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
-  margin-bottom: var(--spacing-sm);
+  /* 卡片左右各内缩 --spacing-lg,左边框与卡片头 padding 同缘(与 hint、ModelLibrary 对齐)。 */
+  margin: 0 var(--spacing-lg) var(--spacing-sm);
 }
 .face-model--active {
   border-color: var(--color-accent);
@@ -136,23 +142,25 @@ onMounted(refresh)
   color: var(--color-text-primary);
 }
 .face-model__badge {
-  font-size: var(--font-size-xs);
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
+  /* 与 ModelLibrary 徽章统一为胶囊形:二者常同屏(见设置页),矩形/胶囊混排显杂。 */
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 999px;
 }
-/* token 彩底上的文字用 text-inverse:暗色主题的状态色/accent 是亮色,
-   白字压上去对比不足(S5 批2 统一修法)。 */
+/* 实底状态徽章使用各自的 paired foreground，避免暗色主题上的白字失去对比。 */
 .badge--ok {
   background: var(--color-success);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-success);
 }
 .badge--nc {
   background: var(--color-warning);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-warning);
 }
 .badge--active {
   background: var(--color-accent);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-accent);
 }
 .face-model__desc {
   font-size: var(--font-size-xs);
@@ -161,11 +169,20 @@ onMounted(refresh)
   margin-bottom: 6px;
 }
 .face-model__meta {
+  /* 规格 + 许可证左对齐同排:此前 space-between 把许可证甩到卡片最右缘,
+     与其余左对齐内容(名称/描述/状态)错位成一个孤立的右浮块。 */
   display: flex;
-  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   font-size: var(--font-size-xs);
   color: var(--color-text-tertiary);
   margin-bottom: 4px;
+}
+.face-model__lic::before {
+  /* 左对齐后规格段与许可证相邻,补一个分隔点保持可读。 */
+  content: '·';
+  margin-right: 8px;
+  color: var(--color-text-tertiary);
 }
 .face-model__status {
   font-size: var(--font-size-xs);
@@ -193,7 +210,7 @@ onMounted(refresh)
 }
 .face-model__dl-btn:hover {
   background: var(--color-accent);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-accent);
 }
 .face-model__dl-progress {
   display: inline-flex;

@@ -1,0 +1,49 @@
+# crates/exotic-workers/video-worker/Cargo.toml
+# 视频格式扩展 Worker(视频格式扩展子系统 design.md §2/§3.2/§9):独立长驻子进程,
+# stdin 收协议帧、stdout 回协议帧、stderr 写日志。承接 probe/remux/transcode/frames
+# 四能力,底层调用外部 ffmpeg.exe/ffprobe.exe(LGPL-shared 构建,进程边界隔离,
+# 连 LGPL 动态链接义务都不触发,§3.4)。
+#
+# 与 enhance-worker 同为 msvc 工具链可编译(无 LibRaw C++ vendored 依赖),故加入根
+# workspace members(与 raw-worker 因 LibRaw MSVC panic 脱离 workspace 的处境不同)。
+#
+# ffmpeg 二进制不在本 crate 内:worker 只是纯进程包装,显式路径构造 Command +
+# `-progress pipe:1` 解析(design.md §3.1:退化为手写 Command,不引 ffmpeg-sidecar)。
+
+[package]
+name = "video-worker"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)
+publish = false
+
+[[bin]]
+name = "video-worker"
+path = "src/main.rs"
+
+[dependencies]
+# 共享协议(路径依赖;两端同一份帧/消息/错误码定义,v2 视频 op 族)。
+exotic-protocol = { path = "../../exotic-protocol" }
+# 帧解码(ffmpeg 出 PNG)+ 缩放 + WebP 编码(封面/雪碧图;与主程序同系 0.25,同 raw-worker 用法)。
+image = { version = "=0.25.10", default-features = false, features = ["webp", "png"] }
+# ffprobe JSON 反序列化的结构体派生。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# VideoSessionInit 的 ffmpeg.exe 文件 sha256 完整性校验(防换包,§3.4)。
+sha2 = "0.10"
+# worker 内部错误枚举 → WorkerErrorCode 映射(项目硬约束:结构化错误走 thiserror)。
+thiserror = "1"
+
+# Windows Job Object(kill-on-close,§9.10):worker 被 supervisor kill 时 OS 自动收割
+# 所有 ffmpeg/ffprobe 子进程,杜绝孤儿继续烧 CPU 写文件。用 workspace 已有的 windows-sys。
+# 集成测试(tests/e2e_ffmpeg.rs)以黑盒复核 ffprobe JSON 输出,需 serde_json。
+[dev-dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

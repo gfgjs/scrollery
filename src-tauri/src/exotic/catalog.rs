@@ -58,6 +58,10 @@ pub enum Capability {
     /// 与协议侧 capability::FACE_DETECT_EMBED 不一致。
     #[serde(rename = "face_detect_embed")]
     FaceDetectEmbed,
+    /// 影像增强(降噪/超分子系统 design.md §C):同 OCR 的 D-OCR-7 豁免——enhance **不**进
+    /// exotic 任务化调度(host 侧 EnhanceService 直持 supervisor+worker client),本变体
+    /// 仅作 catalog 展示/授权面存在,不接 coordinator 任务队列。serde 小写序列化为 "enhance"。
+    Enhance,
 }
 
 impl Capability {
@@ -69,6 +73,7 @@ impl Capability {
             Capability::Text => "text",
             Capability::Embedding => "embedding",
             Capability::FaceDetectEmbed => "face_detect_embed",
+            Capability::Enhance => "enhance",
         }
     }
 }
@@ -133,6 +138,17 @@ struct RawOffering {
     /// 多渠道预留(T13/§3.11):Steam DLC AppID(展示;分发面在 RegistryEntry)。
     #[serde(default)]
     steam_dlc_app_id: Option<u32>,
+    /// 分发形态(D-OCR-5):`"builtin"` = 无安装包,`availability_of` 跳过安装态门直接验 license;
+    /// 缺省/其它值按常规 package 处理。
+    #[serde(default)]
+    distribution: Option<String>,
+    /// 运行期调度信息(Part8 前由发布侧显式声明):worker 握手期望的 worker_id。
+    /// 缺省/None 表示该 offering 不进入 exotic Coordinator 调度(如 OCR/Enhance 独立服务)。
+    #[serde(default)]
+    worker_id: Option<String>,
+    /// 运行期调度信息:是否占用 GPU 令牌。缺省 false。
+    #[serde(default)]
+    uses_gpu: Option<bool>,
 }
 
 /// 运行时单格式视图（`by_format` 的值）。一个 offering 的多 format 会复制成多条。
@@ -154,6 +170,12 @@ pub struct CatalogOffering {
     pub store_product_id: Option<String>,
     /// 多渠道预留(T13/§3.11):Steam DLC AppID(展示;分发面在 RegistryEntry)。
     pub steam_dlc_app_id: Option<u32>,
+    /// builtin offering(D-OCR-5):无安装包,`availability_of` 跳过安装态门直接验 license。
+    pub builtin: bool,
+    /// 运行期调度信息:worker 握手期望的 worker_id。None 表示不进入 exotic 调度。
+    pub worker_id: Option<String>,
+    /// 运行期调度信息:是否占用 GPU 令牌。
+    pub uses_gpu: bool,
 }
 
 impl CatalogOffering {
@@ -211,6 +233,18 @@ impl CatalogSnapshot {
                 return Err(CatalogError::EmptyCapabilities(off.plugin_id));
             }
 
+            let builtin = match off.distribution.as_deref() {
+                Some("builtin") => true,
+                Some(other) => {
+                    tracing::warn!(
+                        "offering {} 声明未知 distribution 值 {other:?},按 package 处理",
+                        off.plugin_id
+                    );
+                    false
+                }
+                None => false,
+            };
+
             // 校验并归一化全部 format。
             let mut norm_formats = Vec::with_capacity(off.formats.len());
             for f in &off.formats {
@@ -220,7 +254,13 @@ impl CatalogSnapshot {
                 // 撞常见格式 → 整表拒绝（Part1 §1.2，问题5）。纵深防御：仅靠扫描 common-first
                 // 不够——缩略图 router 直接 key 于 resolve_format(fmt)，若 catalog 误登记 jpg，
                 // jpg 会被判 Exotic 而 gate 出主 generator，瘫痪常见格式缩略图。
-                if classify_media_type(f).is_some() {
+                //
+                // 例外（用户裁决 A，RAW 支持线）：`distribution:"builtin"` 的 offering **可**
+                // 声明已在 builtin_formats 的扩展名——该格式仍走 builtin 识别/扫描/Stage-A
+                // badge，offering 只是额外声明「本插件可提供该格式的 thumbnail 解码能力」，
+                // 是刻意叠加而非误登记。非 builtin（package）offering 仍受常见格式冲突拒绝，
+                // 装机插件模型（如 PSD）不变。
+                if classify_media_type(f).is_some() && !builtin {
                     return Err(CatalogError::CommonFormatConflict(f.clone()));
                 }
                 norm_formats.push(f.clone());
@@ -239,6 +279,9 @@ impl CatalogSnapshot {
                 store_url: off.store_url,
                 store_product_id: off.store_product_id,
                 steam_dlc_app_id: off.steam_dlc_app_id,
+                builtin,
+                worker_id: off.worker_id,
+                uses_gpu: off.uses_gpu.unwrap_or(false),
             };
 
             for f in norm_formats {
@@ -265,8 +308,14 @@ impl CatalogSnapshot {
     }
 
     /// 查某格式的媒体大类——`classify_scanned_file` 的 catalog 回退用。
+    /// builtin offering(D-OCR-5)恒返回 None:它是能力插件而非文件格式,扩展名分类面
+    /// 一律不可见——磁盘上真出现同名扩展杂散文件(如 `.ocr`)不得被判为媒体、进库。
+    /// `resolve_format` 是独立方法,不受此过滤影响(availability 通路仍可查到 builtin offering)。
     pub fn media_kind(&self, format: &str) -> Option<MediaKind> {
-        self.by_format.get(format).map(|o| o.media_kind)
+        self.by_format
+            .get(format)
+            .filter(|o| !o.builtin)
+            .map(|o| o.media_kind)
     }
 
     /// 某格式是否被声明提供 `cap` 能力。
@@ -372,6 +421,33 @@ mod tests {
     }
 
     #[test]
+    fn builtin_distribution_flag_parses_and_defaults() {
+        // distribution="builtin" → builtin==true(exotic-ocr 内置 offering,D-OCR-5)。
+        let snap = CatalogSnapshot::builtin().expect("内置 Catalog 必须合法");
+        let ocr = snap.resolve_format("ocr").expect("ocr 必须在内置 Catalog");
+        assert!(ocr.builtin);
+        // 缺省 distribution 字段 → builtin==false(PSD offering 未声明该字段)。
+        let psd = snap.resolve_format("psd").expect("psd 必须在内置 Catalog");
+        assert!(!psd.builtin);
+    }
+
+    #[test]
+    fn media_kind_hides_builtin_offering() {
+        // builtin(如 exotic-ocr)非文件格式:media_kind 一律 None(扩展名分类面不可见),
+        // 但 resolve_format 仍能查到(availability 通路不受影响)。
+        let snap = CatalogSnapshot::builtin().expect("内置 Catalog 必须合法");
+        assert_eq!(
+            snap.media_kind("ocr"),
+            None,
+            "builtin offering 不该被 media_kind 命中"
+        );
+        assert!(
+            snap.resolve_format("ocr").is_some(),
+            "resolve_format 是独立方法,不受 media_kind 过滤影响"
+        );
+    }
+
+    #[test]
     fn reject_duplicate_format() {
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"a","name":"A","media_kind":"image","formats":["psd"],
@@ -395,6 +471,90 @@ mod tests {
             CatalogSnapshot::parse(json),
             Err(CatalogError::InvalidFormat(_))
         ));
+    }
+
+    #[test]
+    fn allow_builtin_offering_overlap_with_common_format() {
+        // 用户裁决 A(RAW 支持线):distribution=="builtin" 的 offering 可声明已在
+        // builtin_formats 的扩展名(如 cr2)——刻意叠加,不触发 CommonFormatConflict。
+        let json = r#"{"schema":1,"sequence":1,"offerings":[
+          {"plugin_id":"exotic-image-raw","name":"RAW","media_kind":"image","formats":["cr2"],
+           "capabilities":["thumbnail"],"license_tier":"free","platforms":[],
+           "min_host_version":"0.1.0","distribution":"builtin"}
+        ]}"#;
+        let snap = CatalogSnapshot::parse(json).expect("builtin 叠加 offering 应放行");
+        let off = snap.resolve_format("cr2").expect("cr2 应可解析到 offering");
+        assert_eq!(off.plugin_id, "exotic-image-raw");
+        assert!(off.builtin);
+    }
+
+    #[test]
+    fn non_builtin_offering_still_rejects_common_format() {
+        // distribution 非 "builtin"(或缺省)的 offering 撞常见格式仍须整表拒绝——
+        // 装机插件模型(如 PSD)不受本次豁免影响。
+        let json = r#"{"schema":1,"sequence":1,"offerings":[
+          {"plugin_id":"a","name":"A","media_kind":"image","formats":["cr2"],
+           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"}
+        ]}"#;
+        assert!(matches!(
+            CatalogSnapshot::parse(json),
+            Err(CatalogError::CommonFormatConflict(_))
+        ));
+    }
+
+    #[test]
+    fn builtin_catalog_parses_and_resolves_raw() {
+        // 内置 Catalog(真实 resources/exotic-catalog.json)须在加入 RAW builtin
+        // offering 后仍整体解析成功;resolve_format 对 10 个 RAW 扩展名均命中。
+        let snap = CatalogSnapshot::builtin().expect("内置 Catalog 必须合法(含 RAW 叠加)");
+        for ext in [
+            "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2", "pef", "srw",
+        ] {
+            let off = snap
+                .resolve_format(ext)
+                .unwrap_or_else(|| panic!("{ext} 必须在内置 Catalog"));
+            assert_eq!(off.plugin_id, "exotic-image-raw");
+            assert!(off.builtin);
+            assert!(off.claims_capability(Capability::Thumbnail));
+        }
+    }
+
+    #[test]
+    fn builtin_video_offering_claims_common_format_without_conflict() {
+        // D-444③ A4:rmvb/vob 入 utils::format 表(classify=video)后成「常见格式」;video-extended
+        // 是 builtin,认领 rmvb/vob 走用户裁决 A 的 builtin 豁免,不触发 CommonFormatConflict。
+        let json = r#"{"schema":1,"sequence":1,"offerings":[
+          {"plugin_id":"video-extended","name":"VIDEO","media_kind":"video","formats":["rmvb","vob"],
+           "capabilities":["thumbnail"],"license_tier":"free","platforms":[],
+           "min_host_version":"0.1.0","distribution":"builtin"}
+        ]}"#;
+        let snap = CatalogSnapshot::parse(json).expect("builtin video 叠加 offering 应放行");
+        for ext in ["rmvb", "vob"] {
+            let off = snap
+                .resolve_format(ext)
+                .unwrap_or_else(|| panic!("{ext} 应可解析到 offering"));
+            assert_eq!(off.plugin_id, "video-extended");
+            assert!(off.builtin);
+            assert!(off.claims_capability(Capability::Thumbnail));
+        }
+        // media_kind 对 builtin 恒隐藏(扫描器 catalog 回退面不可见);但 rmvb/vob 现由
+        // 注册表直接分类为 video(classify_scanned_file 首段命中),故收录不依赖此回退。
+        assert!(snap.media_kind("rmvb").is_none());
+    }
+
+    #[test]
+    fn builtin_catalog_parses_and_resolves_video_extended() {
+        // 内置 Catalog(真实 resources/exotic-catalog.json)在 rmvb/vob 入表后仍整体解析成功,
+        // video-extended 认领 rmvb/vob 命中(builtin 豁免生效)。
+        let snap = CatalogSnapshot::builtin().expect("内置 Catalog 必须合法(含 video 叠加)");
+        for ext in ["rmvb", "vob"] {
+            let off = snap
+                .resolve_format(ext)
+                .unwrap_or_else(|| panic!("{ext} 必须在内置 Catalog"));
+            assert_eq!(off.plugin_id, "video-extended");
+            assert!(off.builtin);
+            assert!(off.claims_capability(Capability::Thumbnail));
+        }
     }
 
     #[test]

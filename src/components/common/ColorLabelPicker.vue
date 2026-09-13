@@ -12,7 +12,7 @@
       :style="{ '--swatch': c.hex, width: `${size}px`, height: `${size}px` }"
       :disabled="readonly"
       :title="t(c.name)"
-      :aria-label="t(c.name)"
+
       @click="onClick(c.value)"
     ></button>
   </div>

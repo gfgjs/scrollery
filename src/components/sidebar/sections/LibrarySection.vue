@@ -6,7 +6,10 @@
           class="nav-item"
           :class="{
             active:
-              ui.activeSmartAlbum === album.id && !ui.activeDirectoryId && !ui.activeCollection,
+              viewStore.activeSmartAlbum === album.id &&
+              !viewStore.activeDirectoryId &&
+              !viewStore.activeCollection &&
+              !viewStore.activePersonId,
           }"
           @click="onAlbumClick(album.id)"
         >
@@ -22,7 +25,7 @@
       <li>
         <button
           class="nav-item"
-          :class="{ active: route.path === '/collections' || !!ui.activeCollection }"
+          :class="{ active: route.path.startsWith('/collections') }"
           @click="onCollectionsClick"
         >
           <span class="nav-item__icon"><FolderHeart :size="18" /></span>
@@ -34,7 +37,7 @@
       <li>
         <button
           class="nav-item"
-          :class="{ active: route.path === '/persons' || !!ui.activePersonId }"
+          :class="{ active: route.path.startsWith('/persons') }"
           @click="onPersonsClick"
         >
           <span class="nav-item__icon"><Users :size="18" /></span>
@@ -53,6 +56,18 @@
           <span class="nav-item__label">{{ $t('sidebar.plugins') }}</span>
         </button>
       </li>
+
+      <!-- 重复项：进入主画廊重复镜头（browse-only 浏览，方案 §4.3） -->
+      <li>
+        <button
+          class="nav-item"
+          :class="{ active: route.query.duplicates != null }"
+          @click="onDuplicatesClick"
+        >
+          <span class="nav-item__icon"><CopyCheck :size="18" /></span>
+          <span class="nav-item__label">{{ $t('sidebar.duplicates') }}</span>
+        </button>
+      </li>
     </ul>
   </AccordionSection>
 </template>
@@ -61,21 +76,31 @@
 import { computed, markRaw } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { ImageIcon, Heart, Sparkles, Clock, Trash2, FolderHeart, Users, Puzzle } from '@lucide/vue'
+import {
+  ImageIcon,
+  Heart,
+  Sparkles,
+  Clock,
+  Trash2,
+  FolderHeart,
+  Users,
+  Puzzle,
+  CopyCheck,
+} from '@lucide/vue'
 import AccordionSection from '../AccordionSection.vue'
-import { useUiStore } from '../../../stores/uiStore'
+import { useViewStore } from '../../../stores/viewStore'
 import { useMediaStore } from '../../../stores/mediaStore'
 import type { SmartAlbum } from '../../../types/ui'
+import { smartAlbumToPath } from '../../../utils/viewRoute'
 
 defineProps<{ order: number }>()
 
-const ui = useUiStore()
+const viewStore = useViewStore()
 const media = useMediaStore()
 const router = useRouter()
 const route = useRoute()
 const { t } = useI18n()
 
-// Smart albums — counts come from media stats (null = no count shown).
 // 智能相册——计数来自媒体统计（null = 不显示计数）。
 const smartAlbums = computed(() => [
   {
@@ -112,8 +137,11 @@ function formatCount(n: number | undefined | null): string {
 }
 
 function onAlbumClick(albumId: SmartAlbum) {
-  ui.setSmartAlbum(albumId)
-  if (route.path !== '/') router.push('/')
+  // 同步设 viewStore(保 MediaGrid getViewKey 读取时序)+ 导航到该 album 的可寻址路径(S2-c;深链/刷新可恢复)。
+  // watcher 会因相等守卫跳过重复设值。
+  viewStore.setSmartAlbum(albumId)
+  const target = smartAlbumToPath(albumId)
+  if (route.path !== target) router.push(target)
 }
 
 function onCollectionsClick() {
@@ -127,6 +155,14 @@ function onPersonsClick() {
 function onPluginsClick() {
   if (route.path !== '/plugins') router.push('/plugins')
 }
+
+function onDuplicatesClick() {
+  // 深链语义直推 URL（2026-09-02 方案 §4.3）：不走 duplicateLensStore.enterLens——它会把当前
+  // fullPath 拍成返回快照，从侧栏（常已在「/」）点击时快照自指；这里只落
+  // ?duplicates=groups，由 useGalleryQuerySync 的 route.query watcher 水合镜头 store。
+  // 无返回快照 = 深链语义，退出镜头即回普通「/」。已在目标位置时 push 幂等（duplicated nav 直接 resolve）。
+  void router.push({ path: '/', query: { duplicates: 'groups' } })
+}
 </script>
 
 <style scoped>
@@ -134,15 +170,17 @@ function onPluginsClick() {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 0 var(--spacing-xs);
+  padding: 0 var(--spacing-sm);
 }
 .nav-item {
   display: flex;
   align-items: center;
   gap: var(--spacing-sm);
   width: 100%;
-  padding: 6px var(--spacing-sm);
-  border-radius: var(--radius-md);
+  /* 图标列左缘对齐 --sidebar-indent(标题文字起点),子菜单嵌套在群组标签之下;
+     减去 .nav-list 的横向 padding 得行内左缩进。 */
+  padding: 6px var(--spacing-sm) 6px calc(var(--sidebar-indent, 30px) - var(--spacing-sm));
+  border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
   transition:
@@ -157,7 +195,7 @@ function onPluginsClick() {
 .nav-item.active {
   background: var(--color-sidebar-active-bg);
   color: var(--color-sidebar-active-text);
-  font-weight: 600;
+  font-weight: 500;
 }
 .nav-item__icon {
   width: 20px;

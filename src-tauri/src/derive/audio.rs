@@ -12,9 +12,8 @@
 use crate::derive::kind::{not_implemented, DerivationContext, DerivationKind, DerivationOutput};
 use crate::engine::traits::DecodedImage;
 use crate::error::{AppError, Result};
-use crate::thumbnail::generator::{encode_media_step, snap_to_tier, ThumbConfig};
+use crate::thumbnail::generator::{encode_media_step_with_snapshot, snap_to_tier, ThumbConfig};
 
-/// Extract embedded album art and write it as a cover thumbnail (P3, §3.6).
 /// 提取内嵌专辑封面并写为封面缩略图（P3，§3.6）。
 pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
     let (bytes, _ext) = crate::audio::read_cover(&ctx.abs_path)?
@@ -32,6 +31,7 @@ pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
         pixels: rgba.into_raw(),
         width: w,
         height: h,
+        icc: None, // 内嵌专辑封面暂不解析 ICC,按 sRGB 假定
     };
 
     let cfg = ThumbConfig {
@@ -41,8 +41,16 @@ pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
         strategy: String::new(),
         gpu_engine: String::new(),
         ai_hq_cache: false, // 音频封面非 CLIP 分析对象，不产 AI 缓存
+        webp_quality: ctx.webp_quality,
+        ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
     };
-    let res = encode_media_step(ctx.item_id, ctx.cache_key, decoded, &cfg)?;
+    let res = encode_media_step_with_snapshot(
+        ctx.item_id,
+        ctx.source_revision,
+        ctx.cache_key,
+        decoded,
+        &cfg,
+    )?;
 
     Ok(DerivationOutput {
         payload_path: res.thumb_path,

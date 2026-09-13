@@ -7,9 +7,6 @@
 //
 // 渲染器只实现 next()/prev()（一页的含义由渲染器定义：文本/pdf=滚动一屏，epub=rendition 翻页），
 // usePager 负责把滚轮/键盘事件按当前模式翻译过去，并管理监听器生命周期。
-//
-// A renderer-agnostic input→navigation mapper. The renderer implements next()/prev();
-// usePager wires wheel + keyboard to them per the active mode and owns listener lifecycle.
 
 export type PagerMode = 'scroll' | 'wheel-snap' | 'keyboard'
 
@@ -19,7 +16,6 @@ export interface PagerOptions {
   mode: () => PagerMode
   next: () => void
   prev: () => void
-  /** Scroll container for ↑↓/Home/End and the default page step. */
   /** 用于 ↑↓/Home/End 与默认翻页步长的滚动容器。 */
   container: () => HTMLElement | null
 }
@@ -91,8 +87,6 @@ export function usePager(opts: PagerOptions) {
     }
   }
 
-  /** Attach listeners. Pass the scroll container to bind wheel (passive:false for snap
-   *  preventDefault); pass `null` for keyboard-only (e.g. epub, which owns its own wheel). */
   /** 挂载监听。传入滚动容器以绑定滚轮（passive:false 便于吸附 preventDefault）；
    *  传 `null` 则仅键盘（如 epub 自行处理滚轮）。 */
   function attach(el: HTMLElement | null) {

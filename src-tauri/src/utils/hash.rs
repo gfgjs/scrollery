@@ -1,47 +1,125 @@
 // src-tauri/src/utils/hash.rs
-// src-tauri/src/utils/hash.rs
-//! Hashing utilities: xxHash3 (cache keys) + SHA-256 hex (integrity checks, R2-6 收拢).
 //! 哈希实用工具:xxHash3(缓存键)+ SHA-256 hex(完整性校验,R2-6 全仓去重收拢于此)。
 //!
-//! Q13 from the implementation plan:
 //! 来自实施计划的 Q13：
-//! `cache_key = xxh3_64("{rel_path}/{file_name}|{file_mtime}")` → stored as i64.
-//! `cache_key = xxh3_64("{rel_path}/{file_name}|{file_mtime}")` → 存储为 i64。
-//! When used as a file name: `format!("{:016x}", cache_key as u64)` to avoid the negative sign.
+//! 旧键为 `xxh3_64("{rel_path}/{file_name}|{file_mtime}")`；当前扫描键追加
+//! `|ns={file_mtime_ns}` → 存储为 i64。
 //! 当用作文件名时：`format!("{:016x}", cache_key as u64)` 以避免出现负号。
 
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Compute the cache key for a media item.
-/// 计算媒体项的缓存键。
+/// 计算旧格式媒体项缓存键（仅供读取/迁移旧调用点）。
 ///
-/// - `rel_path`: relative path within the scan root (empty string if item is at root level)
 /// - `rel_path`: 在扫描根目录内的相对路径（如果项目在根级别则为空字符串）
-/// - `file_name`: the file's base name
 /// - `file_name`: 文件的基本名称
-/// - `file_mtime`: Unix timestamp of the last modification time
 /// - `file_mtime`: 最后修改时间的 Unix 时间戳
 ///
-/// Returns a i64 (bit-reinterpreted from u64).
 /// 返回一个 i64（由 u64 重新解释位）。
 pub fn compute_cache_key(rel_path: &str, file_name: &str, file_mtime: i64) -> i64 {
-    // Construct a stable input string. Use a leading "/" when rel_path is empty
-    // 构建稳定的输入字符串。当 rel_path 为空时使用前导 "/"，
-    // so the format is always "{rel_path}/{file_name}|{mtime}".
-    // 使得格式始终为 "{rel_path}/{file_name}|{mtime}"。
-    let input = if rel_path.is_empty() {
-        format!("/{file_name}|{file_mtime}")
-    } else {
-        format!("{rel_path}/{file_name}|{file_mtime}")
-    };
-    xxh3_64(input.as_bytes()) as i64
+    compute_cache_key_impl(rel_path, file_name, file_mtime, None)
 }
 
-/// Convert a cache_key i64 to the hex string used in file names.
+/// 计算带纳秒 mtime 的媒体项缓存键。
+///
+/// 纳秒值是缓存路径的一部分，避免同秒同大小改写时，迟到的旧 worker 仍能原子替换
+/// 当前 worker 使用的同一最终文件。`0` 表示平台无法提供纳秒精度，仍显式写入版本化
+/// 输入以免与旧三字段键混用。
+pub fn compute_cache_key_with_mtime_ns(
+    rel_path: &str,
+    file_name: &str,
+    file_mtime: i64,
+    file_mtime_ns: i64,
+) -> i64 {
+    compute_cache_key_impl(rel_path, file_name, file_mtime, Some(file_mtime_ns))
+}
+
+fn compute_cache_key_impl(
+    rel_path: &str,
+    file_name: &str,
+    file_mtime: i64,
+    file_mtime_ns: Option<i64>,
+) -> i64 {
+    // 构建稳定的输入序列。当 rel_path 为空时使用前导 "/"，
+    // 使得格式始终为 "{rel_path}/{file_name}|{mtime}"。
+    // 扫描热路径(百万文件)优先在 512 字节栈缓冲内完成拼接,避免逐文件 format!/Vec 分配;
+    // 超长路径回退 Vec,字节序列与旧 format! 实现逐字节相同(测试锁定)。
+    const STACK_BUF: usize = 512;
+    let mut mtime_buf = [0u8; 20];
+    let remaining = {
+        use std::io::Write as _;
+        let mut cursor = &mut mtime_buf[..];
+        write!(cursor, "{file_mtime}").expect("20-byte stack buffer always fits i64 decimal");
+        cursor.len()
+    };
+    let mtime_len = 20 - remaining;
+    let mut mtime_ns_buf = [0u8; 20];
+    let mtime_ns_len = if let Some(file_mtime_ns) = file_mtime_ns {
+        let remaining = {
+            use std::io::Write as _;
+            let mut cursor = &mut mtime_ns_buf[..];
+            write!(cursor, "{file_mtime_ns}")
+                .expect("20-byte stack buffer always fits i64 decimal");
+            cursor.len()
+        };
+        Some(20 - remaining)
+    } else {
+        None
+    };
+    const NS_MARKER: &[u8] = b"|ns=";
+    let rel = rel_path.as_bytes();
+    let name = file_name.as_bytes();
+    let total_len = if rel.is_empty() {
+        1 + name.len() + 1 + mtime_len + mtime_ns_len.map_or(0, |len| NS_MARKER.len() + len)
+    } else {
+        rel.len()
+            + 1
+            + name.len()
+            + 1
+            + mtime_len
+            + mtime_ns_len.map_or(0, |len| NS_MARKER.len() + len)
+    };
+    let mut stack = [0u8; STACK_BUF];
+    if total_len <= STACK_BUF {
+        let mut n = 0;
+        if !rel.is_empty() {
+            stack[n..n + rel.len()].copy_from_slice(rel);
+            n += rel.len();
+        }
+        stack[n] = b'/';
+        n += 1;
+        stack[n..n + name.len()].copy_from_slice(name);
+        n += name.len();
+        stack[n] = b'|';
+        n += 1;
+        stack[n..n + mtime_len].copy_from_slice(&mtime_buf[..mtime_len]);
+        n += mtime_len;
+        if let Some(ns_len) = mtime_ns_len {
+            stack[n..n + NS_MARKER.len()].copy_from_slice(NS_MARKER);
+            n += NS_MARKER.len();
+            stack[n..n + ns_len].copy_from_slice(&mtime_ns_buf[..ns_len]);
+            n += ns_len;
+        }
+        xxh3_64(&stack[..n]) as i64
+    } else {
+        let mut bytes = Vec::with_capacity(total_len);
+        if !rel.is_empty() {
+            bytes.extend_from_slice(rel);
+        }
+        bytes.push(b'/');
+        bytes.extend_from_slice(name);
+        bytes.push(b'|');
+        bytes.extend_from_slice(&mtime_buf[..mtime_len]);
+        if let Some(ns_len) = mtime_ns_len {
+            bytes.extend_from_slice(NS_MARKER);
+            bytes.extend_from_slice(&mtime_ns_buf[..ns_len]);
+        }
+        xxh3_64(&bytes) as i64
+    }
+}
+
 /// 将 cache_key i64 转换为文件名中使用的十六进制字符串。
-/// Uses the unsigned bit pattern to avoid a leading `-` sign.
 /// 使用无符号位模式以避免前导 `-` 符号。
 pub fn cache_key_to_hex(cache_key: i64) -> String {
     format!("{:016x}", cache_key as u64)
@@ -132,6 +210,7 @@ pub fn content_fingerprint_with_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xxhash_rust::xxh3::xxh3_64;
 
     #[test]
     fn sha256_hex_known_vector() {
@@ -172,6 +251,39 @@ mod tests {
     }
 
     #[test]
+    fn streaming_cache_key_matches_legacy_concatenation() {
+        // 阶段2:streaming 实现不得改变任何既有 cache_key 值(缩略图缓存/派生键依赖它)。
+        fn legacy(rel_path: &str, file_name: &str, file_mtime: i64) -> i64 {
+            let input = if rel_path.is_empty() {
+                format!("/{file_name}|{file_mtime}")
+            } else {
+                format!("{rel_path}/{file_name}|{file_mtime}")
+            };
+            xxh3_64(input.as_bytes()) as i64
+        }
+        for (rel, name, mtime) in [
+            ("", "root_file.jpg", 12345),
+            ("photos/2024", "IMG_001.jpg", 1_700_000_000),
+            ("a/b/c", "图 片.JPG", -1),
+            ("deep/路径", "x.jpg", i64::MIN),
+            ("", "y.jpg", i64::MAX),
+        ] {
+            assert_eq!(
+                compute_cache_key(rel, name, mtime),
+                legacy(rel, name, mtime)
+            );
+        }
+
+        // 超长路径走 Vec 回退分支,也必须逐字节等价。
+        let long_rel = "d/".repeat(300) + "tail";
+        let long_name = "IMG_0001_VERY_LONG_NAME.JPG";
+        assert_eq!(
+            compute_cache_key(&long_rel, long_name, 1_700_000_000),
+            legacy(&long_rel, long_name, 1_700_000_000)
+        );
+    }
+
+    #[test]
     fn same_input_same_hash() {
         let a = compute_cache_key("photos/2024", "IMG_001.jpg", 1_700_000_000);
         let b = compute_cache_key("photos/2024", "IMG_001.jpg", 1_700_000_000);
@@ -186,9 +298,30 @@ mod tests {
     }
 
     #[test]
+    fn nanosecond_mtime_is_part_of_current_cache_key() {
+        let a = compute_cache_key_with_mtime_ns(
+            "photos/2024",
+            "IMG_001.jpg",
+            1_700_000_000,
+            1_700_000_000_000_000_001,
+        );
+        let b = compute_cache_key_with_mtime_ns(
+            "photos/2024",
+            "IMG_001.jpg",
+            1_700_000_000,
+            1_700_000_000_000_000_002,
+        );
+        assert_ne!(a, b, "同秒文件的纳秒 mtime 变化必须切换缓存路径");
+        assert_ne!(
+            a,
+            compute_cache_key("photos/2024", "IMG_001.jpg", 1_700_000_000),
+            "当前纳秒键不得与旧三字段键混用"
+        );
+    }
+
+    #[test]
     fn empty_rel_path() {
         let key = compute_cache_key("", "root_file.jpg", 12345);
-        // Should not panic and should produce a 16-char hex
         // 不应崩溃并且应生成一个 16 个字符的十六进制字符串
         let hex = cache_key_to_hex(key);
         assert_eq!(hex.len(), 16);
@@ -196,7 +329,6 @@ mod tests {
 
     #[test]
     fn hex_no_negative_sign() {
-        // Force a "negative" i64 (high bit set) — hex must not have a minus sign
         // 强制使用“负数” i64（高位被置位）——十六进制不能有负号
         let key = i64::MIN;
         let hex = cache_key_to_hex(key);

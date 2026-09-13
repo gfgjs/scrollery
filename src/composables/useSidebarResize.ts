@@ -1,5 +1,4 @@
 // src/composables/useSidebarResize.ts
-// Sidebar drag-resize (§14.2)
 // 侧边栏拖拽调整大小 (§14.2)
 
 import { ref, onBeforeUnmount } from 'vue'

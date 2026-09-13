@@ -28,6 +28,11 @@ pub enum AiError {
     /// 分词器错误(词表加载/编码失败;含错误词表防护)。
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
+
+    /// OCR 域错误(字典/模型契约错配、几何奇异、会话缺失等)。
+    /// 纯契约面亦可构造(不依赖 ort),故不门控。
+    #[error("OCR error: {0}")]
+    Ocr(String),
 }
 
 /// 本 crate 统一 Result。

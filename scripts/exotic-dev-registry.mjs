@@ -1,4 +1,3 @@
-// scripts/exotic-dev-registry.mjs
 // 插件商店 dev registry 生成器(开发期专用;Part8 D1 签发端的本地原型)。
 // 签名/打包原语已抽至 lib/exotic-signing.mjs(2026-07-05,与内测生成器/license 签发共用)。
 //
@@ -33,8 +32,17 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(repo, '.dev-registry');
 fs.mkdirSync(out, { recursive: true });
 
-const PLUGIN_ID = 'exotic-image-psd';
-const TARGET = 'x86_64-pc-windows-msvc';
+const PLUGIN_ID = process.env.EXOTIC_PLUGIN_ID || 'exotic-image-psd';
+const TARGET = process.env.EXOTIC_TARGET || 'x86_64-pc-windows-msvc';
+const MEDIA_KIND = process.env.EXOTIC_MEDIA_KIND || 'image';
+const FORMATS = (process.env.EXOTIC_FORMATS || 'psd').split(',').map((s) => s.trim()).filter(Boolean);
+const CAPABILITIES = (process.env.EXOTIC_CAPABILITIES || 'thumbnail').split(',').map((s) => s.trim()).filter(Boolean);
+const SKU = process.env.EXOTIC_SKU || 'psd-engine-2026';
+const MIN_HOST_VERSION = process.env.EXOTIC_MIN_HOST_VERSION || '0.1.0';
+const COMPLIANCE_REVIEW_ID = process.env.EXOTIC_COMPLIANCE_REVIEW_ID || 'dev-local';
+const WORKER_NAME = process.env.EXOTIC_WORKER_NAME || 'psd-worker.exe';
+const WORKER_CRATE = process.env.EXOTIC_WORKER_CRATE || 'psd-worker';
+const WORKER_PATH = process.env.EXOTIC_WORKER_PATH || path.join(repo, 'target', 'debug', WORKER_NAME);
 
 // ── 1. 密钥对(存在即复用,保证 keyset 稳定) ─────────────────────────────────
 const releaseKey = ensureKey(path.join(out, 'dev-release.pem'));
@@ -50,9 +58,9 @@ const keyset = {
 fs.writeFileSync(path.join(out, 'dev-keyset.json'), JSON.stringify(keyset, null, 2));
 
 // ── 2. worker 载荷 ────────────────────────────────────────────────────────────
-const workerExe = path.join(repo, 'target', 'debug', 'psd-worker.exe');
+const workerExe = WORKER_PATH;
 if (!fs.existsSync(workerExe)) {
-  console.error(`缺 ${workerExe}\n先构建:cargo build -p psd-worker`);
+  console.error(`缺 ${workerExe}\n先构建:cargo build -p ${WORKER_CRATE} 或设置 EXOTIC_WORKER_PATH`);
   process.exit(1);
 }
 const workerBytes = fs.readFileSync(workerExe);
@@ -75,11 +83,11 @@ const { zipBytes } = buildPluginZip({
   keyId: 'dev-release-local',
   releaseKey,
   workerBytes,
-  workerName: 'psd-worker.exe',
-  formats: ['psd'],
-  capabilities: ['thumbnail'],
-  minHostVersion: '0.1.0',
-  complianceReviewId: 'dev-local',
+  workerName: WORKER_NAME,
+  formats: FORMATS,
+  capabilities: CAPABILITIES,
+  minHostVersion: MIN_HOST_VERSION,
+  complianceReviewId: COMPLIANCE_REVIEW_ID,
 });
 const zipPath = path.join(out, `${PLUGIN_ID}.zip`);
 fs.writeFileSync(zipPath, zipBytes);
@@ -98,11 +106,11 @@ const { indexBytes, sigBytes } = signIndex({
       plugin_id: PLUGIN_ID,
       version,
       package_sequence: seq,
-      media_kind: 'image',
-      formats: ['psd'],
-      capabilities: ['thumbnail'],
-      sku: 'psd-engine-2026',
-      min_host_version: '0.1.0',
+      media_kind: MEDIA_KIND,
+      formats: FORMATS,
+      capabilities: CAPABILITIES,
+      sku: SKU,
+      min_host_version: MIN_HOST_VERSION,
       target: TARGET,
       package_url: fileUrl,
       package_size: zipBytes.length,

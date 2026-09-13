@@ -7,6 +7,7 @@
 name = "ai-worker"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)
 publish = false
 
 [[bin]]
@@ -24,6 +25,16 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 ndarray = "0.16"
 # SessionInit 逐模型 sha256 完整性校验(D1 §3)。
 sha2 = "0.10"
+# 日志订阅者接 stderr(2026-07-11 加固):没有它,ai-core 的装载/降级 tracing 日志被
+# 静默丢弃,SessionInit 级故障零线索(stdout=协议帧,日志只走 stderr)。
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# tracing::{Event,Subscriber,field::{Field,Visit}}(日志能力重构线 阶段 3 · W3,D-314 自定义
+# FormatEvent 直接引用)。此前经 tracing-subscriber/scrollery-ai-core 传递依赖但未直接声明——
+# Rust extern prelude 只对**直接依赖**开放,自定义 FormatEvent 须直接 `use tracing::*`。
+# 版本与 src-tauri/Cargo.toml 一致(同一份已解析依赖树,零新增外部代码)。
+tracing = "0.1"
+# WorkerLogLine 序列化 + 自定义 FormatEvent 的字段收集(D-313/D-314)。
+serde_json = "1"
 
 [features]
 # 合规隔离(Part4-T1):转发至 ai-core,研究/自用构建才含 SCRFD/ArcFace 轨。

@@ -1,10 +1,7 @@
-<!-- src/components/settings/ModelLibrary.vue -->
 <!-- AI 模型库：按「架构 → batch 变体」列出可下载/可切换的 ONNX。架构来自后端动态发现（新仓库）+ 静态 fp16 B/16。 -->
-<!-- AI model library: lists downloadable/switchable ONNX grouped by "architecture → batch variant". -->
 <template>
   <CollapsibleCard id="modelLibrary" :title="$t('settings.mlTitle')">
     <!-- 下载源选择：决定下载/重新下载时优先连接的服务器（失败自动回退另一源）。 -->
-    <!-- Download source picker: which server to try first when downloading (auto-falls back). -->
     <div class="ml-source">
       <div class="ml-source__info">
         <div class="ml-source__label">{{ $t('settings.mlSource') }}</div>
@@ -25,7 +22,6 @@
       </div>
 
       <!-- 每个架构一组（可折叠），组内列出各 batch 变体。 -->
-      <!-- One collapsible group per architecture; each lists its batch variants. -->
       <div
         v-for="arch in archs"
         :key="arch.id"
@@ -35,9 +31,9 @@
         <!-- 标题行：点击整行折叠/展开；chevron 旋转表达状态。 -->
         <div
           class="ml-arch__head"
-          role="button"
+
           tabindex="0"
-          :aria-expanded="isOpen(arch.id)"
+
           @click="toggleArch(arch.id)"
           @keydown.enter.prevent="toggleArch(arch.id)"
           @keydown.space.prevent="toggleArch(arch.id)"
@@ -73,8 +69,6 @@
 
         <!-- 折叠主体：grid 0fr↔1fr 平滑展开；内层 overflow:hidden。DOM 常驻，
              下载进度不因折叠而丢失。 -->
-        <!-- Collapsible body via grid 0fr↔1fr; inner clips overflow. DOM stays
-             mounted so in-progress download state survives a collapse. -->
         <div class="ml-arch__body">
           <div class="ml-arch__body-inner">
             <div v-if="arch.description" class="ml-arch__desc">{{ arch.description }}</div>
@@ -157,14 +151,14 @@
 import { ref, reactive, onMounted } from 'vue'
 import { ChevronRight } from '@lucide/vue'
 import { useAiStore } from '../../stores/aiStore'
-import { useUiStore } from '../../stores/uiStore'
+import { useToastStore } from '../../stores/toastStore'
 import { useConfigStore } from '../../stores/configStore'
 import CollapsibleCard from './CollapsibleCard.vue'
 import type { ModelArch, ModelVariant, ModelDownloadProgress } from '../../types/ai'
 import { useI18n } from 'vue-i18n'
 
 const ai = useAiStore()
-const ui = useUiStore()
+const toast = useToastStore()
 const config = useConfigStore()
 const { t } = useI18n()
 
@@ -178,7 +172,6 @@ const dl = reactive<Record<string, ModelDownloadProgress | undefined>>({})
 const switching = ref<string | null>(null)
 
 // 各架构分组的展开状态（key = arch.id）。刷新时保留用户已有的折叠选择。
-// Per-architecture expand state (key = arch.id). Preserved across refreshes.
 const expanded = reactive<Record<string, boolean>>({})
 let seededOnce = false
 function isOpen(id: string): boolean {
@@ -214,7 +207,7 @@ async function refresh() {
     online.value = r.online
     seedExpand()
   } catch (e) {
-    ui.addToast('error', t('settings.mlLoadFailed', { error: e }))
+    toast.addToast('error', t('settings.mlLoadFailed', { error: e }))
   } finally {
     loading.value = false
   }
@@ -230,14 +223,14 @@ async function onSourceChange(e: Event) {
   const val = (e.target as HTMLSelectElement).value
   try {
     await config.setAiDownloadSource(val)
-    ui.addToast(
+    toast.addToast(
       'success',
       val === 'mirror'
         ? t('settings.mlSourceSwitchedMirror')
         : t('settings.mlSourceSwitchedOfficial'),
     )
   } catch (err) {
-    ui.addToast('error', t('settings.mlSourceSwitchFailed', { error: err }))
+    toast.addToast('error', t('settings.mlSourceSwitchFailed', { error: err }))
   }
 }
 
@@ -274,10 +267,10 @@ async function download(v: ModelVariant) {
     await ai.downloadModel(id, (p) => {
       dl[id] = p
     })
-    ui.addToast('success', t('settings.mlDownloadComplete', { name: variantLabel(v) }))
+    toast.addToast('success', t('settings.mlDownloadComplete', { name: variantLabel(v) }))
     await refresh()
   } catch (e) {
-    ui.addToast('error', t('settings.mlDownloadFailed', { error: e }))
+    toast.addToast('error', t('settings.mlDownloadFailed', { error: e }))
   } finally {
     dl[id] = undefined
   }
@@ -290,10 +283,10 @@ async function switchTo(v: ModelVariant) {
   try {
     // setActiveModel 内部已 fetchStatus，会刷新 activeFixedBatch 供「AI 批处理大小」最小限制使用。
     await ai.setActiveModel(v.imageFile)
-    ui.addToast('success', t('settings.mlSwitchedTo', { name: variantLabel(v) }))
+    toast.addToast('success', t('settings.mlSwitchedTo', { name: variantLabel(v) }))
     await refresh()
   } catch (e) {
-    ui.addToast('error', t('settings.mlSwitchFailed', { error: e }))
+    toast.addToast('error', t('settings.mlSwitchFailed', { error: e }))
   } finally {
     switching.value = null
   }
@@ -302,7 +295,6 @@ async function switchTo(v: ModelVariant) {
 
 <style scoped>
 /* 卡片内容统一左右内边距，与 .settings-card__header 对齐（避免内容贴边）。 */
-/* Content shares one horizontal inset (matches .settings-card__header). */
 .ml-loading {
   padding: var(--spacing-md) var(--spacing-lg);
   color: var(--color-text-tertiary);
@@ -421,7 +413,7 @@ async function switchTo(v: ModelVariant) {
 .ml-arch__body {
   display: grid;
   grid-template-rows: 0fr;
-  transition: grid-template-rows 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: grid-template-rows var(--duration-moderate) var(--ease-in-out);
 }
 .ml-arch--open .ml-arch__body {
   grid-template-rows: 1fr;
@@ -477,7 +469,7 @@ async function switchTo(v: ModelVariant) {
 }
 .ml-badge--active {
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-on-accent);
 }
 .ml-badge--ok {
   background: var(--color-bg-hover);
@@ -507,7 +499,7 @@ async function switchTo(v: ModelVariant) {
 .ml-progress__fill {
   height: 100%;
   background: var(--color-accent);
-  transition: width 200ms linear;
+  transition: width var(--duration-fast) linear;
 }
 .ml-progress__text {
   font-size: var(--font-size-xs);

@@ -1,86 +1,71 @@
 <template>
-  <div
-    class="dialog-overlay"
-    @click.self="cancel"
-    tabindex="-1"
-    @keydown.esc.stop="cancel"
-    ref="overlayRef"
+  <!-- 外壳迁 UiDialog:恒 Teleport(修此前原位渲染被祖先 overflow/transform 裁剪的隐患)+
+       焦点陷阱(此前仅 focus 遮罩、Tab 会逃逸;初始焦点由 data-autofocus 落到文件夹名输入)。
+       本组件由父 v-if 条件挂载,故 open 恒 true;焦点陷阱经 useFocusTrap immediate 挂载即 engage。 -->
+  <UiDialog
+    :open="true"
+    :title="isGlobal ? t('folderCreate.titleGlobal') : t('sidebar.newSubfolder')"
+    :close-label="t('common.cancel')"
+    @close="cancel"
   >
-    <div class="dialog-content">
-      <header class="dialog-header">
-        <h2 class="dialog-title">
-          {{ isGlobal ? t('folderCreate.titleGlobal') : t('sidebar.newSubfolder') }}
-        </h2>
-        <button
-          class="btn-close"
-          :title="t('common.cancel')"
-          :aria-label="t('common.cancel')"
-          @click="cancel"
-        >
-          <X :size="18" />
-        </button>
-      </header>
+    <UiField v-if="isGlobal" :label="t('folderCreate.basePath')" associate="for" v-slot="{ id }">
+      <div class="base-path-row">
+        <input
+          :id="id"
+          type="text"
+          class="input-text base-path-input"
+          v-model="selectedBasePath"
+          readonly
+          :placeholder="t('folderCreate.basePathPlaceholder')"
+        />
+        <UiButton variant="secondary" @click="selectBasePath">
+          {{ t('folderCreate.choose') }}
+        </UiButton>
+      </div>
+    </UiField>
+    <UiField v-else :label="t('folderCreate.parentPath')">
+      <input type="text" class="input-text" :value="basePath" readonly disabled />
+    </UiField>
 
-      <main class="dialog-body">
-        <div v-if="isGlobal" class="form-group">
-          <label>{{ t('folderCreate.basePath') }}</label>
-          <div style="display: flex; gap: 8px">
-            <input
-              type="text"
-              class="input-text"
-              v-model="selectedBasePath"
-              readonly
-              :placeholder="t('folderCreate.basePathPlaceholder')"
-              style="flex: 1"
-            />
-            <button class="btn btn-secondary" @click="selectBasePath">
-              {{ t('folderCreate.choose') }}
-            </button>
-          </div>
-        </div>
-        <div v-else class="form-group">
-          <label>{{ t('folderCreate.parentPath') }}</label>
-          <input type="text" class="input-text" :value="basePath" readonly disabled />
-        </div>
+    <UiField :label="t('folderCreate.folderName')">
+      <input
+        type="text"
+        class="input-text"
+        v-model="folderName"
+        :placeholder="t('folderCreate.folderNamePlaceholder')"
+        data-autofocus
+        @keyup.enter="create"
+      />
+    </UiField>
 
-        <div class="form-group">
-          <label>{{ t('folderCreate.folderName') }}</label>
-          <input
-            type="text"
-            class="input-text"
-            v-model="folderName"
-            :placeholder="t('folderCreate.folderNamePlaceholder')"
-            autofocus
-            @keyup.enter="create"
-          />
-        </div>
-
-        <div v-if="errorMessage" class="error-message">
-          {{ errorMessage }}
-        </div>
-      </main>
-
-      <footer class="dialog-footer">
-        <button class="btn btn-secondary" @click="cancel">{{ t('common.cancel') }}</button>
-        <button class="btn btn-primary" :disabled="!canCreate" @click="create">
-          {{ t('folderCreate.create') }}
-        </button>
-      </footer>
+    <div v-if="errorMessage" class="error-message">
+      {{ errorMessage }}
     </div>
-  </div>
+
+    <template #footer>
+      <UiButton variant="secondary" @click="cancel">{{ t('common.cancel') }}</UiButton>
+      <!-- 不用 :disabled——原生 disabled 按钮不在 Tab 焦点序,键盘用户无法聚焦到「创建」(真机反馈)。
+           改为恒可聚焦,提交时在 create() 内校验并给出行级错误反馈。 -->
+      <UiButton variant="primary" @click="create">
+        {{ t('folderCreate.create') }}
+      </UiButton>
+    </template>
+  </UiDialog>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { X } from '@lucide/vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { invokeIpc } from '../../utils/ipc'
 import { IPC } from '../../constants/ipc'
-import { useUiStore } from '../../stores/uiStore'
+import { useToastStore } from '../../stores/toastStore'
+import UiDialog from '../ui/UiDialog.vue'
+import UiButton from '../ui/UiButton.vue'
+import UiField from '../ui/UiField.vue'
 
 const props = defineProps<{
-  basePath: string // If empty, it's global create
+  basePath: string // 空则为全局创建
 }>()
 
 const emit = defineEmits<{
@@ -89,19 +74,12 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const ui = useUiStore()
+const toast = useToastStore()
 
 const isGlobal = computed(() => !props.basePath)
 const selectedBasePath = ref(props.basePath || '')
 const folderName = ref('')
 const errorMessage = ref('')
-const overlayRef = ref<HTMLElement | null>(null)
-
-onMounted(() => {
-  nextTick(() => {
-    overlayRef.value?.focus()
-  })
-})
 
 const canCreate = computed(() => {
   return selectedBasePath.value.trim() !== '' && folderName.value.trim() !== ''
@@ -128,7 +106,13 @@ function cancel() {
 }
 
 async function create() {
-  if (!canCreate.value) return
+  // 校验前置(替代按钮 disabled):缺项时给行级错误反馈而非静默无操作,键盘用户可感知原因。
+  if (!canCreate.value) {
+    errorMessage.value = !folderName.value.trim()
+      ? t('folderCreate.nameRequired')
+      : t('folderCreate.basePathRequired')
+    return
+  }
   errorMessage.value = ''
 
   try {
@@ -136,7 +120,7 @@ async function create() {
       basePath: selectedBasePath.value,
       folderName: folderName.value.trim(),
     })
-    ui.addToast('success', t('folderCreate.createSuccess'))
+    toast.addToast('success', t('folderCreate.createSuccess'))
     emit('created')
     emit('close')
   } catch (e) {
@@ -146,89 +130,17 @@ async function create() {
 </script>
 
 <style scoped>
-.dialog-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  background: color-mix(in srgb, var(--color-bg-primary) 60%, transparent);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  animation: fadeIn 0.2s ease-out;
-}
-
-.dialog-content {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-  width: 100%;
-  max-width: 460px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: slideUp 0.2s ease-out;
-}
-
-.dialog-header {
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--color-border);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.dialog-title {
-  margin: 0;
-  font-size: var(--font-size-lg);
-  font-weight: 600;
-  color: var(--color-text-primary);
-}
-
-.btn-close {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  border: none;
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-
-.btn-close:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
-}
-
-.dialog-body {
-  padding: var(--spacing-lg);
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-md);
-}
-
-.form-group {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.form-group label {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-secondary);
-}
-
+/* 外壳(overlay/content/header/title/关闭键/body/footer/动画)由 UiDialog + 全局 Modal 基座提供;
+   字段 label 关联/朝向由 UiField 原语提供(原 .form-group + label 已删)。本组件只保留输入框视觉、
+   基路径行布局、表单级错误特化;作用于插槽内容(插槽带本组件 data-v,scoped 仍命中)。 */
 .input-text {
-  padding: 8px 12px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-primary);
+  width: 100%;
+  height: var(--control-size-default);
+  min-height: var(--control-size-default);
+  padding: 0 var(--control-padding-inline);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-input-bg);
   color: var(--color-text-primary);
   font-size: var(--font-size-sm);
 }
@@ -238,38 +150,18 @@ async function create() {
   color: var(--color-text-tertiary);
 }
 
+/* 基路径行:输入占满 + 右侧「选择」按钮(原内联 style 收进 class,S1 机械批) */
+.base-path-row {
+  display: flex;
+  gap: var(--spacing-sm);
+}
+.base-path-input {
+  flex: 1;
+}
+
 .error-message {
   font-size: var(--font-size-sm);
   color: var(--color-error);
-  margin-top: 4px;
-}
-
-.dialog-footer {
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--color-border);
-  background: var(--color-bg-primary);
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--spacing-sm);
-}
-
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-@keyframes slideUp {
-  from {
-    opacity: 0;
-    transform: translateY(10px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
+  margin-top: var(--spacing-xs);
 }
 </style>

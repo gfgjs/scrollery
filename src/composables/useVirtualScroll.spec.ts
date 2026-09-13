@@ -1,13 +1,16 @@
 // useVirtualScroll 坐标平移数学的特性化锁测试(R2-5)。
 // ⚠️ 本文件是 **pre-T16 characterization lock**:锁定现行(方案A 兜底态)行为原样,包括几处
-// 刻意保留的已知瑕疵——requestBottom 不钳制(:330)、fetch 失败不回滚跳过框(:367-373)、
-// viewH=0 早退时 spacer/isTranslated 已半更新(:280-297)。T16 方案B 重写本模块时,这些
-// 测试应随新契约整体重写,不要为「看起来更对」而修改断言。
+// 刻意保留的已知瑕疵——requestBottom 不钳制(:330)、viewH=0 早退时 spacer/isTranslated
+// 已半更新(:280-297)。T16 方案B 重写本模块时,这些测试应随新契约整体重写,不要为
+// 「看起来更对」而修改断言。
+// 2026-07-06 审查 F1:「fetch 失败毒化跳过框」已从瑕疵清单修复出列——bucket 成为默认引擎后
+// 方案 A 是官方回退路径,失败永不重试属带病上路;对应断言已随行为同步改为「失败框回滚可重试」。
 // node 环境,无 DOM:composable 在组件外调用时 onMounted/onBeforeUnmount 为 no-op(仅
 // [Vue warn]),ResizeObserver 永不构造;容器/渲染层用普通对象伪造。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { nextTick } from 'vue'
+import { nextTick, ref } from 'vue'
 import { useVirtualScroll, resolveSafeMax, SAFE_MAX_DEFAULT } from './useVirtualScroll'
+import { canvasPrefetchCoveragePx } from '../utils/galleryPrefetchWindow'
 import type { LayoutRow } from '../types/layout'
 
 // ── 测试夹具 ─────────────────────────────────────────────────────────────────
@@ -48,12 +51,20 @@ interface Harness {
   /** 为 true 时 fetch 返回 deferred(手动 settle);否则立即 resolve rowsToReturn。 */
   useDeferred: boolean
   rowsToReturn: LayoutRow[]
+  /** Canvas 渲染模式开关(§4.3 S3),运行时可翻转并经 watch 触发重取。 */
+  canvasMode: { value: boolean }
 }
 
-function makeHarness(init: { totalHeight: number; totalRows?: number; rowHeight?: number }): Harness {
+function makeHarness(init: {
+  totalHeight: number
+  totalRows?: number
+  rowHeight?: number
+}): Harness {
   let th = init.totalHeight
   let rows = init.totalRows ?? 100
   let rh = init.rowHeight ?? 100
+  // 真实 ref:引擎经 watch(canvasMode) 监听运行时切换,普通对象不具响应性。
+  const canvasMode = ref(false)
 
   const transformWrites: string[] = []
   let transformBacking = ''
@@ -100,9 +111,11 @@ function makeHarness(init: { totalHeight: number; totalRows?: number; rowHeight?
     containerRef: () => container as unknown as HTMLElement,
     layerRef: () => ({ style: layerStyle }) as unknown as HTMLElement,
     rowHeight: () => rh,
+    canvasMode: () => canvasMode.value,
   })
 
   h.vs = vs
+  h.canvasMode = canvasMode
   h.setTotalHeight = (v) => {
     th = v
   }
@@ -218,11 +231,13 @@ describe('缓冲窗口数学与 renderAnchor', () => {
     expect(h.vs.renderAnchor.value).toBe(4040)
   })
 
-  it('bufferH 双向钳制:rh=40→400;rh=200→1200;rh=10(先抬到 40)→400', async () => {
+  it('bufferH 钳制:compact(rh=40/10→240) 非compact(rh=200→1200)(T2 §7.2 收窗)', async () => {
+    // T2 收窗:rh<100(compact) 缓冲行 8→4 且下限 400→240px。rh=40/10(抬到40)均 compact → 240;
+    // rh=200 非 compact → 仍 1200(证明非 compact 路径未改)。窗口再放大 1.2×(取更大逻辑盒)。
     for (const [rh, top] of [
-      [40, 5000 - 400 * 1.2],
+      [40, 5000 - 240 * 1.2],
       [200, 5000 - 1200 * 1.2],
-      [10, 5000 - 400 * 1.2],
+      [10, 5000 - 240 * 1.2],
     ] as const) {
       const h = makeHarness({ totalHeight: 500_000, rowHeight: rh })
       h.container.scrollTop = 5000
@@ -252,6 +267,70 @@ describe('缓冲窗口数学与 renderAnchor', () => {
     h.container.scrollTop = 499_000 // = logMax
     await h.vs.updateVisible(true)
     expect(h.fetchCalls[0][1]).toBe(499_000 + 1000 + 960)
+  })
+})
+
+// ── 契约 3b:Canvas 取行窗(§4.3 S3)────────────────────────────────────────
+// Canvas 只枚举已就绪的挂载行备图,故取行窗必须先覆盖位图预取的几何范围;DOM 路径
+// (canvasMode 恒 false)保持既有缓冲语义不变,只放大数据窗、不增挂 DOM 行。
+
+describe('canvas 取行窗(§4.3 S3)', () => {
+  const VIEW_H = 2160
+  const ROW_H = 64
+
+  // node 无 rAF:updateVisible 收尾的 pendingUpdate 派发依赖它,同步执行回调以隔离窗数学。
+  beforeEach(() => {
+    vi.stubGlobal('requestAnimationFrame', (cb: () => void) => {
+      void cb()
+      return 0
+    })
+  })
+
+  it('canvas 模式:请求窗覆盖视口 ± 1.25 屏(高视口 2160 + 64px 行高)', async () => {
+    const h = makeHarness({ totalHeight: 3_000_000, rowHeight: ROW_H })
+    h.canvasMode.value = true
+    h.container.clientHeight = VIEW_H
+    h.container.scrollTop = 100_000
+    await h.vs.updateVisible(true)
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    const [top, bottom] = h.fetchCalls[0]
+    expect(top).toBeLessThanOrEqual(100_000 - cover.aheadPx)
+    expect(bottom).toBeGreaterThanOrEqual(100_000 + VIEW_H + cover.aheadPx)
+  })
+
+  it('DOM 模式(默认)零变化:仍是既有 compact 缓冲数学', async () => {
+    const h = makeHarness({ totalHeight: 3_000_000, rowHeight: ROW_H })
+    h.container.clientHeight = VIEW_H
+    h.container.scrollTop = 100_000
+    await h.vs.updateVisible(true)
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    const [top, bottom] = h.fetchCalls[0]
+    expect(top).toBeGreaterThan(100_000 - cover.aheadPx)
+    expect(bottom).toBeLessThan(100_000 + VIEW_H + cover.aheadPx)
+    // 既有 compact 缓冲数学逐字未变:rh=64 → bufferH=max(240, 64×4)=256,取更大盒再 ×1.2
+    expect(top).toBe(100_000 - 256 * 1.2)
+  })
+
+  it('运行时切到 Canvas:按新窗即时重取,不等下一次滚动', async () => {
+    const h = makeHarness({ totalHeight: 3_000_000, rowHeight: ROW_H })
+    h.container.clientHeight = VIEW_H
+    h.container.scrollTop = 100_000
+    await h.vs.updateVisible(true)
+    expect(h.fetchCalls.length).toBe(1)
+    h.canvasMode.value = true
+    await nextTick()
+    await new Promise((r) => setTimeout(r, 0)) // 等 updateVisible 的 fetch 落地
+    expect(h.fetchCalls.length).toBe(2)
+    const cover = canvasPrefetchCoveragePx(VIEW_H, ROW_H)
+    expect(h.fetchCalls[1][1]).toBeGreaterThanOrEqual(100_000 + VIEW_H + cover.aheadPx)
+  })
+
+  it('视口未测量(viewH=0)时保持既有早退语义', async () => {
+    const h = makeHarness({ totalHeight: 3_000_000, rowHeight: ROW_H })
+    h.canvasMode.value = true
+    h.container.clientHeight = 0
+    await h.vs.updateVisible(true)
+    expect(h.fetchCalls.length).toBe(0)
   })
 })
 
@@ -287,7 +366,7 @@ describe('fetch 去重生命周期', () => {
     expect(h.vs.isFetching.value).toBe(false)
   })
 
-  it('fetch 失败:isFetching 复位、行不变;失败框毒化跳过(特性化:同窗不重试)', async () => {
+  it('fetch 失败:isFetching 复位、行不变;失败框回滚(同窗可重试,2026-07-06 F1 修复)', async () => {
     const h = makeHarness({ totalHeight: 500_000, rowHeight: 100 })
     h.useDeferred = true
     h.container.scrollTop = 5000
@@ -296,8 +375,12 @@ describe('fetch 去重生命周期', () => {
     await p1
     expect(h.vs.isFetching.value).toBe(false)
     expect(h.vs.visibleRows.value).toEqual([])
-    await h.vs.updateVisible(false)
-    expect(h.fetchCalls.length).toBe(1) // 失败框未回滚 → 非 force 同窗不重试
+    // 失败已回滚跳过框 → 非 force 同窗重试会真正发起第二次 fetch
+    const p2 = h.vs.updateVisible(false)
+    expect(h.fetchCalls.length).toBe(2)
+    h.pendingFetches[1].resolve([normalRow(4100, 200)])
+    await p2
+    expect(h.vs.visibleRows.value).toEqual([normalRow(4100, 200)])
   })
 })
 
@@ -325,7 +408,9 @@ describe('padding 计算', () => {
   it('非数值 y/height 防御性归 0', async () => {
     const h = makeHarness({ totalHeight: 500_000, rowHeight: 100 })
     h.container.scrollTop = 5000
-    h.rowsToReturn = [{ rowType: 'normal', y: undefined, height: undefined, items: [] } as unknown as LayoutRow]
+    h.rowsToReturn = [
+      { rowType: 'normal', y: undefined, height: undefined, items: [] } as unknown as LayoutRow,
+    ]
     await h.vs.updateVisible(true)
     expect(h.vs.paddingTop.value).toBe(0)
     expect(h.vs.paddingBottom.value).toBe(500_000)

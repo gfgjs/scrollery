@@ -1,7 +1,6 @@
-// src-tauri/src/download/mod.rs
 //! R10 通用下载引擎（Part6 §3.1.2）。
 //!
-//! 此前 exotic（`exotic/fetch.rs`）与 AI/face（`ipc/ai_commands.rs::download_assets`）各写一套下载逻辑：
+//! 此前 exotic（`exotic/fetch.rs`）与 AI/face（今 `ipc/model_download.rs::download_assets`）各写一套下载逻辑：
 //! sha256 循环、reqwest client 构建、`.part` 原子改名、size/sha 校验重复两份；且 exotic 缺 Range
 //! 续传/镜像回退/进度，AI 缺 HTTPS 强制/超时加固。本模块把**可共享的机制原语**收敛到一处：
 //! 安全 client（HTTPS 强制 + 重定向加固 + 分级超时）、单文件流式下载（Range 续传）、镜像回退、
@@ -98,9 +97,15 @@ fn require_https(url: &str) -> Result<(), DownloadError> {
 /// 构建强制全程 HTTPS 的安全 client：连接 15s；重定向跳非 https 即拒、>10 跳即停；
 /// 整体超时按 `policy` 分级。HF `resolve/` → CDN 的 302 是 HTTPS，故 AI 大文件下载兼容
 /// （只拒**降级**到非 HTTPS 的跳转，不拒 HTTPS 跳转）。
+/// `user_agent(..)`：reqwest 默认不发 User-Agent 头；部分源（如 ModelScope）前置 WAF 对
+/// 空 UA 直接 403（2026-07-23 实测钉死：空 UA 必 403，非空 UA 即通，与 cookie 无关——curl
+/// 默认自带 UA 从未复现过这个 403，此前误判为 cookie 缺失）。`cookie_store(true)` 一并开
+/// 顺手对齐浏览器语义（同 client 内后续文件受益），非本次 403/size mismatch 的必要条件。
 pub fn secure_client(policy: TimeoutPolicy) -> Result<reqwest::Client, DownloadError> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
+        .cookie_store(true)
+        .user_agent(concat!("scrollery/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.url().scheme() != "https" {
                 attempt.error("重定向到非 HTTPS 地址被拒")

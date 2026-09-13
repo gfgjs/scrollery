@@ -1,9 +1,10 @@
 <template>
   <Teleport to="body">
+    <!-- toast 是全应用异步操作的完成/失败通知汇聚点。 -->
     <div class="toast-container">
       <TransitionGroup name="toast">
         <div
-          v-for="toast in ui.toasts"
+          v-for="toast in toastStore.toasts"
           :key="toast.id"
           class="toast"
           :class="`toast--${toast.type}`"
@@ -11,7 +12,15 @@
           <div class="toast__row">
             <component :is="iconMap[toast.type]" :size="16" class="toast__icon" />
             <span class="toast__msg">{{ toast.message }}</span>
-            <X :size="14" class="toast__close" @click="ui.removeToast(toast.id)" />
+            <!-- 关闭是真按钮:此前是裸 svg 挂 click,键盘不可达。 -->
+            <button
+              type="button"
+              class="toast__close"
+
+              @click="toastStore.removeToast(toast.id)"
+            >
+              <X :size="14" />
+            </button>
           </div>
           <!-- 交互式快捷 chips（如「加入收藏夹」），点击后执行并关闭该 toast -->
           <div v-if="toast.actions?.length" class="toast__actions">
@@ -31,12 +40,12 @@
 </template>
 
 <script setup lang="ts">
-import { useUiStore } from '../../stores/uiStore'
+import { useToastStore } from '../../stores/toastStore'
 import { Check, X, AlertTriangle, Info } from '@lucide/vue'
 import type { Component } from 'vue'
 import type { ToastAction } from '../../types/ui'
 
-const ui = useUiStore()
+const toastStore = useToastStore()
 const iconMap: Record<string, Component> = {
   success: Check,
   error: X,
@@ -44,12 +53,12 @@ const iconMap: Record<string, Component> = {
   info: Info,
 }
 
-// Run a chip action, then dismiss its toast. | 执行 chip 动作后关闭该 toast。
+// 执行 chip 动作后关闭该 toast。
 async function onAction(toastId: string, action: ToastAction) {
   try {
     await action.onClick()
   } finally {
-    ui.removeToast(toastId)
+    toastStore.removeToast(toastId)
   }
 }
 </script>
@@ -70,16 +79,18 @@ async function onAction(toastId: string, action: ToastAction) {
 .toast {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 16px;
-  border-radius: var(--radius-lg);
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: var(--radius-xl);
   font-size: var(--font-size-sm);
   font-weight: 500;
   pointer-events: auto;
   cursor: default;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  box-shadow: var(--shadow-lg);
+  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--material-recipe-float-border-color);
+  backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--material-recipe-float-box-shadow);
   max-width: 460px;
   user-select: text;
 }
@@ -91,17 +102,18 @@ async function onAction(toastId: string, action: ToastAction) {
 .toast__actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  padding-left: 24px; /* align under message, past the icon | 与消息对齐，让过图标 */
+  gap: var(--spacing-xs);
+  padding-left: 24px; /* 与消息对齐，让过图标 */
 }
 .toast__chip {
-  padding: 3px 10px;
-  border-radius: 999px;
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
+  border-radius: var(--radius-full);
   font-size: var(--font-size-xs);
   font-weight: 600;
-  background: rgba(255, 255, 255, 0.25);
-  color: inherit;
-  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border);
   cursor: pointer;
   transition: background var(--transition-fast);
   max-width: 160px;
@@ -110,40 +122,49 @@ async function onAction(toastId: string, action: ToastAction) {
   white-space: nowrap;
 }
 .toast__chip:hover {
-  background: rgba(255, 255, 255, 0.4);
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
 }
 .toast__msg {
   flex-grow: 1;
   word-break: break-all;
 }
 .toast__close {
+  display: inline-flex;
+  width: var(--control-size-compact);
+  height: var(--control-size-compact);
+  padding: 0; /* 压掉 UA button 默认内边距(全局 reset 未清 padding) */
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
   cursor: pointer;
   opacity: 0.7;
-  transition: opacity 0.2s;
+  transition: opacity var(--transition-normal);
   flex-shrink: 0;
   margin-left: 8px;
 }
 .toast__close:hover {
+  background: var(--color-bg-hover);
   opacity: 1;
 }
-/* 状态色走主题 token(S5:原 rgba 字面量重复且绕开了各主题的明暗适配);
-   文字用 text-inverse——亮主题白字压深色 token,暗主题深字压亮色 token。 */
+/* Toast 统一使用浮层材质；状态只负责边线与图标，避免高饱和色块夺走内容焦点。 */
 .toast--success {
-  background: var(--color-success);
-  color: var(--color-text-inverse);
+  border-inline-start: 3px solid var(--color-success);
 }
 .toast--error {
-  background: var(--color-error);
-  color: var(--color-text-inverse);
+  border-inline-start: 3px solid var(--color-error);
 }
 .toast--warning {
-  background: var(--color-warning);
-  color: var(--color-text-inverse);
+  border-inline-start: 3px solid var(--color-warning);
 }
 .toast--info {
-  background: var(--color-info);
-  color: var(--color-text-inverse);
+  border-inline-start: 3px solid var(--color-info);
 }
+.toast--success .toast__icon { color: var(--color-success); }
+.toast--error .toast__icon { color: var(--color-error); }
+.toast--warning .toast__icon { color: var(--color-warning); }
+.toast--info .toast__icon { color: var(--color-info); }
 
 .toast-enter-from {
   opacity: 0;
@@ -155,6 +176,9 @@ async function onAction(toastId: string, action: ToastAction) {
 }
 .toast-enter-active,
 .toast-leave-active {
-  transition: all 200ms ease;
+  /* 显式列举(勿 transition:all):进出场只动 opacity/transform 两个合成器友好属性。 */
+  transition:
+    opacity 200ms ease,
+    transform 200ms ease;
 }
 </style>

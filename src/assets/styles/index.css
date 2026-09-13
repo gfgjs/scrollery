@@ -6,13 +6,18 @@
 @import '@fontsource-variable/inter/opsz.css';
 
 @import './variables.css';
-/* 内置主题(语义色层;每份 = [data-theme='<id>'] 全键集覆写,契约见 src/themes/contract 测试) */
-@import './themes/ink.css';
-@import './themes/porcelain.css';
-@import './themes/moonlight.css';
-@import './themes/xuan.css';
-@import './themes/obsidian.css';
-@import './themes/dai.css';
+/* 内置主题：每份文件提供完整语义 token 集。 */
+@import './themes/fresh-light.css';
+@import './themes/fresh-dark.css';
+@import './themes/minimal-light.css';
+@import './themes/minimal-dark.css';
+@import './themes/tech-light.css';
+@import './themes/tech-dark.css';
+/* 宿主材质适配层必须位于主题之后、任何 token 消费者之前。 */
+@import './material.css';
+/* 窗口玻璃模式覆写层:消费 material 层角色 token(--material-chrome),故须在 material.css 之后;
+   置于 reset.css 之前以保导入顺序契约(两者相对 order 由契约测试断言)。 */
+@import './glass.css';
 @import './reset.css';
 @import './animations.css';
 
@@ -69,26 +74,41 @@
   display: inline-flex;
   align-items: center;
   gap: var(--spacing-xs);
-  padding: 6px 14px;
-  border-radius: var(--radius-md);
+  justify-content: center;
+  height: var(--control-size-default);
+  min-height: var(--control-size-default);
+  padding: 0 var(--spacing-sm);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   font-size: var(--font-size-sm);
   font-weight: 500;
+  line-height: var(--leading-tight);
   cursor: pointer;
   transition:
     background-color var(--transition-fast),
-    transform var(--transition-fast);
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    opacity var(--transition-fast);
   user-select: none;
   white-space: nowrap;
 }
 
-.btn:active {
-  transform: scale(0.97);
+.btn-sm {
+  height: var(--control-size-compact);
+  min-height: var(--control-size-compact);
+  padding-inline: var(--spacing-sm);
+  font-size: var(--font-size-xs);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
 }
 
 .btn-primary {
   background: var(--color-accent);
   /* 彩底文字用反色 token:暗色主题 accent 偏亮,白字压上约 1.6:1 不可读(S5) */
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-accent);
 }
 .btn-primary:hover {
   background: var(--color-accent-hover);
@@ -103,13 +123,49 @@
   color: var(--color-text-primary);
 }
 
+.btn-secondary {
+  background: transparent;
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+}
+.btn-secondary:hover {
+  background: var(--color-bg-hover);
+}
+
+/* 危险动作按钮:静默描边、hover 实底红。此前仅 SettingsView scoped 定义,DynamicSettingControl/
+   CloseConfirmDialog 等跨组件消费时一直无危险视觉(scoped 不可达),S4 提升为全局变体;
+   SettingsView 自带 scoped 副本因其 `.btn[data-v]` 特异性须保留,收敛归 S1 UiButton。 */
+.btn-danger {
+  background: transparent;
+  color: var(--color-error);
+  border: 1px solid var(--color-border);
+}
+.btn-danger:hover {
+  background: var(--color-error);
+  color: var(--color-text-on-error);
+  border-color: var(--color-error);
+}
+
 .btn-icon {
+  /* inline-flex 居中:按钮默认 inline-block 会把 SVG 贴文字基线,留出下行内间距 → 图标视觉偏上「歪」;
+     flex 居中消除基线,图标在按钮盒内水平垂直都居中(全体图标按钮受益)。 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-size-compact);
+  height: var(--control-size-compact);
+  min-width: var(--control-size-compact);
+  min-height: var(--control-size-compact);
   padding: 6px;
-  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
   color: var(--color-text-secondary);
   transition:
     background-color var(--transition-fast),
-    color var(--transition-fast);
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    opacity var(--transition-fast);
 }
 .btn-icon:hover {
   background: var(--color-bg-hover);
@@ -119,9 +175,13 @@
   background: var(--color-accent-subtle);
   color: var(--color-accent);
 }
-/* 按压态:置于 .active 之后使按压反馈在开关型按钮上也可见(同特异性,后者胜) */
 .btn-icon:active {
   background: var(--color-bg-active);
+  color: var(--color-accent);
+}
+.btn-icon:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
 }
 
 /* ── Chip / badge ────────────────────────────────────────────────────────── */
@@ -129,18 +189,21 @@
 .chip {
   display: inline-flex;
   align-items: center;
-  padding: 4px 10px;
-  border-radius: 100px;
+  gap: var(--spacing-xs);
+  height: 24px;
+  padding: 0 var(--spacing-sm);
+  border-radius: var(--radius-full);
   font-size: var(--font-size-xs);
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
-  background: var(--color-bg-elevated);
+  background: transparent;
   color: var(--color-text-secondary);
-  border: 1px solid var(--color-border);
+  border: none;
   transition:
     background-color var(--transition-fast),
     color var(--transition-fast),
-    border-color var(--transition-fast);
+    opacity var(--transition-fast);
+  user-select: none;
   white-space: nowrap;
 }
 .chip:hover {
@@ -149,11 +212,15 @@
 }
 .chip.active {
   background: var(--color-accent-subtle);
-  color: var(--color-accent);
-  border-color: var(--color-accent);
+  color: var(--color-accent-text);
 }
 .chip:active {
   background: var(--color-bg-active);
+  color: var(--color-accent-text);
+}
+.chip:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 /* ── Overlay backdrop ────────────────────────────────────────────────────── */
@@ -162,8 +229,8 @@
   inset: 0;
   background: var(--color-bg-overlay);
   z-index: 100;
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
 }
 
 /* ── Empty state ─────────────────────────────────────────────────────────── */
@@ -193,25 +260,45 @@
   max-width: 320px;
   line-height: 1.6;
 }
-/* 空状态「下一步动作」按钮(§6.3):与说明文案拉开一点距离,样式由 .btn-primary 提供 */
-.empty-state__action {
+/* 空状态「下一步动作」容器(§6.3/§9):与说明文案拉开距离,横向排布可容 primary + secondary 两动作(居中)。
+   由 UiEmptyState 原语的 #actions 插槽包裹;动作按钮样式仍由全局 .btn/.btn-{variant}(经 UiButton)提供。 */
+.empty-state__actions {
+  display: flex;
+  gap: var(--spacing-sm);
   margin-top: var(--spacing-xs);
+  justify-content: center;
 }
 
 /* ── Input ───────────────────────────────────────────────────────────────── */
 .input {
   width: 100%;
-  padding: 6px 12px;
-  border-radius: var(--radius-md);
-  background: var(--color-bg-surface);
-  border: 1px solid var(--color-border);
+  height: var(--control-size-default);
+  min-height: var(--control-size-default);
+  padding: 0 var(--control-padding-inline);
+  border-radius: var(--radius-sm);
+  background: var(--color-input-bg);
+  border: 1px solid var(--color-input-border);
   color: var(--color-text-primary);
   font-size: var(--font-size-base);
-  transition: border-color var(--transition-fast);
+  line-height: var(--leading-normal);
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
 }
 .input:focus {
-  border-color: var(--color-accent);
+  border-color: var(--color-input-border-focus);
   outline: none;
+  box-shadow: var(--control-focus-ring);
+}
+.input:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
+}
+.input--compact {
+  height: var(--control-size-compact);
+  min-height: var(--control-size-compact);
+  font-size: var(--font-size-sm);
 }
 
 /* ── Toggle Switch ───────────────────────────────────────────── */
@@ -241,7 +328,7 @@
   height: var(--toggle-thumb);
   border-radius: 50%;
   background: var(--color-toggle-thumb);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--shadow-sm);
   transition: transform var(--transition-fast);
   pointer-events: none;
 }
@@ -255,6 +342,10 @@
   outline: var(--focus-ring-width) solid var(--color-focus-ring);
   outline-offset: var(--focus-ring-offset);
 }
+.toggle:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
+}
 
 /* ── Custom Select ───────────────────────────────────────────── */
 
@@ -263,8 +354,9 @@
   display: inline-flex;
   align-items: center;
   height: var(--select-height);
-  padding: 0 32px 0 12px;
-  border-radius: var(--radius-md);
+  min-height: var(--select-height);
+  padding: 0 32px 0 var(--spacing-sm);
+  border-radius: var(--radius-sm);
   background: var(--color-input-bg);
   border: 1px solid var(--color-input-border);
   color: var(--color-text-primary);
@@ -274,7 +366,9 @@
   appearance: none;
   transition:
     border-color var(--transition-fast),
-    background var(--transition-fast);
+    background-color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    opacity var(--transition-fast);
 }
 .select:hover {
   border-color: var(--color-border-strong);
@@ -282,6 +376,17 @@
 .select:focus {
   border-color: var(--color-input-border-focus);
   outline: none;
+  box-shadow: var(--control-focus-ring);
+}
+.select:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
+}
+.select--compact {
+  height: var(--control-size-compact);
+  min-height: var(--control-size-compact);
+  padding-left: var(--spacing-sm);
+  font-size: var(--font-size-xs);
 }
 .select-wrap {
   position: relative;
@@ -326,7 +431,7 @@
   border-radius: 50%;
   background: var(--color-accent);
   cursor: pointer;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  box-shadow: var(--shadow-sm);
   transition: transform var(--transition-fast);
 }
 
@@ -343,19 +448,28 @@
 .input-number {
   width: 120px;
   height: var(--input-height);
-  padding: 0 10px;
-  border-radius: var(--radius-md);
+  min-height: var(--input-height);
+  padding: 0 var(--control-padding-inline);
+  border-radius: var(--radius-sm);
   background: var(--color-input-bg);
   border: 1px solid var(--color-input-border);
   color: var(--color-text-primary);
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   text-align: center;
-  transition: border-color var(--transition-fast);
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    opacity var(--transition-fast);
 }
 .input-number:focus {
   border-color: var(--color-input-border-focus);
   outline: none;
+  box-shadow: var(--control-focus-ring);
+}
+.input-number:disabled {
+  cursor: not-allowed;
+  opacity: var(--opacity-disabled);
 }
 .input-number::-webkit-inner-spin-button,
 .input-number::-webkit-outer-spin-button {
@@ -369,9 +483,10 @@
 /* ── Settings Card ───────────────────────────────────────────── */
 
 .settings-card {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
+  background-color: var(--material-recipe-surface-background-color);
+  border: 1px solid var(--material-recipe-surface-border-color);
   border-radius: var(--radius-lg);
+  box-shadow: var(--material-recipe-surface-box-shadow);
   overflow: hidden;
 }
 .settings-card__header {
@@ -395,7 +510,7 @@
   border-top: none;
 }
 .settings-card__item:hover {
-  background: var(--color-bg-hover);
+  background: var(--card-hover);
 }
 .settings-card__info {
   flex: 1;
@@ -411,4 +526,71 @@
   color: var(--color-text-tertiary);
   margin-top: 2px;
   line-height: var(--leading-relaxed);
+}
+
+/* ── Modal 基座(2026-07-10 审查 A2) ──────────────────────────────────────────
+   .dialog-overlay/.dialog-content 是全库模态范式的**全局基础层**:此前它只存在于五个对话框
+   组件的 scoped 样式里,而 OnboardingWizard/FaceApprovalPanel 按注释「复用全局」直接引用
+   ——全局版从未存在,两组件实为无遮罩流内块。本层落地后:
+   - 仅引用者(向导/审批面板)获得完整模态骨架,自身 scoped 只保留 z-index/尺寸特化;
+   - 五个自带同名 scoped 定义的对话框:scoped 选择器带 [data-v-*] 特异性更高,其同名属性
+     照常覆写,观感零变化。
+   keyframes 用 dialog- 前缀命名:各组件 scoped 的 fadeIn/slideUp 编译后是 hash 名,
+   全局层引用不到,须独立全局定义。 */
+@keyframes dialog-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes dialog-slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: var(--color-bg-overlay);
+  backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: dialog-fade-in 0.2s ease-out;
+}
+
+.dialog-content {
+  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--material-recipe-float-border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--material-recipe-float-box-shadow);
+  backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  width: 100%;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: dialog-slide-up 0.2s ease-out;
+}
+
+/* 关闭(leave)动画:enter 保持挂载 keyframes 不变,仅补 leave-active 反向复用同套 keyframes。
+   leave-active 必须带 animation 声明,Vue Transition 才会等 animationend 后再摘 DOM(见 UiDialog.vue)。 */
+.ui-dialog-leave-active {
+  pointer-events: none;
+  animation: dialog-fade-in var(--duration-fast) ease-in reverse;
+}
+.ui-dialog-leave-active .dialog-content {
+  animation: dialog-slide-up var(--duration-fast) ease-in reverse;
 }

@@ -13,7 +13,7 @@ pub fn get_gpu_engine(name: &str) -> Option<Box<dyn ImageEngine>> {
         // None → CPU 解码回退,行为不变。
         #[cfg(windows)]
         "wic" => Some(Box::new(wic_engine::WicEngine)),
-        // Future GPU engines can be added here (e.g., nvjpeg, dxva, etc.)
+        // 后续可在此接入更多 GPU 引擎（如 nvjpeg、dxva）
         _ => None,
     }
 }

@@ -1,14 +1,11 @@
-<!-- src/components/settings/CollapsibleCard.vue -->
-<!-- 可折叠的设置卡片：复用全局 .settings-card 外观，标题行点击折叠/展开，状态按 id 持久化。 -->
-<!-- Collapsible settings card: reuses the global .settings-card look; header toggles the body,
-     expand-state persisted per id in localStorage. -->
+<!-- 可折叠的设置分组：复用全局设置行契约，标题行点击折叠/展开，状态按 id 持久化。 -->
 <template>
   <div class="settings-card" :class="{ 'settings-card--collapsed': !open }">
     <div
       class="settings-card__header settings-card__header--toggle"
-      role="button"
+
       tabindex="0"
-      :aria-expanded="open"
+
       @click="toggle"
       @keydown.enter.prevent="toggle"
       @keydown.space.prevent="toggle"
@@ -46,6 +43,9 @@ const props = defineProps<{
   /** 首次（无持久化值时）是否展开，默认展开 | default open when no stored value */
   defaultOpen?: boolean
 }>()
+const emit = defineEmits<{
+  toggle: [open: boolean]
+}>()
 
 // 展开状态交由全局协调器管理，使「一键全部折叠/展开」能跨组件作用。
 const cards = useSettingsCards()
@@ -54,6 +54,7 @@ onUnmounted(() => cards.unregister(props.id))
 const open = computed(() => cards.isOpen(props.id))
 function toggle() {
   cards.toggle(props.id)
+  emit('toggle', open.value)
 }
 </script>
 
@@ -105,7 +106,7 @@ function toggle() {
 .settings-card__body {
   display: grid;
   grid-template-rows: 1fr;
-  transition: grid-template-rows 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: grid-template-rows var(--duration-moderate) var(--ease-in-out);
 }
 .settings-card--collapsed .settings-card__body {
   grid-template-rows: 0fr;

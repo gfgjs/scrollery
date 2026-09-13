@@ -2,12 +2,11 @@
 //! 冷门格式插件 · keyring 授权存储 `KeyringLicenseStore`（v3 Part3 §5.2/§5.3）。
 //!
 //! 【Part6 §3.9.1a 去环 ③a】纯验签逻辑（`verify_token`/`evaluate_token`/`LicensePayload`）已迁至
-//! 开源叶 crate `scrollery-exotic-trust`（无秘密价值、pro 需复用）。本文件保留**真实 keyring I/O**
-//! 实现 `KeyringLicenseStore`(依赖 keyring crate;③b 裁决 2026-07-05:**保留本实现**为公开树直销
-//! 装配,私有树由组合根标记块 swap 至闭源 DirectEntitlement,双实现有意并存),并
-//! `pub use` 再导出迁走的原语，使既有 `crate::exotic::license::{verify_token, LicensePayload, ...}`
-//! 引用路径不变。授权 DTO / trait（`EntitlementProvider`/`LicenseStatus`/`LicenseError`）住更底层的
-//! 叶 crate `scrollery-plugin-api`。
+//! 叶 crate `scrollery-exotic-trust`（无秘密价值）。本文件保留**真实 keyring I/O** 实现
+//! `KeyringLicenseStore`(依赖 keyring crate,是 direct 渠道唯一的 keyring 授权实现),并
+//! `pub use` 再导出迁走的原语，使既有
+//! `crate::exotic::license::{verify_token, LicensePayload, ...}` 引用路径不变。授权 DTO / trait
+//! （`EntitlementProvider`/`LicenseStatus`/`LicenseError`）住更底层的叶 crate `scrollery-plugin-api`。
 //!
 //! 三份真相中的「授权真相」（§5.1）：token 存系统 keyring（service 固定、account=plugin_id），
 //! DB 不保存 token；日志/遥测/panic/IPC **绝不**输出 token 或 subject_hash（§5.2）。
@@ -40,9 +39,9 @@ fn license_account(plugin_id: &str) -> &str {
 }
 
 // `LicenseSource` trait 升格为 plugin-api 的 `EntitlementProvider`（上方 `pub use`）;
-// 始终未授权的 `UnlicensedSource` 下沉为 free-stub 的 `FreeStubEntitlement`。
-// 本文件保留真实 keyring 实现 `KeyringLicenseStore`(验签逻辑经 exotic-trust 复用,§8.7;③b 已落地:
-// 真实生产公钥仅在 pro 侧,本实现信任根=exotic-trust builtin——公开树为占位集,对生产 token 恒验签失败)。
+// 始终未授权的桩为 `channel_stubs::FreeStubEntitlement`（组合根 fail-closed 回退用）。
+// `KeyringLicenseStore` 的验签逻辑经 exotic-trust 复用(§8.7):信任根=编译期内置公钥集
+// (默认占位集,发布经 PICASA_EXOTIC_KEYSET_FILE 注入受控签发机公钥)。
 
 /// keyring 实现：token 存系统凭据库；验签用编入 Host 的信任根公钥集。
 #[cfg(feature = "channel-direct")]

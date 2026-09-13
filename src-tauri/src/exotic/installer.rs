@@ -281,6 +281,9 @@ fn check_catalog_subset(
             "thumbnail" => Capability::Thumbnail,
             "metadata" => Capability::Metadata,
             "text" => Capability::Text,
+            "embedding" => Capability::Embedding,
+            "face_detect_embed" => Capability::FaceDetectEmbed,
+            "enhance" => Capability::Enhance,
             other => return Err(reject(format!("未知 capability：{other}"))),
         };
         if !off.claims_capability(cap) {
@@ -314,6 +317,28 @@ pub(crate) fn installed_worker_path(install_root: &Path, plugin_id: &str) -> Opt
     }
 }
 
+/// builtin worker(随主程序打包的 sidecar,非插件商店安装)的二进制基名映射。
+/// RAW 与 video-extended 均为 builtin distribution，经 Tauri externalBin 与主程序同目录
+/// 分发(无安装包/无 DB 安装记录)。未登记的 plugin_id 返回 None，不走本路径。
+fn builtin_worker_basename(plugin_id: &str) -> Option<&'static str> {
+    if plugin_id == crate::exotic::coordinator::RAW_PLUGIN_ID {
+        Some("raw-worker")
+    } else if plugin_id == crate::exotic::coordinator::VIDEO_PLUGIN_ID {
+        Some("video-worker")
+    } else {
+        None
+    }
+}
+
+/// 由「主程序所在目录 + plugin_id」拼 builtin worker 候选路径(加平台可执行后缀:windows 为 .exe)。
+/// why 抽成纯函数:dev/prod 选路都需要「exe 目录 + 二进制名 → 候选路径」的拼装，
+/// 把它剥离出来即可单测(路径拼装/后缀/未知 id)。本函数不摸盘、逻辑不依赖 cfg；
+/// 是否真存在由调用方 `is_file()` 判断。
+fn builtin_worker_candidate(exe_dir: &Path, plugin_id: &str) -> Option<PathBuf> {
+    let base = builtin_worker_basename(plugin_id)?;
+    Some(exe_dir.join(format!("{base}{}", std::env::consts::EXE_SUFFIX)))
+}
+
 /// 解析运行期 Worker 路径（Part3 §3.6 启动顺序第一步：「验证安装记录与当前文件 hash」）。
 ///
 /// dev/test 环境变量 `EXOTIC_PSD_WORKER_PATH` 优先且**不验签**（保留 Part2 开发入口与 e2e 测试）。
@@ -329,14 +354,105 @@ pub fn resolve_worker_path(
     now: i64,
 ) -> Option<PathBuf> {
     // 🔒 dev/test 旁路仅在 debug 构建编入；Release 因 #[cfg(debug_assertions)] 整条剔除（编译期，非运行期判断）。
+    // 按 plugin_id 分发到各自专属 env——PSD/RAW 现有行为不变，video-extended 保留 env 覆盖，
+    // 并在 debug 下自动尝试主程序 target/debug 同目录的 video-worker.exe。
     #[cfg(debug_assertions)]
-    if let Some(p) = std::env::var_os("EXOTIC_PSD_WORKER_PATH") {
-        return Some(PathBuf::from(p));
+    {
+        if plugin_id == crate::exotic::coordinator::PSD_PLUGIN_ID {
+            if let Some(p) = std::env::var_os("EXOTIC_PSD_WORKER_PATH") {
+                return Some(PathBuf::from(p));
+            }
+        } else if plugin_id == crate::exotic::coordinator::RAW_PLUGIN_ID {
+            // RAW 是 builtin distribution(catalog.rs distribution=="builtin"):无安装包、
+            // 无 installed-plugin 验签记录——下方 verify_installed_integrity 对它必然落空。
+            // dev 用专属 env 指向 gnu-only sidecar(独立 target,与 msvc 默认 target/debug 分离)。
+            if let Some(p) = std::env::var_os("EXOTIC_RAW_WORKER_PATH") {
+                return Some(PathBuf::from(p));
+            }
+            // dev 未设 env:不误落进下方 installed-plugin 流程(RAW 无安装记录必然 None,
+            // 但语义不清)——明确拒绝并留可诊断日志,不 panic、不误用其他 worker 二进制。
+            tracing::warn!(
+                "{plugin_id} 是 builtin worker(RAW gnu sidecar),dev 需设 EXOTIC_RAW_WORKER_PATH \
+                 指向 raw-worker.exe 才能拉起;prod 打包留待 H2b-prod(tauri externalBin 跨工具链 sidecar)"
+            );
+            return None;
+        } else if plugin_id == crate::exotic::coordinator::VIDEO_PLUGIN_ID {
+            // video-extended 是 builtin distribution(catalog.rs distribution=="builtin")：无安装包/
+            // 无验签记录。显式 env 优先，便于自定义 worker；默认取 tauri dev 的同目录 debug 产物。
+            if let Some(p) = std::env::var_os("EXOTIC_VIDEO_WORKER_PATH") {
+                return Some(PathBuf::from(p));
+            }
+            let candidate = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                .and_then(|dir| builtin_worker_candidate(&dir, plugin_id));
+            if let Some(p) = candidate.filter(|p| p.is_file()) {
+                return Some(p);
+            }
+            tracing::warn!(
+                "{plugin_id} 是 builtin worker(video-worker),dev 需设 EXOTIC_VIDEO_WORKER_PATH \
+                 或将 video-worker.exe 放在 target/debug 同目录才能拉起"
+            );
+            return None;
+        }
+    }
+    // Release 构建：builtin worker 经 Tauri externalBin 与主程序同目录分发。
+    // 镜像 ai_worker_exe 的「current_exe 同目录 + 二进制名 + 平台后缀」策略定位 sidecar。
+    // 不落进下方 installed-plugin 验签流程(RAW/video 均无安装包/无 DB 安装记录)。
+    #[cfg(not(debug_assertions))]
+    if plugin_id == crate::exotic::coordinator::RAW_PLUGIN_ID
+        || plugin_id == crate::exotic::coordinator::VIDEO_PLUGIN_ID
+    {
+        let candidate = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .and_then(|dir| builtin_worker_candidate(&dir, plugin_id));
+        return match candidate {
+            Some(p) if p.is_file() => Some(p),
+            Some(p) => {
+                tracing::warn!(
+                    "{plugin_id} builtin sidecar 未在主程序同目录找到({}):externalBin 未随包分发?拒绝拉起",
+                    p.display()
+                );
+                None
+            }
+            None => {
+                // current_exe 失败或无 builtin 映射，兜底不 panic。
+                tracing::warn!(
+                    "{plugin_id} 无法定位 builtin sidecar 路径(current_exe/映射缺失),拒绝拉起"
+                );
+                None
+            }
+        };
     }
     // 启动前完整性复核(含 P0-3 协议版本比对):失败即不返回路径,并留稳定码日志
     // (protocol_mismatch=需重装匹配版本;hash_mismatch=被篡改/损坏)。
     if let Err(e) = verify_installed_integrity(install_root, plugin_id, keyset, now) {
-        tracing::warn!("{plugin_id} 启动前复核未过({}):拒绝拉起 worker", e.code());
+        // 复核失败去重(2026-07-13):Coordinator 每 30s RetryDue 都会调本函数,protocol_mismatch
+        // 这类「不重装不会自愈」的失败会把日志刷成每 30s 一条 WARN(实测一天 871 条,淹没真问题)。
+        // 同一 (plugin, code) 仅首次 WARN,后续降 debug;code 变化(如修好后又坏)重新 WARN。
+        // **只改日志级别**——验证结果与返回值(None)不变,安全路径语义零改动。
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static LAST_WARNED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        let code = e.code();
+        let first_or_changed = {
+            let mut map = LAST_WARNED
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // insert 返回旧值:None(首次)或不同 code → 需要 WARN;相同 code → 抑制为 debug。
+            map.insert(plugin_id.to_string(), code.to_string())
+                .as_deref()
+                != Some(code)
+        };
+        if first_or_changed {
+            tracing::warn!(
+                "{plugin_id} 启动前复核未过({code}):拒绝拉起 worker(同码后续降 debug,不再每 30s 刷屏)"
+            );
+        } else {
+            tracing::debug!("{plugin_id} 启动前复核未过({code}):拒绝拉起 worker(重复,已抑制 WARN)");
+        }
         return None;
     }
     installed_worker_path(install_root, plugin_id)
@@ -528,6 +644,64 @@ mod tests {
         let root2 = lay_installed("curproto", &sk, exotic_protocol::PROTOCOL_VERSION);
         assert!(verify_installed_integrity(&root2, PID, &ks, NOW).is_ok());
         assert!(resolve_worker_path(&root2, PID, &ks, NOW).is_some());
+    }
+
+    /// H2b(dev):RAW 是 builtin distribution(无安装包/无验签记录),资源路径走专属
+    /// `EXOTIC_RAW_WORKER_PATH`(镜像 PSD 的 `EXOTIC_PSD_WORKER_PATH` 旁路语义,不验签);
+    /// 未设该 env 时必须明确拒绝(None + 日志),不得误落进下方 installed-plugin 验签流程
+    /// (RAW 无 DB 安装记录,那条路径对它从设计上不适用)、也不得 panic。
+    #[test]
+    fn raw_builtin_worker_path_dev_env_override_and_absence() {
+        let sk = signing_key(11);
+        let ks = release_keyset(&sk);
+        let root = std::env::temp_dir(); // builtin 分支不摸盘,任意存在目录即可
+        const RAW_PID: &str = crate::exotic::coordinator::RAW_PLUGIN_ID;
+
+        // 未设 env → 明确拒绝(H2b-prod 打包待办),不是 panic、也不是误用 PSD 二进制。
+        std::env::remove_var("EXOTIC_RAW_WORKER_PATH");
+        assert!(
+            resolve_worker_path(&root, RAW_PID, &ks, NOW).is_none(),
+            "builtin RAW 未设专属 env 时必须拒绝拉起(prod 打包留待 H2b-prod)"
+        );
+
+        // 设了 env → 不验签直接返回该路径(dev 旁路,镜像 PSD 现有行为)。
+        let fake_worker = root.join("raw-worker-test-fixture.exe");
+        std::env::set_var("EXOTIC_RAW_WORKER_PATH", &fake_worker);
+        let resolved = resolve_worker_path(&root, RAW_PID, &ks, NOW);
+        std::env::remove_var("EXOTIC_RAW_WORKER_PATH");
+        assert_eq!(resolved, Some(fake_worker));
+    }
+
+    /// builtin worker 的 prod 选路依赖「exe 目录 + 二进制名 → 候选路径」的纯拼装：RAW →
+    /// raw-worker、video-extended → video-worker；未登记 plugin_id(含 PSD——它走安装包/验签流程)
+    /// 返回 None。
+    #[test]
+    fn builtin_worker_candidate_maps_builtin_workers_and_rejects_unknown() {
+        use crate::exotic::coordinator::{PSD_PLUGIN_ID, RAW_PLUGIN_ID, VIDEO_PLUGIN_ID};
+        let dir = Path::new("some").join("exe-dir");
+        // RAW → <dir>/raw-worker(+平台后缀)。
+        let p = builtin_worker_candidate(&dir, RAW_PLUGIN_ID).expect("RAW 应有 builtin 映射");
+        assert_eq!(p.parent().unwrap(), dir.as_path());
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            format!("raw-worker{}", std::env::consts::EXE_SUFFIX)
+        );
+        // windows 平台后缀断言。
+        #[cfg(windows)]
+        assert!(p.to_string_lossy().ends_with("raw-worker.exe"));
+        // video-extended → <dir>/video-worker(+平台后缀)。
+        let p = builtin_worker_candidate(&dir, VIDEO_PLUGIN_ID)
+            .expect("video-extended 应有 builtin 映射");
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            format!("video-worker{}", std::env::consts::EXE_SUFFIX)
+        );
+        // 未登记 plugin_id → None(非 builtin,不走本路径)。
+        assert!(builtin_worker_candidate(&dir, "exotic-nope").is_none());
+        assert!(
+            builtin_worker_candidate(&dir, PSD_PLUGIN_ID).is_none(),
+            "PSD 走安装包/验签流程,非 builtin,不应有 sidecar 映射"
+        );
     }
 
     /// T13:非 direct 渠道 fail-closed——Steam/Store 安装路径 Part8 才实装,当前必须整体

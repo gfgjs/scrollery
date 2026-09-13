@@ -27,7 +27,7 @@ pub struct WebDavBackend {
 }
 
 fn map_err(e: reqwest_dav::Error) -> AppError {
-    AppError::System(format!("WebDAV error | WebDAV 错误: {e}"))
+    AppError::internal("WebDAV 操作失败 | WebDAV operation failed", e)
 }
 
 impl WebDavBackend {
@@ -46,7 +46,6 @@ impl WebDavBackend {
             ));
         }
 
-        // Current-thread runtime so block_on works inside spawn_blocking (no ambient runtime).
         // current-thread 运行时，使 block_on 在 spawn_blocking 内可用（无环境运行时）。
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -74,7 +73,6 @@ impl WebDavBackend {
         Ok(Self { rt, client, base })
     }
 
-    /// Join the base + a backend-relative path into a server path (leading-slash, normalised).
     /// 把 base + 后端相对路径拼为服务器路径（前导斜杠、规范化）。
     fn server_path(&self, rel_path: &str) -> String {
         let rel = rel_path.trim_matches('/');
@@ -88,14 +86,11 @@ impl WebDavBackend {
     }
 }
 
-/// Derive the entry name + backend-relative path from a WebDAV `href`, given our base prefix.
 /// 由 WebDAV `href` 与 base 前缀推导项名 + 后端相对路径。
 fn rel_from_href(href: &str, base: &str) -> (String, String) {
-    // href is server-absolute and URL-encoded; decode percent-escapes for display/joining.
     // href 为服务器绝对路径且 URL 编码；解码百分号转义以便显示/拼接。
     let decoded = percent_decode(href);
     let trimmed = decoded.trim_matches('/');
-    // Strip our base prefix to get the backend-relative path.
     // 剥掉 base 前缀得到后端相对路径。
     let rel = trimmed
         .strip_prefix(base)
@@ -106,7 +101,6 @@ fn rel_from_href(href: &str, base: &str) -> (String, String) {
     (name, rel)
 }
 
-/// Minimal percent-decoding for WebDAV hrefs (spaces, CJK, etc.). Pure, no extra deps.
 /// WebDAV href 的最小百分号解码（空格、中文等）。纯函数，无额外依赖。
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -147,7 +141,6 @@ impl StorageBackend for WebDavBackend {
             .block_on(self.client.list(&path, Depth::Number(1)))
             .map_err(map_err)?;
 
-        // The first entry is the listed directory itself — skip entries equal to our request path.
         // 首项通常是被列目录自身 —— 跳过等于请求路径的项。
         let self_rel = path
             .trim_matches('/')
@@ -229,7 +222,6 @@ impl StorageBackend for WebDavBackend {
                 .start_request(reqwest::Method::GET, &path)
                 .await
                 .map_err(map_err)?;
-            // Range header for partial reads (streaming proxy / large remote originals, §3.8).
             // Range 头用于部分读取（流式代理 / 远程大原图，§3.8）。
             if let Some(n) = len {
                 let end = start + n.saturating_sub(1);
@@ -240,10 +232,26 @@ impl StorageBackend for WebDavBackend {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| AppError::System(format!("WebDAV GET failed | 读取失败: {e}")))?;
-            let bytes = resp.bytes().await.map_err(|e| {
-                AppError::System(format!("WebDAV body read failed | 响应体读取失败: {e}"))
-            })?;
+                .map_err(|e| AppError::internal("WebDAV 读取失败 | WebDAV GET failed", e))?;
+            // 状态码校验(2026-07-06 审查 R8):不校验则 404/500 的错误体会被当成文件数据返回。
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(AppError::System(format!(
+                    "WebDAV GET 非成功状态 {status} | non-success status"
+                )));
+            }
+            // 带 Range 请求时,服务器应回 206 Partial Content;若回 200 说明它忽略了 Range、
+            // 返回整个文件——调用方拿到的字节会远超请求窗口,宁可报错也不返错误数据。
+            let ranged = len.is_some() || start > 0;
+            if ranged && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(AppError::System(format!(
+                    "WebDAV 忽略 Range(状态 {status},期望 206)| server ignored Range header"
+                )));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| AppError::internal("WebDAV 响应体读取失败 | body read failed", e))?;
             Ok(bytes.to_vec())
         })
     }

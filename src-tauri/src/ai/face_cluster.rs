@@ -1,5 +1,4 @@
 // src-tauri/src/ai/face_cluster.rs
-//! Incremental nearest-centroid face clustering (F4).
 //! 增量最近质心人脸聚类（F4）。
 //!
 //! # 范围：仅增量，没有全量复核
@@ -89,7 +88,6 @@ impl From<PersonRow> for RosterEntry {
     }
 }
 
-/// One face ready for clustering (decoded embedding).
 /// 一张就绪可聚类的人脸（已解码嵌入向量）。
 struct ClusterableFace {
     id: i64,
@@ -107,15 +105,6 @@ impl From<ClusterableFaceRow> for ClusterableFace {
     }
 }
 
-/// Decide person assignment for one new face against the in-memory `roster`, mutating it in
-/// place (updates an existing match's centroid/face_count/cover, or appends a new placeholder
-/// entry). Returns the assigned id (negative = placeholder, not yet persisted).
-///
-/// Greedy and final: once a face joins a person here, nothing in this module ever reconsiders
-/// it (no full-reconciliation pass — see module header). The centroid update is a running
-/// average re-normalized to unit length; this drifts slightly from the true mean depending on
-/// arrival order, which is fine for an incremental-only design.
-///
 /// 为一张新脸在内存 `roster` 中决定归属，原地修改（命中则更新既有条目的质心/计数/封面，未命中
 /// 则追加一条占位条目）。返回归属 id（负数=占位，尚未落库）。
 ///
@@ -129,9 +118,6 @@ fn assign_face(
     next_placeholder_id: &mut i64,
     rejected: &HashSet<i64>,
 ) -> i64 {
-    // Skip roster entries whose REAL person id the user rejected for this face (negative-sample
-    // guard, Part4 T3 StageB). Placeholder entries (id<0, new clusters this pass) are never
-    // rejected, so they remain candidates — a rejected face can still seed/join a fresh cluster.
     // 跳过用户为此脸拒绝过的**真实** person id 的名册条目（负样本守卫，Part4 T3 StageB）。占位条目
     //（id<0，本趟新簇）从不被拒，仍可作候选——被拒脸仍能另立/并入新簇。
     let best = roster
@@ -157,7 +143,6 @@ fn assign_face(
             }
             p.centroid = merged;
             p.face_count += 1;
-            // Cover upgrade: a later, sharper/larger-looking face replaces the person-wall thumbnail.
             // 封面升级：后来一张质量更高的脸替换人物墙缩略图。
             if face.quality > p.cover_quality {
                 p.cover_face_id = face.id;
@@ -180,13 +165,6 @@ fn assign_face(
 }
 
 /// Incrementally cluster the faces just written for `item_ids` under `model_name`.
-///
-/// Must be called AFTER the caller has released the `db_writer` lock it used for the main face
-/// write — this function does its own short read (via `db_read_pool`) then a short write (via
-/// `db_writer`), and must not be nested inside a longer write critical section (would lengthen
-/// the lock scan/thumbnail generation also contend for). Faces with `quality < min_quality` are
-/// left unclustered (`person_id` stays NULL), matching `FaceProfile::min_quality`'s "skip
-/// low-quality, noise reduction" contract.
 ///
 /// 增量聚类刚为 `item_ids`（`model_name` 下）写入的人脸。
 ///
@@ -236,7 +214,6 @@ pub fn cluster_new_faces(
         (roster, faces)
     };
 
-    // Map of roster-id (real or placeholder) → face ids assigned to it during this flush.
     // 名册 id（真实或占位）→ 本次刷新归入它的脸 id 列表。
     let mut touched: HashMap<i64, Vec<i64>> = HashMap::new();
     let mut next_placeholder_id = -1i64;
@@ -286,7 +263,6 @@ pub fn cluster_new_faces(
 // ── 全量重新聚类（显式命令：修增量碎片化，但护用户劳动）──────────────────────────
 // ── Full re-clustering (explicit command: fixes incremental fragmentation, protects labor) ──
 
-/// L2-normalized mean of a set of embeddings (the true centroid). Returns empty for empty input.
 /// 一组嵌入的 L2 归一化均值（真质心）。空输入返回空。
 fn mean_centroid(embeddings: &[&[f32]]) -> Vec<f32> {
     if embeddings.is_empty() {
@@ -310,7 +286,7 @@ fn mean_centroid(embeddings: &[&[f32]]) -> Vec<f32> {
     acc
 }
 
-/// One decoded person row for the rebuild.
+/// 待重建的一行 person 数据。
 struct ReclusterPerson {
     id: i64,
     is_named: bool,
@@ -318,7 +294,7 @@ struct ReclusterPerson {
     centroid: Vec<f32>,
 }
 
-/// One decoded face row for the rebuild.
+/// 待重建的一行 face 数据。
 struct ReclusterFace {
     id: i64,
     person_id: Option<i64>,
@@ -327,18 +303,15 @@ struct ReclusterFace {
     is_confirmed: bool,
 }
 
-/// Pure core of the full re-cluster: decide every face's person assignment from scratch while
-/// PINNING user labor. Separated from DB I/O so it is unit-testable.
-///
-/// Protection contract (per-face `is_confirmed`, per schema comment "重聚类不打散")：
-/// - **Pinned faces** (never move): `is_confirmed` faces, and any face in an `is_ignored` person.
-/// - **Anchored persons** (survive): named, ignored, or holding ≥1 pinned face.
-/// - **Free faces** are re-assigned greedily by nearest centroid (quality-desc so strong faces
-///   seed first); below `min_quality` → left unclustered (NULL).
-///
-/// Returns the `PersonClusterUpdate`s for `rebuild_person_clusters` (placeholder ids are negative).
-///
 /// 全量重聚类的纯核心：从零决定每张脸归属，同时锁定用户劳动。与 DB I/O 分离以便单测。
+///
+/// 保护契约（按脸 `is_confirmed`，对应 schema 注释「重聚类不打散」）：
+/// - **锁定脸**（永不移动）：`is_confirmed` 的脸，以及归属 `is_ignored` 人物下的任何脸。
+/// - **锚定人物**（得以存续）：已命名、已忽略、或持有 ≥1 张锁定脸的人物。
+/// - **Free 脸** 按最近质心贪心重新分配（质量降序，强脸优先占位）；低于 `min_quality` 者
+///   不参与聚类（`person_id` 保持 NULL）。
+///
+/// 返回供 `rebuild_person_clusters` 用的 `PersonClusterUpdate` 列表（占位 id 为负）。
 fn plan_recluster(
     persons: Vec<ReclusterPerson>,
     faces: Vec<ReclusterFace>,
@@ -352,8 +325,6 @@ fn plan_recluster(
         .map(|p| p.id)
         .collect();
 
-    // A face is pinned if confirmed OR it lives in an ignored bucket — but only if it actually has
-    // a person to be pinned TO (a confirmed-but-unassigned face falls through to free).
     // 锁定脸 = 已确认 或 落在忽略桶里——前提是它确有所属人物（已确认但未分配的脸落入 free）。
     let is_pinned = |f: &ReclusterFace| -> bool {
         match f.person_id {
@@ -362,7 +333,6 @@ fn plan_recluster(
         }
     };
 
-    // Group pinned faces by their (fixed) person.
     // 按所属（固定）人物分组锁定脸。
     let mut pinned_by_person: HashMap<i64, Vec<&ReclusterFace>> = HashMap::new();
     for f in &faces {
@@ -373,7 +343,6 @@ fn plan_recluster(
         }
     }
 
-    // Aggregate a group of faces → (centroid, cover_face_id) picking the max-quality face as cover.
     // 聚合一组脸 → (质心, 封面脸id)，取质量最高者为封面。
     let aggregate = |fs: &[&ReclusterFace]| -> (Vec<f32>, i64, f32) {
         let embs: Vec<&[f32]> = fs.iter().map(|f| f.embedding.as_slice()).collect();
@@ -391,8 +360,7 @@ fn plan_recluster(
 
     let mut updates: Vec<PersonClusterUpdate> = Vec::new();
 
-    // 1. Ignored buckets: re-emit their pinned faces verbatim; NEVER attract free faces.
-    //    忽略桶：原样重挂其锁定脸；绝不吸附 free 脸。
+    // 1. 忽略桶：原样重挂其锁定脸；绝不吸附 free 脸。
     for p in persons.iter().filter(|p| p.is_ignored) {
         if let Some(fs) = pinned_by_person.get(&p.id) {
             let (centroid, cover_id, _) = aggregate(fs);
@@ -454,8 +422,7 @@ fn plan_recluster(
         roster.push(entry);
     }
 
-    // 3. Free faces (not pinned, quality≥min), strongest first, greedily assigned.
-    //    Free 脸（非锁定、质量达标），强脸优先，贪心分配。
+    // 3. Free 脸（非锁定、质量达标），强脸优先，贪心分配。
     let mut free: Vec<&ReclusterFace> = faces
         .iter()
         .filter(|f| !is_pinned(f) && f.quality >= min_quality)
@@ -486,8 +453,7 @@ fn plan_recluster(
         touched.entry(pid).or_default().push(f.id);
     }
 
-    // 4. Emit updates for every roster entry that ended up with faces (matchable + new placeholders).
-    //    为最终有脸的每个名册条目产出 update（可匹配 + 新占位）。
+    // 4. 为最终有脸的每个名册条目产出 update（可匹配 + 新占位）。
     let by_id: HashMap<i64, &RosterEntry> = roster.iter().map(|p| (p.id, p)).collect();
     for (pid, face_ids) in touched {
         if let Some(p) = by_id.get(&pid) {
@@ -504,14 +470,6 @@ fn plan_recluster(
     updates
 }
 
-/// Full re-clustering of all faces for `model_name`: load → `plan_recluster` → persist.
-///
-/// Like `cluster_new_faces`, this must run OUTSIDE any long write critical section — it does its
-/// own short read (`db_read_pool`) then a single short write transaction (`db_writer`). Callers
-/// must ensure the face pipeline is NOT writing concurrently (the command guards on the analysis
-/// token). O(n²) in the worst case but rare (explicit command), unlike the per-flush incremental
-/// pass — see the module header.
-///
 /// 全量重聚类 `model_name` 下所有脸：加载 → `plan_recluster` → 落库。同 `cluster_new_faces`，必须在
 /// 任何长写临界区**之外**运行——自做一次短读再一次短写事务。调用方须保证人脸流水线未并发写入
 ///（命令以分析令牌守卫）。最坏 O(n²) 但罕见（显式命令），不同于每批增量。

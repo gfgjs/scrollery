@@ -15,8 +15,8 @@ vi.mock('@tauri-apps/api/core', () => ({
   },
 }))
 
-import { useExoticStore, mergeStorePlugins } from './useExoticStore'
-import type { ExoticRegistryEntry, InstalledExoticPlugin } from '../types/exotic'
+import { dedupeBuiltinOfferings, useExoticStore, mergeStorePlugins } from './useExoticStore'
+import type { ExoticRegistryEntry, FormatResolution, InstalledExoticPlugin } from '../types/exotic'
 
 function regEntry(overrides: Partial<ExoticRegistryEntry> = {}): ExoticRegistryEntry {
   return {
@@ -41,6 +41,20 @@ function installedEntry(overrides: Partial<InstalledExoticPlugin> = {}): Install
     installState: 'installed',
     installedAt: 1000,
     updatedAt: 1000,
+    ...overrides,
+  }
+}
+
+function resolution(overrides: Partial<FormatResolution> = {}): FormatResolution {
+  return {
+    format: 'cr2',
+    mediaKind: 'image',
+    pluginId: 'exotic-image-raw',
+    capabilities: ['thumbnail'],
+    availability: 'authorized',
+    storeUrl: null,
+    installedVersion: null,
+    builtin: true,
     ...overrides,
   }
 }
@@ -102,6 +116,25 @@ describe('mergeStorePlugins', () => {
   })
 })
 
+describe('dedupeBuiltinOfferings', () => {
+  it('同一 builtin 插件声明多个格式时只保留一张展示卡片', () => {
+    const offerings = dedupeBuiltinOfferings([
+      resolution({ format: 'cr2' }),
+      resolution({ format: 'cr3' }),
+      resolution({ format: 'nef' }),
+      resolution({ pluginId: 'video-extended', format: 'rmvb' }),
+      resolution({ pluginId: 'video-extended', format: 'vob' }),
+      resolution({ builtin: false, pluginId: 'exotic-image-psd', format: 'psd' }),
+    ])
+
+    expect(offerings.map((offering) => offering.pluginId)).toEqual([
+      'exotic-image-raw',
+      'video-extended',
+    ])
+    expect(offerings.map((offering) => offering.format)).toEqual(['cr2', 'rmvb'])
+  })
+})
+
 describe('useExoticStore.loadAll', () => {
   it('并发拉三态填充 registry/installed/status', async () => {
     route({
@@ -116,6 +149,7 @@ describe('useExoticStore.loadAll', () => {
         running: false,
         paused: false,
       },
+      list_exotic_format_resolutions: [],
     })
     const s = useExoticStore()
     await s.loadAll()
@@ -131,6 +165,7 @@ describe('useExoticStore.loadAll', () => {
       list_exotic_registry: new Error('cache read failed'),
       list_installed_exotic_plugins: [],
       get_exotic_processing_status: {},
+      list_exotic_format_resolutions: [],
     })
     const s = useExoticStore()
     await s.loadAll()

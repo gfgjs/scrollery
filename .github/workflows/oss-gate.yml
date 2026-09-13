@@ -1,12 +1,15 @@
-# oss-gate —— 公开镜像发布 gate(Part6 ③c §6)。
+# oss-gate —— 公开镜像发布 gate(Part6 ③c)。
 #
-# 定位:Copybara 把私有投影 push 到公开仓 `sync-staging` 分支后,本 gate 在 sync-staging 上跑**完整开源构建 +
-#       泄漏断言**,全绿方可提升到 main(提升为你侧动作:分支保护 + 手动/自动 ff,见文末说明)。
+# 定位:私有投影由 scripts/publish-oss.ps1(git archive + 固定排除表 + gitleaks 双扫)push 到公开仓
+#       `sync-staging` 分支后,本 gate 在该分支跑**前端构建 + 完整开源构建 + 测试 + 密钥扫描**,
+#       全绿方可提升到 main(提升为你侧动作:分支保护 + 手动/自动 ff,见文末说明)。
 #
-# 🔴 本文件**不被 copy.bara.sky 排除** → 随投影同步到公开仓,在公开仓生效。它也存在于私有仓,但:
+# 分工:前端 typecheck/单测/构建 + Rust `--locked` 构建/测试检验投影的**完整性**;gitleaks 检验
+#   **秘密**——私钥与私密签发凭证。两条各管一面,不含任何「某 crate 不得存在」式断言,也不重生 lock。
+#
+# 🔴 本文件**不在 scripts/publish-oss.ps1 的排除表内** → 随投影同步到公开仓,在公开仓生效。私有仓也有它,但:
 #    ①`if: github.repository == 'gfgjs/scrollery'` 守门使它**只在公开仓执行**(私有仓 workflow_dispatch 也不跑);
 #    ②私有仓无 sync-staging 分支,push 触发在私有仓天然不发生。
-#    这样 ③b 后「私有 main 含 pro member」绝不会误触本 gate 的「assert 无 pro」而误报。
 name: oss-gate
 
 on:
@@ -14,25 +17,19 @@ on:
     branches: [ "sync-staging" ]
   workflow_dispatch:
 
-# 与 FORBIDDEN(copy.bara.sky)保持一致的硬指标;gate 侧再验一遍(双保险,防 Copybara 规则漏网)。
-# 🔴 \b 词边界防子串误伤(scrollery_probe_* 含 scrollery_pro 子串,2026-07-06 剥离模拟实抓);
-#    必须 YAML **单引号**——双引号会把 \b 解析成退格控制符,禁词静默失效。
-env:
-  FORBIDDEN: 'scrollery_pro\b picasa_next_pro\b BEGIN-INTERNAL END-INTERNAL'
-
 jobs:
   gate:
-    name: OSS strip-tree gate
+    name: OSS 投影构建 gate
     # 🔴 只在公开仓执行,私有仓一律跳过。
     if: github.repository == 'gfgjs/scrollery'
-    # 2026-07-05 回迁 ubuntu(todo C 节,原 2026-07-02「跑 windows」fork 决策的解除):当年 Linux 编不过
-    # 的两个前提(wic_engine 无条件编译 / windows crate 未 target 限定)已被审查 R0-2 + Part4-T16 清除;
-    # 私有超集树在 ci.yml rust-linux job(check+test)全绿实证后回迁——公开投影树是其剥离子集。
-    # ubuntu 收益:runner 更快更省;gitleaks job 早已因 windows 资产 404 而单跑 ubuntu,现两 job 同平台。
+    # ubuntu runner 更快更省;私有超集树在 ci.yml rust-linux job(check+test)已全绿,公开投影树是其子集。
     runs-on: ubuntu-latest
+    # 本 job 只做源码编译与单测，发行资源由 release 打包门验证。
+    env:
+      TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":[]}}'
     defaults:
       run:
-        shell: bash        # 显式声明(GitHub 对显式 bash 注入 -eo pipefail,本文件 grep 断言已全 herestring)
+        shell: bash
     steps:
       - name: Checkout sync-staging
         uses: actions/checkout@v4
@@ -41,56 +38,8 @@ jobs:
       - name: Tauri Linux 系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-
-      # ① 静态断言:pro 目录/生产 keyset 必须不存在;禁词必须零出现(剥离成功的双验)。
-      - name: 断言 pro 源码 + 生产 keyset 已剥离
-        run: |
-          set -e
-          if [ -d crates/scrollery-pro ]; then
-            echo "::error::crates/scrollery-pro/ 出现在公开树 —— Copybara glob 排除失效"; exit 1
-          fi
-          # 🔴 herestring 而非管道:shell:bash 注入 pipefail,grep -q 命中早退给上游发
-          #    SIGPIPE(141)→ 管道非零 → if 为假 → **真泄漏被静默放行**(私有仓 ci.yml
-          #    渠道断言 2026-07-04 首跑实证同型竞态,正向断言侧误报;此处是更危险的反向)。
-          tracked=$(git ls-files)
-          if grep -q "exotic-keyset-prod.json" <<< "$tracked"; then
-            echo "::error::生产 keyset 文件出现在公开树"; exit 1
-          fi
-          echo "✓ pro 目录 / 生产 keyset 均不在公开树"
-
-      - name: 禁词复验(剥离漏网双保险)
-        run: |
-          set -e
-          fail=0
-          for tok in $FORBIDDEN; do
-            # 范围与 copy.bara.sky verify_match **对齐**(rs/toml/json/yml 代码文件):FORBIDDEN 的语义是
-            # 「代码文件零出现」;计划/说明类 .md 会合法**讨论**这些标记名,全树 grep 必假阳性(gate 首跑实证)。
-            # ⚠ GNU grep 规则:--include/--exclude 矛盾时**最后匹配的选项获胜**——oss-gate.yml 的排除必须写在
-            #   include 之后,否则 --include='*.yml' 压过排除、gate 自指命中 env 里的 FORBIDDEN(第二跑实证踩坑)。
-            hits=$(grep -RIn --exclude-dir=.git \
-                   --include='*.rs' --include='*.toml' --include='*.json' --include='*.yml' \
-                   --exclude=oss-gate.yml --exclude=rename-gate.json \
-                   -e "$tok" . || true)
-            if [ -n "$hits" ]; then
-              echo "::error::禁词 [$tok] 出现在公开树代码文件:"; echo "$hits"; fail=1
-            fi
-          done
-          [ "$fail" = "0" ] && echo "✓ 禁词零出现(rs/toml/json/yml)" || exit 1
-
-      # ② Cargo.lock:公开 lock 绝不能含 pro(§10-3)。私有 lock 含 pro 时须重生;重生后仍须无 pro。
-      - name: 校验 + 重生 Cargo.lock 无 pro
-        run: |
-          set -e
-          if [ -f Cargo.lock ] && grep -q "scrollery-pro" Cargo.lock; then
-            echo "::error::同步来的 Cargo.lock 含 scrollery-pro —— 须在 gate 重生公开 lock"; exit 1
-          fi
-          # 重生一份(依当前剥离后的 Cargo.toml),确认可解析且不引入 pro。
-          cargo generate-lockfile
-          if grep -q "scrollery-pro" Cargo.lock; then
-            echo "::error::重生的 Cargo.lock 仍含 scrollery-pro"; exit 1
-          fi
-          echo "✓ 公开 Cargo.lock 无 pro"
+          # clang/libclang-dev:raw-worker 独立 workspace 的 Linux 构建前置(见下方 RAW 步骤)。
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev clang libclang-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -99,36 +48,42 @@ jobs:
       - name: Rust 编译缓存
         uses: Swatinem/rust-cache@v2
 
-      # tauri::generate_context! 宏在编译期校验 frontendDist("../dist")存在(四跑实证,debug 也查)。
-      # gate 不做前端构建——前端 build/类型检查是 ci.yml 的职责(审查 R0-1),此处只需占位目录让宏通过。
-      - name: 占位 dist(generate_context 需 frontendDist 存在)
-        run: mkdir -p dist
+      # 前端面(2026-09-14 补):公开树须能独立 typecheck/单测/构建。原 gate 只放占位 dist 目录让
+      # tauri::generate_context! 宏(编译期校验 frontendDist 存在)过编译,前端坏掉不会红;现改为真实构建。
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
 
-      # 原「npm ci 材料化 ONNX 资源」步骤已随 Part7-T6 撤销(2026-07-04):bundle 不再声明
-      # ONNX/DirectML 资源,build script 无资源校验面;dev 推理 DLL 由 .cargo/config.toml
-      # [env] ORT_DYLIB_PATH 直指 npm 包(devDependencies)。
+      - name: npm ci
+        run: npm ci
 
-      # ③ 动态 gate:剥离后的树必须真能**解析+编译**——比静态 grep 更权威的泄漏兜底:任何**活跃**的 pro 符号/
-      #    清单引用若漏剥,workspace 根本过不了 cargo check。check 为强制门;test 为附加断言(项目测试多为
-      #    rusqlite 内存 DB/逻辑单测,可 headless 跑)。
-      - name: cargo check --workspace(强制:剥离未破坏解析/编译)
+      - name: vue-tsc 类型检查
+        run: npm run typecheck
+
+      - name: vitest 单元测试
+        run: npm test
+
+      - name: vite build(生产 bundle)
+        run: npm run build
+
+      # 强制门:公开投影树必须能用**同步来的原锁**解析+编译(Cargo.lock 随投影同步,不重生)。
+      - name: cargo check --workspace --locked
         run: cargo check --workspace --locked
 
-      - name: cargo test --workspace(附加)
-        run: cargo test --workspace --locked
+      # 附加断言:项目测试多为 rusqlite 内存 DB/逻辑单测,可 headless 跑。
+      # 🔴 显式串行(--test-threads=1):不依赖 runner 默认并行度,换取确定性。
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --test-threads=1
 
-      # ④ members 断言:workspace 成员绝不含 scrollery-pro。
-      - name: 断言 workspace members 无 pro
-        run: |
-          set -e
-          # herestring 防 SIGPIPE 竞态(同上方 keyset 断言注,2026-07-04 实录)。
-          meta=$(cargo metadata --no-deps --format-version 1)
-          if grep -q '"name":"scrollery-pro"' <<< "$meta"; then
-            echo "::error::workspace members 含 scrollery-pro"; exit 1
-          fi
-          echo "✓ members 无 pro"
+      # RAW sidecar 刻意脱离根 workspace(crates/exotic-workers/raw-worker 自带 Cargo.lock),
+      # `cargo check --workspace` 天然漏掉它;Linux 侧构建脚本需 clang(见上方 apt 清单)。
+      - name: cargo check(raw-worker 独立 workspace)
+        run: cargo check --manifest-path crates/exotic-workers/raw-worker/Cargo.toml --locked
 
-  # ⑤ 密钥扫描:防生产 keyset / token 意外混入(独立于文件名断言)。拆成独立 ubuntu job(与 gate 并行):
+  # 密钥扫描:防私钥 / 私密签发凭证意外混入公开树或其历史(验签公钥本就可公开,不在此列;
+  #    独立 ubuntu job,与 gate 并行)。
   #    gitleaks 是平台无关的文本扫描,而 gitleaks-action@v2 在 windows 上装不了二进制——它拼的下载名是
   #    windows_x64.tar.gz,官方 release 的 Windows 资产是 .zip → 404(六跑实证)。ubuntu 是该动作的主流路径。
   gitleaks:
@@ -147,4 +102,4 @@ jobs:
 #  本 gate 只做「验证」,不自动推 main(避免在分支保护上做脆弱假设)。提升二选一:
 #   (a) 手动:公开仓开 sync-staging → main 的 PR,gate 绿即 merge(推荐首发,人工把关 baseline)。
 #   (b) 自动:另加一个 needs: gate 的 job,用 PAT/GITHUB_TOKEN ff main→sync-staging;需分支保护放行该 actor。
-#  公开仓分支保护(§8):main 只接受 sync-bot / 本 gate 通过的提升,拦人类直接 push(防反向漂移被下次 SQUASH 无声覆盖)。
+#  公开仓分支保护:main 只接受 sync-bot / 本 gate 通过的提升,拦人类直接 push(防反向漂移被下次 SQUASH 无声覆盖)。

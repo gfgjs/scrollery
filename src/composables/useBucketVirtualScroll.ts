@@ -1,5 +1,5 @@
 // src/composables/useBucketVirtualScroll.ts
-// T16 方案 B(B1.5):bucket 分段虚拟滚动——等高算术分段 + 单飞取数管线。
+// T16 方案 B(B1.5):bucket 分段虚拟滚动——等高算术分段 + 有界最新优先取数管线。
 //
 // 机制:废弃「单 spacer + 行级坐标压缩」——容器总高 = 真实逻辑总高,每段(bucket)一个
 // 绝对定位 div(top=seg.start、height=段真实高),段内行以 (row.y - seg.start) 定位。
@@ -13,10 +13,10 @@
 // - **可见段 = 纯算术**(scrollTop/S 两次除法)→ 不再需要 IntersectionObserver,也不再
 //   渲染全量占位 div(原方案数百段 div × 内联函数 ref × 每滚动帧重渲染 = 每帧数千次
 //   observe churn,真机根因 C);只渲染愿望窗口内的 2-3 个段。
-// - **愿望清单 + 单飞取数**:任意时刻至多 1 个 IPC 在途;出队时按「距视口中心最近」
-//   重新挑选,应答落地前复核「该段仍被需要且仍是同一对象」——滚动条横扫时飞掠段自然
-//   被跳过、终点段最先取(真机根因 A:取数风暴无优先级、终点段排队尾 → 白屏 1-2s);
-//   离屏应答一律丢弃(真机根因 B:幽灵挂载致 DOM 无界驻留 → 选择模式全量重 patch 卡顿)。
+// - **愿望清单 + 最新视口优先取数**:常态仍单飞;若唯一在途段已因远跳离开愿望集,
+//   允许 1 个最新目标段旁路(总在途硬上限 2),不让陈旧 IPC 阻塞当前视口。出队按「距
+//   视口中心最近」重选,应答落地前复核「该段仍被需要且仍是同一对象」——飞掠应答
+//   仍会丢弃,也不会形成无界并发或幽灵挂载。
 //
 // B3 段级坐标映射(2026-07-04):总高 > 物理 spacer 上限(16M,WebView2 2^24 钳制留余量)
 // 时进入「映射态」——spacer 封顶,段以 (seg.start − anchorDelta) 物理定位。滚动语义按
@@ -36,8 +36,19 @@
 // 各自 enabled() 互斥激活,运行时即切即生效(T16 评估文档 §5 迁移策略);方案 A 保留为
 // 回退引擎(设置关闭即回退)。
 
-import { shallowRef, reactive, ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import {
+  shallowRef,
+  reactive,
+  ref,
+  computed,
+  watch,
+  nextTick,
+  onMounted,
+  onBeforeUnmount,
+} from 'vue'
 import type { LayoutRow } from '../types/layout'
+import { logger } from '../utils/logger'
+import { canvasPrefetchCoveragePx } from '../utils/galleryPrefetchWindow'
 
 const LOG = '[BucketScroll]'
 
@@ -54,7 +65,7 @@ export function resolveBucketSpacerCap(): number {
       const raw = localStorage.getItem('scrollery.debug.bucketSpacer')
       const o = raw == null ? NaN : Number(raw)
       if (Number.isFinite(o) && o > 0) {
-        console.info(LOG, `spacer cap overridden → ${o} (debug, B3)`)
+        logger.info(`${LOG} spacer cap overridden → ${o} (debug, B3)`)
         return o
       }
     }
@@ -81,14 +92,43 @@ export const ONE_TO_ONE_STICKY_MS = 250
 /// 比例重锚,恰好精确落到逻辑边界。
 const ONE_TO_ONE_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', ' '])
 
-/// 段高(px,约 2-4 屏):既是懒加载取数单元(一次 IPC ≈ 数十行),也是挂载粒度——
-/// 愿望窗口通常只含 1-2 段,挂载 DOM 面与方案 A 同量级。注意这与「元素高度上限」是两个
-/// 量级的问题:>16.7M 总高所需的粗粒度(~10M)段级映射是 B3 在本层之上的正交一层。
+/// 段高上限/默认(px):既是懒加载取数单元(一次 IPC),也是挂载粒度。**现为上限**——实际段高
+/// 由 clampSegmentPx 按行高自适应(见下)。默认行高 200px × ROWS_PER_SEGMENT(20) = 4000px,
+/// 与历史固定值一致(≥200px 行高维持 4000px,零回归)。注意这与「元素高度上限」是两个量级的
+/// 问题:>16.7M 总高所需的粗粒度段级映射是 B3 在本层之上的正交一层。
 export const SEGMENT_PX = 4_000
 
-/// 预取边距(px):愿望窗口 = 视口 ± 此值。须大于最大行高(跨界行归「行首 y 所在段」,
-/// 由边距保证其所属段在该行可见前已被挂载),其余部分是纯预取余量。
+/// 每段目标行数:× 行高 = 段高。200px × 20 = 4000px = SEGMENT_PX(默认行为锚点)。
+export const ROWS_PER_SEGMENT = 20
+
+/// 自适应段高下限(px):防极小行高下段过碎(段 div / IPC 过多);取 ≈ PRELOAD_MARGIN_PX 量级。
+const MIN_SEGMENT_PX = 1_000
+
+/**
+ * 自适应段高(纯函数,单测锁定):clamp(行高 × ROWS_PER_SEGMENT, MIN_SEGMENT_PX, SEGMENT_PX)。
+ *
+ * 固定 4000px 段在小行高下每段项数 ∝ 段高/行高² 爆炸(60px 满屏 ~1860 项/段),跨段的挂载
+ * (DOM)/反序列化落地成为单帧 ~100ms 卡顿——探针实测 60px 快滚 dropped 5-11/burst、120px 仅
+ * 0-1(症状①的主因)。按行高线性缩小段高把每段项数拉回可控量级(60px → 1200px,~1/3 项),
+ * 把「大爆发」切成「更频繁但更小、能塞进一帧」的块。≥200px 行高封顶 4000px = 历史值,零回归。
+ */
+export function clampSegmentPx(rowHeight: number): number {
+  const raw = Math.round(Math.max(1, rowHeight) * ROWS_PER_SEGMENT)
+  return Math.max(MIN_SEGMENT_PX, Math.min(SEGMENT_PX, raw))
+}
+
+/// 预取边距基线(px):愿望窗口 = 视口 ± 此值(静止/慢滚时的边距)。须大于最大行高(跨界行
+/// 归「行首 y 所在段」,由边距保证其所属段在该行可见前已被挂载),其余部分是纯预取余量。
+/// 甩滚更快时实际生效边距由 [`adaptiveMarginPx`] 按速度放大——canvas 模式对未就绪段没有
+/// 占位兜底(mountedRows 只吐 ready 段),取数跟不上视口会在该 y 段出现内容空洞（画廊滚动
+/// 卡顿分析·canvas 段空洞）,故甩滚快时提前把更远的段纳入愿望集,抢在视口抵达前完成取数。
 export const PRELOAD_MARGIN_PX = 1_000
+
+/// 速度→预取边距放大系数:每 1px/ms 的平滑滚动速度追加这么多像素边距。
+const VELOCITY_MARGIN_FACTOR = 300
+/// 预取边距放大上限(px):防极端速度(远跳/惯性峰值)把愿望窗口撑得过大,徒增段数与
+/// IPC 排队深度——常态并发仍受 pumpFetch 单飞节流,边距只决定「多早把段纳入愿望集」。
+const MAX_PRELOAD_MARGIN_PX = 6_000
 
 /// 渲染段 = 几何 + 懒加载状态。仅愿望窗口内的段存在(离窗即整体丢弃,无占位)。
 export interface RenderSegment {
@@ -130,6 +170,13 @@ interface UseBucketVirtualScrollOptions {
   layoutVersion: () => number
   fetchBucketRows: (startY: number, endY: number) => Promise<LayoutRow[]>
   containerRef: () => HTMLElement | null
+  /// 当前行高(px):驱动自适应段高(clampSegmentPx)。行高变→relayout→layoutVersion 变→rebuild
+  /// 重算段高,故段高与布局版本同源、一代内恒定。
+  rowHeight: () => number
+  /// Canvas 渲染模式开关(可选,T16 §4.3 S3):true 时愿望窗口除速度边距外,至少覆盖位图
+  /// 预取的几何范围(前 1.25 屏 + 行级余量,两侧同宽以兜住方向反转)。缺省/恒 false = 既有
+  /// 语义,零变化——DOM 路径不得因本契约扩大挂载量。
+  canvasMode?: () => boolean
 }
 
 export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
@@ -143,13 +190,19 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
 
   /// 愿望集(index → 段对象,与 segments 数组共享同一批 reactive 对象)。
   const desired = new Map<number, RenderSegment>()
+  /// 换代重建时把旧段行作为暂存首帧种子；新 IPC 落地前继续显示旧行，避免整段闪成空白。
+  let rebuildSeed: Map<number, RenderSegment> | null = null
   /// 换代计数:布局版本变化/开关翻转即 +1;在途应答须同时满足「同代 + 段对象仍在愿望集
   /// 且是同一对象」才落地——飞掠丢弃与幽灵挂载的双保险。
   let generation = 0
-  /// 单飞泵標志:任意时刻至多一个取数循环、至多一个 IPC 在途。
-  let pumping = false
+  /// 常态单飞；仅当所有在途请求都已离开当前愿望集时，允许最新视口额外旁路一个。
+  /// 由 Set 同时承担身份复核与总在途硬上限，避免滚动条横扫演变为 IPC 风暴。
+  const activeFetches = new Set<RenderSegment>()
   /// 愿望窗口快速路径 key(代数+区间):滚动帧内区间未变则整个 sync 为 no-op。
   let lastRangeKey = ''
+  /// 当前自适应段高:在 rebuild(行高/版本变)时快照,保证「一代内所有段边界用同一段高」——
+  /// makeSegment(index*segPx)与 desiredSegmentRange(…, segPx)读同一值,不会因中途行高抖动串位。
+  let segPx = clampSegmentPx(opts.rowHeight())
   let resizeObserver: ResizeObserver | null = null
 
   // ── B3 段级坐标映射状态 ────────────────────────────────────────────────────
@@ -170,6 +223,32 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   let oneToOneUntil = -Infinity
   /// 当前手势是否局部 1:1(手势起点定类,链内沿用)。
   let gestureOneToOne = false
+
+  // ── 甩滚速度追踪(预取边距自适应)──────────────────────────────────────────
+  /// 物理滚动速度 EMA(px/ms)。与上面 B3.1 的 lastScrollTs 分开追踪——常见库规模恒不进
+  /// 映射分支,而 lastScrollTs 只在 mapped 分支更新;此处不区分映射态,onScroll 每次都算。
+  let scrollVelocityPxMs = 0
+  /// 上次速度采样时刻(ms);0 = 尚未采样(下一次 onScroll 只播种时间戳,不计速度,避免
+  /// 首次调用因缺基准把巨跳误判成瞬时高速)。
+  let lastVelocityTs = 0
+
+  /// 速度→预取边距:基线 [`PRELOAD_MARGIN_PX`] 按当前平滑速度线性放大,封顶
+  /// [`MAX_PRELOAD_MARGIN_PX`]。
+  function adaptiveMarginPx(): number {
+    return Math.min(
+      MAX_PRELOAD_MARGIN_PX,
+      PRELOAD_MARGIN_PX + scrollVelocityPxMs * VELOCITY_MARGIN_FACTOR,
+    )
+  }
+
+  /// 实际生效的取数边距:速度边距是下限,canvas 模式再抬到「位图预取几何」之上。
+  /// 两侧取同一跨度(前向值):反向滚动时原后方立刻成为新的前方,对称覆盖保证反转后仍有
+  /// 完整的 1.25 屏。余量(一行行高)已含在纯函数内。
+  function effectiveMarginPx(viewH: number): number {
+    const speedMargin = adaptiveMarginPx()
+    if (!(opts.canvasMode?.() ?? false) || !(viewH > 0)) return speedMargin
+    return Math.max(speedMargin, canvasPrefetchCoveragePx(viewH, opts.rowHeight()).aheadPx)
+  }
 
   function geometry() {
     const el = opts.containerRef()
@@ -200,11 +279,13 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
 
   function makeSegment(index: number): RenderSegment {
     const total = opts.totalHeight()
+    const previous = rebuildSeed?.get(index)
     return reactive({
       index,
-      start: index * SEGMENT_PX,
-      end: Math.min((index + 1) * SEGMENT_PX, total),
-      rows: null,
+      start: index * segPx,
+      end: Math.min((index + 1) * segPx, total),
+      // rows 可以是上一代布局；state 仍从 idle 开始，让新代立即发起取数并在完成后原子替换。
+      rows: previous?.rows ?? null,
       state: 'idle',
     }) as RenderSegment
   }
@@ -222,7 +303,13 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     const el = opts.containerRef()
     if (!el) return
     const logicalTop = logicalOverride ?? el.scrollTop + anchorDelta.value
-    const range = desiredSegmentRange(logicalTop, el.clientHeight, opts.totalHeight())
+    const range = desiredSegmentRange(
+      logicalTop,
+      el.clientHeight,
+      opts.totalHeight(),
+      segPx,
+      effectiveMarginPx(el.clientHeight),
+    )
     if (!range) {
       if (desired.size > 0) {
         desired.clear()
@@ -270,39 +357,62 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     return best
   }
 
-  /// 单飞取数泵:循环「挑最近的 idle → fetch → 复核落地」直到无事可做。每次 await 恢复后
-  /// 都重新对当前愿望集挑选,滚动期间新增/丢弃的段自然被接上/跳过;跨代存活(换代后继续
-  /// 为新段表服务)。唯一的挂起点在 await 上,break 到清标志之间无挂起 → 无 TOCTOU 悬空。
-  async function pumpFetch() {
-    if (pumping) return
-    pumping = true
+  function hasActiveDesiredFetch(): boolean {
+    for (const seg of activeFetches) {
+      if (desired.get(seg.index) === seg) return true
+    }
+    return false
+  }
+
+  /**
+   * 单段取数与落地。陈旧段仍完成 IPC，但因代次/对象复核不会落地；finally 释放槽位后
+   * 重新踢泵，让期间最新的愿望窗口获得下一优先槽。
+   */
+  async function fetchSegment(seg: RenderSegment) {
+    const myGeneration = generation
+    activeFetches.add(seg)
+    seg.state = 'loading'
     try {
-      while (opts.enabled()) {
-        const seg = pickNextIdle()
-        if (!seg) break
-        const myGeneration = generation
-        seg.state = 'loading'
-        try {
-          const rows = await opts.fetchBucketRows(seg.start, seg.end)
-          // 落地三重复核:同代 + 该 index 的愿望对象仍是本对象(飞掠段已被 syncDesired
-          // 丢弃 → get 返回 undefined 或新建对象 → 丢弃应答,杜绝幽灵挂载)。
-          if (myGeneration === generation && desired.get(seg.index) === seg) {
-            seg.rows = rows
-            seg.state = 'ready'
-          }
-        } catch (err) {
-          if (myGeneration === generation && desired.get(seg.index) === seg) {
-            // error 粘滞至该段离窗重进或布局换代——LayoutNotReady 多为换代竞态,
-            // 换代 watch 马上会整表重建。
-            seg.state = 'error'
-            console.error(LOG, `fetchBucketRows(${seg.start}, ${seg.end}) FAILED:`, err)
-          }
-        }
-        flushSettled()
+      const rows = await opts.fetchBucketRows(seg.start, seg.end)
+      // 落地三重复核:同代 + 该 index 的愿望对象仍是本对象(飞掠段已被 syncDesired
+      // 丢弃 → get 返回 undefined 或新建对象 → 丢弃应答,杜绝幽灵挂载)。
+      if (myGeneration === generation && desired.get(seg.index) === seg) {
+        seg.rows = rows
+        seg.state = 'ready'
+      }
+    } catch (err) {
+      if (myGeneration === generation && desired.get(seg.index) === seg) {
+        // error 粘滞至该段离窗重进或布局换代——LayoutNotReady 多为换代竞态,
+        // 换代 watch 马上会整表重建。
+        seg.state = 'error'
+        logger.error(`${LOG} fetchBucketRows(${seg.start}, ${seg.end}) FAILED`, { error: err })
       }
     } finally {
-      pumping = false
+      activeFetches.delete(seg)
       flushSettled()
+      pumpFetch()
+    }
+  }
+
+  /**
+   * 常态只维持 1 个 IPC；若现有在途均已被远跳淘汰，则允许最新目标段占第 2 槽。
+   * 连续横扫最多积压 2 个请求，其中任一落定后都会重新挑当前最近段，不追历史队列。
+   */
+  function pumpFetch() {
+    if (!opts.enabled()) return
+    while (true) {
+      const limit = activeFetches.size === 0 || hasActiveDesiredFetch() ? 1 : 2
+      if (activeFetches.size >= limit) return
+      const seg = pickNextIdle()
+      if (!seg) {
+        flushSettled()
+        return
+      }
+      void fetchSegment(seg)
+      // fetchSegment 在首次 await 前同步把 seg 记为 loading 并入 activeFetches，下一轮可安全
+      // 重新计算 limit；常态因此停在 1，只有陈旧请求占槽时才会进入第 2 槽。
+      if (activeFetches.size >= 2) return
+      if (hasActiveDesiredFetch()) return
     }
   }
 
@@ -330,14 +440,22 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   }
 
   function rebuild() {
+    const previous = new Map(desired)
     generation++
     desired.clear()
     lastRangeKey = ''
+    // 行高变(→relayout→layoutVersion→本函数)时重算段高:段高与布局版本同源、一代内恒定。
+    segPx = clampSegmentPx(opts.rowHeight())
     // 布局换代后钳制锚差(总高可能缩水;非映射态自然归 0)。滚动位恢复由宿主的
     // layoutVersion watcher 经 scrollToLogicalY 完成,此处只保证几何不越界。
     anchorDelta.value = Math.min(anchorDelta.value, Math.max(0, opts.totalHeight() - SPACER_CAP))
-    publish()
-    syncDesired(true)
+    rebuildSeed = previous
+    try {
+      // syncDesired 会先建立带旧 rows 的新代段，再 publish；期间不发布空段表。
+      syncDesired(true)
+    } finally {
+      rebuildSeed = null
+    }
   }
 
   /// 宿主 @scroll 转发入口。非映射态:纯记录 + 算术同步(零映射零补偿——顺滑来源)。
@@ -345,18 +463,35 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// 零干预);无印记的滚动链 = 滚动条拖动/轨道点击 → **逐事件**全局线性重锚(拇指比例
   /// 语义,拖到边 = 逻辑边);单事件巨跳(Home/End/拇指跳转)无论分类一律比例兜底。
   /// 手势进行中绝不写 scrollTop——偿债只在停稳后(scheduleRepay)。
-  function onScroll() {
+  /// 返回 true = 本事件为程序化落点(偿债/远跳)的自触发事件,已被引擎消费;宿主的用户
+  /// 手势侧采样(加载闸门速度采样)应豁免该事件——单帧巨位移会被误判为飞掠(审查 F1)。
+  function onScroll(): boolean {
     const el = opts.containerRef()
-    if (!el) return
+    if (!el) return false
     const p = el.scrollTop
     if (internalScroll) {
       // 偿债/远跳落点的自触发事件:逻辑位与愿望窗口已就绪,仅更新跳变基准并断开手势链
-      // (程序化落点不是用户手势,下一事件重新定类)。
+      // (程序化落点不是用户手势,下一事件重新定类)。速度基准同步清零——程序化落点不是
+      // 真实甩滚,不该把它的巨位移算进速度 EMA 抬高预取边距。
       internalScroll = false
       lastP = p
       lastScrollTs = -Infinity
-      return
+      scrollVelocityPxMs = 0
+      lastVelocityTs = 0
+      return true
     }
+    // 甩滚速度 EMA(px/ms,物理坐标):独立于映射态分类,驱动 adaptiveMarginPx。
+    // lastVelocityTs=0 时(首次采样/刚重置)只播种基准,不计入本次——避免把首个事件的
+    // 巨位移(如远跳后紧跟的下一帧)误判成瞬时高速。
+    const nowMs = Date.now()
+    if (lastVelocityTs > 0) {
+      const dt = nowMs - lastVelocityTs
+      if (dt > 0) {
+        const inst = Math.abs(p - lastP) / dt
+        scrollVelocityPxMs = scrollVelocityPxMs * 0.6 + inst * 0.4
+      }
+    }
+    lastVelocityTs = nowMs
     const g = geometry()
     if (g.mapped) {
       const now = Date.now()
@@ -370,6 +505,7 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     logicalScrollTop.value = p + anchorDelta.value
     syncDesired()
     if (g.mapped) scheduleRepay()
+    return false
   }
 
   /// 偿还压缩债(映射态):scrollTop 归位到当前逻辑位的全局线性位置。原子重锚——
@@ -503,6 +639,8 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
         lastScrollTs = -Infinity
         oneToOneUntil = -Infinity
         gestureOneToOne = false
+        scrollVelocityPxMs = 0
+        lastVelocityTs = 0
         publish()
         flushSettled() // 空愿望集 = 已稳定,释放等待者(如引擎切换瞬间的 FLIP)
         return
@@ -511,6 +649,17 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     },
     { immediate: true },
   )
+
+  // Canvas 模式翻转(一键切换 DOM↔Canvas)按新边距**即时**重算愿望窗口:否则可能出现
+  // 「位图想预取 1.25 屏、行数据只到 1000px」的旧窗残留,要等下一次滚动才补齐(S3 的
+  // 及时重取要求)。停用时 syncDesired 自会早退,行为与既有休眠语义一致。
+  if (opts.canvasMode) {
+    const isCanvasMode = opts.canvasMode
+    watch(
+      () => isCanvasMode(),
+      () => syncDesired(true),
+    )
+  }
 
   // 视口尺寸变化 → 愿望窗口变化(宽度变化走 relayout→版本重建,此处兜住纯高度变化)。
   onMounted(() => {

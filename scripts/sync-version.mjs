@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// scripts/sync-version.mjs —— 版本号单一事实源工具(Part7-T5 / Part7 §3.2 R3)。
+// 版本号单一事实源工具(Part7-T5 / Part7 §3.2 R3)。
 // 锚 = 根 Cargo.toml 的 [workspace.package] version;零依赖,node 直跑。
 //
 // 用法:

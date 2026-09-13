@@ -1,45 +1,237 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Scrollery</title>
-    <script>
-      // 防 FOUC:样式解析前按本地快照(uiStore.applyAppearance 每次应用时刷新)先落
-      // data-theme,固定主题的老用户首帧即着对色;权威源仍是 app_config,挂载后由
-      // 启动配置批(get_startup_config)校正。快照缺失/损坏 → 回退系统偏好。
-      ;(function () {
-        var mode = 'system'
-        var light = 'porcelain'
-        var dark = 'ink'
-        try {
-          var s = JSON.parse(localStorage.getItem('scrollery.themeSnapshot.v1') || 'null')
-          if (s) {
-            if (s.appearance === 'light' || s.appearance === 'dark' || s.appearance === 'system')
-              mode = s.appearance
-            if (typeof s.light === 'string' && s.light) light = s.light
-            if (typeof s.dark === 'string' && s.dark) dark = s.dark
-            // legacy 快照 id 映射(S1 期写过 'light'/'dark');未注册 id 首帧可能无匹配,
-            // 挂载后由 uiStore 的注册表归一化校正。
-            if (light === 'light') light = 'porcelain'
-            if (dark === 'dark') dark = 'ink'
-          }
-        } catch (e) {
-          /* 快照损坏走系统偏好兜底 */
+    <!-- 防 FOUC 脚本外置(见 public/theme-snapshot.js 头注):经典脚本、必须阻塞解析,不可加 type="module"/defer/async。 -->
+    <script src="/theme-snapshot.js"></script>
+    <style>
+      /* 样式刻意自包含：模块样式表在 HTML 首帧之后才到达，静态层必须先覆盖恢复后的完整主窗口。 */
+      :root {
+        /* 各主题块内的 --startup-bg/--startup-(text|muted) 是 color-mix 浓度缩放(与 themes/*.css
+           的底色 wash/文字 ramp 同配方,分别消费 --theme-tint-scale/--theme-text-scale;未设置时
+           回退满浓度 1),保证首帧底色与文字观感与水合后一致。 */
+        --startup-bg: #edf5f1;
+        --startup-text: color-mix(in oklch, #132a22 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-muted: color-mix(in oklch, #3d594e calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-accent: #0b7c52;
+      }
+
+      html,
+      body {
+        margin: 0;
+        background: var(--startup-bg);
+      }
+
+      #startup-layer {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        color: var(--startup-text);
+        background: color-mix(in srgb, var(--startup-bg) 90%, transparent);
+        font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+        user-select: none;
+        -webkit-app-region: drag;
+        opacity: 1;
+        transition: opacity 320ms cubic-bezier(0.16, 1, 0.3, 1);
+      }
+
+      html[data-theme='fresh-dark'] {
+        --startup-bg: color-mix(in oklch, #0d1512 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #0d1512 l 0 h));
+        --startup-text: color-mix(in oklch, #edf7f2 calc(var(--theme-text-scale, 1) * 100%), oklch(from #edf7f2 l 0 h));
+        --startup-muted: color-mix(in oklch, #a4c2b4 calc(var(--theme-text-scale, 1) * 100%), oklch(from #a4c2b4 l 0 h));
+        --startup-accent: #34d399;
+      }
+      html[data-theme='fresh-light'] {
+        --startup-bg: color-mix(in oklch, #edf5f1 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+        --startup-text: color-mix(in oklch, #132a22 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-muted: color-mix(in oklch, #3d594e calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-accent: #0b7c52;
+      }
+      html[data-theme='minimal-light'] {
+        --startup-bg: color-mix(in oklch, #f1f3f5 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+        --startup-text: color-mix(in oklch, #18181b calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-muted: color-mix(in oklch, #52525b calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-accent: #27272a;
+      }
+      html[data-theme='tech-light'] {
+        --startup-bg: color-mix(in oklch, #ebf1fa calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
+        --startup-text: color-mix(in oklch, #111f38 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-muted: color-mix(in oklch, #3d5073 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
+        --startup-accent: #2563eb;
+      }
+      html[data-theme='minimal-dark'] {
+        --startup-bg: color-mix(in oklch, #121214 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #121214 l 0 h));
+        --startup-text: color-mix(in oklch, #f4f4f5 calc(var(--theme-text-scale, 1) * 100%), oklch(from #f4f4f5 l 0 h));
+        --startup-muted: color-mix(in oklch, #a1a1aa calc(var(--theme-text-scale, 1) * 100%), oklch(from #a1a1aa l 0 h));
+        --startup-accent: #e4e4e7;
+      }
+      html[data-theme='tech-dark'] {
+        --startup-bg: color-mix(in oklch, #0e131b calc(var(--theme-tint-scale, 1) * 100%), oklch(from #0e131b l 0 h));
+        --startup-text: color-mix(in oklch, #eff4fc calc(var(--theme-text-scale, 1) * 100%), oklch(from #eff4fc l 0 h));
+        --startup-muted: color-mix(in oklch, #a2b4cf calc(var(--theme-text-scale, 1) * 100%), oklch(from #a2b4cf l 0 h));
+        --startup-accent: #60a5fa;
+      }
+
+      html[data-glass] #startup-layer {
+        background: color-mix(in srgb, var(--startup-bg) 78%, transparent);
+      }
+
+      #startup-layer[data-state='ready'] {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .startup-layer__content {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 18px;
+        transform: translateY(0) scale(1);
+        transition: transform 320ms cubic-bezier(0.16, 1, 0.3, 1);
+      }
+
+      #startup-layer[data-state='ready'] .startup-layer__content {
+        transform: translateY(-6px) scale(0.98);
+      }
+
+      .startup-layer__logo {
+        position: relative;
+        display: grid;
+        width: 88px;
+        height: 88px;
+        place-items: center;
+      }
+
+      .startup-layer__ring {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        background: conic-gradient(
+          from 0deg,
+          var(--startup-accent),
+          color-mix(in srgb, var(--startup-accent) 62%, white),
+          var(--startup-accent)
+        );
+        animation: startup-layer-ring-spin 2.8s linear infinite;
+      }
+
+      .startup-layer__face {
+        position: absolute;
+        inset: 4px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: color-mix(in srgb, var(--startup-bg) 84%, transparent);
+      }
+
+      .startup-layer__face svg {
+        width: 38px;
+        height: 38px;
+        fill: none;
+        stroke: var(--startup-accent);
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 1.5;
+        filter: drop-shadow(0 0 6px color-mix(in srgb, var(--startup-accent) 45%, transparent));
+      }
+
+      .startup-layer__title {
+        color: var(--startup-text);
+        font-size: 21px;
+        font-weight: 700;
+        letter-spacing: -0.4px;
+      }
+
+      .startup-layer__subtitle {
+        margin-top: -12px;
+        color: var(--startup-muted);
+        font-size: 12px;
+        letter-spacing: 0.05em;
+      }
+
+      .startup-layer__dots {
+        display: flex;
+        gap: 7px;
+      }
+
+      .startup-layer__dots span {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--startup-accent);
+        animation: startup-layer-dot-bounce 1.3s ease-in-out infinite;
+      }
+
+      .startup-layer__dots span:nth-child(1) {
+        animation-delay: 0s;
+      }
+      .startup-layer__dots span:nth-child(2) {
+        animation-delay: 0.18s;
+      }
+      .startup-layer__dots span:nth-child(3) {
+        animation-delay: 0.36s;
+      }
+
+      @keyframes startup-layer-ring-spin {
+        to {
+          transform: rotate(360deg);
         }
-        var isDark =
-          mode === 'dark' ||
-          (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
-        var d = document.documentElement
-        d.setAttribute('data-theme', isDark ? dark : light)
-        d.setAttribute('data-color-scheme', isDark ? 'dark' : 'light')
-      })()
-    </script>
+      }
+
+      @keyframes startup-layer-dot-bounce {
+        0%,
+        75%,
+        100% {
+          opacity: 0.25;
+          transform: scale(0.5);
+        }
+        38% {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+    </style>
   </head>
 
   <body>
+    <!--
+      启动层必须位于 Vue 根之外：它在入口模块、Pinia 和配置 IPC 完成前就能绘制，
+      并覆盖同一个完整尺寸的 main WebView。ready 状态由 Vue/日志窗口在各自就绪后切换。
+    -->
+    <div id="startup-layer" data-state="loading">
+      <div class="startup-layer__content">
+        <div class="startup-layer__logo">
+          <div class="startup-layer__ring"></div>
+          <div class="startup-layer__face">
+            <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="14.31" y1="8" x2="20.05" y2="17.94" />
+              <line x1="9.69" y1="8" x2="21.17" y2="8" />
+              <line x1="7.38" y1="12" x2="13.12" y2="2.06" />
+              <line x1="9.69" y1="16" x2="3.95" y2="6.06" />
+              <line x1="14.31" y1="16" x2="2.83" y2="16" />
+              <line x1="16.62" y1="12" x2="10.88" y2="21.94" />
+            </svg>
+          </div>
+        </div>
+        <div class="startup-layer__title">Scrollery</div>
+        <div class="startup-layer__subtitle" id="startup-layer-status">正在启动</div>
+        <div class="startup-layer__dots">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+      </div>
+    </div>
     <div id="app"></div>
+    <script src="/startup-layer.js"></script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

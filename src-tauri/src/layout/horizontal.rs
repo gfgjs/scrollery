@@ -1,5 +1,5 @@
 // src-tauri/src/layout/horizontal.rs
-//! 横向画廊实验室(H-Lab)布局算法族(plan-docs/2026-07-02-horizontal-gallery-lab.md §3)。
+//! 横向画廊实验室(H-Lab)布局算法族(docs/designs/2026-07-02-horizontal-gallery-lab.md §3)。
 //!
 //! 三种候选模式统一为纯函数 `(items, params) → Vec<HBlock>`,块沿 x 主轴单调排布:
 //!   - `paged`:分屏 justified——页宽 = 视口宽 × factor,页内等高行装配,页高恰纳视口;
@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::db::models::LayoutItem;
-use crate::layout::justified::{aspect_ratio, median_measured_aspect};
+use crate::layout::geometry::{aspect_ratio, median_measured_aspect};
 
 // ── 契约类型(跨 IPC,camelCase 序列化)─────────────────────────────────────────
 
@@ -595,6 +595,7 @@ mod tests {
             availability: "online".into(),
             dir_id: None,
             similarity: None,
+            cache_key: 0,
         }
     }
 

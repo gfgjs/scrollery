@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-// Part8-D10 改名门禁:改名施工(Scrollery,见 plan-docs/2026-07-06-R2-7-改名施工计划-Scrollery.md)
+// Part8-D10 改名门禁:改名施工(Scrollery,见 docs/decisions/2026-07-06-R2-7-改名施工计划-Scrollery.md)
 // 第 7 步把 rename-gate.json 翻 active 后,任何把品牌旧词根带回 tracked 文件的提交在 CI 被拦。
 //
 // 设计三层:
 //   1. git grep -I -i 扫全部 tracked 文本文件(含大小写变体 Picasa/picasanext/…);
-//   2. 路径前缀豁免——历史快照文档(plan-docs/**)按施工计划 §2-D 裁决不改名;
+//   2. 路径前缀豁免——历史快照文档(docs/**,2026-07-11 前名 plan-docs/**)按施工计划 §2-D 裁决不改名;
 //   3. token 前缀豁免——PICASA_* env 常量族按 §2-E「缓改」裁决暂留(大小写敏感,
 //      只豁免真 env 拼法,小写 picasa_xxx 不放行)。
 // 休眠期(active=false)只跑 selftest 后 skip:改名前全仓合法满是旧名,门禁不应生效。
-// 与 Copybara FORBIDDEN 的分工:本门管「新名时代旧名残留回流」,FORBIDDEN 管「公开树
-// 商业符号泄漏」,两表独立演进互不替代。
+// 分工:本门只管「新名时代旧名残留回流」,与公开投影门禁(copy.bara.sky 内部文件过滤 +
+// oss-gate 公开构建/密钥扫描)互不替代。
 // 零依赖 + 启动即 selftest(仓例 verify-channel-bundle):防扫描器退化成只会 PASS 的空壳。
 // 用法:node scripts/check-rename-gate.mjs [--force-active](本地彩排:无视配置强制按 active 跑)
 import { spawnSync } from 'node:child_process';
@@ -62,8 +62,8 @@ function selftest() {
       process.exit(2);
     }
   }
-  const allow = ['plan-docs/', 'scripts/rename-gate.json'];
-  if (!pathAllowed('plan-docs/todo.md', allow) || pathAllowed('src-tauri/tauri.conf.json', allow)) {
+  const allow = ['docs/', 'scripts/rename-gate.json'];
+  if (!pathAllowed('docs/todo.md', allow) || pathAllowed('src-tauri/tauri.conf.json', allow)) {
     console.error('✗ selftest 失败: 路径豁免逻辑');
     process.exit(2);
   }

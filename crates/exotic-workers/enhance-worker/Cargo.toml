@@ -1,0 +1,33 @@
+# crates/exotic-workers/enhance-worker/Cargo.toml
+# 影像增强 Worker(降噪/超分子系统 design.md §A):独立长驻子进程,stdin 收协议帧、
+# stdout 回协议帧、stderr 写日志。推理核不在本 crate——共享 scrollery-ai-core 的
+# enhance/ 推理面(inference feature);会话装载/EP 探测复用 ai-core engine 骨架。
+#
+# 与 ai-worker 同为 ort 载体(load-dynamic),msvc 工具链可编译,故加入根 workspace
+# members(与 raw-worker 因 LibRaw MSVC panic 脱离 workspace 的处境不同)。
+
+[package]
+name = "enhance-worker"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)
+publish = false
+
+[[bin]]
+name = "enhance-worker"
+path = "src/main.rs"
+
+[dependencies]
+# 共享协议(路径依赖;两端同一份帧/消息/错误码定义,v2 会话族 op)。
+exotic-protocol = { path = "../../exotic-protocol" }
+# 共享推理核(enhance/ 执行链 + engine/provider 骨架 + enhance_profile 注册表)。
+scrollery-ai-core = { path = "../../scrollery-ai-core" }
+# EnhanceSessionInit 逐模型 sha256 完整性校验(对齐 ai-worker session.rs::verify_descriptor)。
+sha2 = "0.10"
+# 日志订阅者接 stderr:ai-core 装载/降级 tracing 日志否则被静默丢弃(stdout=协议帧,
+# 日志只走 stderr)。与 ai-worker 同姿态。
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 自定义 FormatEvent 直接引用 tracing::{Event,Subscriber,field::{Field,Visit}}(D-314)。
+tracing = "0.1"
+# WorkerLogLine 序列化 + 自定义 FormatEvent 的字段收集(D-313/D-314)。
+serde_json = "1"

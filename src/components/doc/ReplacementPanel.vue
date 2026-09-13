@@ -6,7 +6,7 @@
         class="repl-panel__x"
         @click="emit('close')"
         :title="t('common.close')"
-        :aria-label="t('common.close')"
+
       >
         <X :size="16" />
       </button>
@@ -55,7 +55,7 @@
           class="repl-row__del"
           @click="remove(r)"
           :title="t('selection.delete')"
-          :aria-label="t('selection.delete')"
+
         >
           <Trash2 :size="14" />
         </button>
@@ -80,16 +80,18 @@
 // 替换规则管理面板（§5.2）。两套作用域：本文档（item）与全局（global）。任何增删改后 emit
 // 'changed'，由 DocumentViewer 重新拉取生效规则并重渲染。
 import { ref, reactive, watch } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
 import { X, Trash2, Plus } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
 import { IPC } from '../../constants/ipc'
+import { invokeIpc, ipcErrorMessage } from '../../utils/ipc'
+import { useToastStore } from '../../stores/toastStore'
 import type { ReplacementRule } from '../../utils/replacements'
 
 const props = defineProps<{ itemId: number }>()
 const emit = defineEmits<{ (e: 'changed'): void; (e: 'close'): void }>()
 
 const { t } = useI18n()
+const toast = useToastStore()
 
 const scope = ref<'item' | 'global'>('item')
 const rules = ref<ReplacementRule[]>([])
@@ -102,7 +104,7 @@ function scopeArgs() {
 }
 
 async function reload() {
-  rules.value = await invoke<ReplacementRule[]>(IPC.LIST_REPLACEMENTS, scopeArgs()).catch(() => [])
+  rules.value = await invokeIpc<ReplacementRule[]>(IPC.LIST_REPLACEMENTS, scopeArgs()).catch(() => [])
 }
 
 function setScope(s: 'item' | 'global') {
@@ -114,7 +116,7 @@ async function persist(
   rule: Partial<ReplacementRule> & { find: string; replace: string; isRegex: boolean },
 ) {
   const a = scopeArgs()
-  await invoke(IPC.UPSERT_REPLACEMENT, {
+  await invokeIpc(IPC.UPSERT_REPLACEMENT, {
     rule: {
       id: rule.id ?? null,
       scopeKind: a.scopeKind,
@@ -131,28 +133,53 @@ async function persist(
 
 async function save(r: ReplacementRule) {
   if (!r.find) return
-  await persist(r)
+  try {
+    await persist(r)
+  } catch (e) {
+    toast.addToast('error', t('doc.replacementOpFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 async function toggleEnabled(r: ReplacementRule, v: boolean) {
+  // P1-16:先改 UI 后 await,失败须回滚,否则开关显示已启用而 DB 未改(UI/DB 分叉)。
+  const prev = r.enabled
   r.enabled = v
-  await persist(r)
+  try {
+    await persist(r)
+  } catch (e) {
+    r.enabled = prev
+    toast.addToast('error', t('doc.replacementOpFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 async function toggleRegex(r: ReplacementRule, v: boolean) {
+  const prev = r.isRegex
   r.isRegex = v
-  await persist(r)
+  try {
+    await persist(r)
+  } catch (e) {
+    r.isRegex = prev
+    toast.addToast('error', t('doc.replacementOpFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 async function remove(r: ReplacementRule) {
-  await invoke(IPC.DELETE_REPLACEMENT, { id: r.id })
-  await reload()
-  emit('changed')
+  try {
+    await invokeIpc(IPC.DELETE_REPLACEMENT, { id: r.id })
+    await reload()
+    emit('changed')
+  } catch (e) {
+    toast.addToast('error', t('doc.replacementOpFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 async function add() {
   if (!draft.find) return
-  await persist({ find: draft.find, replace: draft.replace, isRegex: draft.isRegex, enabled: true })
-  draft.find = ''
-  draft.replace = ''
-  draft.isRegex = false
-  await reload()
+  try {
+    await persist({ find: draft.find, replace: draft.replace, isRegex: draft.isRegex, enabled: true })
+    draft.find = ''
+    draft.replace = ''
+    draft.isRegex = false
+    await reload()
+  } catch (e) {
+    toast.addToast('error', t('doc.replacementOpFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 
 watch(() => props.itemId, reload, { immediate: true })
@@ -165,13 +192,13 @@ watch(() => props.itemId, reload, { immediate: true })
   width: 340px;
   height: 100%;
   background: var(--color-bg-surface);
-  border-left: 1px solid var(--color-border);
+  border-left: 1px solid var(--color-divider);
 }
 .repl-panel__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 12px;
+  padding: var(--spacing-sm) var(--spacing-md);
   border-bottom: 1px solid var(--color-border);
 }
 .repl-panel__title {
@@ -185,13 +212,14 @@ watch(() => props.itemId, reload, { immediate: true })
 }
 .repl-panel__tabs {
   display: flex;
-  gap: 4px;
-  padding: 8px 12px;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-sm) var(--spacing-md);
 }
 .repl-panel__tabs button {
   flex: 1;
-  padding: 5px;
-  background: var(--color-bg-elevated);
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
+  background: var(--color-bg-hover);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   color: var(--color-text-secondary);
@@ -199,26 +227,26 @@ watch(() => props.itemId, reload, { immediate: true })
   font-size: var(--font-size-sm);
 }
 .repl-panel__tabs button.active {
-  background: var(--color-accent);
-  color: var(--color-text-inverse);
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
   border-color: transparent;
 }
 .repl-panel__list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 12px;
+  padding: var(--spacing-xs) var(--spacing-md);
 }
 .repl-panel__empty {
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
-  padding: 16px 0;
+  padding: var(--spacing-xl) 0;
   text-align: center;
 }
 .repl-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 0;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-xs) 0;
 }
 .repl-row.disabled {
   opacity: 0.45;
@@ -231,7 +259,8 @@ watch(() => props.itemId, reload, { immediate: true })
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   color: var(--color-text-primary);
-  padding: 4px 6px;
+  height: var(--control-size-compact);
+  padding: 0 var(--spacing-xs);
   font-size: var(--font-size-xs);
 }
 .repl-row__arrow {
@@ -242,7 +271,7 @@ watch(() => props.itemId, reload, { immediate: true })
   align-items: center;
   gap: 2px;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--font-size-2xs);
   color: var(--color-text-secondary);
 }
 .repl-row__del {
@@ -258,8 +287,8 @@ watch(() => props.itemId, reload, { immediate: true })
 .repl-panel__add {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 10px 12px;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-sm) var(--spacing-md);
   border-top: 1px solid var(--color-border);
   flex-wrap: wrap;
 }
@@ -271,7 +300,8 @@ watch(() => props.itemId, reload, { immediate: true })
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   color: var(--color-text-primary);
-  padding: 4px 6px;
+  height: var(--control-size-compact);
+  padding: 0 var(--spacing-xs);
   font-size: var(--font-size-xs);
 }
 .repl-panel__addbtn {
@@ -279,10 +309,11 @@ watch(() => props.itemId, reload, { immediate: true })
   align-items: center;
   gap: 4px;
   background: var(--color-accent);
-  color: var(--color-text-inverse);
+  color: var(--color-text-on-accent);
   border: none;
   border-radius: var(--radius-sm);
-  padding: 5px 10px;
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
   cursor: pointer;
   font-size: var(--font-size-xs);
 }

@@ -4,7 +4,6 @@
 //! 探测——batch 自动档(resolve_batch_size)与状态栏 vram_gb 展示是 host 关切,
 //! 与推理面无关,故在此自持实现,调用路径 `crate::ai::provider::*` 不变)。
 
-/// Detect the dedicated video memory (VRAM) in bytes.
 /// 探测专用显存大小(字节)。
 pub fn detect_vram_bytes() -> Option<u64> {
     #[cfg(target_os = "windows")]

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_note": "冷门格式插件信任根公钥集（v3 §5.1）。仅含公钥；私钥离线/HSM，永不入仓、不写 CI 环境变量、不出现在测试 fixture。这两把为占位生产公钥（openssl 生成，私钥已弃），发布前由发布流水线替换为受控签发机公钥。key_id 命名为 release-/license-，绝不以 test-/dev- 开头（无授权旁路自检依赖此约定）。",
+  "_note": "冷门格式插件信任根公钥集（v3 §5.1），是 registry 与 license 两用途共用的唯一信任根。仅含公钥；私钥离线/HSM，永不入仓、不写 CI 环境变量、不出现在测试 fixture。这四把为占位生产公钥（openssl 生成，私钥已弃），发布前由发布流水线替换为受控签发机公钥。key_id 命名为 release-/license-，绝不以 test-/dev- 开头（无授权旁路自检依赖此约定）。带 -prod-placeholder 后缀的两把是历史 key_id 别名：与同名正名同公钥、同用途、同有效期，保证按旧 key_id 签发的凭证继续可验。",
   "keys": [
     {
       "key_id": "release-2026-01",
@@ -12,6 +12,22 @@
     },
     {
       "key_id": "license-2026-01",
+      "purpose": "license",
+      "public_key_b64": "2n5maeyvPja+n8Ynt/muNLlX9Byd6K7B1lClUmXV6gw=",
+      "status": "active",
+      "not_before": 1700000000,
+      "not_after": null
+    },
+    {
+      "key_id": "release-prod-placeholder",
+      "purpose": "release",
+      "public_key_b64": "CJ0l4jfzOpJHZMGg5/SDTEGbM1kl8KAmG0ZoZR3yDOM=",
+      "status": "active",
+      "not_before": 1700000000,
+      "not_after": null
+    },
+    {
+      "key_id": "license-prod-placeholder",
       "purpose": "license",
       "public_key_b64": "2n5maeyvPja+n8Ynt/muNLlX9Byd6K7B1lClUmXV6gw=",
       "status": "active",

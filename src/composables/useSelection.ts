@@ -6,7 +6,7 @@
 // flat_ids 而非可视 DOM。这根治 G1 三症状：Shift 跨视口失效 / Ctrl+A 只选一屏 / 框选漏滚出项。
 // 🔴 开发期不冻结契约：当前固定 classic 模式 + 当前意图集，两层结构令后续演进影响面收敛。
 //
-// 设计依据：plan-docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §3/§4/§6。
+// 设计依据：docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §3/§4/§6。
 
 import { ref, computed, readonly, watch } from 'vue'
 import {
@@ -21,6 +21,7 @@ import {
   type SelectionContext,
 } from './selection/types'
 import { getSelectionMode } from './selection/registry'
+import { applyRangeInvert } from './selection/sweep'
 import { useViewIds } from './useViewIds'
 import { buildCurrentViewDescriptor } from './useViewDescriptor'
 import type { ViewDescriptorDto } from '../types/view'
@@ -28,21 +29,18 @@ import type { ViewDescriptorDto } from '../types/view'
 /** 批量命令的选区入参实型（R1-2/S4：泛型协议层绑定后端 ViewDescriptor 镜像）。 */
 export type BackendSelectionDescriptor = SelectionDescriptor<ViewDescriptorDto>
 
-type DragMode = 'select' | 'deselect' | null
-
 // 视图布局序全集（range / 全选物化 / 反选 的顺序与全集来源,脱离可视 DOM）。
 const viewIds = useViewIds()
 // 当前激活的选择模式（现固定 classic;未来从 config 读、设置页可切——不冻结）。
 const mode = getSelectionMode()
 
-// ── 单例状态 | Singleton state ──
+// ── 单例状态 ──
 // 所有消费者共享同一选区。判别联合:explicit 显式枚举 / all 全选语义(不物化百万 id)。
 const state = ref<SelectionState>(EMPTY_SELECTION)
 const isSelectionMode = ref(false)
 
 // 框选（拖拽选择）瞬时状态
 const isDragging = ref(false)
-const dragMode = ref<DragMode>(null)
 const dragStartPos = ref<{ x: number; y: number } | null>(null)
 const dragStartId = ref<number | null>(null)
 const lastHoveredId = ref<number | null>(null)
@@ -57,8 +55,31 @@ const lastValidRangeIds = ref<number[]>([])
 // 移动阈值:必须移动 > 5px 才算拖拽（不是单击）。
 const DRAG_THRESHOLD = 5
 
+// 指针→项 id 解析器（canvas 网格注入）。canvas 无逐格 DOM,框选的 pointermove 不能靠
+// elementFromPoint→closest('[data-item-id]') 找当前悬停项;由 MediaGridCanvas 注入一个纯算术
+// 解析器(hitTestCell,O(1)),使框选脱离逐格 DOM。DOM 模式为 null,走原 elementFromPoint 路径。
+let pointerIdResolver: ((clientX: number, clientY: number) => number | null) | null = null
+export function setPointerIdResolver(
+  fn: ((clientX: number, clientY: number) => number | null) | null,
+): void {
+  pointerIdResolver = fn
+}
+
 // 选区基数:explicit→ids.size;all→全集数−排除数（需 viewIds 已就绪,随其刷新自动重算）。
 const selectedCount = computed(() => selectionSize(state.value, viewIds.totalCount()))
+
+// 选区代次:state 每次引用替换即递增(2026-07-10 审查 B10)。canvas 网格的 selectionVersion
+// prop 契约是「任何选区变化时递增」——此前用 selectedCount 别名,等基数的成员变化(扣除
+// 框选滑动、反选恰半)count 不变 → 漏重绘。两处赋值点均为不可变替换,watch ref 本体全覆盖;
+// sync flush 保持与 selectedCount 相同的同步可见时序。
+const selectionEpoch = ref(0)
+watch(
+  state,
+  () => {
+    selectionEpoch.value++
+  },
+  { flush: 'sync' },
+)
 
 // 选区为空时自动退出选择模式。用 isEmptySelection 而非 count===0:
 // all 态在 viewIds 未加载时 count 会暂为 0,但它**不是空选区**,不能误退出（isEmptySelection 对 all 恒 false）。
@@ -69,7 +90,7 @@ watch(
   },
 )
 
-// ── 调度核心 | Dispatch core ──
+// ── 调度核心 ──
 
 /** 组装策略上下文:布局序全集 + O(1) 区间 + 全集计数,均来自 useViewIds。 */
 function makeCtx(): SelectionContext {
@@ -88,7 +109,7 @@ function dispatch(intent: SelectionIntent) {
 }
 
 export function useSelection() {
-  // ── 单项操作 | Single item operations ──
+  // ── 单项操作 ──
 
   function toggleSelect(id: number) {
     dispatch({ type: 'toggle', id })
@@ -167,7 +188,7 @@ export function useSelection() {
     return toDescriptor(state.value, view)
   }
 
-  // ── 框选（拖拽选择）| Drag selection ──
+  // ── 框选（拖拽选择） ──
 
   function onPointerDown(id: number, event: PointerEvent) {
     // 仅处理主按钮（左键）
@@ -184,16 +205,18 @@ export function useSelection() {
       '.media-grid, .semantic-panel__grid',
     ) as HTMLElement | null
 
-    // 确定拖拽模式:从已选中项开始 → 反选;否则选中。
-    dragMode.value = isSelectionMode.value && isSelected(id) ? 'deselect' : 'select'
-
-    // 基线快照:框选在当前选区之上叠加/扣除。物化当前态（all 态亦可,虽框选起于全选属罕见路径）。
+    // 基线快照:扫选相对此基线做「反转」(applyRangeInvert)。物化当前态（all 态亦可,虽扫选起于全选属罕见路径）。
+    // 不再区分 select/deselect 模式——本体滑动统一为「对划过区间做一次反转」,起点已选/未选皆由 XOR 自然处理。
     dragBaseline.value = new Set(materializeIds())
     lastValidRangeIds.value = []
 
-    // 注册文档级监听器（在 onPointerUp 中清理）
+    // 注册文档级监听器（在 onPointerUp/onPointerCancel 中清理）。
+    // pointercancel 必须监听(2026-07-06 审查 P1-15):触屏被 OS 手势接管/指针设备移除时手势以
+    // cancel 结束,否则 document 级 pointermove 残留、拖拽态不复位,之后移动鼠标会继续改写选区
+    // (幽灵拖选)直到某次 pointerup。同仓 usePointerDrag 是正确范本。
     document.addEventListener('pointermove', onPointerMoveGlobal)
     document.addEventListener('pointerup', onPointerUpGlobal)
+    document.addEventListener('pointercancel', onPointerUpGlobal)
 
     // 防止拖拽期间的文本选择
     event.preventDefault()
@@ -217,15 +240,21 @@ export function useSelection() {
       }
     }
 
-    // 通过 elementFromPoint 找到指针下方的项
-    const el = document.elementFromPoint(event.clientX, event.clientY)
-    if (!el) return
-
-    const card = (el as HTMLElement).closest('[data-item-id]') as HTMLElement | null
-    if (!card) return
-
-    const itemId = parseInt(card.dataset.itemId!, 10)
-    if (isNaN(itemId)) return
+    // 指针下方的项 id:canvas 模式走注入的算术解析器(无逐格 DOM);否则 elementFromPoint→closest。
+    let itemId: number
+    if (pointerIdResolver) {
+      const resolved = pointerIdResolver(event.clientX, event.clientY)
+      if (resolved === null) return
+      itemId = resolved
+    } else {
+      const el = document.elementFromPoint(event.clientX, event.clientY)
+      if (!el) return
+      const card = (el as HTMLElement).closest('[data-item-id]') as HTMLElement | null
+      if (!card) return
+      const parsed = parseInt(card.dataset.itemId!, 10)
+      if (isNaN(parsed)) return
+      itemId = parsed
+    }
 
     if (itemId !== lastHoveredId.value) {
       lastHoveredId.value = itemId
@@ -234,7 +263,9 @@ export function useSelection() {
   }
 
   /**
-   * 把 [startId, endId] 区间按 dragMode 叠加/扣除到基线,产出新 explicit 选区。
+   * 把 [startId, endId] 区间相对基线做一次「反转」（applyRangeInvert），产出新 explicit 选区。
+   * 语义:区间内 id 相对基线翻转（含则消、不含则选）——满足「本体滑动=对划过内容做一次反转」,
+   * 且每次 move 都全量重算区间,回弹时移出区间的项自动恢复基线,来回滑不重复翻转。
    * 区间优先取自布局序 flat_ids（跨已滚动区间稳定,根治 G1③ 框选漏滚出项）;
    * viewIds 未就绪时回退到可视 DOM 扫描（绝不比旧实现差）。
    */
@@ -246,11 +277,7 @@ export function useSelection() {
       lastValidRangeIds.value = rangeIds
     }
 
-    const newSet = new Set(dragBaseline.value)
-    for (const id of rangeIds) {
-      if (dragMode.value === 'select') newSet.add(id)
-      else if (dragMode.value === 'deselect') newSet.delete(id)
-    }
+    const newSet = applyRangeInvert(dragBaseline.value, rangeIds)
 
     state.value = { kind: 'explicit', ids: newSet }
     if (newSet.size > 0) isSelectionMode.value = true
@@ -283,9 +310,10 @@ export function useSelection() {
   }
 
   function onPointerUpGlobal(_event: PointerEvent) {
-    // 清理文档监听器
+    // 清理文档监听器（pointercancel 与 pointerup 共用本收尾,见注册处 P1-15 注）
     document.removeEventListener('pointermove', onPointerMoveGlobal)
     document.removeEventListener('pointerup', onPointerUpGlobal)
+    document.removeEventListener('pointercancel', onPointerUpGlobal)
 
     // 框选若真发生了位移 → 把锚点设到拖拽终点项,使其后的 Shift+单击能从此处起区间。
     // 修复:经框选进入选择状态后,首次 Shift+单击因 lastClickedId=null 落入 toggle 兜底、不成区间。
@@ -297,14 +325,13 @@ export function useSelection() {
     dragStartPos.value = null
     dragStartId.value = null
     lastHoveredId.value = null
-    dragMode.value = null
     dragStartContainer.value = null
     // 注意:不在此复位 hasDragMoved——它必须撑过紧随的尾随 click 以抑制之(框选/拖图结束不应
     // 再触发单击)。复位统一在下次交互起手 beginInteraction() 做(T5)。在 pointerup 复位会让
     // 「小框选在同一卡片上松开」的尾随 click 误判为普通单击(回归)。
   }
 
-  // ── 键盘处理 | Keyboard handling ──
+  // ── 键盘处理 ──
 
   function onKeyDown(event: KeyboardEvent) {
     const target = event.target as HTMLElement | null
@@ -346,6 +373,7 @@ export function useSelection() {
     isSelectionMode: readonly(isSelectionMode),
     isDragging: readonly(isDragging),
     selectedCount,
+    selectionEpoch: readonly(selectionEpoch),
     lastClickedId: readonly(lastClickedId),
 
     // 查询

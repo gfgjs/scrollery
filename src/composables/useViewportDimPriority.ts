@@ -13,6 +13,7 @@
 import { watch, type Ref } from 'vue'
 import type { LayoutRow } from '../types/layout'
 import { invokeIpc } from '../utils/ipc'
+import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
 
 interface UseViewportDimPriorityOptions {
@@ -69,7 +70,7 @@ export function useViewportDimPriority(opts: UseViewportDimPriorityOptions) {
       }
     } catch (e) {
       for (const id of ids) requestedDimIds.delete(id) // allow a later retry | 允许之后重试
-      console.error('[useViewportDimPriority] prioritize_dimensions failed:', e)
+      logger.error('[useViewportDimPriority] prioritize_dimensions failed', { error: e })
     } finally {
       dimPriorityInFlight = false
     }

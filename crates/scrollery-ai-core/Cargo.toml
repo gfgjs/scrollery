@@ -10,6 +10,7 @@
 name = "scrollery-ai-core"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)
 publish = false
 
 [dependencies]
@@ -24,7 +25,11 @@ ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 
 # ── 图像预处理(resize/crop/像素访问;解码格式面由消费方各自声明)──────────────────
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff"], optional = true }
+
+# ── OCR 几何(轮廓/最小外接旋转矩形/透视 warp);major 对齐 image 0.25(imageproc 0.27)。
+#    与 src-tauri 同版本 0.27;仅 inference 面消费(ocr::det/geometry)。
+imageproc = { version = "0.27", default-features = false, optional = true }
 
 # ── SessionPool 的有界 channel(RAII 归还)─────────────────────────────────────────
 crossbeam-channel = { version = "0.5.15", optional = true }
@@ -44,6 +49,7 @@ inference = [
     "dep:ndarray",
     "dep:tokenizers",
     "dep:image",
+    "dep:imageproc",
     "dep:crossbeam-channel",
     "dep:windows",
 ]

@@ -6,7 +6,7 @@
         class="ver-panel__x"
         @click="emit('close')"
         :title="t('common.close')"
-        :aria-label="t('common.close')"
+
       >
         <X :size="16" />
       </button>
@@ -37,7 +37,7 @@
           <button
             @click="showDiff(v.id)"
             :title="t('doc.verDiffOriginal')"
-            :aria-label="t('doc.verDiffOriginal')"
+
           >
             <GitCompare :size="14" />
           </button>
@@ -48,7 +48,7 @@
             class="ver-row__del"
             @click="remove(v.id)"
             :title="t('selection.delete')"
-            :aria-label="t('selection.delete')"
+
           >
             <Trash2 :size="14" />
           </button>
@@ -68,7 +68,7 @@
           class="ver-panel__x"
           @click="diff = null"
           :title="t('common.close')"
-          :aria-label="t('common.close')"
+
         >
           <X :size="14" />
         </button>
@@ -89,9 +89,10 @@
 // 文档版本时间线 + 差异（§5.3）。列出原始文件基线 + 各版本快照；设为当前 / 删除 / 与原始比较。
 import { ref, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { invoke } from '@tauri-apps/api/core'
 import { X, Trash2, GitCompare } from '@lucide/vue'
 import { IPC } from '../../constants/ipc'
+import { invokeIpc, ipcErrorMessage } from '../../utils/ipc'
+import { useToastStore } from '../../stores/toastStore'
 
 interface DocVersion {
   id: number
@@ -114,6 +115,7 @@ interface DiffOp {
 const props = defineProps<{ itemId: number }>()
 const emit = defineEmits<{ (e: 'changed'): void; (e: 'close'): void }>()
 const { t } = useI18n()
+const toast = useToastStore()
 
 const versions = ref<DocVersion[]>([])
 const diff = ref<DiffOp[] | null>(null)
@@ -134,28 +136,37 @@ function fmtTime(t: number) {
 }
 
 async function reload() {
-  versions.value = await invoke<DocVersion[]>(IPC.LIST_VERSIONS, { itemId: props.itemId }).catch(
+  versions.value = await invokeIpc<DocVersion[]>(IPC.LIST_VERSIONS, { itemId: props.itemId }).catch(
     () => [],
   )
 }
 
 async function setCurrent(versionId: number | null) {
-  await invoke(IPC.SET_CURRENT_VERSION, { itemId: props.itemId, versionId })
-  await reload()
-  emit('changed')
+  // P1-16:切换当前版本失败静默 → 列表高亮与实际生效版本分叉。
+  try {
+    await invokeIpc(IPC.SET_CURRENT_VERSION, { itemId: props.itemId, versionId })
+    await reload()
+    emit('changed')
+  } catch (e) {
+    toast.addToast('error', t('doc.versionOpFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 
 async function remove(versionId: number) {
-  await invoke(IPC.DELETE_VERSION, { versionId })
-  if (diffVid.value === versionId) diff.value = null
-  await reload()
-  emit('changed')
+  try {
+    await invokeIpc(IPC.DELETE_VERSION, { versionId })
+    if (diffVid.value === versionId) diff.value = null
+    await reload()
+    emit('changed')
+  } catch (e) {
+    toast.addToast('error', t('doc.versionOpFailed', { error: ipcErrorMessage(e) }))
+  }
 }
 
 async function showDiff(versionId: number) {
   diffVid.value = versionId
   // a = null（原始基线），b = 该版本
-  diff.value = await invoke<DiffOp[]>(IPC.DIFF_VERSIONS, {
+  diff.value = await invokeIpc<DiffOp[]>(IPC.DIFF_VERSIONS, {
     itemId: props.itemId,
     a: null,
     b: versionId,
@@ -173,13 +184,13 @@ defineExpose({ reload })
   width: 340px;
   height: 100%;
   background: var(--color-bg-surface);
-  border-left: 1px solid var(--color-border);
+  border-left: 1px solid var(--color-divider);
 }
 .ver-panel__head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 12px;
+  padding: var(--spacing-sm) var(--spacing-md);
   border-bottom: 1px solid var(--color-border);
 }
 .ver-panel__title {
@@ -194,25 +205,25 @@ defineExpose({ reload })
 .ver-panel__list {
   flex: 1;
   overflow-y: auto;
-  padding: 6px 0;
+  padding: var(--spacing-xs) 0;
 }
 .ver-panel__empty {
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
   text-align: center;
-  padding: 16px;
+  padding: var(--spacing-xl);
 }
 .ver-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
   border-left: 3px solid transparent;
 }
 .ver-row.current {
   border-left-color: var(--color-accent);
-  background: var(--color-bg-elevated);
+  background: var(--color-accent-subtle);
 }
 .ver-row__main {
   display: flex;
@@ -225,21 +236,21 @@ defineExpose({ reload })
   font-weight: 500;
 }
 .ver-row__meta {
-  font-size: 10px;
+  font-size: var(--font-size-2xs);
   color: var(--color-text-secondary);
 }
 .ver-badge {
   align-self: flex-start;
-  font-size: 9px;
+  font-size: var(--font-size-2xs);
   background: var(--color-accent);
-  color: var(--color-text-inverse);
-  border-radius: 3px;
-  padding: 1px 5px;
+  color: var(--color-text-on-accent);
+  border-radius: var(--radius-xs);
+  padding: var(--spacing-2xs) var(--spacing-xs);
 }
 .ver-row__actions {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--spacing-xs);
   flex: 0 0 auto;
 }
 .ver-row__actions button {
@@ -248,8 +259,9 @@ defineExpose({ reload })
   border-radius: var(--radius-sm);
   color: var(--color-text-secondary);
   cursor: pointer;
-  font-size: 11px;
-  padding: 3px 6px;
+  font-size: var(--font-size-xs);
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-xs);
   display: inline-flex;
   align-items: center;
 }
@@ -274,7 +286,7 @@ defineExpose({ reload })
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 12px;
+  padding: var(--spacing-xs) var(--spacing-md);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
 }
@@ -282,12 +294,12 @@ defineExpose({ reload })
   flex: 1;
   overflow: auto;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--font-size-2xs);
 }
 .ver-diff__line {
   display: flex;
-  gap: 6px;
-  padding: 0 8px;
+  gap: var(--spacing-xs);
+  padding: 0 var(--spacing-sm);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -296,10 +308,10 @@ defineExpose({ reload })
   color: var(--color-text-secondary);
 }
 .op-insert {
-  background: color-mix(in srgb, var(--color-success) 18%, transparent);
+  background: var(--color-success-subtle);
 }
 .op-delete {
-  background: color-mix(in srgb, var(--color-error) 18%, transparent);
+  background: var(--color-error-subtle);
 }
 .op-insert .ver-diff__sign {
   color: var(--color-success);

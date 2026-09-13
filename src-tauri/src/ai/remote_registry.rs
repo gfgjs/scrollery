@@ -24,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use crate::ai::profile::ModelAsset;
 
 /// 自托管仓库 id（全部 ViT 系列 fp32 ONNX）。
-/// Self-hosted repo id (all ViT-series fp32 ONNX).
 pub const REPO: &str = "gficcg/clip_cn_vit-onnx";
 
 /// 发现结果缓存有效期(内存 L1 与磁盘 L2 的「免联网」窗口共用)。
@@ -37,7 +36,6 @@ pub const DISK_CACHE_FILE: &str = "registry_discovery.cache.json";
 static CACHE: Mutex<Option<(Instant, Vec<DiscoveredArch>)>> = Mutex::new(None);
 
 /// 图像塔 batch 轴类型：固定大小 `k` 或动态（任意批）。
-/// Image-tower batch-axis kind: fixed size `k`, or dynamic (any batch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BatchKind {
     Dynamic,
@@ -45,7 +43,6 @@ pub enum BatchKind {
 }
 
 /// 一个可下载文件（onnx 头或其 extra_file）的远程信息。
-/// Remote info for one downloadable file (an onnx header or its extra_file).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoteFile {
     /// 仓库内相对路径，如 `clip_cn_vit-l-14/vit-l-14.img.b8.fp32.onnx`。
@@ -58,7 +55,6 @@ pub struct RemoteFile {
 }
 
 /// 一个图像塔 batch 变体（含其 `.extra_file`）。
-/// One image-tower batch variant (with its `.extra_file`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageVariant {
     pub batch: BatchKind,
@@ -67,7 +63,6 @@ pub struct ImageVariant {
 }
 
 /// 一个架构（= 仓库的一个文件夹）发现到的图像变体 + 共享文本塔。
-/// What was discovered for one architecture (= one repo folder): image variants + shared text tower.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveredArch {
     pub folder: String,
@@ -101,9 +96,6 @@ struct Lfs {
 /// 从图像塔 onnx 文件名解析 batch 类型。
 /// 例：`vit-l-14.img.b8.fp32.onnx` → Fixed(8)；`...img.dyn...` → Dynamic；
 /// `vit-b-16.img.fp16.onnx`（eisneim 静态，batch 钉死为 1）→ None（无 `bN`/`dyn` 标记）。
-///
-/// Parse the batch kind from an image-tower onnx filename. Returns None when the name carries no
-/// `bN`/`dyn` marker (e.g. the eisneim fp16 export whose batch axis is pinned to 1).
 pub fn parse_batch(file: &str) -> Option<BatchKind> {
     let after = file.split(".img.").nth(1)?; // "b8.fp32.onnx" / "dyn.fp32.onnx" / "fp16.onnx"
     let tok = after.split('.').next()?; // "b8" / "dyn" / "fp16"
@@ -115,7 +107,6 @@ pub fn parse_batch(file: &str) -> Option<BatchKind> {
 }
 
 /// 由远程文件构造一个带主源 + hf-mirror 镜像 + 大小/sha256 校验的下载资产。
-/// Build a download asset from a remote file (primary + hf-mirror URLs + size/sha256 verification).
 pub fn remote_asset(rf: &RemoteFile) -> ModelAsset {
     ModelAsset {
         url: format!("https://huggingface.co/{REPO}/resolve/main/{}", rf.path),
@@ -233,7 +224,6 @@ fn store_disk_cache(path: &Path, archs: &[DiscoveredArch], now_unix: u64) {
 }
 
 /// 拉取 tree JSON：按偏好顺序尝试官方源与 hf-mirror，任一成功即返回。
-/// Fetch the tree JSON, trying official + hf-mirror in preference order; first success wins.
 async fn fetch_tree(mirror_first: bool) -> Result<Vec<TreeEntry>, String> {
     let hosts: [&str; 2] = if mirror_first {
         ["https://hf-mirror.com", "https://huggingface.co"]
@@ -241,7 +231,10 @@ async fn fetch_tree(mirror_first: bool) -> Result<Vec<TreeEntry>, String> {
         ["https://huggingface.co", "https://hf-mirror.com"]
     };
     let path = format!("/api/models/{REPO}/tree/main?recursive=true");
-    let client = reqwest::Client::new();
+    // 安全 client(2026-07-10 审查 B9):原裸 Client::new() 无 connect/整体超时,恶劣网络下
+    // discover() 可挂到 OS 级 TCP 超时;SmallFile=连接 15s+整体 300s,并继承拒绝重定向降级。
+    let client = crate::download::secure_client(crate::download::TimeoutPolicy::SmallFile)
+        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
 
     let mut last_err = String::from("no host tried");
     for host in hosts {
@@ -264,8 +257,6 @@ async fn fetch_tree(mirror_first: bool) -> Result<Vec<TreeEntry>, String> {
 }
 
 /// 把扁平文件列表归类为各架构的图像变体 + 共享文本塔。无图像 onnx 的架构（如尚未导出的 h-14）跳过。
-/// Group the flat file list into per-architecture image variants + shared text tower.
-/// Architectures without any image onnx (e.g. not-yet-exported h-14) are skipped.
 fn classify(entries: Vec<TreeEntry>) -> Vec<DiscoveredArch> {
     use std::collections::BTreeMap;
 

@@ -86,6 +86,7 @@ fn thumbhash_from_webp(blob: &[u8]) -> Result<Vec<u8>> {
         pixels: rgba.into_raw(),
         width: w,
         height: h,
+        icc: None, // 仅用于 ThumbHash 计算,ICC 与此无关
     };
     generate_thumbhash(&decoded)
 }
@@ -120,18 +121,23 @@ mod tests {
         buf
     }
 
+    /// 测试用档位：绑 THUMB_TIERS 事实源。thumb_path 会断言档位合法，硬编码数值在
+    /// b554aa5「档位重定」后即失效（详见 exotic/fingerprint.rs 测试模块的同名常量注释）。
+    const TIER: u32 = crate::thumbnail::generator::THUMB_TIERS[3];
+
     #[test]
     fn writes_atomically_and_computes_thumbhash() {
         let dir = std::env::temp_dir().join(format!("exotic-sink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        // 480x240 是**图像尺寸**（与档位无关，仅需一张能编码的图）。
         let webp = make_webp(480, 240);
-        let out = write_thumbnail_atomic(&dir, 480, 0x1234_5678, &webp).unwrap();
+        let out = write_thumbnail_atomic(&dir, TIER, 0x1234_5678, &webp).unwrap();
 
         // 最终文件存在、内容一致、无残留 .tmp。
-        let final_path = thumb_path(&dir, 480, 0x1234_5678);
+        let final_path = thumb_path(&dir, TIER, 0x1234_5678);
         assert!(final_path.exists());
         assert_eq!(std::fs::read(&final_path).unwrap(), webp);
-        assert!(out.thumb_db_path.starts_with("480/"));
+        assert!(out.thumb_db_path.starts_with(&format!("{TIER}/")));
         assert!(!out.thumbhash.is_empty());
         let leftover: Vec<_> = walkdir::WalkDir::new(&dir)
             .into_iter()
@@ -145,7 +151,7 @@ mod tests {
     #[test]
     fn rejects_non_webp_blob() {
         let dir = std::env::temp_dir().join(format!("exotic-sink-bad-{}", std::process::id()));
-        let r = write_thumbnail_atomic(&dir, 480, 1, b"not webp");
+        let r = write_thumbnail_atomic(&dir, TIER, 1, b"not webp");
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

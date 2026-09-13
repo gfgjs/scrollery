@@ -1,4 +1,3 @@
-// src-tauri/src/ipc/volume_commands.rs
 //! 已知卷面板命令（T13 §3.7 离线 UX）。
 //!
 //! 「已知卷」= 应用登记过的物理卷（U盘/移动硬盘/网络盘/本机盘）。在线态由 volume_watch 后台

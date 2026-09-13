@@ -1,16 +1,14 @@
-<!-- src/components/exotic/PluginGate.vue -->
 <!-- 插件授权 gate（Part5 T12）：包裹一个受授权门控的功能。已授权→渲染 slot（真实功能）；
      未授权但有产品→显功能说明 + 购买/激活引导；纯不可用→信息提示；不确定→放行。 -->
-<!-- Plugin entitlement gate (Part5 T12): wraps a licensed feature. -->
 <!--
-  🔴 开源/闭源边界（Part0 §10）：本组件**纯展示**——授权判定全来自后端（经 `entitlement` prop 传入），
+  前后端职责：本组件**纯展示**——授权判定全来自后端（经 `entitlement` prop 传入），
      组件不持任何验签逻辑。分类规则复用 composable 的 `gateModeFor`（单一事实源）。
   设计取舍：gate 做「展示型」（接 DTO、不自取数据），由各触点拥有 fetch 生命周期 → 单一职责、可复用。
 -->
 <template>
   <!-- 检查中：轻量占位，避免闪现购买引导。 -->
-  <div v-if="loading" class="gate gate--muted" role="status">
-    <span class="gate__spinner" aria-hidden="true" />
+  <div v-if="loading" class="gate gate--muted">
+    <span class="gate__spinner" />
     <span class="gate__muted-text">{{ $t('exotic.gateChecking') }}</span>
   </div>
 
@@ -19,7 +17,7 @@
 
   <!-- 购买 / 激活引导：未授权但有产品可领。 -->
   <div v-else-if="mode === 'purchase'" class="gate gate--purchase">
-    <div class="gate__icon" aria-hidden="true">
+    <div class="gate__icon">
       <Lock :size="22" />
     </div>
     <div class="gate__body">
@@ -51,8 +49,8 @@
   </div>
 
   <!-- 纯不可用（平台 / 版本 / 损坏 / 禁用）：只做信息提示，不引导购买。 -->
-  <div v-else class="gate gate--blocked" role="note">
-    <div class="gate__icon gate__icon--warn" aria-hidden="true">
+  <div v-else class="gate gate--blocked">
+    <div class="gate__icon gate__icon--warn">
       <AlertTriangle :size="22" />
     </div>
     <div class="gate__body">
@@ -70,7 +68,7 @@ import { useI18n } from 'vue-i18n'
 
 import type { PluginEntitlement } from '../../types/exotic'
 import { gateModeFor } from '../../composables/usePluginEntitlement'
-import { useUiStore } from '../../stores/uiStore'
+import { useToastStore } from '../../stores/toastStore'
 
 /**
  * Props：授权判定（后端已定）+ 可选的功能展示信息。
@@ -97,7 +95,7 @@ const props = withDefaults(defineProps<Props>(), {
 const emit = defineEmits<{ (e: 'activate'): void }>()
 
 const { t } = useI18n()
-const ui = useUiStore()
+const toast = useToastStore()
 
 // 渲染分支：复用 composable 的纯分类函数（单一事实源）。
 const mode = computed(() => gateModeFor(props.entitlement))
@@ -147,7 +145,7 @@ async function openStore() {
   try {
     await shellOpen(url)
   } catch (e) {
-    ui.addToast('error', t('exotic.gateOpenStoreFailed', { error: e }))
+    toast.addToast('error', t('exotic.gateOpenStoreFailed', { error: e }))
   } finally {
     openingStore.value = false
   }
@@ -161,8 +159,8 @@ async function openStore() {
   gap: var(--spacing-md);
   padding: var(--spacing-lg);
   border-radius: var(--radius-lg);
-  border: 1px solid var(--color-border);
-  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-surface);
 }
 
 /* 检查中：单行轻量占位。 */
@@ -183,7 +181,7 @@ async function openStore() {
   border-radius: 50%;
   border: 2px solid var(--color-border-strong);
   border-top-color: var(--color-accent);
-  animation: gate-spin 0.7s linear infinite;
+  animation: gate-spin var(--duration-spin) linear infinite;
 }
 @keyframes gate-spin {
   to {
@@ -204,7 +202,7 @@ async function openStore() {
   color: var(--color-accent);
 }
 .gate__icon--warn {
-  background: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  background: var(--color-warning-subtle);
   color: var(--color-warning);
 }
 

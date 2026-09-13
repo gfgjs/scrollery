@@ -4,7 +4,7 @@ import skipFormatting from '@vue/eslint-config-prettier/skip-formatting'
 
 // Vue 3 + TypeScript strict 官方推荐 flat config（create-vue 同款）。
 // - flat/essential：Vue 模板/SFC 必备规则。
-// - vueTsConfigs.recommended：typescript-eslint 推荐集（含类型感知规则）。
+// - vueTsConfigs.recommended：typescript-eslint 推荐集（非类型感知，不依赖 tsconfig 类型信息）。
 // - skipFormatting：关闭与 Prettier 冲突的格式类规则，把「格式」交给 Prettier，
 //   ESLint 只管代码质量（避免二者打架）。
 export default defineConfigWithVueTs(
@@ -21,8 +21,14 @@ export default defineConfigWithVueTs(
       '**/dist-ssr/**',
       '**/coverage/**',
       'src-tauri/**',
+      // vendored 第三方源码(foliate-js,钉定 commit;见 src/vendor/foliate-js/VENDOR.md):
+      // 不参与本项目 lint —— 其代码风格(私有 class 字段 `#x`、生成器等)非本仓约定,
+      // 且刻意保持与上游零 diff 以便升级,格式化/规则整改都会破坏这一点。
+      'src/vendor/**',
       // workspace 化后 Rust target/ 在仓库根(tauri codegen 产出 .js/.mjs 资产,非前端源码)。
       'target/**',
+      // 本地 git worktree 副本及外部代理脚本,非项目源码。
+      '.claude/**',
       'crates/**',
       'venv/**',
       '**/site-packages/**',
@@ -48,10 +54,12 @@ export default defineConfigWithVueTs(
             '[', ']', '{', '}', '<', '>', '·', '•', '‐', '–', '—',
             '−', '|', '×', '…', '‹', '›', '→', '↑', '↓', '✗',
             // 计量单位（紧跟插值的后缀片段）
-            'px', 's', 'MB', 'GB',
+            'px', 's', 'MB', 'GB', 'em',
             // 品牌 / 协议 / 技术徽标
-            'Scrollery', 'v0.1.0', 'WebDAV', 'LIVE', 'Live', 'ORIG', 'THUMB', 'fp16',
+            'Scrollery', 'v0.1.0', 'WebDAV', 'LIVE', 'Live', 'ORIG', 'THUMB', 'RAW', 'fp16',
             '1:1', 'API Key',
+            // 图片简单编辑(方案 C):裁剪比例/输出格式,技术标识非自然语言
+            '4:3', '3:4', '16:9', '9:16', 'JPEG', 'PNG',
             // 技术占位示例（placeholder 中的 URL / 模型名 / 密钥格式）
             'https://api.openai.com/v1', 'https://dav.example.com/remote.php/dav/files/me',
             'gpt-4o-mini', 'sk-...', 'photos',
@@ -60,6 +68,46 @@ export default defineConfigWithVueTs(
           ],
         },
       ],
+    },
+  },
+  {
+    // 审查 P1-17 防回潮：除 utils/ipc.ts(唯一 wrapper)外,禁止从 @tauri-apps/api/core 裸导入
+    // `invoke` —— 一切 IPC 调用走 invokeIpc(常量强制 + 结构化 IpcError.code 分流),消除
+    // 「raw invoke 错误退化为 (e as Error).message」的双轨。convertFileSrc/Channel 仍从 core 导入。
+    name: 'app/no-raw-invoke',
+    files: ['src/**/*.{ts,vue}'],
+    ignores: ['src/utils/ipc.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@tauri-apps/api/core',
+              importNames: ['invoke'],
+              message:
+                '请用 invokeIpc(from utils/ipc)而非裸 invoke——统一结构化错误码分流(审查 P1-17)。convertFileSrc/Channel 仍可从 core 导入。',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // 日志能力重构 S3(方案 §4/§9.4)防回潮:裸 console.* 不落盘、agent/用户查不到,一律走
+    // utils/logger.ts(汇入后端 tracing,同一套 JSONL/UI/压缩治理)。三处例外真是"给浏览器
+    // devtools 看"而非应用日志:logger.ts 自身(桥接点)、useGalleryPerfProbe.ts(dev 门控性能
+    // 探针,localStorage 开关,产物是给开发者当场读的 console.table 风格输出)、harness/ipcFixtures.ts
+    // (仅 UI harness dev 场景运行,不进生产构建的真实用户路径)。
+    name: 'app/no-console',
+    files: ['src/**/*.{ts,vue}'],
+    ignores: [
+      'src/utils/logger.ts',
+      'src/composables/useGalleryPerfProbe.ts',
+      'src/harness/ipcFixtures.ts',
+    ],
+    rules: {
+      'no-console': 'error',
     },
   },
   {

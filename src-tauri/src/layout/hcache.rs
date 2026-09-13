@@ -1,7 +1,6 @@
-// src-tauri/src/layout/hcache.rs
 //! H-Lab(横向画廊实验)独立布局缓存——与生产 `layout_cache` 互不可见。
 //!
-//! 契约(plan-docs/2026-07-02-horizontal-gallery-lab.md §2):
+//! 契约(docs/designs/2026-07-02-horizontal-gallery-lab.md §2):
 //!   - `compute_h_layout` 存入,`get_h_blocks_by_x` 按 bbox 相交取块;
 //!   - 版本号独立计数,**锁内递增**(承接生产缓存 R0-3 写序倒置教训);
 //!   - 取块为线性过滤:块数 ≈ 项数/3,数十万项也只是微秒级,实验期不建索引;
@@ -33,7 +32,7 @@ pub fn new_h_layout_cache() -> HLayoutCache {
 /// 避免并发计算下缓存留旧块集配小版本号、前端握大版本号后恒不匹配(生产 R0-3 同款守护)。
 pub fn store_h_layout(cache: &HLayoutCache, blocks: Vec<HBlock>, total_width: f64) -> u64 {
     let total_items = blocks.iter().map(|b| b.items.len()).sum();
-    let mut guard = cache.write().unwrap();
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
     let version = H_LAYOUT_VERSION_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
     *guard = Some(HLayoutCacheData {
         blocks,
@@ -52,7 +51,7 @@ pub fn get_h_blocks_by_x(
     right_x: f64,
     expected_version: Option<u64>,
 ) -> Option<Vec<HBlock>> {
-    let guard = cache.read().unwrap();
+    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
     let data = guard.as_ref()?;
 
     if let Some(ver) = expected_version {

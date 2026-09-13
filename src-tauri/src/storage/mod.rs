@@ -61,10 +61,10 @@ pub trait StorageBackend: Send + Sync {
     fn stat(&self, rel_path: &str) -> Result<RemoteEntry>;
 
     /// Read a byte range `[start, start+len)` of a file (`len=None` → to EOF). Backs the streaming
-    /// proxy for remote originals (§3.8). | 读取文件字节范围（`len=None` → 至文件尾）。支撑远程原图流式代理。
+    /// proxy for remote originals (§3.8). | 读取文件字节范围（左闭右开区间 `[start, start+len)`，
+    /// `len=None` → 至文件尾）。支撑远程原图流式代理。
     fn read_range(&self, rel_path: &str, start: u64, len: Option<u64>) -> Result<Vec<u8>>;
 
-    /// Connectivity + credentials check (default: try to list the base dir).
     /// 连通性 + 凭据检查（默认：尝试列出 base 目录）。
     fn test(&self) -> Result<()> {
         self.list_dir("").map(|_| ())

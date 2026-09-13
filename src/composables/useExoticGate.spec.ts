@@ -33,6 +33,7 @@ function res(overrides: Partial<FormatResolution> = {}): FormatResolution {
     availability: 'installedUnlicensed',
     storeUrl: 'https://store.example/psd',
     installedVersion: null,
+    builtin: false,
     ...overrides,
   }
 }
@@ -139,6 +140,45 @@ describe('useExoticGate.resolveForItem', () => {
     await g.resolveForItem(2, 'jpg')
     const listCalls = calls.filter((c) => c.cmd === 'list_exotic_format_resolutions')
     expect(listCalls).toHaveLength(1)
+  })
+
+  it('切换条目后，旧 item-state 响应不得覆盖新条目的 gate 状态', async () => {
+    let resolveOld!: (value: unknown) => void
+    const oldResponse = new Promise<unknown>((resolve) => {
+      resolveOld = resolve
+    })
+    state.handler = (cmd, args) => {
+      if (cmd === 'list_exotic_format_resolutions') return [res({ format: 'psd' })]
+      if (cmd === 'get_exotic_item_state') {
+        const itemId = (args as { itemId: number }).itemId
+        if (itemId === 1) return oldResponse
+        return {
+          itemId,
+          format: 'psd',
+          resolution: res({ availability: 'licenseExpired' }),
+          taskState: 'none',
+        }
+      }
+      return undefined
+    }
+
+    const g = useExoticGate()
+    const first = g.resolveForItem(1, 'psd')
+    await vi.waitFor(() => {
+      expect(calls).toContainEqual({ cmd: 'get_exotic_item_state', args: { itemId: 1 } })
+    })
+    expect(await g.resolveForItem(2, 'psd')).toBe(true)
+    expect(g.entitlement.value?.availability).toBe('licenseExpired')
+
+    resolveOld({
+      itemId: 1,
+      format: 'psd',
+      resolution: res({ availability: 'authorized' }),
+      taskState: 'none',
+    })
+    expect(await first).toBe(false)
+    expect(g.entitlement.value?.availability).toBe('licenseExpired')
+    expect(g.loading.value).toBe(false)
   })
 })
 

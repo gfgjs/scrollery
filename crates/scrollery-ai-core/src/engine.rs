@@ -1,5 +1,4 @@
 // crates/scrollery-ai-core/src/engine.rs
-//! AI inference engine pool — wraps ort Sessions for CLIP models.
 //! AI 推理引擎池 — 封装用于 CLIP 模型的 ort Session。
 //!
 //! # 踩坑记录（2026-06-03）
@@ -87,8 +86,8 @@ use crate::face_profile::FaceProfile;
 use crate::profile::ModelProfile;
 use crate::provider::AiProvider;
 
-/// A thread-safe pool of ONNX Runtime Sessions.
-/// 用于解决 ort rc.12 中 Session::run 需要 &mut self 导致的串行瓶颈。
+/// 线程安全的 ONNX Runtime Session 池。
+/// 用于解决 ort rc.12 中 Session::run 需要 &mut self 导致的串行瓶颈:session 经 channel 借出/归还,而非共享。
 #[derive(Clone)]
 pub struct SessionPool {
     rx: Receiver<Session>,
@@ -112,7 +111,7 @@ impl SessionPool {
     }
 
     pub fn get(&self) -> Option<SessionGuard> {
-        // Block until a session is available
+        // 阻塞直到有可用 session
         match self.rx.recv() {
             Ok(session) => Some(SessionGuard {
                 session: Some(session),
@@ -126,7 +125,7 @@ impl SessionPool {
     }
 }
 
-/// A RAII guard that automatically returns the Session to the pool on drop.
+/// RAII 守卫:drop 时自动把 Session 归还池中。
 pub struct SessionGuard {
     session: Option<Session>,
     tx: Sender<Session>,
@@ -170,52 +169,159 @@ impl std::fmt::Debug for SessionPool {
 /// FP16 外部数据格式（eisneim/cn-clip_vit-b-16）在 ORT 1.26 + CPU + Level1 下
 /// 加载仅需 ~200ms；设 600s 超时是为了应对极端情况（NAS/慢速 HDD）或
 /// DirectML shader 编译（DirectML 卡死是无限期的，600s 内会被捕获）。
+/// 2026-07-11 加固批 A 起,这只是**单段后备上界**:宿主侧改静默限时(心跳在途即不杀),
+/// dylib 级卡死已被 [`preflight_ort_runtime`] 的短 watchdog 前置拦截。
 const SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// AI inference engine pool.
+// ── ORT 运行时 preflight(2026-07-11 加固批 A-1:死路径快败)──────────────────
+//
+// 病灶背景:ort `load-dynamic` 的懒加载在首个 Session::builder 时才解析动态库——
+// env `ORT_DYLIB_PATH` 指向不存在文件、或裸名回退命中 System32 的 1.17 旧版时,
+// 装载线程**无限阻塞而非快败**(0 CPU 零日志,2026-07-10/11 夜事故的直接杀伤机制)。
+// 对策:worker 侧**自解析**路径(拒绝隐式 DLL 搜索回退)+ `ort::init_from` 急切装载
+// + 短 watchdog,把「无限静默」变成秒级可判别错误。
+
+/// ORT 运行时 preflight 失败(三态映射协议错误码:unavailable→OrtDylibUnavailable,
+/// timeout→OrtRuntimeInitTimeout,failed→同 timeout 归运行时本体病灶)。
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum OrtPreflightError {
+    /// 路径层不可用:env 指向不存在文件,或未设 env 且 exe 旁无库文件。
+    #[error("ORT 动态库不可用:{0}")]
+    DylibUnavailable(String),
+    /// 装载卡死超出 watchdog 预算(如损坏的 DLL/System32 旧版无限阻塞)。
+    #[error("ORT 运行时初始化超时:{0}")]
+    RuntimeInitTimeout(String),
+    /// 装载明确失败(libloading 报错:符号缺失/依赖 DLL 缺失等)。
+    #[error("ORT 运行时初始化失败:{0}")]
+    RuntimeInitFailed(String),
+}
+
+/// 平台动态库文件名(与 ort setup_api 的裸名默认一致)。
+#[cfg(target_os = "windows")]
+const ORT_DYLIB_NAME: &str = "onnxruntime.dll";
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ORT_DYLIB_NAME: &str = "libonnxruntime.so";
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ORT_DYLIB_NAME: &str = "libonnxruntime.dylib";
+
+/// 解析 ort 将使用的动态库路径。规则与 ort 懒加载一致但**收紧**:
+/// ① env `ORT_DYLIB_PATH` 非空 → 该路径必须真实存在(死路径即错,不静默回退);
+/// ② 未设 env → exe 同目录的 [`ORT_DYLIB_NAME`] 必须存在——**刻意拒绝**裸名交给
+///    系统 DLL 搜索链的回退(会命中 System32 的 WebView2 遗留 1.17,无限阻塞,坑2)。
+/// 返回 (绝对路径, 来源描述)。
+pub fn resolve_ort_dylib() -> std::result::Result<(PathBuf, &'static str), OrtPreflightError> {
+    match std::env::var("ORT_DYLIB_PATH") {
+        Ok(v) if !v.is_empty() => {
+            let p = PathBuf::from(&v);
+            if p.is_file() {
+                Ok((p, "env ORT_DYLIB_PATH"))
+            } else {
+                Err(OrtPreflightError::DylibUnavailable(format!(
+                    "env ORT_DYLIB_PATH 指向不存在的文件:{v}(常见成因:仓库配置里的失效路径/DLL 未随构建复制)"
+                )))
+            }
+        }
+        _ => {
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .ok_or_else(|| {
+                    OrtPreflightError::DylibUnavailable("无法定位当前 exe 目录".to_string())
+                })?;
+            let p = exe_dir.join(ORT_DYLIB_NAME);
+            if p.is_file() {
+                Ok((p, "exe 同目录"))
+            } else {
+                Err(OrtPreflightError::DylibUnavailable(format!(
+                    "未设 ORT_DYLIB_PATH 且 exe 旁无 {ORT_DYLIB_NAME}(目录:{});拒绝回退系统 DLL 搜索——System32 旧版 1.17 会无限阻塞",
+                    exe_dir.display()
+                )))
+            }
+        }
+    }
+}
+
+/// 一次性急切装载 ORT 运行时(进程级缓存,重复调用直接返回首次结果)。
+/// 成功后 ort 全局库句柄已就位,后续 `Session::builder` 不再走 env 懒解析;
+/// 失败则调用方应把错误映射为协议级错误码立即回报,**不要**再让加载路径去撞无限阻塞。
+/// watchdog 超时的装载线程会泄漏(ort 装载不可中断)——进程级一次、可接受,与
+/// `load_session_pool` 超时泄漏同性质。
+pub fn preflight_ort_runtime(timeout: Duration) -> std::result::Result<String, OrtPreflightError> {
+    static RESULT: std::sync::OnceLock<std::result::Result<String, OrtPreflightError>> =
+        std::sync::OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            let (path, source) = resolve_ort_dylib()?;
+            let desc = format!("{}({source})", path.display());
+            info!("ORT preflight:急切装载 {desc}");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path_clone = path.clone();
+            std::thread::spawn(move || {
+                // init_from 急切 libloading;commit 仅存环境配置(重复 commit 返回 false 无害)。
+                let r = ort::init_from(&path_clone).map(|builder| {
+                    builder.commit();
+                });
+                let _ = tx.send(r);
+            });
+            match rx.recv_timeout(timeout) {
+                Ok(Ok(())) => {
+                    info!("ORT preflight 通过:{desc}");
+                    Ok(desc)
+                }
+                Ok(Err(e)) => Err(OrtPreflightError::RuntimeInitFailed(format!("{desc}:{e}"))),
+                Err(_) => Err(OrtPreflightError::RuntimeInitTimeout(format!(
+                    "{desc}:{}s 内未完成(疑似损坏/不兼容的运行时,装载线程已泄漏)",
+                    timeout.as_secs()
+                ))),
+            }
+        })
+        .clone()
+}
+
 /// AI 推理引擎池。
 pub struct AiEnginePool {
-    /// Best detected execution provider.
     /// 已探测到的最优执行提供者。
     pub provider: AiProvider,
 
-    /// GPU display name (empty string for CPU).
     /// GPU 显示名称（CPU 时为空字符串）。
     pub gpu_name: String,
 
-    /// Active model contract this pool was built for (drives preprocessing / I/O / dim / tokenizer).
     /// 本池所加载模型的契约（驱动预处理 / I/O / 维度 / 分词器）。
     pub profile: ModelProfile,
 
-    /// Chinese-CLIP image encoder session pool.
     /// Chinese-CLIP 图像编码器 Session 池。
     pub clip_image_session: Option<SessionPool>,
 
-    /// Chinese-CLIP text encoder session pool.
     /// Chinese-CLIP 文本编码器 Session 池。
     pub clip_text_session: Option<SessionPool>,
 
-    /// Cached BERT tokenizer (loaded from vocab.txt).
     /// 缓存的 BERT 分词器（从 vocab.txt 加载）。
-    /// Avoids re-reading vocab.txt on every semantic search call.
     /// 避免每次语义搜索都重新读取 vocab.txt。
     pub clip_tokenizer: Option<ClipTokenizer>,
 
-    /// Face detection session pool (YuNet/SCRFD); None when the model file is absent (graceful degrade).
     /// 人脸检测 Session 池（YuNet/SCRFD）；模型文件缺失则为 None（功能优雅降级）。
     pub face_detect_session: Option<SessionPool>,
 
-    /// Face embedding session pool (SFace/ArcFace).
     /// 人脸嵌入 Session 池（SFace/ArcFace）。
     pub face_embed_session: Option<SessionPool>,
 
-    /// The loaded face model contract (drives F2 detect/embed post-processing dispatch); None when no face model loaded.
     /// 已加载的人脸模型契约（驱动 F2 检测/嵌入的后处理分派）；None = 未加载人脸模型。
     pub face_profile: Option<FaceProfile>,
 }
 
+/// 装载阶段进度回调:参数为事件字符串 `<stage>:<event>`(如 `clip_image_load:begin(DirectML)`、
+/// `face_embed_load:timeout(600s)`)。worker 侧转译成协议 Progress 帧/据 `:timeout` 分类错误码;
+/// `None` = 静默(进程内调用/测试)。回调在装载调用线程同步执行,须轻量不阻塞。
+pub type LoadProgress<'a> = Option<&'a dyn Fn(&str)>;
+
+/// 向进度回调发射一个阶段事件(回调缺省时零开销)。
+fn emit(progress: LoadProgress<'_>, event: &str) {
+    if let Some(f) = progress {
+        f(event);
+    }
+}
+
 impl AiEnginePool {
-    /// Initialise the engine pool from the given models directory.
     /// 从给定的模型目录初始化引擎池。
     pub fn init(
         models_dir: &Path,
@@ -223,12 +329,24 @@ impl AiEnginePool {
         face_profile: Option<&FaceProfile>,
         provider_override: &str,
     ) -> Result<Self> {
+        Self::init_with_progress(models_dir, profile, face_profile, provider_override, None)
+    }
+
+    /// 同 [`Self::init`],但带装载阶段进度回调(2026-07-11 加固批 A-2:
+    /// worker 借此把「卡在哪段」实时回执给宿主,替代黑盒 300s 总限时)。
+    pub fn init_with_progress(
+        models_dir: &Path,
+        profile: &ModelProfile,
+        face_profile: Option<&FaceProfile>,
+        provider_override: &str,
+        progress: LoadProgress<'_>,
+    ) -> Result<Self> {
         let image_path = models_dir.join(&profile.image_file);
         let text_path = models_dir.join(&profile.text_file);
 
-        // ── Step 1: provider detection ──────────────────────────────────────
         // ── 步骤 1：提供者探测 ──────────────────────────────────────
         info!("Starting AI provider detection | 开始 AI 提供者探测...");
+        emit(progress, "provider_detect:begin");
         let mut provider_info = crate::provider::detect_best_provider();
 
         if provider_override == "cpu" {
@@ -240,7 +358,7 @@ impl AiEnginePool {
         let pool_size = match provider_info.provider {
             // CPU 路径：流水线是单推理线程的，所以给单个 Session 分配全核心，将池子大小限制为 2
             AiProvider::Cpu => 2,
-            _ => 1, // GPU providers: DirectML/CUDA drivers handle internal concurrency; multiple sessions cause severe DX12 lock contention
+            _ => 1, // GPU:DirectML/CUDA 驱动自行处理内部并发,多 session 会导致严重的 DX12 锁争用
         };
 
         // 人脸专用 pool 尺寸（问题6c 提速）：独立于 CLIP 的 `pool_size`，不影响 CLIP。
@@ -252,11 +370,7 @@ impl AiEnginePool {
             _ => 2,
         };
 
-        // ── Step 2: load CLIP models ────────────────────────────────────────
         // ── 步骤 2：加载 CLIP 模型 ──────────────────────────────────────
-        // Image encoder: use the detected best provider. The ViT runs correctly (and much
-        // faster) on DirectML/CUDA — verified by the stored embeddings producing accurate
-        // search results.
         // 图像编码器：用探测到的最优 provider。ViT 在 DirectML/CUDA 上结果正确且快得多
         // —— 已用库内向量产出准确搜索结果验证。
         let mut clip_image_session = load_session_pool(
@@ -264,9 +378,10 @@ impl AiEnginePool {
             &provider_info.provider,
             "CLIP image encoder | CLIP 图像编码器",
             pool_size,
+            "clip_image_load",
+            progress,
         );
 
-        // Text encoder: ALWAYS CPU.
         // 【坑9·致命·2026-06-17】eisneim cn-clip 的 BERT 文本编码器含 int64 的 embedding
         // Gather 等算子，**DirectML 会静默算错**（不报错、不回退），产出被污染的查询向量，使
         // 语义搜索结果完全错乱。实测：同一组（DirectML 生成且正确的）图像向量下，app 的
@@ -280,9 +395,10 @@ impl AiEnginePool {
             &AiProvider::Cpu,
             "CLIP text encoder (CPU forced) | CLIP 文本编码器 (强制 CPU)",
             2,
+            "clip_text_load",
+            progress,
         );
 
-        // Fallback to CPU for the IMAGE encoder if the GPU failed to load it (text is already CPU).
         // 图像编码器 GPU 加载失败则回退 CPU（文本已是 CPU）。
         if clip_image_session.is_none() && provider_info.provider != AiProvider::Cpu {
             tracing::warn!("GPU image encoder failed to load, falling back to CPU | 图像编码器 GPU 加载失败，回退 CPU...");
@@ -293,7 +409,18 @@ impl AiEnginePool {
                 &AiProvider::Cpu,
                 "CLIP image encoder (CPU) | CLIP 图像编码器 (CPU)",
                 2,
+                "clip_image_cpu_fallback",
+                progress,
             );
+        }
+
+        // 装载期契约自检(2026-07-10 审查 K1):错配模型文件(手动导入/改名错放)在激活时
+        // 即拒,给出指向明确的错误;否则要等运行期形状断言,且旧版本会静默产出错切向量。
+        emit(progress, "contract_check:begin");
+        if let Some(pool) = &clip_image_session {
+            if let Some(guard) = pool.get() {
+                crate::clip::verify_image_tower_contract(&guard, profile)?;
+            }
         }
 
         info!(
@@ -304,7 +431,6 @@ impl AiEnginePool {
             provider_info.gpu_name
         );
 
-        // ── Step 3: load face models (optional; skip gracefully if files absent) ──
         // ── 步骤 3：加载人脸模型（可选；文件缺失则优雅降级，不阻断 CLIP）──
         // 人脸为纯 CNN（YuNet/SCRFD/SFace/ArcFace），跟随图像侧探测到的 provider。不同于 CLIP 文本塔
         // （BERT int64 在 DirectML 静默算错，坑9），CNN 在 GPU 上一般正确，留待 F8 对拍参考实现验正。
@@ -316,12 +442,16 @@ impl AiEnginePool {
                     &provider_info.provider,
                     "Face detector | 人脸检测器",
                     face_pool_size,
+                    "face_detect_load",
+                    progress,
                 );
                 let emb = load_session_pool(
                     &models_dir.join(&fp.embed_file),
                     &provider_info.provider,
                     "Face embedder | 人脸嵌入器",
                     face_pool_size,
+                    "face_embed_load",
+                    progress,
                 );
                 if det.is_some() && emb.is_some() {
                     info!("Face models ready: {} | 人脸模型就绪: {}", fp.id, fp.id);
@@ -351,41 +481,68 @@ impl AiEnginePool {
         })
     }
 
-    /// Returns `true` if the CLIP image encoder is loaded.
     /// 返回 `true` 如果 CLIP 图像编码器已加载。
     pub fn clip_image_ready(&self) -> bool {
         self.clip_image_session.is_some()
     }
 
-    /// Returns `true` if both CLIP encoders are loaded.
     /// 返回 `true` 如果两个 CLIP 编码器都已加载。
     pub fn clip_ready(&self) -> bool {
         self.clip_image_session.is_some() && self.clip_text_session.is_some()
     }
 
-    /// Returns `true` if both face models (detector + embedder) are loaded.
     /// 返回 `true` 如果人脸检测器与嵌入器均已加载。
     pub fn face_ready(&self) -> bool {
         self.face_detect_session.is_some() && self.face_embed_session.is_some()
     }
 }
 
+/// 影像增强会话池装载(P0 批 3:enhance-worker 复用既有 `build_session`/EP 骨架,
+/// design.md §A/§E「复用既有 ort engine/provider/session 骨架」)。单模型单 session
+/// (增强严格串行、一次一请求,无并发压力);`provider` 由调用方 [`detect_best_provider`]
+/// 探测后传入。缺文件/超时/装载失败均返回 `None`(语义同 [`load_session_pool`]),
+/// 调用方据此回 `ModelLoadFailed`。
+pub fn load_enhance_session_pool(
+    model_path: &Path,
+    provider: &AiProvider,
+    stage: &str,
+    progress: LoadProgress<'_>,
+) -> Option<SessionPool> {
+    load_session_pool(
+        &model_path.to_path_buf(),
+        provider,
+        "enhance model | 影像增强模型",
+        1,
+        stage,
+        progress,
+    )
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
 
-fn load_session_pool(
+// `pub(crate)`:OCR 模块(ocr::mod::OcrEngine::init)复用它的池装载+超时+进度姿态,
+// 以 CPU EP、pool_size=1 加载 det/cls/rec 三 session(D-OCR-2)。
+pub(crate) fn load_session_pool(
     model_path: &PathBuf,
     provider: &AiProvider,
     label: &str,
     pool_size: usize,
+    stage: &str,
+    progress: LoadProgress<'_>,
 ) -> Option<SessionPool> {
     if !model_path.exists() {
         warn!(
             "Model file not found, skipping {} | 模型文件未找到，跳过 {}: {:?}",
             label, label, model_path
         );
+        emit(progress, &format!("{stage}:missing_file"));
         return None;
     }
+    emit(
+        progress,
+        &format!("{stage}:begin({},pool={pool_size})", provider.label()),
+    );
 
     info!(
         "Loading {} (pool size: {}) with provider {} | 正在用 {} 加载 {} (容量: {}): {:?}",
@@ -434,9 +591,11 @@ fn load_session_pool(
                     );
                 }
                 pool.push(session);
+                emit(progress, &format!("{stage}:slot_ok({}/{pool_size})", i + 1));
             }
             Ok(Err(e)) => {
                 warn!("Failed to load {} [{}/{}], AI feature degraded | {} 加载失败 [{}/{}], AI 功能降级: {}", label, i + 1, pool_size, label, i + 1, pool_size, e);
+                emit(progress, &format!("{stage}:fail({e})"));
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -451,10 +610,16 @@ fn load_session_pool(
                     pool_size,
                     SESSION_LOAD_TIMEOUT
                 );
+                // 事件尾缀 `:timeout` 是 worker 分类 SessionLoadTimeout 错误码的判据,勿改拼写。
+                emit(
+                    progress,
+                    &format!("{stage}:timeout({}s)", SESSION_LOAD_TIMEOUT.as_secs()),
+                );
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 warn!("Session loader thread panicked while loading {} [{}/{}] | 加载 {} 时 Session 加载线程崩溃 [{}/{}]", label, i + 1, pool_size, label, i + 1, pool_size);
+                emit(progress, &format!("{stage}:loader_panicked"));
                 break;
             }
         }
@@ -475,13 +640,6 @@ fn load_session_pool(
     }
 }
 
-/// Build a Session with the appropriate EP for the selected provider.
-/// Key DirectML constraints applied:
-///   - `with_intra_threads(1)` — DirectML requires single-threaded session
-///   - `disable_mem_pattern()` — DirectML does not support memory pattern optimization
-///   - `with_optimization_level(Level1)` — Only Basic graph optimization to avoid
-///     expensive shader pre-compilation that hangs on ViT/transformer models
-///
 /// 使用选定提供者对应的 EP 构建 Session。
 /// DirectML 必须满足的约束：
 ///   - 单线程（intra_threads=1）
@@ -491,10 +649,6 @@ fn build_session(model_path: &PathBuf, provider: &AiProvider) -> ort::Result<Ses
     match provider {
         #[cfg(target_os = "windows")]
         AiProvider::DirectML => {
-            // DirectML requires sequential execution and no memory pattern.
-            // Graph optimization must be LIMITED to Basic (Level1) — ORT_ENABLE_ALL (Level3)
-            // triggers full DML shader pre-compilation which hangs indefinitely on
-            // ViT/transformer models with complex attention or Int64 ops.
             // DirectML 需要顺序执行且不能使用内存模式优化。
             // 图优化级别必须限制为 Basic（Level1）——Level3 会触发完整的 DML shader 预编译，
             // 在含有复杂 Attention 或 Int64 算子的 ViT/Transformer 模型上会无限期卡死。
@@ -553,5 +707,59 @@ impl std::fmt::Debug for AiEnginePool {
             .field("clip_text_ready", &self.clip_text_session.is_some())
             .field("face_ready", &self.face_ready())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// env 是进程级全局:三分支收进单个测试串行覆盖,避免并行测试互踩;
+    /// 结尾还原现场(cargo 经根 config [env] 给测试进程注入了真实值)。
+    #[test]
+    fn resolve_ort_dylib_branches() {
+        let saved = std::env::var("ORT_DYLIB_PATH").ok();
+
+        // ① env 指向死路径 → DylibUnavailable,且消息指名 env 源(事故签名)。
+        // 死路径必须落在**存在的盘符**下:不存在盘符(如 Z:)会触发 Windows 网络驱动器
+        // 解析,is_file 可拖 ~60s——测试首跑实测 63s,生产自检同理不该撞这条慢路。
+        let dead = std::env::temp_dir().join("no-such-dir-x7f3q\\onnxruntime.dll");
+        std::env::set_var("ORT_DYLIB_PATH", &dead);
+        let err = resolve_ort_dylib().unwrap_err();
+        assert!(matches!(err, OrtPreflightError::DylibUnavailable(_)));
+        assert!(err.to_string().contains("ORT_DYLIB_PATH"), "err: {err}");
+
+        // ② env 指向真实存在的文件 → Ok(用测试可执行文件自身充当存在文件,零依赖)。
+        let self_exe = std::env::current_exe().unwrap();
+        std::env::set_var("ORT_DYLIB_PATH", &self_exe);
+        let (p, src) = resolve_ort_dylib().expect("存在的 env 路径应通过");
+        assert_eq!(p, self_exe);
+        assert_eq!(src, "env ORT_DYLIB_PATH");
+
+        // ③ 未设 env → 只认 exe 旁,拒绝系统搜索回退:结果取决于 exe 旁是否真有库文件,
+        //    两种情形都断言到对应分支(deps 测试目录通常无库 → DylibUnavailable)。
+        std::env::remove_var("ORT_DYLIB_PATH");
+        let exe_adjacent = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(ORT_DYLIB_NAME);
+        match resolve_ort_dylib() {
+            Ok((p, src)) => {
+                assert!(exe_adjacent.is_file());
+                assert_eq!(p, exe_adjacent);
+                assert_eq!(src, "exe 同目录");
+            }
+            Err(e) => {
+                assert!(!exe_adjacent.is_file());
+                assert!(matches!(e, OrtPreflightError::DylibUnavailable(_)));
+                assert!(e.to_string().contains("拒绝回退"), "err: {e}");
+            }
+        }
+
+        match saved {
+            Some(v) => std::env::set_var("ORT_DYLIB_PATH", v),
+            None => std::env::remove_var("ORT_DYLIB_PATH"),
+        }
     }
 }

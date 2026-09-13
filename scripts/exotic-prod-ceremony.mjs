@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// scripts/exotic-prod-ceremony.mjs
 // 生产信任根 key ceremony 工具(Part8 D1 / ③b B1 真钥,2026-07-06)。
 //
 // 🔴 设计为**自包含单文件**:离线签发机上只需本文件 + Node ≥18,经 USB 拷入即可运行,
@@ -18,8 +17,8 @@
 //     只用 keyset 公钥验一枚 license token(不触私钥,可在开发机上跑——验证「keyset
 //     运回开发机后与签发机私钥确实配对」的闭环)。
 //
-// 产物去向:exotic-keyset-prod.json → 替换 crates/scrollery-pro/resources/ 占位,或经
-// PICASA_EXOTIC_KEYSET_FILE 注入构建(两通道已就绪,见 pro/exotic-trust build.rs)。
+// 产物去向:exotic-keyset-prod.json → 替换 crates/scrollery-exotic-trust/resources/exotic-keyset.json
+// 内置占位集,或经 PICASA_EXOTIC_KEYSET_FILE 注入构建(通道见 crates/scrollery-exotic-trust/build.rs)。
 // 红线:私钥永不入仓、不进 CI env、不出现在测试 fixture(仅 ceremony 产物目录 + 冷备)。
 
 import crypto from 'node:crypto';
@@ -127,7 +126,7 @@ if (cmd === 'init') {
   const notBefore = Math.floor(Date.now() / 1000);
   const keyset = {
     schema: 1,
-    _note: `生产信任根公钥集(ceremony ${tag},由 exotic-prod-ceremony.mjs 生成)。私钥仅签发机本机+冷备,永不入仓/CI/fixture。替换 pro resources 占位或经 PICASA_EXOTIC_KEYSET_FILE 注入构建。`,
+    _note: `生产信任根公钥集(ceremony ${tag},由 exotic-prod-ceremony.mjs 生成)。私钥仅签发机本机+冷备,永不入仓/CI/fixture。替换 crates/scrollery-exotic-trust/resources/exotic-keyset.json 占位,或经 PICASA_EXOTIC_KEYSET_FILE 注入构建。`,
     keys: [
       keysetEntry(`release-prod-${tag}`, 'release', rel, notBefore),
       keysetEntry(`license-prod-${tag}`, 'license', lic, notBefore),

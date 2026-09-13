@@ -10,6 +10,7 @@
 //!   - 重试时钟：独立 interval 周期发 `RetryDue`，使到期 retryable 任务被重新评估。
 //!   - 门控（[`evaluate_run`]）：enabled/未暂停/可领取(授权+平台+能力)/有就绪任务/Worker 可用 → 才跑。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +24,7 @@ use crate::db::queries as q;
 use crate::exotic::catalog::Capability;
 use crate::exotic::pipeline::{
     recover_stale_exotic_leases, run_exotic_pipeline_blocking, PipelineDeps, SupervisorFactory,
+    VideoThumbnailFactory, WorkerFactory,
 };
 use crate::exotic::worker::{WorkerConfig, WorkerSpec};
 use crate::exotic::ExoticHost;
@@ -31,6 +33,24 @@ use crate::state::AppState;
 /// 首发唯一插件 + 能力（Part2）。
 pub const PSD_PLUGIN_ID: &str = "exotic-image-psd";
 const PSD_WORKER_ID: &str = "psd-worker";
+/// RAW 图像缩略图解码插件（builtin 叠加豁免，见 catalog.rs CommonFormatConflict 例外）。
+pub const RAW_PLUGIN_ID: &str = "exotic-image-raw";
+const RAW_WORKER_ID: &str = "raw-worker";
+/// 视频格式扩展插件（builtin+free，design.md §4.1）。**Service 型 worker**：remux/转码/
+/// 缩略图均由 host 侧 `VideoWorkerService` 直持 supervisor（同 OCR/Enhance 先例，§2.1）。
+///
+/// D-444③ A4 裁决(单轨收敛):rmvb/vob 已入 `utils::format` 注册表(classify=video),其缩略图
+/// 走**常规 video 派生链**(video_cover/video_keyframes → `backend_for` → V5 `WorkerVideoBackend`
+/// ffmpeg 桥),不经 exotic 任务化——`fast_scan::seed_gate_admits` 掐掉 builtin+video 的 exotic
+/// 播种,避免与派生链双写 `thumb_path`。故 video-extended 的 exotic 缩略图任务实际恒零。
+///
+/// 尽管如此,video-extended 仍以 **Thumbnail 能力**进 `plugin_descriptors`、并保留
+/// [`VideoThumbnailFactory`]（派发前先 `VideoSessionInit` 建 ffmpeg 会话）——作为 offering
+/// 声明 thumbnail 能力的**一致性面可达实现**(路径可达可测;若播种侧未来放开即刻生效),
+/// 非当前缩略图的实际产出方。
+pub const VIDEO_PLUGIN_ID: &str = "video-extended";
+/// video-worker 握手期望的 ReadyBody.worker_id（design.md §2.2）。
+pub const VIDEO_WORKER_ID: &str = "video-worker";
 // T13 后调度路径全走注册表(descriptor),此常量仅测试作 shorthand。
 #[cfg(test)]
 const CAPABILITY: Capability = Capability::Thumbnail;
@@ -42,9 +62,12 @@ pub(crate) mod op_timeouts {
     use std::time::Duration;
     /// thumbnail 单请求(原 pipeline::TASK_TIMEOUT 同值收拢至此)。
     pub const THUMBNAIL: Duration = Duration::from_secs(30);
-    /// SessionInit:冷加载 ViT-L fp32 + DirectML 编译内核的上界(D3 §2;进程握手
-    /// 仍 5s 不动——模型加载不在握手)。
-    pub const SESSION_INIT: Duration = Duration::from_secs(300);
+    /// SessionInit **静默限时**(2026-07-11 加固批 A-2 语义变更:worker 装载期发
+    /// Progress 阶段帧+10s 心跳,收帧即重置本计时;总上界另见 worker.rs
+    /// PROGRESS_TOTAL_CAP)。旧值 300s 是「猜冷加载总时长」——与 worker 单段 600s
+    /// 后备预算倒挂,宿主恒先杀。现在 90s = 九拍心跳全丢才判死,只量「进程还活着吗」
+    /// 而非「装载要多久」;进程握手仍 5s 不动——模型加载不在握手(D3 §2)。
+    pub const SESSION_INIT: Duration = Duration::from_secs(90);
     /// SessionClose:健康 worker 卸载即 drop(毫秒级);上界只兜「驱动释放 VRAM 慢」,
     /// 超时即 kill 回收,会话随进程消亡(T17)。
     pub const SESSION_CLOSE: Duration = Duration::from_secs(30);
@@ -64,6 +87,26 @@ pub(crate) mod op_timeouts {
     }
     /// EncodeText 一批(文本塔恒 CPU、查询通常单条,轻;30s 已是慢盘冷启余量)。
     pub const ENCODE_TEXT: Duration = Duration::from_secs(30);
+    /// OcrSessionInit(T6/D-OCR-2:三模型 CPU EP,worker 同步装载**不发 Progress 心跳**,
+    /// 故不能按 SESSION_INIT 的「静默心跳」量纲缩到 90s——须容 server 档冷载全程;
+    /// host 侧总兜底,越界即 kill 回收)。
+    /// ⚠180s flat 系保守估计,无实测依据——ocr_bench 落位后回填冷载耗时;慢机 server 档
+    /// (~190MB)若两 attempt 均撞冷载墙,按档位分预算(mobile/server 各钉各的)。
+    pub const OCR_SESSION_INIT: Duration = Duration::from_secs(180);
+    /// OcrBatch 一批:基础 60s + 单项 30s(交互恒单图;批口面向未来,det+cls+rec 全链
+    /// CPU、大图经 limit_side_len 降采样后秒级,宽松即可——「假死检测器」非性能指标)。
+    pub fn ocr_batch(items: usize) -> Duration {
+        Duration::from_secs(60) + Duration::from_secs(30) * (items as u32)
+    }
+    /// EnhanceSessionInit **静默限时**(降噪/超分子系统 design.md §E):enhance-worker 装载期
+    /// 发 Progress 阶段帧 + 10s 心跳(main.rs HEARTBEAT_INTERVAL),收帧即重置本计时——与
+    /// CLIP `SESSION_INIT`(90s)同「静默心跳」量纲。增强模型仅数十 MB、加载秒级,90s 足够;
+    /// 九拍心跳全丢才判死,只量「进程还活着吗」。
+    pub const ENHANCE_SESSION_INIT: Duration = Duration::from_secs(90);
+    /// EnhanceRun 的 per-tile **静默限时**(design.md §E):worker 每完成一个 tile 发 Progress,
+    /// host 收帧即重置本计时。300s 容 CPU 兜底单 tile 慢跑(fp32、512² tile,慢机分钟级不误杀);
+    /// ⚠ 数值系草案,dev 机 bench(单 tile 吞吐)落位后回填,与 design.md §E「未实测不给数字」一致。
+    pub const ENHANCE_SILENCE: Duration = Duration::from_secs(300);
 }
 
 /// 单插件运行描述(Part6 §3.3 C1/T13):调度循环按注册表逐项评估与运行,不再写死 PSD。
@@ -83,19 +126,39 @@ pub(crate) struct PluginDescriptor {
 /// 运行注册表(Part6 §3.3:Catalog + 运行时支持信息构建)。capabilities 取自
 /// Catalog(权威);worker_id/uses_gpu 是运行时支持信息,Catalog 与插件 manifest
 /// 尚无此数据(Part8 扩展 manifest 字段后改为全数据驱动)。ai/face worker 化
-/// descriptor 随 T15 加入。新插件加入 = 注册表添一项,调度代码零改动。
+/// descriptor 随 T15 加入。新插件加入 = 在 Catalog 中声明 worker_id/uses_gpu，调度代码无需再改。
 fn plugin_descriptors(snap: &crate::exotic::catalog::CatalogSnapshot) -> Vec<PluginDescriptor> {
-    let psd_caps = snap
-        .resolve_format("psd")
-        .map(|o| o.capabilities.clone())
-        .unwrap_or_else(|| vec![Capability::Thumbnail]);
-    vec![PluginDescriptor {
-        plugin_id: PSD_PLUGIN_ID.to_string(),
-        worker_id: PSD_WORKER_ID.to_string(),
-        capabilities: psd_caps,
-        handshake_timeout: HANDSHAKE_TIMEOUT,
-        uses_gpu: false,
-    }]
+    // 运行注册表改为优先读取 Catalog 里显式声明的 worker_id/uses_gpu：
+    // 新插件只要在 catalog 中声明 worker_id 即可被调度，不必再改这段 Rust 注册表。
+    // 兼容旧 catalog：PSD/RAW/video-extended 仍保留内置 fallback，避免老数据/测试断链。
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (_, off) in snap.iter_formats() {
+        if !seen.insert(off.plugin_id.clone()) {
+            continue;
+        }
+        let worker_id = off
+            .worker_id
+            .clone()
+            .or_else(|| match off.plugin_id.as_str() {
+                PSD_PLUGIN_ID => Some(PSD_WORKER_ID.to_string()),
+                RAW_PLUGIN_ID => Some(RAW_WORKER_ID.to_string()),
+                VIDEO_PLUGIN_ID => Some(VIDEO_WORKER_ID.to_string()),
+                _ => None,
+            });
+        let Some(worker_id) = worker_id else {
+            // 未声明 worker_id 的 offering 不进入 exotic 调度（如 OCR/Enhance 独立服务）。
+            continue;
+        };
+        out.push(PluginDescriptor {
+            plugin_id: off.plugin_id.clone(),
+            worker_id,
+            capabilities: off.capabilities.clone(),
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            uses_gpu: off.uses_gpu,
+        });
+    }
+    out
 }
 
 /// 事件通道容量（可合并；满时置 dirty 不丢 wake）。
@@ -298,24 +361,48 @@ async fn run_capability_until_drained(
             now,
         )
     });
-    let worker_available = worker_path.is_some();
+    // A3 gating(D-444③):video-extended 的任务化 Thumbnail 依赖 ffmpeg 工具包就绪(sha 钉死
+    // 校验 + `.ready` 标记);未就绪(未下载/下载中)视 worker 不可用 → 不派、任务留 pending,
+    // 不烧重试预算(与「插件未安装即不派」同语义)。非 video 插件恒 true。
+    let ffmpeg_ready = desc.plugin_id != VIDEO_PLUGIN_ID
+        || matches!(
+            crate::exotic::tools::ffmpeg_tool_status(&state.app_data_dir),
+            crate::exotic::tools::ToolStatus::Ready { .. }
+        );
+    let worker_available = worker_path.is_some() && ffmpeg_ready;
 
     // 版本对账只允许「首轮」免 has_ready(消费一次即失效)——后续轮次须有真实就绪任务,
     // 否则对账后零任务会无限空转。
     let mut force_once = force_reconcile;
     loop {
         // 门控判定（读配置 + 授权 + 就绪任务）。
+        // rusqlite 下沉 spawn_blocking(2026-07-10 审查 B4,CLAUDE.md 硬化条款零豁免):
+        // evaluate_run 同步跑多条 SQL 且持全局写锁(扫描批提交可持锁数秒),原样直跑
+        // async 正文会占住 tokio worker 并放大 IPC 延迟。JoinError(闭包 panic)视同
+        // 「本轮不运行」——下次 wake 自然重试,不级联。
         let should = {
-            let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-            evaluate_run(
-                &conn,
-                host,
-                &desc.plugin_id,
-                capability,
-                worker_available,
-                bypass_auto,
-                std::mem::take(&mut force_once),
-            )
+            let state_for_eval = Arc::clone(state);
+            let host_for_eval = Arc::clone(host);
+            let plugin_id = desc.plugin_id.clone();
+            let force = std::mem::take(&mut force_once);
+            tokio::task::spawn_blocking(move || {
+                let conn = state_for_eval
+                    .db_writer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                evaluate_run(
+                    &conn,
+                    &state_for_eval.config,
+                    &host_for_eval,
+                    &plugin_id,
+                    capability,
+                    worker_available,
+                    bypass_auto,
+                    force,
+                )
+            })
+            .await
+            .unwrap_or(false)
         };
         if !should {
             break;
@@ -346,21 +433,44 @@ async fn run_capability_until_drained(
         let handshake_timeout = desc.handshake_timeout;
 
         let result = tokio::task::spawn_blocking(move || {
-            let factory = SupervisorFactory {
-                spec: WorkerSpec {
-                    exe_path,
-                    expected_worker_id: worker_id,
-                    required_capabilities: vec![capability.as_str().to_string()],
-                },
-                cfg: WorkerConfig {
-                    handshake_timeout,
-                    host_version: env!("CARGO_PKG_VERSION").to_string(),
-                    max_blob_len: exotic_protocol::MAX_BLOB_LEN,
-                },
-            };
             let (cache_dir, requested_size) = {
-                let cfg = state_run.thumb_config.read().unwrap();
+                let cfg = state_run
+                    .thumb_config
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
                 (cfg.cache_dir.clone(), cfg.size)
+            };
+            let spec = WorkerSpec {
+                exe_path,
+                expected_worker_id: worker_id,
+                required_capabilities: vec![capability.as_str().to_string()],
+            };
+            let cfg = WorkerConfig {
+                handshake_timeout,
+                host_version: env!("CARGO_PKG_VERSION").to_string(),
+                max_blob_len: exotic_protocol::MAX_BLOB_LEN,
+            };
+            // video-extended:任务化 Thumbnail 无 session/ffmpeg 路径,用 VideoThumbnailFactory
+            // 在派发前先建 ffmpeg 会话(D-444③)。ffmpeg 就绪已在 worker_available 门控,此处
+            // 再取一次路径(idempotent 文件检查);竞态变不就绪则本轮不处理(任务留 pending)。
+            let factory: Box<dyn WorkerFactory> = if plugin_id == VIDEO_PLUGIN_ID {
+                match crate::exotic::tools::ffmpeg_tool_status(&state_run.app_data_dir) {
+                    crate::exotic::tools::ToolStatus::Ready { ffmpeg_exe, .. } => {
+                        // 输出白名单前缀 = {cache_dir}/video(与 VideoWorkerService 同址,§5.2)。
+                        let work_dir = cache_dir.join("video");
+                        let _ = std::fs::create_dir_all(&work_dir);
+                        let init = exotic_protocol::RequestBody::VideoSessionInit {
+                            session_id: 1,
+                            ffmpeg_exe_path: ffmpeg_exe.to_string_lossy().into_owned(),
+                            ffmpeg_sha256: crate::exotic::tools::FFMPEG_EXE_SHA256.to_string(),
+                            work_dir: work_dir.to_string_lossy().into_owned(),
+                        };
+                        Box::new(VideoThumbnailFactory { spec, cfg, init })
+                    }
+                    _ => return crate::exotic::pipeline::PipelineStats::default(),
+                }
+            } else {
+                Box::new(SupervisorFactory { spec, cfg })
             };
             let app_evt = app_run.clone();
             let state_yield = Arc::clone(&state_run);
@@ -376,18 +486,14 @@ async fn run_capability_until_drained(
                     // 合并发：画廊刷新（复用 enrichment 事件）+ 状态变化。
                     let _ = app_evt.emit(
                         "db:media_enriched",
-                        crate::scanner::enricher::MediaEnrichedPayload {
-                            root_id: 0,
-                            enriched_count: 0,
-                            total: 0,
-                        },
+                        crate::scanner::enricher::MediaEnrichedPayload::refresh_signal(),
                     );
                     let _ = app_evt.emit("exotic:status-changed", ());
                 }),
                 should_yield: Arc::new(move || state_yield.should_yield_exotic()),
                 is_runnable: Arc::new(move || host_run.is_task_runnable(&plugin_id, capability)),
             };
-            run_exotic_pipeline_blocking(&deps, &factory)
+            run_exotic_pipeline_blocking(&deps, factory.as_ref())
         })
         .await;
 
@@ -425,9 +531,13 @@ async fn run_capability_until_drained(
 /// 自动 wake（扫描/重试时钟/启动）为 false，`exotic_auto_process=false` 时不运行。
 /// `force_run_once`(病历 #4):安装/升级/回滚/启动的版本对账——仅跳过末位 has_ready 检查
 /// (其余门控全部照常),让 pipeline 起一轮做步骤 2 的 worker_version 失效比对。
+/// A2:`config` 参数新增——`exotic_enabled`/`exotic_auto_process` 是 schema 设置类键,唯一
+/// 真源已切到 config.toml;`exotic_paused` 仍是状态类键(用户点「暂停」的临时开关,非表单
+/// 项),照旧走 `conn` 查 DB。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_run(
     conn: &Connection,
+    config: &crate::config::ConfigManager,
     host: &ExoticHost,
     plugin_id: &str,
     capability: Capability,
@@ -438,9 +548,8 @@ pub(crate) fn evaluate_run(
     if !worker_available {
         return false;
     }
-    let enabled = q::get_config(conn, "exotic_enabled")
-        .ok()
-        .flatten()
+    let enabled = config
+        .get("exotic_enabled")
         .map(|v| v != "false")
         .unwrap_or(true);
     let paused = q::get_config(conn, "exotic_paused")
@@ -452,9 +561,8 @@ pub(crate) fn evaluate_run(
         return false;
     }
     // auto 门控：关闭自动处理后，仅用户显式请求（start/retry）可运行；自动 wake 一律不跑（P2）。
-    let auto = q::get_config(conn, "exotic_auto_process")
-        .ok()
-        .flatten()
+    let auto = config
+        .get("exotic_auto_process")
         .map(|v| v != "false")
         .unwrap_or(true);
     if !auto && !bypass_auto {
@@ -478,6 +586,23 @@ pub(crate) fn evaluate_run(
     q::has_ready_exotic_task(conn, plugin_id, capability.as_str(), now).unwrap_or(false)
 }
 
+/// exotic（冷门格式插件）Coordinator 启动期装配（Part2 §4.1）。
+///
+/// 单一调度器：接扫描/安装/激活/配置/重试事件，幂等唤醒唯一 Pipeline。Part2 无真实
+/// License → 默认门控为不可领取（除 dev fixture）；有 Worker + 授权时自动出图。
+///
+/// 自 `lib.rs::run()` 的 setup 段 p 迁出(D-450 纯结构移动,行为不变)。
+/// 顺序不变量:必须在 `app.manage(app_state)` 之后调用。
+pub fn bootstrap(app: AppHandle, state: Arc<AppState>) {
+    // 运行期 Host：catalog + 只读连接池安装真相 + keyring 授权真相（Part3 §5）。
+    let host = Arc::new(state.exotic_host());
+    let coord = ExoticCoordinator::start(app, state.clone(), host);
+    state.set_exotic_coordinator(coord);
+    // 启动 wake：恢复上次遗留的就绪任务（孤儿恢复 + backfill 后的待处理）。
+    state.wake_exotic(WakeReason::Startup);
+    info!("exotic Coordinator 已启动 | exotic Coordinator started");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +613,18 @@ mod tests {
         crate::db::migration::run_migrations(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c
+    }
+
+    /// A2:`evaluate_run` 的 `exotic_enabled`/`exotic_auto_process` 已迁往 config.toml——测试
+    /// 需要一个独立于 `mem_db()` 的 `ConfigManager`(临时目录,泄漏而非清理,测试进程退出即回收,
+    /// 与仓内其余 `tempdir()` 测试用法一致)。
+    fn mem_config() -> crate::config::ConfigManager {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("config.toml");
+        let conn = mem_db();
+        crate::config::ConfigManager::load_or_init(path, &conn)
+            .unwrap()
+            .0
     }
 
     /// 平台无关 Catalog 夹具(2026-07-05 Linux CI 面):本组测试验证 coordinator 的
@@ -520,39 +657,75 @@ mod tests {
     #[test]
     fn plugin_registry_from_builtin_catalog() {
         // 注册表(T13):capabilities 来自内置 Catalog;PSD 不占 GPU、握手 5s。
+        // RAW(builtin 叠加豁免,cr2..srw)接入后注册表含 PSD + RAW 两项。
         let store = CatalogStore::from_builtin().unwrap();
         let descs = plugin_descriptors(&store.snapshot());
-        assert_eq!(descs.len(), 1);
-        let d = &descs[0];
+        // PSD + RAW + video-extended(rmvb/vob 缩略图收编,D-444③)三项。
+        assert_eq!(descs.len(), 3);
+        let d = descs
+            .iter()
+            .find(|d| d.plugin_id == PSD_PLUGIN_ID)
+            .expect("PSD descriptor 应存在");
         assert_eq!(d.plugin_id, PSD_PLUGIN_ID);
         assert_eq!(d.worker_id, "psd-worker");
         assert_eq!(d.capabilities, vec![Capability::Thumbnail]);
         assert!(!d.uses_gpu);
         assert_eq!(d.handshake_timeout, HANDSHAKE_TIMEOUT);
+        let raw = descs
+            .iter()
+            .find(|d| d.plugin_id == RAW_PLUGIN_ID)
+            .expect("RAW descriptor 应存在");
+        assert_eq!(raw.worker_id, "raw-worker");
+        assert_eq!(raw.capabilities, vec![Capability::Thumbnail]);
+        assert!(!raw.uses_gpu);
+        assert_eq!(raw.handshake_timeout, HANDSHAKE_TIMEOUT);
+        // video-extended:worker=video-worker,只 Thumbnail 能力(remux/transcode/frames 归
+        // VideoWorkerService,不进任务化)。
+        let video = descs
+            .iter()
+            .find(|d| d.plugin_id == VIDEO_PLUGIN_ID)
+            .expect("video-extended descriptor 应存在");
+        assert_eq!(video.worker_id, VIDEO_WORKER_ID);
+        assert_eq!(video.capabilities, vec![Capability::Thumbnail]);
+        assert!(!video.uses_gpu);
     }
 
     #[test]
     fn op_timeout_table_invariants() {
-        // 表内不变量(D3):进程握手(5s,快失败)≪ thumbnail ≪ 批 ≤ SessionInit(冷加载上界)。
+        use crate::exotic::worker::PROGRESS_TOTAL_CAP;
+        // 表内不变量(D3,2026-07-11 加固批 A-2 修订):进程握手(5s,快失败)≪ thumbnail ≪ 批。
         assert!(HANDSHAKE_TIMEOUT < op_timeouts::THUMBNAIL);
         assert!(op_timeouts::THUMBNAIL < op_timeouts::EMBED_BATCH);
-        assert!(op_timeouts::EMBED_BATCH <= op_timeouts::SESSION_INIT);
-        // face 批超时按项数缩放(2026-07-03):单项不低于 thumbnail 档;
-        // 派发上限 16 项(ai::face_pipeline::FACE_DISPATCH_BATCH)时不超 SessionInit。
+        // v3:SESSION_INIT 是**静默限时**(worker 装载期 10s 一拍心跳,收帧即重置),与各批
+        // 处理的总限时不再同量纲——旧不变量「批 ≤ SessionInit(冷加载总上界)」随语义废止。
+        // 新不变量:静默档 ≥ 数拍心跳(单拍抖动不误杀,worker HEARTBEAT_INTERVAL=10s),
+        // 且 ≤ 批总限时(静默检测本应比任何总预算灵敏)。
+        assert!(op_timeouts::SESSION_INIT >= std::time::Duration::from_secs(30));
+        assert!(op_timeouts::SESSION_INIT <= op_timeouts::EMBED_BATCH);
+        // face 批超时按项数缩放(2026-07-03):单项不低于 thumbnail 档。
         assert!(op_timeouts::face_detect_embed(1) >= op_timeouts::THUMBNAIL);
-        assert!(op_timeouts::face_detect_embed(16) <= op_timeouts::SESSION_INIT);
-        // T17 新档:文本编码(CPU 轻)不重于图像批;SessionClose 远小于 SessionInit。
+        // v3 总上界:一切 per-op 预算(含 16 项 face 批与静默档)必须落在 PROGRESS_TOTAL_CAP 之内
+        // ——总上界是心跳在途时的最后防线,不得被任何单 op 预算越过。
+        assert!(op_timeouts::face_detect_embed(16) < PROGRESS_TOTAL_CAP);
+        assert!(op_timeouts::EMBED_BATCH < PROGRESS_TOTAL_CAP);
+        assert!(op_timeouts::SESSION_INIT < PROGRESS_TOTAL_CAP);
+        // T17 新档:文本编码(CPU 轻)不重于图像批;SessionClose 不重于文本编码。
         assert!(op_timeouts::ENCODE_TEXT <= op_timeouts::EMBED_BATCH);
-        assert!(op_timeouts::SESSION_CLOSE < op_timeouts::SESSION_INIT);
+        assert!(op_timeouts::SESSION_CLOSE <= op_timeouts::ENCODE_TEXT);
+        // OCR 新档(T6):session_init 与 8 项批预算须落在总上界内(总上界是最后防线)。
+        assert!(op_timeouts::ocr_batch(8) < PROGRESS_TOTAL_CAP);
+        assert!(op_timeouts::OCR_SESSION_INIT < PROGRESS_TOTAL_CAP);
     }
 
     #[test]
     fn no_run_without_worker() {
         let c = mem_db();
+        let cfg = mem_config();
         q::seed_exotic_tasks_for_item(&c, 1, PSD_PLUGIN_ID, &["thumbnail".into()]).unwrap();
         // worker 不可用 → 不跑，即使其他条件满足。
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -565,10 +738,12 @@ mod tests {
     #[test]
     fn no_run_when_unauthorized() {
         let c = mem_db();
+        let cfg = mem_config();
         q::seed_exotic_tasks_for_item(&c, 1, PSD_PLUGIN_ID, &["thumbnail".into()]).unwrap();
         // 未授权（无 fixture）→ 不跑（Part2：需 License/Part3）。
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &unauthorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -581,10 +756,12 @@ mod tests {
     #[test]
     fn no_run_when_paused() {
         let c = mem_db();
+        let cfg = mem_config();
         q::seed_exotic_tasks_for_item(&c, 1, PSD_PLUGIN_ID, &["thumbnail".into()]).unwrap();
         q::set_config(&c, "exotic_paused", "true").unwrap();
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -597,9 +774,11 @@ mod tests {
     #[test]
     fn no_run_when_no_ready_task() {
         let c = mem_db();
+        let cfg = mem_config();
         // 无任务 → 不跑（避免空转）。
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -612,9 +791,11 @@ mod tests {
     #[test]
     fn runs_when_all_conditions_met() {
         let c = mem_db();
+        let cfg = mem_config();
         q::seed_exotic_tasks_for_item(&c, 1, PSD_PLUGIN_ID, &["thumbnail".into()]).unwrap();
         assert!(evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -627,10 +808,12 @@ mod tests {
     #[test]
     fn disabled_subsystem_blocks_run() {
         let c = mem_db();
+        let cfg = mem_config();
         q::seed_exotic_tasks_for_item(&c, 1, PSD_PLUGIN_ID, &["thumbnail".into()]).unwrap();
-        q::set_config(&c, "exotic_enabled", "false").unwrap();
+        cfg.set_and_persist("exotic_enabled", "false").unwrap();
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -643,11 +826,13 @@ mod tests {
     #[test]
     fn auto_disabled_blocks_automatic_wake() {
         let c = mem_db();
+        let cfg = mem_config();
         q::seed_exotic_tasks_for_item(&c, 1, PSD_PLUGIN_ID, &["thumbnail".into()]).unwrap();
-        q::set_config(&c, "exotic_auto_process", "false").unwrap();
+        cfg.set_and_persist("exotic_auto_process", "false").unwrap();
         // 自动 wake（bypass_auto=false）→ 不跑（P2）。
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -662,9 +847,11 @@ mod tests {
         // 病历 #4(2026-07-05 真机):安装/升级/回滚/启动的版本对账轮——无就绪任务
         // (纯升级后任务全 done)也放行一轮,让 pipeline 步骤 2 拿探针 worker_version 做失效比对。
         let c = mem_db();
+        let cfg = mem_config();
         // 零任务/零就绪:对账轮放行(版本是否变了只有 spawn 探针才知道)。
         assert!(evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -675,6 +862,7 @@ mod tests {
         // 其余门控不被对账绕过:worker 不可用照拦……
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -686,6 +874,7 @@ mod tests {
         q::set_config(&c, "exotic_paused", "true").unwrap();
         assert!(!evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,
@@ -709,11 +898,13 @@ mod tests {
     #[test]
     fn auto_disabled_allows_user_request() {
         let c = mem_db();
+        let cfg = mem_config();
         q::seed_exotic_tasks_for_item(&c, 1, PSD_PLUGIN_ID, &["thumbnail".into()]).unwrap();
-        q::set_config(&c, "exotic_auto_process", "false").unwrap();
+        cfg.set_and_persist("exotic_auto_process", "false").unwrap();
         // 用户显式请求（start/retry → bypass_auto=true）→ 仍运行。
         assert!(evaluate_run(
             &c,
+            &cfg,
             &authorized_host(),
             PSD_PLUGIN_ID,
             CAPABILITY,

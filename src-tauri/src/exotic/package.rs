@@ -178,10 +178,10 @@ pub fn is_safe_relative_path(path: &str) -> bool {
     if path.is_empty() || path.len() > 1024 {
         return false;
     }
-    // 反斜杠、NUL、控制字符一律拒（统一只用正斜杠）。
+    // 反斜杠、冒号、NUL、控制字符一律拒（统一只用正斜杠）。
     if path
         .bytes()
-        .any(|b| b == b'\\' || b == 0 || b.is_ascii_control())
+        .any(|b| b == b'\\' || b == b':' || b == 0 || b.is_ascii_control())
     {
         return false;
     }

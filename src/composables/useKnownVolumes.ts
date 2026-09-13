@@ -1,6 +1,5 @@
 // src/composables/useKnownVolumes.ts
 // 已知卷面板数据层（Part5 T13 §3.7 离线 UX）：列出应用登记的物理卷 + 重命名 / 忘记。
-// Known-volumes panel data layer (Part5 T13): list registered volumes, rename, forget.
 //
 // 在线态是后端 volume_watch 每 15s 对账维护的真相，前端只读展示 + 触发用户操作，不自行判定在线。
 

@@ -1,11 +1,13 @@
 import {
   Sun,
   Globe,
+  Layers,
   Type,
   Maximize,
   XSquare,
   MessageSquare,
   Monitor,
+  Gauge,
   Image,
   Cpu,
   HardDrive,
@@ -14,16 +16,23 @@ import {
   Terminal,
   Map,
   Trash2,
+  RotateCcw,
   Shield,
   Play,
   Video,
   Film,
   Rows3,
+  GripVertical,
+  PanelBottom,
+  AlignCenter,
+  AlignHorizontalJustifyCenter,
+  FileCog,
+  Palette,
 } from '@lucide/vue'
 import type { Component } from 'vue'
 
 /** 设置卡分区 id(与 SettingsView 的 CollapsibleCard id 一致)。 */
-export type SettingsSection = 'general' | 'thumbnails' | 'video' | 'aiModels' | 'debug'
+export type SettingsSection = 'general' | 'thumbnails' | 'video' | 'aiModels' | 'debug' | 'danger'
 
 /** select 类控件的选项:labelKey 走 i18n;语言名等「自名不随界面语言变」的场景用 label 原文。 */
 export interface SettingOptionSpec {
@@ -58,8 +67,13 @@ export interface SettingSpec {
 /**
  * 注册表本体。
  * ⚠ 插入顺序即设置页各分区内的行序(Object.keys 对字符串键保序),调序=改这里。
+ *
+ * 类型锁(2026-07-06 审查 P1-20):用 `satisfies` 而非 `: Record<string, SettingSpec>` 注解——
+ * 后者把键宽化为 string,`keyof typeof` 拿不到具体键集,拼错 settingKey 编译期无感(运行时
+ * `undefined.label` 崩)。`satisfies` 既校验每项符合 SettingSpec,又保留字面键集,导出 SettingKey
+ * 联合供 props/绑定表用于编译期对账。不加 `as const`:避免 options 变 readonly 波及消费方。
  */
-export const SETTINGS_MAP: Record<string, SettingSpec> = {
+export const SETTINGS_MAP = {
   /* ── 外观 general ─────────────────────────────────────────── */
   theme: {
     icon: Sun,
@@ -75,6 +89,28 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
       { value: 'dark', labelKey: 'settings.themeDark' },
     ],
   },
+  // 主题色浓度(2026-09-06):底色 wash token 的 color-mix 缩放,100=满浓度出厂锚点,
+  // 默认 60(用户反馈出厂偏深,默认即调浅);调小底色越接近中性。见 src/themes/strength.ts。
+  themeTintStrength: {
+    icon: Palette,
+    label: 'settings.themeTintStrength',
+    descKey: 'settings.themeTintStrengthDesc',
+    section: 'general',
+    control: 'number',
+    min: 0,
+    max: 100,
+  },
+  // 文字浓度(2026-09-06):文字 ramp 的 color-mix 缩放,100=满浓度出厂文字色,默认 75
+  // (用户反馈出厂文字对比过强);调小文字越接近底色、观感越柔。见 src/themes/strength.ts。
+  themeTextStrength: {
+    icon: Type,
+    label: 'settings.themeTextStrength',
+    descKey: 'settings.themeTextStrengthDesc',
+    section: 'general',
+    control: 'number',
+    min: 40,
+    max: 100,
+  },
   language: {
     icon: Globe,
     label: 'settings.language',
@@ -86,6 +122,77 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
       { value: 'en-US', label: 'English' },
     ],
   },
+  // 窗口材质(毛玻璃,2026-08-24):仅 Windows 生效(Rust 侧 DWM 背板,与 uiStore
+  // applyWindowMaterial 的 css 层配对)。mica 采样壁纸(Win10 自动退化 blur)、
+  // acrylic 实时透出窗口背后内容(拖动可能卡顿)、none 不透明(观感与现状逐像素一致)。
+  windowMaterial: {
+    icon: Layers,
+    label: 'settings.windowMaterial',
+    descKey: 'settings.windowMaterialDesc',
+    section: 'general',
+    control: 'select',
+    options: [
+      { value: 'mica', labelKey: 'settings.windowMaterialMica' },
+      { value: 'acrylic', labelKey: 'settings.windowMaterialAcrylic' },
+      { value: 'none', labelKey: 'settings.windowMaterialNone' },
+    ],
+  },
+  glassChromeOpacity: {
+    icon: Layers,
+    label: 'settings.glassChromeOpacity',
+    descKey: 'settings.glassChromeOpacityDesc',
+    section: 'general',
+    control: 'number',
+    min: 20,
+    max: 120,
+  },
+  glassStickyOpacity: {
+    icon: Layers,
+    label: 'settings.glassStickyOpacity',
+    descKey: 'settings.glassStickyOpacityDesc',
+    section: 'general',
+    control: 'number',
+    min: 20,
+    max: 120,
+  },
+  glassSurfaceOpacity: {
+    icon: Layers,
+    label: 'settings.glassSurfaceOpacity',
+    descKey: 'settings.glassSurfaceOpacityDesc',
+    section: 'general',
+    control: 'number',
+    min: 20,
+    max: 120,
+  },
+  glassControlOpacity: {
+    icon: Layers,
+    label: 'settings.glassControlOpacity',
+    descKey: 'settings.glassControlOpacityDesc',
+    section: 'general',
+    control: 'number',
+    min: 20,
+    max: 120,
+  },
+  // 内容底面缩放(2026-09-06):文字密集视图根(设置/收藏/人物/插件商店/文档阅读器)
+  // 的承重面,基准约 90% 主题色;120 起 color-mix 钳到全不透明(调大=更实)。
+  glassContentOpacity: {
+    icon: Layers,
+    label: 'settings.glassContentOpacity',
+    descKey: 'settings.glassContentOpacityDesc',
+    section: 'general',
+    control: 'number',
+    min: 20,
+    max: 120,
+  },
+  glassGalleryOpacity: {
+    icon: Layers,
+    label: 'settings.glassGalleryOpacity',
+    descKey: 'settings.glassGalleryOpacityDesc',
+    section: 'general',
+    control: 'number',
+    min: 0,
+    max: 100,
+  },
   uiFontSize: {
     icon: Type,
     label: 'settings.uiFontSize',
@@ -94,6 +201,90 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
     control: 'number',
     min: 12,
     max: 24,
+  },
+  // 标题栏与 Gallery 工具栏合并/分离(useTitlebarMode):开=工具栏并入自绘标题栏同一行(默认,Phase G);
+  // 关=独立成标题栏下方第二条 bar(S3 分层)。切换 live 生效。
+  titlebarMerged: {
+    icon: Rows3,
+    label: 'settings.titlebarMerged',
+    descKey: 'settings.titlebarMergedDesc',
+    section: 'general',
+    control: 'toggle',
+  },
+  // 顶栏中部 chips 簇水平对齐(useToolbarAlign):居中默认/靠左/靠右。仅挪中部折叠区,标题恒左、搜索恒右。
+  toolbarAlign: {
+    icon: AlignCenter,
+    label: 'settings.toolbarAlign',
+    descKey: 'settings.toolbarAlignDesc',
+    section: 'general',
+    control: 'select',
+    options: [
+      { value: 'center', labelKey: 'settings.alignCenter' },
+      { value: 'left', labelKey: 'settings.alignLeft' },
+      { value: 'right', labelKey: 'settings.alignRight' },
+    ],
+  },
+  // 选区操作条停靠状态栏(useSelectionBarMode):开=多选动作并入底部状态栏(替换式);关=浮动可拖胶囊(默认)。
+  // 切换 live 生效(经 useSelectionBarMode 共享单例)。
+  selectionBarDocked: {
+    icon: PanelBottom,
+    label: 'settings.selectionBarDocked',
+    descKey: 'settings.selectionBarDockedDesc',
+    section: 'general',
+    control: 'toggle',
+  },
+  // 选区浮动胶囊水平对齐(useSelectionBarMode.align):居中默认/靠左/靠右=默认停靠位,拖拽仍可覆盖。
+  selectionBarAlign: {
+    icon: AlignHorizontalJustifyCenter,
+    label: 'settings.selectionBarAlign',
+    descKey: 'settings.selectionBarAlignDesc',
+    section: 'general',
+    control: 'select',
+    options: [
+      { value: 'center', labelKey: 'settings.alignCenter' },
+      { value: 'left', labelKey: 'settings.alignLeft' },
+      { value: 'right', labelKey: 'settings.alignRight' },
+    ],
+  },
+  // 时间轴两项宽度:轴宽(.timeline-sidebar 列宽,决定密度带/条可见性)与滚动条 thumb 宽相互独立,
+  // 同置「界面」节紧挨字号(UI 尺度类),避免落在「缩略图」节难找(原 timelineScrollWidth 之误)。
+  timelineAxisWidth: {
+    icon: Map,
+    label: 'settings.timelineAxisWidth',
+    descKey: 'settings.timelineAxisDesc',
+    section: 'general',
+    control: 'number',
+    min: 32,
+    max: 80,
+  },
+  timelineScrollWidth: {
+    icon: Maximize,
+    label: 'settings.timelineScrollWidth',
+    descKey: 'settings.timelineScrollDesc',
+    section: 'general',
+    control: 'number',
+    min: 2,
+    max: 40,
+  },
+  scrollThumbMinHeight: {
+    icon: Rows3,
+    label: 'settings.scrollThumbMinHeight',
+    descKey: 'settings.scrollThumbMinHeightDesc',
+    section: 'general',
+    control: 'number',
+    min: 24,
+    max: 120,
+  },
+  // 轴视窗不透明度缩放(2026-07-24):时间轴/minimap 半透明拖动视窗共享,100=默认观感。
+  // 上限 200 保时间轴 color-mix 乘后 ≤100%(见 uiScale.applyAxisViewportOpacity)。
+  axisViewportOpacity: {
+    icon: Map,
+    label: 'settings.axisViewportOpacity',
+    descKey: 'settings.axisViewportOpacityDesc',
+    section: 'general',
+    control: 'number',
+    min: 20,
+    max: 200,
   },
   hoverScale: {
     icon: Maximize,
@@ -116,6 +307,15 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
     section: 'general',
     control: 'toggle',
   },
+  // 窗口化沉浸模式(2026-07-23):非全屏(且非查看器沉浸)时自动隐藏顶栏/底栏,鼠标移到窗口
+  // 边缘唤出。与 F11 全屏沉浸独立——不改全屏行为,只是把同一套“隐藏+唤出”机制挪进窗口态。
+  autoHideChromeWindowed: {
+    icon: Maximize,
+    label: 'settings.autoHideChromeWindowed',
+    descKey: 'settings.autoHideChromeWindowedDesc',
+    section: 'general',
+    control: 'toggle',
+  },
   closeBehavior: {
     icon: XSquare,
     label: 'settings.closeBehavior',
@@ -128,8 +328,50 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
       { value: 'exit', labelKey: 'settings.closeBehaviorExit' },
     ],
   },
+  // 查看器渲染色域(2026-07-23 自定义 ICC 与色域切换,方案 B §0⑤):仅作用大图查看器(ContentViewer),
+  // 桌面先行、移动端锁 sRGB(D-414,SettingsView 侧以 v-if="!isMobilePlatform" 隐藏本行 + 管理行)。
+  viewerColorTarget: {
+    icon: Palette,
+    label: 'settings.viewerColorTarget',
+    descKey: 'settings.viewerColorTargetDesc',
+    section: 'general',
+    control: 'select',
+    options: [
+      { value: 'srgb', labelKey: 'settings.viewerColorSrgb' },
+      { value: 'display-p3', labelKey: 'settings.viewerColorDisplayP3' },
+      { value: 'dci-p3', labelKey: 'settings.viewerColorDciP3' },
+      { value: 'custom', labelKey: 'settings.viewerColorCustom' },
+    ],
+  },
+  // 特例行:自定义 ICC 导入按钮 + 已导入列表(单选/删除),行体由 SettingsView 内嵌模板提供。
+  viewerIccManager: {
+    icon: Palette,
+    label: 'settings.viewerIccManager',
+    descKey: 'settings.viewerIccManagerDesc',
+    section: 'general',
+    control: 'custom',
+    customRow: true,
+  },
 
   /* ── 缩略图 thumbnails ────────────────────────────────────── */
+  showDragHandle: {
+    icon: GripVertical,
+    label: 'settings.showDragHandle',
+    descKey: 'settings.showDragHandleDesc',
+    section: 'thumbnails',
+    control: 'toggle',
+  },
+  minimapRenderMode: {
+    icon: Map,
+    label: 'settings.minimapRenderMode',
+    descKey: 'settings.minimapRenderModeDesc',
+    section: 'thumbnails',
+    control: 'select',
+    options: [
+      { value: 'colors', labelKey: 'settings.minimapRenderColors' },
+      { value: 'thumbnails', labelKey: 'settings.minimapRenderThumbnails' },
+    ],
+  },
   showThumbInfo: {
     icon: MessageSquare,
     label: 'settings.thumbInfoHover',
@@ -174,6 +416,16 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
     section: 'thumbnails',
     control: 'segmented',
   },
+  // WebP 编码质量:1..=99 有损,100=无损(encode_as_webp 契约);变更即复位存量重生成。
+  thumbWebpQuality: {
+    icon: Image,
+    label: 'settings.thumbWebpQuality',
+    descKey: 'settings.thumbWebpQualityDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 1,
+    max: 100,
+  },
   thumbSkipMaxKb: {
     icon: Shield,
     label: 'settings.thumbSkipMaxKb',
@@ -192,14 +444,14 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
     min: 100,
     max: 100000,
   },
-  timelineScrollWidth: {
-    icon: Map,
-    label: 'settings.timelineScrollWidth',
-    descKey: 'settings.timelineScrollDesc',
+  // 缓存占用统计(§3.3.3):后端 get_cache_stats 遍历缓存目录,分类目字节+文件数;
+  // 特例行=进入自动拉取一次 + 手动刷新按钮(遍历大缓存有秒级 IO,不做轮询)。
+  cacheStats: {
+    icon: Database,
+    label: 'settings.cacheStats',
     section: 'thumbnails',
-    control: 'number',
-    min: 2,
-    max: 40,
+    control: 'custom',
+    customRow: true,
   },
   fullThumbGen: {
     icon: Image,
@@ -225,6 +477,15 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
     descKey: 'settings.enableVideoKeyframesDesc',
     section: 'video',
     control: 'toggle',
+  },
+  videoDeriveGen: {
+    icon: Video,
+    label: 'settings.videoDeriveGen',
+    descKey: 'settings.videoDeriveGenDesc',
+    section: 'video',
+    control: 'custom',
+    // 特例行:视频封面/关键帧手动提取(增量/全量/停止 + 进度),镜像 fullThumbGen。
+    customRow: true,
   },
 
   /* ── AI 模型 aiModels ─────────────────────────────────────── */
@@ -265,20 +526,38 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
     ],
   },
 
-  /* ── 开发者工具 debug ─────────────────────────────────────── */
-  clearDb: {
-    icon: Database,
-    label: 'settings.clearDb',
-    descKey: 'settings.clearDbDesc',
+  /* ── 开发者工具 debug(非破坏性诊断项)──────────────────────── */
+  // 画廊 / 时间轴 DOM↔Canvas 渲染引擎(实验性):canvas 为原型,超大库 / iOS 会自动回退 DOM。
+  // 状态经 useRenderMode 共享单例(localStorage 持久),切换 live 生效。
+  performancePanel: {
+    icon: Gauge,
+    label: 'settings.performancePanel',
+    descKey: 'settings.performancePanelDesc',
     section: 'debug',
     control: 'button',
   },
-  clearSettings: {
-    icon: Settings,
-    label: 'settings.clearSettings',
-    descKey: 'settings.clearSettingsDesc',
+
+  galleryRenderMode: {
+    icon: Monitor,
+    label: 'settings.galleryRenderMode',
+    descKey: 'settings.galleryRenderModeDesc',
     section: 'debug',
-    control: 'button',
+    control: 'select',
+    options: [
+      { value: 'dom', labelKey: 'settings.renderModeDom' },
+      { value: 'canvas', labelKey: 'settings.renderModeCanvas' },
+    ],
+  },
+  timelineRenderMode: {
+    icon: Monitor,
+    label: 'settings.timelineRenderMode',
+    descKey: 'settings.timelineRenderModeDesc',
+    section: 'debug',
+    control: 'select',
+    options: [
+      { value: 'dom', labelKey: 'settings.renderModeDom' },
+      { value: 'canvas', labelKey: 'settings.renderModeCanvas' },
+    ],
   },
   logLevel: {
     icon: Terminal,
@@ -292,6 +571,7 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
       { value: 'info', labelKey: 'settings.logLevelInfo' },
       { value: 'warn', labelKey: 'settings.logLevelWarn' },
       { value: 'error', labelKey: 'settings.logLevelError' },
+      { value: 'off', labelKey: 'settings.logLevelOff' },
     ],
   },
   logDir: {
@@ -302,32 +582,78 @@ export const SETTINGS_MAP: Record<string, SettingSpec> = {
     // 特例行:描述=可点击路径,控件=换目录按钮。
     customRow: true,
   },
+  // 外置配置文件(config.toml,批次B):路径展示 + 用外部编辑器打开按钮。
+  configFile: {
+    icon: FileCog,
+    label: 'settings.configFile',
+    section: 'debug',
+    control: 'button',
+    // 特例行:描述=说明文案+当前路径,控件=打开编辑器按钮。
+    customRow: true,
+  },
+  // 独立日志窗口入口(日志能力重构 S4,方案 §5「设置区入口+独立日志窗口」)。
+  openLogWindow: {
+    icon: Terminal,
+    label: 'settings.openLogWindow',
+    descKey: 'settings.openLogWindowDesc',
+    section: 'debug',
+    control: 'button',
+  },
+  // 语义是纯前端 cache-busting 重载,不销毁任何数据——不归 danger(设计 §8.4:Error 只用于 destructive)。
+  clearBrowserCache: {
+    icon: RotateCcw,
+    label: 'settings.clearBrowserCache',
+    descKey: 'settings.clearBrowserCacheDesc',
+    section: 'debug',
+    control: 'button',
+  },
+
+  /* ── 危险操作 danger(设计 §7.2:破坏性项不与普通设置混排;行序=破坏性递增,清库最后)── */
   clearAllThumbnails: {
     icon: Trash2,
     label: 'settings.clearAllThumbnails',
     descKey: 'settings.clearAllThumbnailsDesc',
-    section: 'debug',
-    control: 'button',
-  },
-  clearBrowserCache: {
-    icon: Trash2,
-    label: 'settings.clearBrowserCache',
-    descKey: 'settings.clearBrowserCacheDesc',
-    section: 'debug',
+    section: 'danger',
     control: 'button',
   },
   clearLogs: {
     icon: Trash2,
     label: 'settings.clearLogs',
     descKey: 'settings.clearLogsDesc',
-    section: 'debug',
+    section: 'danger',
     control: 'button',
   },
+  clearSettings: {
+    icon: Settings,
+    label: 'settings.clearSettings',
+    descKey: 'settings.clearSettingsDesc',
+    section: 'danger',
+    control: 'button',
+  },
+  clearDb: {
+    icon: Database,
+    label: 'settings.clearDb',
+    descKey: 'settings.clearDbDesc',
+    section: 'danger',
+    control: 'button',
+  },
+} satisfies Record<string, SettingSpec>
+
+/** 注册表的合法键联合(P1-20):props / 绑定表用它替代宽 string,拼错键即编译期红。 */
+export type SettingKey = keyof typeof SETTINGS_MAP
+
+/**
+ * 按运行时字符串键安全检索(P1-20):键可能来自持久化的置顶列表(可含已废弃键),
+ * 故返回 `SettingSpec | undefined`——消费方必须判空,杜绝原先 `SETTINGS_MAP[typo].label`
+ * 的运行时 `undefined.label` 崩溃。编译期已知键的场景直接用 `SETTINGS_MAP[key as SettingKey]`。
+ */
+export function getSettingSpec(key: string): SettingSpec | undefined {
+  return (SETTINGS_MAP as Record<string, SettingSpec>)[key]
 }
 
 /** 分区内的行键序列(=注册表插入顺序)。SettingsView 各卡片由此驱动逐行渲染。 */
-export function sectionSettingKeys(section: SettingsSection): string[] {
-  return Object.entries(SETTINGS_MAP)
+export function sectionSettingKeys(section: SettingsSection): SettingKey[] {
+  return (Object.entries(SETTINGS_MAP) as [SettingKey, SettingSpec][])
     .filter(([, spec]) => spec.section === section)
     .map(([key]) => key)
 }

@@ -1,0 +1,7 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema/acl/capability.json",
+  "identifier": "logs-window",
+  "description": "Minimal capability for the standalone log viewer window (S4, 日志能力重构方案 §5/§9.1 #8);allow-app-commands 同为构建期生成(日志窗口要读日志/导出诊断等 app 命令)",
+  "windows": ["logs"],
+  "permissions": ["core:default", "allow-app-commands"]
+}

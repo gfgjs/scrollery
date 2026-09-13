@@ -1,157 +1,113 @@
 <template>
+  <!-- 分离(浮动,默认):可拖胶囊。仅非 docked 时渲染。
+       §8.1 browse-only:重复镜头激活(forceHidden)时显式阻断——两形态显隐条件共同置 false。
+       宿主不 v-if 卸载本组件:卸载/重挂会让 onActivated/onDeactivated 的 hostActive 生命周期
+       错拍(镜头期失活再激活,docked Teleport 门控失灵),保持挂载、纯隐显最稳。 -->
   <Transition name="slide-up">
-    <div v-if="selection.isSelectionMode.value" class="selection-toolbar-wrapper">
+    <div
+      v-if="selection.isSelectionMode.value && !mode.docked.value && !forceHidden"
+      ref="wrapperEl"
+      class="selection-toolbar-wrapper"
+      :class="`selection-toolbar-wrapper--${mode.align.value}`"
+    >
       <div
+        ref="pillEl"
         class="selection-toolbar"
         :class="{ 'is-dragging': isDragging }"
         :style="{ transform: `translate(${offsetX}px, ${offsetY}px)` }"
       >
-        <div class="drag-handle" @pointerdown="onDragStart" :title="$t('selection.drag')">
+        <div class="drag-handle" :title="$t('selection.drag')" @pointerdown="onDragStart">
           <GripVertical :size="16" />
         </div>
-        <div class="selection-toolbar__left">
-          <span class="selection-count">
-            {{ $t('selection.selected', { count: selection.selectedCount.value }) }}
-          </span>
-        </div>
-        <div class="selection-toolbar__actions">
-          <button
-            class="selection-action"
-            @click="$emit('select-all')"
-            :data-tooltip="$t('common.selectAll')"
-            :aria-label="$t('common.selectAll')"
-          >
-            <CheckSquare :size="18" />
-          </button>
-          <button
-            class="selection-action"
-            @click="$emit('invert-selection')"
-            :data-tooltip="$t('selection.invert')"
-            :aria-label="$t('selection.invert')"
-          >
-            <CopyMinus :size="18" />
-          </button>
-          <button
-            class="selection-action"
-            @click="$emit('batch-favorite')"
-            :data-tooltip="$t('selection.favorite')"
-            :aria-label="$t('selection.favorite')"
-          >
-            <Heart :size="18" />
-          </button>
-          <button
-            class="selection-action"
-            @click="$emit('batch-unfavorite')"
-            :data-tooltip="$t('selection.unfavorite')"
-            :aria-label="$t('selection.unfavorite')"
-          >
-            <HeartOff :size="18" />
-          </button>
-          <!-- 加入收藏夹（T21）：把选区加入用户收藏夹（复用收藏后的 chips 提示选夹/新建）。 -->
-          <button
-            class="selection-action"
-            @click="$emit('add-to-collection')"
-            :data-tooltip="$t('selection.addToCollection')"
-            :aria-label="$t('selection.addToCollection')"
-          >
-            <FolderPlus :size="18" />
-          </button>
-          <!-- 批量颜色标签（T16）：点色块给选区设色，Ban 清除。:allow-clear=false 因每点即设
-               （无单一"当前色"可 toggle-off）；清除走独立 Ban 按钮 emit batch-color(0)。 -->
-          <ColorLabelPicker
-            class="toolbar-colors"
-            :model-value="0"
-            :size="16"
-            :allow-clear="false"
-            @change="(v: number) => $emit('batch-color', v)"
-          />
-          <button
-            class="selection-action"
-            @click="$emit('batch-color', 0)"
-            :data-tooltip="$t('selection.clearColor')"
-            :aria-label="$t('selection.clearColor')"
-          >
-            <Ban :size="18" />
-          </button>
-          <button
-            class="selection-action selection-action--danger"
-            @click="$emit('batch-delete')"
-            :data-tooltip="$t('selection.delete')"
-            :aria-label="$t('selection.delete')"
-          >
-            <Trash2 :size="18" />
-          </button>
-          <div class="divider"></div>
-          <button
-            class="selection-action"
-            @click="$emit('batch-move')"
-            :data-tooltip="$t('common.moveTo')"
-            :aria-label="$t('common.moveTo')"
-          >
-            <FolderInput :size="18" />
-          </button>
-          <button
-            class="selection-action"
-            @click="$emit('batch-copy')"
-            :data-tooltip="$t('common.copyTo')"
-            :aria-label="$t('common.copyTo')"
-          >
-            <Copy :size="18" />
-          </button>
-          <div class="divider"></div>
-          <button
-            class="selection-action"
-            @click="selection.clearSelection()"
-            :data-tooltip="$t('selection.cancel')"
-            :aria-label="$t('selection.cancel')"
-          >
-            <X :size="18" />
-          </button>
-        </div>
+        <!-- 动作簇(计数 + 折叠命令流 + ⋯ 溢出菜单 + 停靠切换 + ✕)抽入 SelectionActions;浮动壳只余拖拽手柄。
+             docked 壳复用同一 SelectionActions(variant='docked'),两实例各自持折叠引擎。 -->
+        <SelectionActions :commands="commands" variant="floating" />
       </div>
     </div>
   </Transition>
+
+  <!-- 合并(docked):把动作簇 Teleport 进状态栏 outlet。Teleport 只搬 DOM 不搬组件层级——9 个批量 handler
+       原地留 MediaGrid,组件层级/事件链/依赖注入全不变(§3.2)。
+       gate 含 isSelectionMode(挂载期选区必空 → Teleport 不求值目标;用户首次进选区时状态栏早就位,勿改
+       成挂载期常驻渲染)+ kaActive(MediaGrid 被 KeepAlive deactivate 时,teleported DOM 逃逸出缓存子树
+       不会随之摘除 → 显式守卫卸载,防 docked 条在查看器里残留)+ forceHidden(§8.1 browse-only:
+       重复镜头显式阻断批量工具条)。 -->
+  <Teleport
+    v-if="selection.isSelectionMode.value && mode.docked.value && mode.hostActive.value && !forceHidden"
+    to="#statusbar-selection-outlet"
+  >
+    <SelectionActions :commands="commands" variant="docked" />
+  </Teleport>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
-import {
-  Heart,
-  HeartOff,
-  Trash2,
-  X,
-  CheckSquare,
-  CopyMinus,
-  GripVertical,
-  FolderInput,
-  FolderPlus,
-  Copy,
-  Ban,
-} from '@lucide/vue'
-import ColorLabelPicker from '../common/ColorLabelPicker.vue'
+import { ref, watch, nextTick, onMounted, onActivated, onBeforeUnmount, onDeactivated } from 'vue'
+import { GripVertical } from '@lucide/vue'
+import SelectionActions from './SelectionActions.vue'
 import { useSelection } from '../../composables/useSelection'
+import { useSelectionBarMode, clampOffset } from '../../composables/useSelectionBarMode'
+import type { SelectionCommand } from '../../types/selectionCommand'
 
-defineEmits<{
-  (e: 'batch-favorite'): void
-  (e: 'batch-unfavorite'): void
-  (e: 'add-to-collection'): void
-  (e: 'batch-delete'): void
-  (e: 'batch-move'): void
-  (e: 'batch-copy'): void
-  (e: 'batch-color', value: number): void
-  (e: 'select-all'): void
-  (e: 'invert-selection'): void
-}>()
+// 动作数据驱动化(C1):MediaGrid 组装 SelectionCommand[] 传入,原样转交 SelectionActions。
+withDefaults(
+  defineProps<{
+    commands: SelectionCommand[]
+    /** 重复镜头 browse-only(§8.1):激活时显式阻断两形态的批量工具条显隐。 */
+    forceHidden?: boolean
+  }>(),
+  { forceHidden: false },
+)
 
 const selection = useSelection()
+// 分离/合并形态单例(设置页开关 + 条上切换钮同源)。
+const mode = useSelectionBarMode()
 
-const offsetX = ref(0)
-const offsetY = ref(0)
+// KeepAlive 守卫:MediaGrid 被保活,进查看器时 deactivate。docked 形态经 Teleport 逃逸到状态栏,不随
+// MediaGrid 缓存子树摘除 → 用 hostActive 显式卸载(初值 true 兼容非 KeepAlive 上下文)。写入共享单例,
+// 使 AppStatusBar 的 info 让位与本 Teleport gate 同条件同步(防「选区残留进查看器」时 outlet 空白)。
+onActivated(() => {
+  mode.setHostActive(true)
+})
+onDeactivated(() => {
+  mode.setHostActive(false)
+})
+
+// 拖拽位置持久化(C4):live 位移用本地 offsetX/Y 驱动 transform(拖拽期每帧更新,不落库);
+// 初值取持久化 offset(useSelectionBarMode 单例,localStorage 支撑),拖拽结束/恢复/resize 时钳制并回写。
+const wrapperEl = ref<HTMLElement | null>(null)
+const pillEl = ref<HTMLElement | null>(null)
+const offsetX = ref(mode.offset.value.x)
+const offsetY = ref(mode.offset.value.y)
 const isDragging = ref(false)
 let startX = 0
 let startY = 0
 let initOffsetX = 0
 let initOffsetY = 0
+
+/**
+ * 把当前 live offset 钳到「胶囊完整可见且手柄可达」范围并回写持久化。三时机调用:恢复(条出现)/
+ * 拖拽结束/窗口 resize。边界=胶囊定位上下文(.selection-toolbar-wrapper 的 offsetParent=
+ * .media-grid-layout);拖拽中不钳(勿与手势互搏)。
+ */
+function clampToBounds() {
+  if (isDragging.value) return
+  const pill = pillEl.value
+  const bounds = wrapperEl.value?.offsetParent as HTMLElement | null
+  if (!pill || !bounds) return
+  const clamped = clampOffset(
+    { x: offsetX.value, y: offsetY.value },
+    { width: pill.offsetWidth, height: pill.offsetHeight },
+    { width: bounds.clientWidth, height: bounds.clientHeight },
+    // 传当前对齐:靠左/靠右的静止基位非居中,可拖范围随之非对称(靠左几乎只能右移)。
+    mode.align.value,
+  )
+  offsetX.value = clamped.x
+  offsetY.value = clamped.y
+  // 仅在钳制真的改变了值时回写,避免无谓的 localStorage 写。
+  if (clamped.x !== mode.offset.value.x || clamped.y !== mode.offset.value.y) {
+    mode.setOffset(clamped)
+  }
+}
 
 function onDragStart(e: PointerEvent) {
   // Ignore right clicks
@@ -183,19 +139,41 @@ function onDragEnd(e: PointerEvent) {
   target.removeEventListener('pointerup', onDragEnd)
   target.removeEventListener('pointercancel', onDragEnd)
   target.releasePointerCapture(e.pointerId)
+  // 拖拽结束:钳制并持久化(不再退出选区即复位——持久化语义与 reset-on-exit 互斥,有意的行为变更)。
+  clampToBounds()
 }
 
-// Reset position when selection mode is exited
-import { watch } from 'vue'
+// 恢复:条出现时(选区态且非 docked)钳制持久化位置——防「大窗口拖到角落 → 小窗口打开后条在屏外失踪」。
 watch(
-  () => selection.isSelectionMode.value,
-  (newVal) => {
-    if (!newVal) {
-      offsetX.value = 0
-      offsetY.value = 0
-    }
+  () => selection.isSelectionMode.value && !mode.docked.value,
+  (visible) => {
+    if (visible) nextTick(clampToBounds)
+  },
+  { immediate: true },
+)
+
+// 对齐变更(用户裁决:对齐=默认位、拖拽仍可覆盖):切对齐即清空旧拖拽偏移——否则基位一变,旧 offset 会把
+// 胶囊推到意料外甚至屏外。回到该对齐的静止基位(offset=0),下一 tick 再钳一次兜底。
+watch(
+  () => mode.align.value,
+  () => {
+    offsetX.value = 0
+    offsetY.value = 0
+    if (mode.offset.value.x !== 0 || mode.offset.value.y !== 0) mode.setOffset({ x: 0, y: 0 })
+    nextTick(clampToBounds)
   },
 )
+
+// resize:窗口尺寸变化时重新钳制(条可见期恒挂监听,拖拽中由 clampToBounds 自身跳过)。
+function onWindowResize() {
+  clampToBounds()
+}
+onMounted(() => {
+  window.addEventListener('resize', onWindowResize)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onWindowResize)
+})
 </script>
 
 <style scoped>
@@ -206,30 +184,50 @@ watch(
   right: 0;
   display: flex;
   justify-content: center;
+  /* 靠左/靠右时胶囊距边界的呼吸(与 useSelectionBarMode 的 SELECTION_BAR_SIDE_INSET=12 同源,
+     clampOffset 据此算左/右对齐的静止基位 baseLeft);居中对齐对称留白不受影响。 */
+  padding-inline: 12px;
   z-index: 200;
   pointer-events: none; /* Let clicks pass through outside toolbar */
 }
-
-.selection-toolbar {
-  pointer-events: auto; /* Enable clicks on the toolbar itself */
-  width: max-content;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 8px 16px 8px 8px; /* Less padding on left because of drag handle */
-  background: color-mix(in srgb, var(--color-bg-surface) 90%, transparent);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  color: var(--color-text-primary);
-  border: 1px solid var(--color-border);
-  border-radius: 99px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+/* 胶囊水平对齐(新需求 2):对齐=默认停靠位,拖拽 transform 叠加其上(改对齐时 watch 清空旧偏移)。
+   变体类在基类之后 → 覆盖基类的 center;靠左/靠右时窗口收窄先吃 justify 留白、后折叠。 */
+.selection-toolbar-wrapper--center {
+  justify-content: center;
+}
+.selection-toolbar-wrapper--left {
+  justify-content: flex-start;
+}
+.selection-toolbar-wrapper--right {
+  justify-content: flex-end;
 }
 
-.selection-count {
-  font-size: 14px;
-  font-weight: 600;
-  white-space: nowrap;
+/* 可用宽探针帧(round10 #3 修复):SelectionActions.measureAvailable 同步给胶囊加此类, 使其从内容宽撑到
+   max-width 上限, 内部折叠流才读得到真可用宽。
+   为何非撑胶囊不可:flex-grow 只瓜分**自身 flex 容器**内的自由空间、**不向上传导**。折叠流(flow)在
+   .selection-actions 内, 而 .selection-actions 的宽由这个内容宽胶囊决定——命令一折起胶囊就缩、自由空间
+   归零, 只给 flow 加 flex-grow 读回的仍是折叠后的内容宽 → 折叠自锁棘轮(窄窗折叠后拉宽不回弹)。
+   同步加/去类、不经 paint(见 SelectionActions.measureAvailable)。 */
+.selection-toolbar.is-probing-width {
+  flex-grow: 1;
+}
+
+/* 胶囊:max-width 封顶(而非 width:max-content)——使内部 SelectionActions 的折叠流成为可收缩区,
+   窄窗口时命令折入 ⋯ 菜单(§3.4 宽度约束链)。24px 让出左右各 12px 视觉呼吸。 */
+.selection-toolbar {
+  pointer-events: auto; /* Enable clicks on the toolbar itself */
+  max-width: calc(100% - 24px);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md) var(--spacing-sm) var(--spacing-sm);
+  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--material-recipe-float-border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--material-recipe-float-box-shadow);
+  backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  color: var(--color-text-primary);
 }
 
 .drag-handle {
@@ -239,8 +237,11 @@ watch(
   color: var(--color-text-secondary);
   cursor: grab;
   padding: 4px;
+  flex-shrink: 0;
   border-radius: var(--radius-sm);
-  transition: all var(--transition-fast);
+  transition:
+    background-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .drag-handle:hover {
@@ -254,91 +255,14 @@ watch(
 
 .selection-toolbar.is-dragging {
   transition: none; /* disable transition while dragging */
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.3);
-}
-
-.selection-toolbar__actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-/* 批量色块在动作条里垂直居中，与圆形动作按钮对齐。 */
-.toolbar-colors {
-  align-self: center;
-}
-
-.selection-action {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--color-text-primary);
-  border: none;
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-
-.selection-action:hover {
-  background: var(--color-bg-hover);
-}
-
-.selection-action--danger {
-  color: var(--color-error);
-}
-
-.selection-action--danger:hover {
-  background: var(--color-error);
-  color: #fff;
-}
-
-/* ── Custom CSS Tooltip ──────────────────────────────────────────────── */
-[data-tooltip] {
-  position: relative;
-}
-
-[data-tooltip]::after {
-  content: attr(data-tooltip);
-  position: absolute;
-  bottom: calc(100% + 10px);
-  left: 50%;
-  transform: translateX(-50%) translateY(4px);
-  padding: 6px 10px;
-  background: var(--color-bg-elevated);
-  color: var(--color-text-primary);
-  font-size: 12px;
-  font-weight: 500;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--color-border);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  visibility: hidden;
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-  z-index: 1000;
-}
-
-[data-tooltip]:hover::after {
-  opacity: 1;
-  visibility: visible;
-  transform: translateX(-50%) translateY(0);
-}
-
-.divider {
-  width: 1px;
-  height: 20px;
-  background: var(--color-border);
-  margin: 0 4px;
+  box-shadow: var(--material-recipe-float-box-shadow);
 }
 
 .slide-up-enter-active,
 .slide-up-leave-active {
-  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  transition:
+    transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .slide-up-enter-from,
 .slide-up-leave-to {

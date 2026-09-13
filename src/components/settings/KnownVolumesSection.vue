@@ -1,6 +1,4 @@
-<!-- src/components/settings/KnownVolumesSection.vue -->
 <!-- 已知卷面板（Part5 T13 §3.7 离线 UX）：列出应用登记的物理卷（在线态 + 媒体数）+ 重命名 / 忘记。 -->
-<!-- Known-volumes panel (Part5 T13): list registered volumes with online state, rename, forget. -->
 <template>
   <CollapsibleCard id="knownVolumes" :title="$t('settings.volTitle')">
     <div class="kv-intro">{{ $t('settings.volIntro') }}</div>
@@ -44,7 +42,7 @@
           <button
             class="kv-btn"
             :title="$t('settings.volRename')"
-            :aria-label="$t('settings.volRename')"
+
             @click="startRename(v)"
           >
             <Pencil :size="14" />
@@ -52,7 +50,7 @@
           <button
             class="kv-btn kv-btn--danger"
             :title="$t('settings.volForget')"
-            :aria-label="$t('settings.volForget')"
+
             @click="onForget(v)"
           >
             <Trash2 :size="14" />
@@ -70,13 +68,13 @@ import { useI18n } from 'vue-i18n'
 
 import CollapsibleCard from './CollapsibleCard.vue'
 import { useKnownVolumes, type VolumeInfo } from '../../composables/useKnownVolumes'
-import { useUiStore } from '../../stores/uiStore'
+import { useToastStore } from '../../stores/toastStore'
 import { useConfirm } from '../../composables/useConfirm'
 import type { IpcError } from '../../utils/ipc'
 
 const { t } = useI18n()
 const vol = useKnownVolumes()
-const ui = useUiStore()
+const toast = useToastStore()
 const { confirm } = useConfirm()
 
 const editingId = ref<number | null>(null)
@@ -116,9 +114,9 @@ async function submitRename(id: number) {
   if (!name) return // 空名不提交（后端亦拒）
   try {
     await vol.rename(id, name)
-    ui.addToast('success', t('settings.volRenamed'))
+    toast.addToast('success', t('settings.volRenamed'))
   } catch (e) {
-    ui.addToast('error', t('settings.volOpFailedCode', { code: (e as IpcError)?.code ?? e }))
+    toast.addToast('error', t('settings.volOpFailedCode', { code: (e as IpcError)?.code ?? e }))
   }
 }
 
@@ -131,9 +129,9 @@ async function onForget(v: VolumeInfo) {
   if (!confirmed) return
   try {
     await vol.forget(v.id)
-    ui.addToast('success', t('settings.volForgotten'))
+    toast.addToast('success', t('settings.volForgotten'))
   } catch (e) {
-    ui.addToast('error', t('settings.volOpFailedCode', { code: (e as IpcError)?.code ?? e }))
+    toast.addToast('error', t('settings.volOpFailedCode', { code: (e as IpcError)?.code ?? e }))
   }
 }
 </script>
@@ -224,7 +222,7 @@ async function onForget(v: VolumeInfo) {
 }
 .kv-badge--kind {
   background: var(--color-accent);
-  color: #fff;
+  color: var(--color-text-on-accent);
 }
 .kv-item__actions {
   display: flex;
@@ -247,7 +245,7 @@ async function onForget(v: VolumeInfo) {
   color: var(--color-text-primary);
 }
 .kv-btn--danger:hover {
-  color: #ff6b6b;
-  background: rgba(255, 107, 107, 0.12);
+  color: var(--color-error);
+  background: var(--color-error-subtle);
 }
 </style>

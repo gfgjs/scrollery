@@ -1,0 +1,174 @@
+{
+  "version": 1,
+  "ortVersion": "1.26.0",
+  "ffmpegSourceVersion": "2aefd64d48",
+  "btbnBuildRevision": "8c736b2",
+  "graphvizVersion": "2.40.1",
+  "vizjsVersion": "2.1.2",
+  "luteVersion": "1.7.6",
+  "spdxVersion": "v3.27.0",
+  "vendoredArtifacts": [
+    {
+      "id": "graphviz-full-render",
+      "component": "graphviz",
+      "path": "public/vditor/dist/js/graphviz/full.render.js",
+      "size": 1979941,
+      "sha256": "9e49a783fb9ad41d0ba3ca6e6c424e712eaa5e25562eb2c6cff102e6d586b9c4",
+      "versionMarker": "Viz.js 2.1.2 (Graphviz 2.40.1, Expat 2.2.5, Emscripten 1.37.36)"
+    },
+    {
+      "id": "graphviz-viz",
+      "component": "graphviz",
+      "path": "public/vditor/dist/js/graphviz/viz.js",
+      "size": 11468,
+      "sha256": "f111f22be005ceaf625f06c5a36ba7aa27703dbc0753914559edd1c24715b6e5",
+      "versionMarker": "Viz.js 2.1.2 (Graphviz 2.40.1"
+    },
+    {
+      "id": "lute-min",
+      "component": "lute",
+      "path": "public/vditor/dist/js/lute/lute.min.js",
+      "size": 3739251,
+      "sha256": "8e7a18344afd870f195248f5de189b9e130b53b991470cb171f788d8908bafc9",
+      "versionMarker": "new $String(\"1.7.6\")"
+    }
+  ],
+  "sources": [
+    {
+      "id": "onnxruntime-license",
+      "kind": "onnxruntime",
+      "target": "onnxruntime/LICENSE",
+      "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.26.0/LICENSE",
+      "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c"
+    },
+    {
+      "id": "onnxruntime-third-party-notices",
+      "kind": "onnxruntime",
+      "target": "onnxruntime/ThirdPartyNotices.txt",
+      "url": "https://raw.githubusercontent.com/microsoft/onnxruntime/v1.26.0/ThirdPartyNotices.txt",
+      "sha256": "0e07b95f3a8d6230037707c5c4a2b554d12c4cb67369669ac255635528ffcee2"
+    },
+    {
+      "id": "ffmpeg-license",
+      "kind": "ffmpeg",
+      "target": "ffmpeg/LICENSE.md",
+      "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/2aefd64d48/LICENSE.md",
+      "sha256": "cb48bf09a11f5fb576cddb0431c8f5ed0a60157a9ec942adffc13907cbe083f2"
+    },
+    {
+      "id": "ffmpeg-copying-lgplv2.1",
+      "kind": "ffmpeg",
+      "target": "ffmpeg/COPYING.LGPLv2.1",
+      "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/2aefd64d48/COPYING.LGPLv2.1",
+      "sha256": "246041b6ecf9bc32d718a62c57877c78b5eb397b6467e74ed7ae2626ab189c30"
+    },
+    {
+      "id": "btbn-license",
+      "kind": "ffmpeg",
+      "target": "ffmpeg/BtbN-LICENSE",
+      "url": "https://raw.githubusercontent.com/BtbN/FFmpeg-Builds/8c736b2/LICENSE",
+      "sha256": "c1b3cc7eec42bd9c4f6247169bb887b4a9bc904abfd2a7f7f9231ed357844993"
+    },
+    {
+      "id": "graphviz-license",
+      "kind": "graphviz",
+      "target": "graphviz/Graphviz-2.40.1-LICENSE.txt",
+      "url": "https://gitlab.com/graphviz/graphviz/-/raw/2.40.1/LICENSE",
+      "sha256": "cc07bd2bd6ba843a9a2865ed891d5a3b5835a64bab6fa90945403ee53965d46f"
+    },
+    {
+      "id": "vizjs-license",
+      "kind": "graphviz",
+      "target": "graphviz/Viz.js-2.1.2-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/mdaines/viz.js/v2.1.2/LICENSE",
+      "sha256": "b9a0b3fcb35b2b675f3a199c31eb19edd1dec3aa08687be4fb0d317e865e35cd"
+    },
+    {
+      "id": "lute-license",
+      "kind": "lute",
+      "target": "lute/Lute-1.7.6-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/88250/lute/v1.7.6/LICENSE",
+      "sha256": "5a36a4ef787bb02ae700b92030d98411736c5ec3879b75b03fa839b415d1b7d0"
+    },
+    {
+      "id": "Apache-2.0",
+      "kind": "spdx",
+      "licenseId": "Apache-2.0",
+      "target": "spdx/Apache-2.0.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/Apache-2.0.txt",
+      "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff"
+    },
+    {
+      "id": "BSD-2-Clause",
+      "kind": "spdx",
+      "licenseId": "BSD-2-Clause",
+      "target": "spdx/BSD-2-Clause.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/BSD-2-Clause.txt",
+      "sha256": "f32fb3b417a194167cfad068223fc975ba96c5960513a10f66a3c28720aec1df"
+    },
+    {
+      "id": "BSD-3-Clause",
+      "kind": "spdx",
+      "licenseId": "BSD-3-Clause",
+      "target": "spdx/BSD-3-Clause.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/BSD-3-Clause.txt",
+      "sha256": "5a93d5831e1297ab10fe643e1a631e83be392896da14ee2951285a79012df69d"
+    },
+    {
+      "id": "BSL-1.0",
+      "kind": "spdx",
+      "licenseId": "BSL-1.0",
+      "target": "spdx/BSL-1.0.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/BSL-1.0.txt",
+      "sha256": "84c6ef3ea9e3254a54d0acf5d3e0c61ae011b8fef7dd6940591cf060e6380a8f"
+    },
+    {
+      "id": "EPL-1.0",
+      "kind": "spdx",
+      "licenseId": "EPL-1.0",
+      "target": "spdx/EPL-1.0.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/EPL-1.0.txt",
+      "sha256": "f3d8dc494be2e7ea9cd31ac2fb902e35dce7ff8181b9b30d05861b47c339cb25"
+    },
+    {
+      "id": "MIT",
+      "kind": "spdx",
+      "licenseId": "MIT",
+      "target": "spdx/MIT.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/MIT.txt",
+      "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+    },
+    {
+      "id": "MPL-2.0",
+      "kind": "spdx",
+      "licenseId": "MPL-2.0",
+      "target": "spdx/MPL-2.0.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/MPL-2.0.txt",
+      "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+    },
+    {
+      "id": "MulanPSL-2.0",
+      "kind": "spdx",
+      "licenseId": "MulanPSL-2.0",
+      "target": "spdx/MulanPSL-2.0.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/MulanPSL-2.0.txt",
+      "sha256": "eb7a1d713eb919b146787629e22e4c975cb701f529a65d4d7e0fcd417558bf1c"
+    },
+    {
+      "id": "Unlicense",
+      "kind": "spdx",
+      "licenseId": "Unlicense",
+      "target": "spdx/Unlicense.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/Unlicense.txt",
+      "sha256": "0bdebfeda07d45dada625ae1317c6f833186e798b171d0db640bcf32e92a8240"
+    },
+    {
+      "id": "Zlib",
+      "kind": "spdx",
+      "licenseId": "Zlib",
+      "target": "spdx/Zlib.txt",
+      "url": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/Zlib.txt",
+      "sha256": "bfb1112d49db5b1daecdfef24bd7e2f3ea0bafb33aa67aa0ab51e2bf8407c03d"
+    }
+  ]
+}

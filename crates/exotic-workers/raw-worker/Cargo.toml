@@ -1,0 +1,38 @@
+# crates/exotic-workers/raw-worker/Cargo.toml
+# RAW 缩略图 Worker（RAW 支持线 阶段 C）。长驻子进程：stdin 收协议帧、stdout 回协议帧、stderr 写日志。
+# 一期仅提取厂商嵌入预览（JPEG）+ 缩放/转码，**不做完整 demosaic**（D-430）。
+#
+# 🔴 rsraw 的 build.rs（经 rsraw-sys，vendored LibRaw C++）在 MSVC 下 panic!("MSVC is not supported")，
+#    故本 crate 只能用 --target x86_64-pc-windows-gnu 编译，绝不可能在默认 msvc 工具链下编译。
+# 🔴 因此本 crate 刻意**不**加入根 Cargo.toml 的 workspace members：加入会在默认
+#    `cargo build`（msvc host）时把整个 workspace 拖进 MSVC panic。用下面这个空
+#    `[workspace]` 表把本 crate 从父 workspace 摘出，独立构建/运行（与 raw-probe 同法）。
+
+[workspace]
+
+[package]
+name = "raw-worker"
+version = "0.1.0"
+edition = "2021"
+# 第一方许可(2026-09-14 决议):本 crate 独立 workspace,不继承根 [workspace.package],故显式声明。
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "raw-worker"
+path = "src/main.rs"
+
+[dependencies]
+# 共享协议（路径依赖；两端同一份帧/消息/错误码定义）。
+exotic-protocol = { path = "../../exotic-protocol" }
+# 候选 RAW 解码器：vendored LibRaw C++ 包装。精确锁定版本，升级须重跑探针
+# （见 crates/exotic-workers/raw-probe）。
+rsraw = "=0.1.1"
+# 后处理：嵌入预览（通常 JPEG）解码 + 缩放 + WebP 编码（与主程序 src-tauri 同系 0.25）。
+image = { version = "=0.25.10", default-features = false, features = ["webp", "jpeg"] }
+# stderr 日志行协议（emit_stderr_log 的 fields 形参为 serde_json::Map<String, Value>）。
+serde_json = "1"
+
+# [profile.release] 已上移 workspace 根（../../../Cargo.toml）：member 内 profile 被 cargo 忽略。
+# 本 crate 已用空 [workspace] 表脱离父 workspace，故根 profile 对本 crate 不生效，采 cargo 默认
+# release profile（默认 unwind、非 abort），顶层 catch_unwind 拦截 FFI/解码 panic 的语义不受影响。

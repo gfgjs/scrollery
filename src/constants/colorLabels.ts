@@ -8,7 +8,7 @@ import i18n from '../i18n'
 export interface ColorLabel {
   /** 档位 1-7（0 保留为「未标」，不在此表）。 */
   value: number
-  /** 展示名的 i18n 键（渲染点经 t() 取词，用于 tooltip / 无障碍标签）。 */
+  /** 展示名的 i18n 键（渲染点经 t() 取词，用于 tooltip）。 */
   name: string
   /** 显示色（swatch / 网格色条）。 */
   hex: string

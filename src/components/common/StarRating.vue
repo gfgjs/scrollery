@@ -2,7 +2,7 @@
   <!-- 鼠标移出整组 → 取消 hover 预览，回落到 modelValue。 -->
   <div
     class="star-rating"
-    :class="{ 'star-rating--readonly': readonly }"
+    :class="{ 'star-rating--readonly': readonly, 'star-rating--rating': tone === 'rating' }"
     @mouseleave="hoverValue = 0"
   >
     <button
@@ -12,7 +12,7 @@
       class="star-rating__star"
       :class="{ filled: n <= displayValue }"
       :disabled="readonly"
-      :aria-label="t('common.nStars', { n })"
+
       @mouseenter="onHover(n)"
       @click="onClick(n)"
     >
@@ -25,10 +25,7 @@
 // 可复用星级控件：既用于评分录入（点星打分、点当前值清零），也用于"≥N 星"筛选。
 // 单一职责、纯展示+交互，不内嵌任何 IPC/store——副作用由父层经 v-model / change 处理。
 import { ref, computed } from 'vue'
-import { useI18n } from 'vue-i18n'
 import { Star } from '@lucide/vue'
-
-const { t } = useI18n()
 
 const props = withDefaults(
   defineProps<{
@@ -42,8 +39,10 @@ const props = withDefaults(
     readonly?: boolean
     /** 允许"点当前值清零"（评分清空 / 筛选取消"≥N"）。默认开。 */
     allowClear?: boolean
+    /** 评分语义色只在媒体深底使用;普通工具栏/筛选控件沿用主题 accent。 */
+    tone?: 'accent' | 'rating'
   }>(),
-  { max: 5, size: 18, readonly: false, allowClear: true },
+  { max: 5, size: 18, readonly: false, allowClear: true, tone: 'accent' },
 )
 
 const emit = defineEmits<{
@@ -88,10 +87,16 @@ function onClick(n: number) {
   transition: color var(--transition-fast);
 }
 .star-rating__star.filled {
-  color: #ffc107;
+  color: var(--color-accent-text);
 }
 .star-rating:not(.star-rating--readonly) .star-rating__star:hover {
-  color: #ffd54f;
+  color: var(--color-accent-hover);
+}
+.star-rating--rating .star-rating__star.filled {
+  color: var(--color-rating-amber);
+}
+.star-rating--rating:not(.star-rating--readonly) .star-rating__star:hover {
+  color: var(--color-rating-amber);
 }
 .star-rating--readonly .star-rating__star {
   cursor: default;

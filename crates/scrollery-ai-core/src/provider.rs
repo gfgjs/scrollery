@@ -1,25 +1,22 @@
 // crates/scrollery-ai-core/src/provider.rs
-//! AI hardware provider detection and selection.
 //! AI 硬件加速后端探测与选择。
 //!
-//! Detection order: DirectML → CUDA → CoreML → OpenVINO → CPU
 //! 探测顺序：DirectML → CUDA → CoreML → OpenVINO → CPU
 
 use serde::{Deserialize, Serialize};
-/// Supported AI execution providers.
 /// 支持的 AI 执行提供者。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AiProvider {
-    /// Windows DirectML (GPU-agnostic, AMD/NVIDIA/Intel)
+    /// Windows DirectML（与厂商无关,兼容 AMD/NVIDIA/Intel）
     DirectML,
     /// NVIDIA CUDA
     CUDA,
-    /// Apple CoreML (macOS/iOS)
+    /// Apple CoreML（macOS/iOS）
     CoreML,
     /// Intel OpenVINO
     OpenVINO,
-    /// CPU fallback
+    /// CPU 兜底
     #[default]
     Cpu,
 }
@@ -65,12 +62,9 @@ pub struct ProviderInfo {
     pub gpu_name: String,
 }
 
-/// Detect the best available AI execution provider for the current platform.
 /// 检测当前平台上可用的最优 AI 执行提供者。
 ///
-/// Currently uses compile-time platform detection. Future versions may add
-/// runtime GPU probing (e.g. DirectML capability check, CUDA device query).
-/// 目前使用编译期平台检测。未来版本可能会添加运行时 GPU 探测。
+/// 目前使用编译期平台检测。未来版本可能会添加运行时 GPU 探测（如 DirectML 能力检测、CUDA 设备查询）。
 pub fn detect_best_provider() -> ProviderInfo {
     #[cfg(target_os = "windows")]
     {
@@ -103,7 +97,6 @@ pub fn detect_best_provider() -> ProviderInfo {
     }
 }
 
-/// Detect the dedicated video memory (VRAM) in bytes.
 /// 探测专用显存大小（字节）。
 pub fn detect_vram_bytes() -> Option<u64> {
     #[cfg(target_os = "windows")]

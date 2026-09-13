@@ -1,14 +1,24 @@
 <template>
-  <!-- 首启向导（Part5 T17, §3.8）：3 步 onboarding —— 加扫描目录 / 选主题 / 选语言。
-       视觉沿用项目模态范式（.dialog-overlay + 设计 token），非外部调色板，保与全局一致。
-       刻意不支持点遮罩关闭：首启须显式「完成」或「跳过」，避免误触留下空图库且 flag 未写。 -->
-  <div class="dialog-overlay onboarding-overlay">
-    <div class="dialog-content onboarding-card">
+  <!-- 首启向导（Part5 T17, §3.8）：3 步 onboarding —— 加扫描目录 / 选主题 / 选语言。外壳迁 UiDialog。
+       刻意不支持点遮罩 / Escape 关闭（close-on-overlay/esc=false + show-close=false）：首启须显式「完成」或
+       「跳过」，避免误触留下空图库且 flag 未写。自定义头部（副标题 + 步骤点）走 #header 插槽整体覆盖默认标题行。 -->
+  <UiDialog
+    :open="true"
+    :title="t('onboarding.welcome')"
+    :show-close="false"
+    :close-on-overlay="false"
+    :close-on-esc="false"
+    max-width="520px"
+    body-padding="0"
+  >
+    <template #header>
       <!-- 顶部：欢迎语 + 步骤进度点 -->
       <header class="onboarding-header">
         <h2 class="onboarding-title">{{ t('onboarding.welcome') }}</h2>
         <p class="onboarding-subtitle">{{ t('onboarding.subtitle') }}</p>
-        <div class="step-dots" role="progressbar" :aria-valuenow="step" aria-valuemin="1" aria-valuemax="3">
+        <div
+          class="step-dots"
+        >
           <span
             v-for="n in 3"
             :key="n"
@@ -17,90 +27,93 @@
           ></span>
         </div>
       </header>
+    </template>
 
-      <main class="onboarding-body">
-        <!-- 步骤 ①：添加扫描目录（核心，否则空图库） -->
-        <section v-if="step === 1" class="step">
-          <div class="step-icon"><FolderPlus :size="32" /></div>
-          <h3 class="step-title">{{ t('onboarding.step1.title') }}</h3>
-          <p class="step-desc">{{ t('onboarding.step1.desc') }}</p>
+    <div class="onboarding-body">
+      <!-- 步骤 ①：添加扫描目录（核心，否则空图库） -->
+      <section v-if="step === 1" class="step">
+        <div class="step-icon"><FolderPlus :size="32" /></div>
+        <h3 class="step-title">{{ t('onboarding.step1.title') }}</h3>
+        <p class="step-desc">{{ t('onboarding.step1.desc') }}</p>
 
-          <button class="btn btn-primary add-folder-btn" @click="pickFolder">
-            <FolderPlus :size="16" />
-            <span>{{ t('onboarding.step1.addBtn') }}</span>
-          </button>
+        <button class="btn btn-primary add-folder-btn" @click="pickFolder">
+          <FolderPlus :size="16" />
+          <span>{{ t('onboarding.step1.addBtn') }}</span>
+        </button>
 
-          <ul v-if="addedFolders.length" class="folder-list">
-            <li v-for="p in addedFolders" :key="p" class="folder-item">
-              <Folder :size="14" />
-              <span class="folder-name" :title="p">{{ basename(p) }}</span>
-              <Check :size="14" class="folder-check" />
-            </li>
-          </ul>
-          <p v-else class="step-hint">{{ t('onboarding.step1.empty') }}</p>
-        </section>
+        <ul v-if="addedFolders.length" class="folder-list">
+          <li v-for="p in addedFolders" :key="p" class="folder-item">
+            <Folder :size="14" />
+            <span class="folder-name" :title="p">{{ basename(p) }}</span>
+            <Check :size="14" class="folder-check" />
+          </li>
+        </ul>
+        <p v-else class="step-hint">{{ t('onboarding.step1.empty') }}</p>
+      </section>
 
-        <!-- 步骤 ②：选主题（即时 live 应用，所见即所得） -->
-        <section v-else-if="step === 2" class="step">
-          <div class="step-icon"><Palette :size="32" /></div>
-          <h3 class="step-title">{{ t('onboarding.step2.title') }}</h3>
-          <p class="step-desc">{{ t('onboarding.step2.desc') }}</p>
+      <!-- 步骤 ②：选主题（即时 live 应用，所见即所得） -->
+      <section v-else-if="step === 2" class="step">
+        <div class="step-icon"><Palette :size="32" /></div>
+        <h3 class="step-title">{{ t('onboarding.step2.title') }}</h3>
+        <p class="step-desc">{{ t('onboarding.step2.desc') }}</p>
 
-          <div class="option-grid">
-            <button
-              v-for="opt in themeOptions"
-              :key="opt.value"
-              class="option-card"
-              :class="{ selected: ui.appearance === opt.value }"
-              @click="chooseTheme(opt.value)"
-            >
-              <component :is="opt.icon" :size="22" />
-              <span>{{ t(opt.labelKey) }}</span>
-              <Check v-if="ui.appearance === opt.value" :size="15" class="option-check" />
-            </button>
-          </div>
-        </section>
-
-        <!-- 步骤 ③：选语言（即时 live 应用，向导文案自身随之切换） -->
-        <section v-else class="step">
-          <div class="step-icon"><Languages :size="32" /></div>
-          <h3 class="step-title">{{ t('onboarding.step3.title') }}</h3>
-          <p class="step-desc">{{ t('onboarding.step3.desc') }}</p>
-
-          <div class="option-grid">
-            <button
-              v-for="opt in langOptions"
-              :key="opt.value"
-              class="option-card"
-              :class="{ selected: ui.language === opt.value }"
-              @click="chooseLang(opt.value)"
-            >
-              <span class="lang-label">{{ opt.label }}</span>
-              <Check v-if="ui.language === opt.value" :size="15" class="option-check" />
-            </button>
-          </div>
-        </section>
-      </main>
-
-      <footer class="onboarding-footer">
-        <button class="btn btn-ghost" @click="complete">{{ t('onboarding.skip') }}</button>
-        <div class="footer-nav">
-          <button v-if="step > 1" class="btn btn-secondary" @click="back">
-            <ArrowLeft :size="15" />
-            <span>{{ t('onboarding.back') }}</span>
-          </button>
-          <button v-if="step < 3" class="btn btn-primary" @click="next">
-            <span>{{ t('onboarding.next') }}</span>
-            <ArrowRight :size="15" />
-          </button>
-          <button v-else class="btn btn-primary" @click="complete">
-            <Check :size="15" />
-            <span>{{ t('onboarding.finish') }}</span>
+        <div class="option-grid">
+          <button
+            v-for="opt in themeOptions"
+            :key="opt.value"
+            class="option-card"
+            :class="{ selected: ui.appearance === opt.value }"
+            @click="chooseTheme(opt.value)"
+          >
+            <component :is="opt.icon" :size="22" />
+            <span>{{ t(opt.labelKey) }}</span>
+            <Check v-if="ui.appearance === opt.value" :size="15" class="option-check" />
           </button>
         </div>
-      </footer>
+      </section>
+
+      <!-- 步骤 ③：选语言（即时 live 应用，向导文案自身随之切换） -->
+      <section v-else class="step">
+        <div class="step-icon"><Languages :size="32" /></div>
+        <h3 class="step-title">{{ t('onboarding.step3.title') }}</h3>
+        <p class="step-desc">{{ t('onboarding.step3.desc') }}</p>
+
+        <div class="option-grid">
+          <button
+            v-for="opt in langOptions"
+            :key="opt.value"
+            class="option-card"
+            :class="{ selected: ui.language === opt.value }"
+            @click="chooseLang(opt.value)"
+          >
+            <span class="lang-label">{{ opt.label }}</span>
+            <Check v-if="ui.language === opt.value" :size="15" class="option-check" />
+          </button>
+        </div>
+      </section>
     </div>
-  </div>
+
+    <template #footer>
+      <!-- UiDialog footer 为 flex-end,故用 width:100% 的 footer-split 自撑「跳过 ↔ 导航」两端布局。 -->
+      <div class="footer-split">
+        <UiButton variant="ghost" @click="complete">{{ t('onboarding.skip') }}</UiButton>
+        <div class="footer-nav">
+          <UiButton v-if="step > 1" variant="secondary" @click="back">
+            <ArrowLeft :size="15" />
+            <span>{{ t('onboarding.back') }}</span>
+          </UiButton>
+          <UiButton v-if="step < 3" variant="primary" @click="next">
+            <span>{{ t('onboarding.next') }}</span>
+            <ArrowRight :size="15" />
+          </UiButton>
+          <UiButton v-else variant="primary" @click="complete">
+            <Check :size="15" />
+            <span>{{ t('onboarding.finish') }}</span>
+          </UiButton>
+        </div>
+      </div>
+    </template>
+  </UiDialog>
 </template>
 
 <script setup lang="ts">
@@ -119,9 +132,13 @@ import {
   ArrowLeft,
   ArrowRight,
 } from '@lucide/vue'
+import UiDialog from '../ui/UiDialog.vue'
+import UiButton from '../ui/UiButton.vue'
 import { invokeIpc } from '../../utils/ipc'
+import { logger } from '../../utils/logger'
 import { IPC } from '../../constants/ipc'
 import { useUiStore } from '../../stores/uiStore'
+import { useToastStore } from '../../stores/toastStore'
 import { useScanStore } from '../../stores/scanStore'
 import type { AppearanceMode } from '../../types/ui'
 
@@ -129,6 +146,7 @@ const emit = defineEmits<{ (e: 'done'): void }>()
 
 const { t } = useI18n()
 const ui = useUiStore()
+const toast = useToastStore()
 const scan = useScanStore()
 
 const step = ref(1)
@@ -162,7 +180,7 @@ async function pickFolder() {
     await scan.addScanRoot(path)
     addedFolders.value.push(path)
   } catch (e) {
-    ui.addToast('error', t('onboarding.step1.addFailed', { error: String(e) }))
+    toast.addToast('error', t('onboarding.step1.addFailed', { error: String(e) }))
   }
 }
 
@@ -189,26 +207,19 @@ async function complete() {
     await invokeIpc(IPC.SET_APP_CONFIG, { key: 'first_launch', value: 'false' })
   } catch (e) {
     // flag 写失败不致命（下次启动会再弹一次），仅记录不阻断关闭。
-    console.error('Failed to persist first_launch flag', e)
+    logger.error('Failed to persist first_launch flag', { error: e })
   }
   emit('done')
 }
 </script>
 
 <style scoped>
-/* 复用全局 .dialog-overlay / .dialog-content（见 CloseConfirmDialog），此处仅做向导特化覆盖。 */
-.onboarding-overlay {
-  z-index: 10000; /* 高于设置/详情等既有覆盖层，首启时独占焦点 */
-}
-
-.onboarding-card {
-  max-width: 520px;
-}
-
+/* 外壳(overlay/content/关闭键/动画)由 UiDialog + 全局 Modal 基座提供;宽度 520px 走 max-width prop。
+   本组件保留头部(副标题+步骤点)、正文步骤区、分栏页脚特化。 */
 .onboarding-header {
   padding: var(--spacing-lg) var(--spacing-lg) var(--spacing-md);
   text-align: center;
-  border-bottom: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-divider);
 }
 
 .onboarding-title {
@@ -227,7 +238,7 @@ async function complete() {
 .step-dots {
   display: flex;
   justify-content: center;
-  gap: 8px;
+  gap: var(--spacing-sm);
   margin-top: var(--spacing-md);
 }
 
@@ -236,7 +247,11 @@ async function complete() {
   height: 8px;
   border-radius: 50%;
   background: var(--color-border);
-  transition: all var(--transition-fast);
+  /* 圆点→胶囊形变刻意补间 width(S1 机械批:属性显式列举) */
+  transition:
+    width var(--transition-fast),
+    border-radius var(--transition-fast),
+    background-color var(--transition-fast);
 }
 
 .step-dot.active {
@@ -246,7 +261,7 @@ async function complete() {
 }
 
 .step-dot.done {
-  background: color-mix(in srgb, var(--color-accent) 55%, transparent);
+  background: var(--color-accent-subtle);
 }
 
 .onboarding-body {
@@ -271,8 +286,8 @@ async function complete() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
-  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
   margin-bottom: var(--spacing-md);
 }
 
@@ -284,7 +299,7 @@ async function complete() {
 }
 
 .step-desc {
-  margin: 6px 0 var(--spacing-lg);
+  margin: var(--spacing-xs) 0 var(--spacing-lg);
   font-size: var(--font-size-sm);
   color: var(--color-text-secondary);
   line-height: 1.5;
@@ -292,7 +307,7 @@ async function complete() {
 }
 
 .add-folder-btn {
-  gap: 8px;
+  gap: var(--spacing-sm);
 }
 
 .folder-list {
@@ -303,15 +318,16 @@ async function complete() {
   max-width: 380px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--spacing-xs);
 }
 
 .folder-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-radius: var(--radius-md);
+  gap: var(--spacing-sm);
+  min-height: var(--control-size-default);
+  padding: 0 var(--spacing-md);
+  border-radius: var(--radius-sm);
   background: var(--color-bg-hover);
   color: var(--color-text-primary);
   font-size: var(--font-size-sm);
@@ -326,7 +342,7 @@ async function complete() {
 }
 
 .folder-check {
-  color: var(--color-success, #43a047);
+  color: var(--color-success);
   flex-shrink: 0;
 }
 
@@ -350,15 +366,18 @@ async function complete() {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
+  gap: var(--spacing-sm);
   padding: var(--spacing-md);
-  border: 1.5px solid var(--color-border);
-  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
   background: var(--color-bg-surface);
   color: var(--color-text-primary);
   font-size: var(--font-size-sm);
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition:
+    border-color var(--transition-fast),
+    background-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .option-card:hover {
@@ -368,8 +387,8 @@ async function complete() {
 
 .option-card.selected {
   border-color: var(--color-accent);
-  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
-  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
 }
 
 .option-check {
@@ -383,36 +402,18 @@ async function complete() {
   font-weight: 600;
 }
 
-.onboarding-footer {
-  padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--color-border);
-  background: var(--color-bg-primary);
+/* 页脚外壳(padding/border-top/背景)由 UiDialog .dialog-footer 提供;它是 flex-end,故 footer-split
+   用 width:100% 自撑「跳过 ↔ 导航」space-between。跳过/导航按钮已迁 UiButton(ghost/secondary/primary),
+   图标+文字对齐/间距走全局 .btn;原 scoped .btn-ghost(tertiary,违「交互文本禁用 tertiary」)一并清除。 */
+.footer-split {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  width: 100%;
 }
 
 .footer-nav {
   display: flex;
   gap: var(--spacing-sm);
-}
-
-.btn-ghost {
-  background: transparent;
-  border: none;
-  color: var(--color-text-tertiary);
-  cursor: pointer;
-  font-size: var(--font-size-sm);
-}
-
-.btn-ghost:hover {
-  color: var(--color-text-secondary);
-}
-
-.btn-primary,
-.btn-secondary {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
 }
 </style>

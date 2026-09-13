@@ -27,7 +27,7 @@ body {
 }
 
 a {
-  color: var(--color-accent);
+  color: var(--color-accent-text);
   text-decoration: none;
 }
 
@@ -63,8 +63,8 @@ ol {
 
 /* Scrollbar styling */
 ::-webkit-scrollbar {
-  width: var(--scrollbar-width, 6px);
-  height: var(--scrollbar-width, 6px);
+  width: var(--scrollbar-width, 8px);
+  height: var(--scrollbar-width, 8px);
 }
 ::-webkit-scrollbar-track {
   background: var(--color-scrollbar-track);

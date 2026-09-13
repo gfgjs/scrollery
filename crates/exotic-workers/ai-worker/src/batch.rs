@@ -84,8 +84,14 @@ const MAX_TEXTS_PER_BATCH: usize = 64;
 /// 异常 host 用超长串把 worker 拖进无谓的分词开销)。
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 
-fn log(msg: &str) {
-    eprintln!("[ai-worker] {msg}");
+// WorkerLogLine 行协议输出(D-314 单一 schema:reviewer 深审揪出本文件曾漏收编,
+// 裸 eprintln 行会被 supervisor 以 WARN+unparsed 兜底转发,正常批诊断被抬成 WARN 噪音)。
+// 定级同 main.rs 原则:批诊断=info、推理/单项失败(worker 继续服务)=warn。
+fn log_info(msg: impl Into<String>) {
+    exotic_protocol::emit_stderr_log("info", msg, serde_json::Map::new());
+}
+fn log_warn(msg: impl Into<String>) {
+    exotic_protocol::emit_stderr_log("warn", msg, serde_json::Map::new());
 }
 
 /// 整批失败帧(逐项 Err 之外的系统性失败:批超限/推理错误/维度红线/blob 超限)。
@@ -246,7 +252,7 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
                     }
                 }
                 Err(e) => {
-                    log(&format!("EmbedBatch 推理失败:{e}"));
+                    log_warn(format!("EmbedBatch 推理失败:{e}"));
                     batch_fail = Some(batch_failure(
                         request_id,
                         WorkerErrorCode::InternalError,
@@ -344,7 +350,7 @@ pub fn handle_encode_text(sess: &SessionState, request_id: u64, texts: &[String]
                 append_embedding(&mut blob, &emb);
             }
             Err(e) => {
-                log(&format!("EncodeText 推理失败:{e}"));
+                log_warn(format!("EncodeText 推理失败:{e}"));
                 return batch_failure(
                     request_id,
                     WorkerErrorCode::InternalError,
@@ -392,6 +398,7 @@ fn load_face_image(ai_cache_dir: &Path, item: &FaceItem) -> Result<DecodedImage,
         pixels: rgba.into_raw(),
         width,
         height,
+        icc: None, // AI worker 子进程解码仅供推理,ICC 与此无关
     })
 }
 
@@ -516,7 +523,7 @@ pub fn handle_face(
                 }
                 Err((code, msg)) => {
                     if let Some(m) = msg {
-                        log(&m);
+                        log_warn(m);
                     }
                     results.push(FaceItemResult::Err {
                         item_id: item.item_id,
@@ -531,7 +538,7 @@ pub fn handle_face(
     // 对齐+池等待),墙钟为整批实耗。解码均值远大于检测/嵌入 ⇒ 瓶颈在 CPU 解码
     // (源过大或未优化构建),与 GPU/provider 无关。
     if n_ok > 0 {
-        log(&format!(
+        log_info(format!(
             "FaceDetectEmbed 批诊断:{}/{} 项 {} 脸,墙钟 {}ms(并行 {});单项均值 解码 {}ms / 检测 {}ms / 嵌入 {}ms",
             n_ok,
             items.len(),

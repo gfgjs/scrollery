@@ -5,21 +5,19 @@
       <button
         class="hlab__back"
         :title="$t('hlab.back')"
-        :aria-label="$t('hlab.back')"
+
         @click="router.push('/')"
       >
         <ArrowLeft :size="16" />
       </button>
       <span class="hlab__title">{{ $t('hlab.title') }}</span>
 
-      <div class="hlab__modes" role="radiogroup" :aria-label="$t('hlab.mode')">
+      <div class="hlab__modes">
         <button
           v-for="m in MODE_OPTIONS"
           :key="m.kind"
           class="hlab__mode-btn"
           :class="{ active: modeKind === m.kind }"
-          role="radio"
-          :aria-checked="modeKind === m.kind"
           @click="modeKind = m.kind"
         >
           {{ $t(m.labelKey) }}
@@ -109,6 +107,9 @@
             height: it.h + 'px',
           }"
         >
+          <!-- 无 :item:lab 独立后端缓存(HItem)不含 originalWidth/Height 等行项字段,悬停判「重」
+               的静态分辨率轴在此失效——由 useHoverPreview.onPreviewMeta 的真实 metadata 运行时
+               补判兜底(超 4K 起播即降级),勿在此伪造 LayoutRowItem。 -->
           <MediaThumb
             :id="it.id"
             :w="it.w"
@@ -135,7 +136,7 @@
 </template>
 
 <script setup lang="ts">
-// H-Lab 横向画廊实验室(plan-docs/2026-07-02-horizontal-gallery-lab.md)。
+// H-Lab 横向画廊实验室(docs/designs/2026-07-02-horizontal-gallery-lab.md)。
 // 定位:多种横向布局候选的真人调研载体——仅布局 + 滚动,多选/收藏/详情等附加能力显式推迟。
 // 与生产 MediaGrid 完全平行:独立路由、独立后端缓存、独立滚动 composable,零共享可变状态;
 // 唯二复用 = MediaThumb(缩略图状态机)与 useRequestQueue(批量请求,槽位生命周期已测锁定)。
@@ -146,11 +147,15 @@ import MediaThumb from '../components/media/MediaThumb.vue'
 import { useHVirtualScroll } from '../composables/useHVirtualScroll'
 import { useRequestQueue } from '../composables/useRequestQueue'
 import { invokeIpc } from '../utils/ipc'
+import { logger } from '../utils/logger'
+import { getThumbCacheDir } from '../utils/thumbCacheDir'
 import { IPC } from '../constants/ipc'
 import { DEFAULTS } from '../constants/defaults'
+import { useUiStore } from '../stores/uiStore'
 import type { HBlock, HItem, HLayoutMode, HLayoutModeKind, HLayoutSummary } from '../types/hgallery'
 
 const router = useRouter()
+const ui = useUiStore()
 const containerEl = ref<HTMLElement | null>(null)
 
 const MODE_OPTIONS: { kind: HLayoutModeKind; labelKey: string }[] = [
@@ -197,7 +202,7 @@ async function fetchBlocksByX(leftX: number, rightX: number): Promise<HBlock[]> 
     })
   } catch (e) {
     // LayoutNotReady(版本换代竞态)→ 空集;下一次滚动/重算会带新版本重取。
-    console.warn('[HLab] get_h_blocks_by_x failed:', e)
+    logger.warn('[HLab] get_h_blocks_by_x failed', { error: e })
     return []
   }
 }
@@ -231,7 +236,7 @@ async function compute() {
     hv.scrollToStart()
     await hv.updateVisible(true)
   } catch (e) {
-    console.error('[HLab] compute_h_layout FAILED:', e)
+    logger.error('[HLab] compute_h_layout FAILED', { error: e })
   } finally {
     isComputing.value = false
   }
@@ -241,7 +246,7 @@ async function compute() {
 let recomputeTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleCompute() {
   if (recomputeTimer) clearTimeout(recomputeTimer)
-  recomputeTimer = setTimeout(compute, DEFAULTS.RESIZE_DEBOUNCE_MS)
+  recomputeTimer = setTimeout(compute, ui.resizeDebounceMs)
 }
 watch(
   [modeKind, pageFactor, targetRowHeight, laneCount, balance, targetColWidth, gapPx, timeAsc],
@@ -315,9 +320,9 @@ function onKeydown(e: KeyboardEvent) {
 
 onMounted(async () => {
   try {
-    cacheDir.value = (await invokeIpc<string>(IPC.GET_THUMB_CACHE_DIR)).replace(/\\/g, '/')
+    cacheDir.value = await getThumbCacheDir()
   } catch (e) {
-    console.error('[HLab] GET_THUMB_CACHE_DIR failed:', e)
+    logger.error('[HLab] GET_THUMB_CACHE_DIR failed', { error: e })
   }
   containerEl.value?.focus()
   await compute()
@@ -334,7 +339,9 @@ onBeforeUnmount(() => {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: var(--color-bg-base, #111);
+  /* 原 var(--color-bg-base, #111) 引用不存在的幽灵 token,一直走 fallback 的固定深色底
+     (与 AudioPlayer/DocumentViewer 两处根视图衬底同族修法一致)(S7 修)。 */
+  background: var(--color-bg-primary);
 }
 
 /* ── 控制条 ─────────────────────────────────────────────────────────── */

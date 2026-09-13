@@ -1,23 +1,69 @@
 // src/stores/mediaStore.ts
-// Layout and media state store
 // 布局和媒体状态存储
 
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, onScopeDispose } from 'vue'
 import type { LayoutRow, LayoutSummary, MediaMeta } from '../types/layout'
-import type { MediaDetail, AppStats } from '../types/media'
+import type { MediaDetail, AppStats, LensAdjacentMedia } from '../types/media'
+import type { DuplicateLensDescriptorDto } from '../types/view'
 import { IPC } from '../constants/ipc'
 import { invokeIpc } from '../utils/ipc'
+import { logger } from '../utils/logger'
+import { createLatestWriteQueue } from '../utils/latestWrite'
 // type-only：无运行时环（useSelection → useViewDescriptor → mediaStore 的反向链在编译期被擦除）。
 import type { BackendSelectionDescriptor } from '../composables/useSelection'
 import { DEFAULTS } from '../constants/defaults'
 
 import { useUiStore } from './uiStore'
 
+export type LayoutContentKeyParams = {
+  directoryId?: number | null
+  filters?: Record<string, unknown> | null
+  duplicateLens?: DuplicateLensDescriptorDto | null
+}
+
+/**
+ * 对布局筛选做按键排序的轻量序列化。
+ * `JSON.stringify` 的结果依赖调用方插入顺序，不能直接作为布局内容键。
+ */
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    const serialized = JSON.stringify(value)
+    return serialized === undefined ? 'null' : serialized
+  }
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`
+
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right))
+  return `{${entries
+    .map(([key, item]) => `${JSON.stringify(key)}:${stableSerialize(item)}`)
+    .join(',')}}`
+}
+
+/**
+ * 生成布局的内容语义键。
+ *
+ * 几何参数（宽度、行高等）不进键：同一内容重排继续保留旧布局的 SWR 行为；
+ * 内容集合变化必须换键，防止普通画廊、groups 和 folders 互相显示旧行。
+ */
+export function buildLayoutContentKey(params: LayoutContentKeyParams = {}): string {
+  const lens = params.duplicateLens
+  if (lens?.mode === 'groups') return 'lens:groups'
+  if (lens?.mode === 'folders') {
+    return `lens:folders:u${lens.showUniqueItems ? 1 : 0}`
+  }
+
+  const directory = params.directoryId == null ? 'all' : String(params.directoryId)
+  return `normal:d${directory}:f${stableSerialize(params.filters ?? {})}`
+}
+
 export const useMediaStore = defineStore('media', () => {
-  // ── Layout state ────────────────────────────────────────────────────────
   // ── 布局状态 ────────────────────────────────────────────────────────
   const layoutSummary = ref<LayoutSummary | null>(null)
+  // 当前已提交布局的内容语义。普通画廊与两种重复镜头不能复用对方的行；
+  // 同一语义内的尺寸/排序重算则继续保留旧布局，维持现有 SWR 体验。
+  const layoutSemanticKey = ref<string | null>(null)
   const isComputingLayout = ref(false)
   const layoutDirty = ref(false)
 
@@ -38,14 +84,13 @@ export const useMediaStore = defineStore('media', () => {
     itemPatchSignal.value = { id, field, value, seq: ++patchSeq }
   }
 
-  // ── Lazy viewport metadata (EXIF / GPS / file name / dir path) ──────────────
-  // Heavy fields stripped from the resident layout cache; fetched per-window
-  // only when the card info overlay is enabled.
   // ── 可视区懒加载元数据（EXIF / GPS / 文件名 / 目录路径） ──────────────────
   // 重型字段已从常驻布局缓存剥离；仅在卡片信息浮层开启时按窗口拉取。
   const viewportMeta = ref<Map<number, MediaMeta>>(new Map())
   const pendingMetaIds = new Set<number>()
   let metaTimer: ReturnType<typeof setTimeout> | null = null
+  // 宽度重排不会改变媒体元数据；只在切换目录/筛选上下文时丢弃，避免每次 resize 都让信息浮层闪空。
+  let viewportMetaScopeKey: string | null = null
 
   async function flushMeta() {
     metaTimer = null
@@ -54,17 +99,15 @@ export const useMediaStore = defineStore('media', () => {
     pendingMetaIds.clear()
     try {
       const metas = await invokeIpc<MediaMeta[]>(IPC.GET_META_FOR_VIEWPORT, { ids })
-      // Reassign the Map so the ref triggers reactivity in consuming components.
       // 重新赋值 Map，使 ref 在消费组件中触发响应式更新。
       const next = new Map(viewportMeta.value)
       for (const m of metas) next.set(m.id, m)
       viewportMeta.value = next
     } catch (e) {
-      console.error('[MediaStore] get_meta_for_viewport FAILED:', e)
+      logger.error('[MediaStore] get_meta_for_viewport FAILED', { error: e })
     }
   }
 
-  /** Ensure metadata is loaded for the given ids (debounced, fetch-once). */
   /** 确保给定 id 的元数据已加载（防抖、只取一次）。 */
   function ensureMeta(ids: number[]) {
     let added = false
@@ -78,23 +121,86 @@ export const useMediaStore = defineStore('media', () => {
     if (metaTimer === null) metaTimer = setTimeout(flushMeta, 120)
   }
 
-  // ── Detail view ─────────────────────────────────────────────────────────
   // ── 详情视图 ─────────────────────────────────────────────────────────
-  interface NavigationContext {
-    type: 'layout' | 'search'
-    itemIds: number[]
-    currentIndex: number
-  }
+  // type='lens':重复镜头(§8.2)只保存布局版本与当前位置，不物化百万级 itemIds；
+  // 上一项/下一项由后端按 layoutVersion 缓存一步解析。普通 layout/search 仍保留既有数组上下文。
+  type NavigationContext =
+    | {
+        type: 'layout' | 'search'
+        itemIds: number[]
+        currentIndex: number
+      }
+    | {
+        type: 'lens'
+        layoutVersion: number
+        totalCount: number
+        currentIndex: number | null
+      }
 
   const navContext = ref<NavigationContext | null>(null)
   const detailItem = ref<MediaDetail | null>(null)
   const isDetailOpen = ref(false)
+  let detailRequestGeneration = 0
 
-  // ── Stats ────────────────────────────────────────────────────────────────
   // ── 统计 ────────────────────────────────────────────────────────────────
   const stats = ref<AppStats | null>(null)
 
-  // ── Computed ─────────────────────────────────────────────────────────────
+  // 统计取数的 single-flight 合并（扫描期每个在跑的根都按秒级节奏调 get_app_stats，
+  // 一次全表聚合，此前各自裸 invoke 会把并发压到同一条查询上）。约定（仅限同一 epoch）：
+  //   · 至多一个在飞请求 + 至多一个尾随请求，共用同一 drain Promise；
+  //   · 在飞期间到达的请求只置尾随标志，不另开 Promise；
+  //   · 调用方 await 到自己那次请求之后的新快照；
+  //   · 失败时整个 drain 一起拒绝并释放槽位，已排的尾随被丢弃（下次调用重新取，
+  //     失败路径不保证尾随新快照）。
+  // epoch：dispose / 清库后旧快照来自清空前的库，必须丢弃；invalidateStats 会清空槽位，
+  // 跨 epoch 的旧请求可能短暂重叠，单飞只保证同 epoch 内。
+  let statsEpoch = 0
+  type StatsDrain = { epoch: number; trailing: boolean; promise: Promise<void> }
+  let statsDrain: StatsDrain | null = null
+
+  async function fetchStatsSnapshot(epoch: number) {
+    const next = await invokeIpc<AppStats>(IPC.GET_STATS)
+    // 越代（dispose / 清库）不得回写。
+    if (epoch !== statsEpoch) return
+    stats.value = next
+  }
+
+  /**
+   * 刷新统计；同 epoch 内并发调用合并为一个 drain（在飞 + 至多一个尾随）。
+   * 返回值经 pinia 动作包装后是**新** promise,调用方要么 await,要么显式 .catch——
+   * 这里不替调用方兜未处理拒绝(内部 drain promise 由包装层的 then/catch 接住)。
+   */
+  function loadStats(): Promise<void> {
+    const current = statsDrain
+    if (current && current.epoch === statsEpoch) {
+      current.trailing = true
+      return current.promise
+    }
+    const epoch = statsEpoch
+    const drain: StatsDrain = { epoch, trailing: false, promise: Promise.resolve() }
+    statsDrain = drain
+    drain.promise = (async () => {
+      try {
+        do {
+          drain.trailing = false
+          await fetchStatsSnapshot(epoch)
+        } while (drain.trailing && epoch === statsEpoch)
+      } finally {
+        // 成功/失败都必须释放槽位（失败后仍要能重新请求）；越代时新 drain 已接管，不得清掉别人。
+        if (statsDrain === drain) statsDrain = null
+      }
+    })()
+    return drain.promise
+  }
+
+  /** 使在飞/排队的统计取数失效（清库、作用域销毁时调用）；旧快照不得越代回写。 */
+  function invalidateStats() {
+    statsEpoch += 1
+    statsDrain = null
+  }
+
+  onScopeDispose(invalidateStats)
+
   // ── 计算属性 ─────────────────────────────────────────────────────────────
   const totalItems = computed(() => stats.value?.totalItems ?? 0)
   const viewTotalItems = computed(() => layoutSummary.value?.totalItems ?? 0)
@@ -102,7 +208,6 @@ export const useMediaStore = defineStore('media', () => {
   const totalRows = computed(() => layoutSummary.value?.totalRows ?? 0)
   const layoutVersion = computed(() => layoutSummary.value?.layoutVersion ?? 0)
 
-  // ── Actions ───────────────────────────────────────────────────────────────
   // ── 动作 ───────────────────────────────────────────────────────────────
 
   // computeLayout 入参形状（pending/current 复用，替代 any）。
@@ -116,57 +221,89 @@ export const useMediaStore = defineStore('media', () => {
     sortWithinGroup?: string
     sortOrder?: string
     layoutMode?: string
+    /** 无缝分组(#1):排序仍按 groupBy 聚合,打包无分隔符、行跨组连续。 */
+    seamless?: boolean
+    /**
+     * 重复镜头描述符(2026-09-02 方案 §10.2)。缺省 = 普通画廊;存在时后端忽略普通排序/分组,
+     * 按 lens 模式产出重复组 separator 的 LayoutRow(folders 模式后端显式报 DuplicateLensUnsupported)。
+     */
+    duplicateLens?: DuplicateLensDescriptorDto
   }
   let pendingComputeParams: ComputeLayoutArgs | null = null
+  let pendingComputeGeneration = 0
   let isComputingInternal = false
+  let computeGeneration = 0
+  let computeSessionGeneration = 0
+  let activeComputeSession = 0
 
   async function computeLayout(params: ComputeLayoutArgs) {
     if (params.containerWidth < 100) {
-      console.warn('[MediaStore] computeLayout: containerWidth too small, skipping')
+      logger.warn('[MediaStore] computeLayout: containerWidth too small, skipping')
       return
+    }
+
+    const requestGeneration = ++computeGeneration
+    const nextContentKey = buildLayoutContentKey(params)
+    if (layoutSummary.value && layoutSemanticKey.value !== nextContentKey) {
+      layoutSummary.value = null
+      layoutSemanticKey.value = null
     }
 
     if (isComputingInternal) {
       pendingComputeParams = params
+      pendingComputeGeneration = requestGeneration
       return
     }
 
+    const session = ++computeSessionGeneration
+    activeComputeSession = session
     isComputingInternal = true
     isComputingLayout.value = true
 
-    let currentParams: ComputeLayoutArgs | null = params
+    let currentRequest = { params, generation: requestGeneration }
 
-    while (currentParams) {
-      // Watchdog (问题6): compute_layout has been observed to hang intermittently after
-      // deleting/re-adding a folder (suspected read-pool exhaustion / lock contention with
-      // an in-flight scan or thumb-gen). If the invoke never returns, the "正在计算布局"
-      // spinner sticks forever. Clear the flag after a generous timeout so the UI recovers
-      // and the user can retry (switching folders triggers a fresh compute).
+    while (currentRequest) {
+      const { params: currentParams, generation: currentGeneration } = currentRequest
       // 看门狗（问题6）：删除/重加文件夹后曾偶发 compute_layout 卡住（疑似读连接池耗尽，
       // 或与在途扫描/缩略图生成的锁竞争）。若 invoke 永不返回，「正在计算布局」会永久卡住。
       // 超时后复位标志，使 UI 恢复、用户可重试（切换文件夹会触发新的计算）。
       const computeWatchdog = setTimeout(() => {
-        if (isComputingLayout.value) {
-          console.warn(
-            '[MediaStore] computeLayout watchdog fired (>30s) — clearing isComputingLayout',
+        if (activeComputeSession === session && isComputingInternal) {
+          logger.warn(
+            `[MediaStore] computeLayout watchdog fired (>30s, session=${session}) — clearing isComputingLayout`,
           )
+          activeComputeSession = 0
           isComputingLayout.value = false
           isComputingInternal = false
+          // 仍有更新请求时立即让最新请求接管；旧 IPC 回来后会因 session 过期而丢弃。
+          if (pendingComputeParams) {
+            const next = pendingComputeParams
+            pendingComputeParams = null
+            pendingComputeGeneration = 0
+            void computeLayout(next)
+          }
         }
       }, 30000)
-      // Drop stale viewport metadata — the visible window will re-fetch what it needs.
-      // 丢弃过时的可视区元数据 —— 可视窗口会按需重新拉取。
-      if (viewportMeta.value.size > 0) viewportMeta.value = new Map()
-      if (metaTimer) {
-        clearTimeout(metaTimer)
-        metaTimer = null
+      const nextMetaScopeKey = JSON.stringify({
+        directoryId: currentParams.directoryId ?? null,
+        filters: currentParams.filters ?? null,
+      })
+      if (viewportMetaScopeKey !== nextMetaScopeKey) {
+        viewportMetaScopeKey = nextMetaScopeKey
+        // 切换上下文后丢弃旧元数据；同一上下文内的宽度重排继续复用已有结果。
+        if (viewportMeta.value.size > 0) viewportMeta.value = new Map()
+        if (metaTimer) {
+          clearTimeout(metaTimer)
+          metaTimer = null
+        }
+        pendingMetaIds.clear()
       }
-      pendingMetaIds.clear()
       const ui = useUiStore()
       const needsMeta = ui.thumbInfoElements.some((el) => ['geo', 'camera', 'params'].includes(el))
+      let computedSummary: LayoutSummary | null = null
 
       try {
-        layoutSummary.value = await invokeIpc<LayoutSummary>(IPC.COMPUTE_LAYOUT, {
+        computedSummary = await invokeIpc<LayoutSummary>(IPC.COMPUTE_LAYOUT, {
           params: {
             directoryId: currentParams.directoryId ?? null,
             filters: currentParams.filters ?? null,
@@ -177,25 +314,45 @@ export const useMediaStore = defineStore('media', () => {
             sortWithinGroup: currentParams.sortWithinGroup ?? 'datetime',
             sortOrder: currentParams.sortOrder ?? 'desc',
             layoutMode: currentParams.layoutMode ?? 'justified',
+            seamless: currentParams.seamless ?? false,
+            // 重复镜头(§10.2):缺省 null = 普通画廊;镜头态下后端按 duplicateLens 决定集合与顺序。
+            duplicateLens: currentParams.duplicateLens ?? null,
             includeMeta: needsMeta,
+            // 多档源服务(2026-08-16 阶段2):后端出口按「格尺寸×DPR」选最小满足档。
+            dpr: window.devicePixelRatio || 1,
           },
         })
       } catch (e) {
-        console.error('[MediaStore] computeLayout FAILED:', e)
+        logger.error('[MediaStore] computeLayout FAILED', { error: e })
       } finally {
         clearTimeout(computeWatchdog)
       }
 
+      // 看门狗或新的会话已经接管时，当前响应不再有提交资格。
+      if (activeComputeSession !== session) break
+
       if (pendingComputeParams) {
-        currentParams = pendingComputeParams
+        // 计算期间若又收到 resize，只继续追最新参数；中间结果不提交，旧帧保持在屏上。
+        currentRequest = {
+          params: pendingComputeParams,
+          generation: pendingComputeGeneration,
+        }
         pendingComputeParams = null
+        pendingComputeGeneration = 0
       } else {
+        if (computedSummary && currentGeneration === computeGeneration) {
+          layoutSummary.value = computedSummary
+          layoutSemanticKey.value = buildLayoutContentKey(currentParams)
+        }
         break
       }
     }
 
-    isComputingInternal = false
-    isComputingLayout.value = false
+    if (activeComputeSession === session) {
+      activeComputeSession = 0
+      isComputingInternal = false
+      isComputingLayout.value = false
+    }
   }
 
   async function fetchRowsByY(topY: number, bottomY: number): Promise<LayoutRow[]> {
@@ -209,7 +366,7 @@ export const useMediaStore = defineStore('media', () => {
       })
       return rows
     } catch (e) {
-      console.error(`[MediaStore] fetchRowsByY(${topY}, ${bottomY}) FAILED:`, e)
+      logger.error(`[MediaStore] fetchRowsByY(${topY}, ${bottomY}) FAILED`, { error: e })
       throw e
     }
   }
@@ -225,52 +382,115 @@ export const useMediaStore = defineStore('media', () => {
         layoutVersion: version,
       })
     } catch (e) {
-      console.error(`[MediaStore] fetchBucketRows(${startY}, ${endY}) FAILED:`, e)
+      logger.error(`[MediaStore] fetchBucketRows(${startY}, ${endY}) FAILED`, { error: e })
       throw e
     }
   }
 
   async function openDetailFromSearch(id: number, resultIds: number[]) {
-    navContext.value = {
+    const generation = ++detailRequestGeneration
+    const nextContext: NavigationContext = {
       type: 'search',
       itemIds: resultIds,
       currentIndex: resultIds.indexOf(id),
     }
-    detailItem.value = await invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id })
+    const nextDetail = await invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id })
+    if (generation !== detailRequestGeneration) return
+    navContext.value = nextContext
+    detailItem.value = nextDetail
     isDetailOpen.value = true
   }
 
+  /**
+   * 重复镜头(2026-09-02 方案 §8.2)从画廊打开查看器前建立导航上下文。
+   * 只保存 layoutVersion/总数，实际相邻项由后端布局缓存解析，避免把 flat_ids 复制到前端。
+   * 首次打开时 currentIndex 未知；第一次镜头导航响应会补齐它。路由化查看器的
+   * loadFromRoute → openDetail(id)(不带 fromLayout)不会清掉本上下文,closeDetail 统一回收。
+   */
+  function setLensNavContext(layoutVersion: number, totalCount: number) {
+    navContext.value = {
+      type: 'lens',
+      layoutVersion,
+      totalCount,
+      currentIndex: null,
+    }
+  }
+
   async function openDetail(id: number, fromLayout = false) {
+    const generation = ++detailRequestGeneration
+    // 从画廊打开时同步清空导航上下文（在 fetch 前）：否则在途窗口内 navContext 仍是旧搜索
+    // 上下文，方向键会按旧列表导航；且 IPC 失败时若只在成功后清空，旧上下文将永久残留。
     if (fromLayout) {
       navContext.value = null
     }
-    detailItem.value = await invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id })
+    const nextDetail = await invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id })
+    if (generation !== detailRequestGeneration) return
+    detailItem.value = nextDetail
     isDetailOpen.value = true
   }
 
   async function navigateDetail(offset: number) {
     if (!detailItem.value) return
 
-    if (navContext.value) {
-      const nextIndex = navContext.value.currentIndex + offset
-      if (nextIndex >= 0 && nextIndex < navContext.value.itemIds.length) {
-        navContext.value.currentIndex = nextIndex
-        const nextId = navContext.value.itemIds[nextIndex]
-        detailItem.value = await invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id: nextId })
+    if (navContext.value?.type === 'lens') {
+      const generation = ++detailRequestGeneration
+      const context = navContext.value
+      let result: LensAdjacentMedia | null = null
+      try {
+        result = await invokeIpc<LensAdjacentMedia | null>(IPC.GET_LENS_ADJACENT_MEDIA, {
+          currentId: detailItem.value.id,
+          offset,
+          layoutVersion: context.layoutVersion,
+        })
+      } catch (e) {
+        // 镜头布局过期/暂未就绪时保持当前项；浏览器绝不退回普通邻接序。
+        logger.warn('[MediaStore] lens adjacent lookup failed; keeping current item', {
+          error: e,
+        })
+      }
+      // 只接受仍属于同一镜头上下文的响应；过期/边界均不退回普通邻接查询。
+      if (generation === detailRequestGeneration && navContext.value === context && result) {
+        context.currentIndex = result.index
+        context.totalCount = result.totalCount
+        detailItem.value = result.detail
       }
       return
     }
 
+    if (navContext.value) {
+      const nextIndex = navContext.value.currentIndex + offset
+      if (nextIndex >= 0 && nextIndex < navContext.value.itemIds.length) {
+        const generation = ++detailRequestGeneration
+        const context = navContext.value
+        const nextId = context.itemIds[nextIndex]
+        const nextDetail = await invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id: nextId })
+        // currentIndex 只在响应提交时一并推进：提前推进会让在途窗口内索引超前于展示项，
+        // 连按方向键时第三次按键会以错误的显示项为基准导航（跳项/落错位）。
+        if (generation === detailRequestGeneration && navContext.value === context) {
+          context.currentIndex = nextIndex
+          detailItem.value = nextDetail
+        }
+      }
+      return
+    }
+
+    const currentId = detailItem.value.id
+    const generation = ++detailRequestGeneration
     const adj = await invokeIpc<MediaDetail | null>(IPC.GET_ADJACENT_MEDIA, {
-      currentId: detailItem.value.id,
+      currentId,
       offset,
     })
-    if (adj) {
+    if (
+      adj &&
+      generation === detailRequestGeneration &&
+      detailItem.value?.id === currentId
+    ) {
       detailItem.value = adj
     }
   }
 
   function closeDetail() {
+    detailRequestGeneration++
     isDetailOpen.value = false
     detailItem.value = null
     navContext.value = null
@@ -289,18 +509,12 @@ export const useMediaStore = defineStore('media', () => {
     if (detailItem.value?.id === cur.id) detailItem.value.availability = fresh.availability
   }
 
-  async function loadStats() {
-    stats.value = await invokeIpc<AppStats>(IPC.GET_STATS)
-  }
-
-  /** Mark the layout as stale — the next time the grid becomes visible it should recompute.
-   *  将布局标记为过时 — 下次网格可见时应重新计算。 */
+  /** 将布局标记为过时 — 下次网格可见时应重新计算。 */
   function invalidateLayout() {
     layoutDirty.value = true
   }
 
-  /** Consume the dirty flag (returns true if it was dirty, then resets).
-   *  消费脏标志（如果为脏则返回 true，然后重置）。 */
+  /** 消费脏标志（如果为脏则返回 true，然后重置）。 */
   function consumeLayoutDirty(): boolean {
     if (layoutDirty.value) {
       layoutDirty.value = false
@@ -349,8 +563,49 @@ export const useMediaStore = defineStore('media', () => {
     return await invokeIpc<number>(IPC.BATCH_SET_COLOR_LABEL, { selection, colorLabel })
   }
 
+  // 旋转写队列(审查 F-09):快速连点时并发 IPC 写取得 DB 锁的顺序不保证等于点击顺序,
+  // 旧角度可能最后落库。latest-write-wins 串行化后每 item 至多一个在途写,终值恒为最后一击。
+  // 写失败:本会话保持乐观角度(当前画面仍正确),重开自然回退持久值——只留证据不打断看图。
+  const rotationWrites = createLatestWriteQueue<number, number>(
+    (id, rotation) => invokeIpc<void>(IPC.SET_VIEW_ROTATION, { itemId: id, rotation }),
+    (id, rotation, e) => {
+      logger.error(`[mediaStore] setViewRotation failed: item=${id} rotation=${rotation}`, {
+        error: e,
+      })
+    },
+  )
+
+  /**
+   * 持久化看图台展示旋转（归一化 0/90/180/270，V20）。后端再归一化一次兜底。
+   * 与 setRating/setColorLabel 不同：旋转不进网格（LayoutRowItem 无此列），故不发 itemPatchSignal，
+   * 只落库——查看器本地已乐观更新 detail.viewRotation。
+   * 经 latest-write-wins 队列串行化(审查 F-09),同步返回;失败在队列内捕获。
+   */
+  function setViewRotation(id: number, rotation: number) {
+    rotationWrites.push(id, rotation)
+  }
+
+  // 播放位置写队列(镜像 rotationWrites,V23):latest-write-wins,防连续 seek/定时上报并发写乱序。
+  const playbackWrites = createLatestWriteQueue<number, number>(
+    (id, ms) => invokeIpc<void>(IPC.SET_PLAYBACK_POSITION, { itemId: id, ms }),
+    (id, ms, e) => {
+      logger.error(`[mediaStore] setPlaybackPosition failed: item=${id} ms=${ms}`, {
+        error: e,
+      })
+    },
+  )
+
+  /**
+   * 持久化播放器播放位置记忆(ms;V23)。后端再 clamp 一次兜底。镜像 setViewRotation:
+   * 不进网格,只落库,经 latest-write-wins 队列串行化(同构审查 F-09 手法)。
+   */
+  function setPlaybackPosition(id: number, ms: number) {
+    playbackWrites.push(id, ms)
+  }
+
   return {
     layoutSummary,
+    layoutSemanticKey,
     isComputingLayout,
     layoutDirty,
     itemPatchSignal,
@@ -370,15 +625,19 @@ export const useMediaStore = defineStore('media', () => {
     ensureMeta,
     openDetail,
     openDetailFromSearch,
+    setLensNavContext,
     refreshDetailAvailability,
     closeDetail,
     navigateDetail,
     loadStats,
+    invalidateStats,
     toggleFavorite,
     setRating,
     batchSetRating,
     setColorLabel,
     batchSetColorLabel,
+    setViewRotation,
+    setPlaybackPosition,
     invalidateLayout,
     consumeLayoutDirty,
   }

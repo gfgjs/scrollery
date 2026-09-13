@@ -122,7 +122,7 @@ def main():
         print(f"      嵌入 dim={feat.shape[0]} L2norm(原始)={nrm:.3f} 归一化前5维={[round(float(v),3) for v in unit[:5]]}")
 
     # ── 3. 与 Rust(face_smoke, FACE_PROFILE=scrfd-arcface-r50) dump 对拍 ───────────
-    rp = r"D:/photoapp/scrollery/src-tauri/target/rust_emb.txt"
+    rp = r"C:/workspace/scrollery/src-tauri/target/rust_emb.txt"
     if os.path.exists(rp):
         rust = [np.array([float(x) for x in ln.split(",")]) for ln in open(rp) if ln.strip()]
         print(f"\n=== Rust vs InsightFace cosine (脸数 rust={len(rust)} insightface={len(feats)}) ===")

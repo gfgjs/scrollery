@@ -1,5 +1,5 @@
 // src/composables/galleryLayoutSource.ts
-// 画廊布局策略接缝（T18-布局切片 + T20，详见 plan-docs/refactor_2026/
+// 画廊布局策略接缝（T18-布局切片 + T20，详见 docs/refactor_2026/
 // T20_T18-layout_布局策略接缝_合并设计.md）。
 //
 // 关键架构事实：useVirtualScroll 本身布局无关——它只依赖 { totalHeight, totalRows,
@@ -14,7 +14,7 @@
 
 import type { LayoutRow } from '../types/layout'
 import { useMediaStore } from '../stores/mediaStore'
-import { useJustifiedLayout } from './useJustifiedLayout'
+import { useJustifiedLayout, type UseJustifiedLayoutOptions } from './useJustifiedLayout'
 
 /**
  * 画廊布局源：把"几何来源 + 行供给 + 重算触发"收敛成一个契约，供 MediaGrid 喂给
@@ -29,8 +29,17 @@ export interface GalleryLayoutSource {
   fetchRowsByY: (topY: number, bottomY: number) => Promise<LayoutRow[]>
   /** 触发布局（重）计算。width 缺省时由策略自取容器宽。 */
   recompute: (width?: number) => Promise<void>
+  /** 自动刷新入口：离屏时只登记 deferred，激活后由宿主补算一次。 */
+  requestCompute: () => boolean
   /** 容器尺寸变化时的（防抖）重算入口。 */
   onResize: (newWidth: number) => void
+  /** 丢弃尚未落地的旧尺寸防抖；过渡结束后由宿主以最终宽度重新判定。 */
+  cancelPendingResize: () => void
+  /**
+   * 补算失活期（`enabled` 为假时）累积的重算请求，用当前视图算一次。返回是否真的算了。
+   * 宿主应在 KeepAlive 激活时调用（见 UseJustifiedLayoutOptions.enabled）。
+   */
+  flushIfDeferred: () => Promise<boolean>
 }
 
 /**
@@ -38,18 +47,28 @@ export interface GalleryLayoutSource {
  * mediaStore 几何 / 行供给。justified 与 grid 共用——模式差异在后端排版，前端零分支。
  *
  * @param containerWidthRef 容器内容区宽度的惰性 getter（透传给 useJustifiedLayout）。
+ * @param options 透传给 useJustifiedLayout（如取数闸门 enabled）。
  *
  * 注意：内部调用 useJustifiedLayout（含 watch / onBeforeUnmount），故必须在组件 setup 上下文中调用。
  */
-export function useGalleryLayoutSource(containerWidthRef: () => number): GalleryLayoutSource {
+export function useGalleryLayoutSource(
+  containerWidthRef: () => number,
+  options?: UseJustifiedLayoutOptions,
+): GalleryLayoutSource {
   const media = useMediaStore()
-  const { compute, onResize } = useJustifiedLayout(containerWidthRef)
+  const { compute, onResize, cancelPendingResize, requestCompute, flushIfDeferred } = useJustifiedLayout(
+    containerWidthRef,
+    options,
+  )
 
   return {
     totalHeight: () => media.totalHeight,
     totalRows: () => media.totalRows,
     fetchRowsByY: (topY, bottomY) => media.fetchRowsByY(topY, bottomY),
     recompute: compute,
+    requestCompute,
     onResize,
+    cancelPendingResize,
+    flushIfDeferred,
   }
 }

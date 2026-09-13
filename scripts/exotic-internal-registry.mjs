@@ -1,4 +1,3 @@
-// scripts/exotic-internal-registry.mjs
 // 内测(internal testing)registry 生成器——Part8 D1 签发端的内测形态(2026-07-05)。
 //
 // 与 exotic-dev-registry.mjs 的差异(其余打包/签名逻辑经 lib/exotic-signing.mjs 完全同源):
@@ -6,7 +5,7 @@
 //   - package_url 是**真实 HTTPS**(默认 raw.githubusercontent.com 内测仓),不是 file://,
 //     因此 Release 安装包无需任何 dev 旁路即可走完「刷新→下载→验签→安装」生产链路;
 //   - 密钥对/keyset 独立于 dev(.internal-signing/,已 gitignore):key_id 带 internal 字样,
-//     与未来生产信任根(exotic-keyset-prod.json,随 ③b 入 pro)彻底隔离;
+//     与生产信任根(exotic-keyset-prod.json,ceremony 产物经 PICASA_EXOTIC_KEYSET_FILE 注入)彻底隔离;
 //   - keyset 是「占位生产集 + 内测键」**超集**:注入构建后 builtin_keyset_parses 等
 //     测试断言(release-2026-01/license-2026-01 存在)依然成立。
 //
@@ -37,10 +36,19 @@ const out = path.join(repo, '.internal-signing');
 const regOut = path.join(out, 'registry');
 fs.mkdirSync(regOut, { recursive: true });
 
-const PLUGIN_ID = 'exotic-image-psd';
-const TARGET = 'x86_64-pc-windows-msvc';
-const RELEASE_KEY_ID = 'release-internal-2026-07';
-const LICENSE_KEY_ID = 'license-internal-2026-07';
+const PLUGIN_ID = process.env.EXOTIC_PLUGIN_ID || 'exotic-image-psd';
+const TARGET = process.env.EXOTIC_TARGET || 'x86_64-pc-windows-msvc';
+const MEDIA_KIND = process.env.EXOTIC_MEDIA_KIND || 'image';
+const FORMATS = (process.env.EXOTIC_FORMATS || 'psd').split(',').map((s) => s.trim()).filter(Boolean);
+const CAPABILITIES = (process.env.EXOTIC_CAPABILITIES || 'thumbnail').split(',').map((s) => s.trim()).filter(Boolean);
+const SKU = process.env.EXOTIC_SKU || 'psd-engine-2026';
+const MIN_HOST_VERSION = process.env.EXOTIC_MIN_HOST_VERSION || '0.1.0';
+const COMPLIANCE_REVIEW_ID = process.env.EXOTIC_COMPLIANCE_REVIEW_ID || 'internal-2026-07';
+const WORKER_NAME = process.env.EXOTIC_WORKER_NAME || 'psd-worker.exe';
+const WORKER_CRATE = process.env.EXOTIC_WORKER_CRATE || 'psd-worker';
+const WORKER_PATH = process.env.EXOTIC_WORKER_PATH || path.join(repo, 'target', 'release', WORKER_NAME);
+const RELEASE_KEY_ID = process.env.EXOTIC_RELEASE_KEY_ID || 'release-internal-2026-07';
+const LICENSE_KEY_ID = process.env.EXOTIC_LICENSE_KEY_ID || 'license-internal-2026-07';
 // 内测发行源(公开仓 raw 直链;更新 registry = 向该仓 push 新的三件套)。
 const REG_BASE =
   process.env.PICASA_INTERNAL_REGISTRY_BASE ||
@@ -61,7 +69,7 @@ const keyset = {
   schema: 1,
   _note:
     '内测信任根(占位生产集 + 内测键超集)。经 PICASA_EXOTIC_KEYSET_FILE 编译期注入内测安装包;' +
-    '私钥仅签发机本机。与未来生产 keyset(exotic-keyset-prod.json,随 ③b 入 pro)无关。',
+    '私钥仅签发机本机。与生产 keyset(exotic-keyset-prod.json,ceremony 产物经 PICASA_EXOTIC_KEYSET_FILE 注入)无关。',
   keys: [
     ...placeholder.keys,
     keysetEntry(RELEASE_KEY_ID, 'release', releaseKey),
@@ -71,9 +79,9 @@ const keyset = {
 fs.writeFileSync(path.join(out, 'internal-keyset.json'), JSON.stringify(keyset, null, 2));
 
 // ── 2. worker 载荷(release 构建) ─────────────────────────────────────────────
-const workerExe = path.join(repo, 'target', 'release', 'psd-worker.exe');
+const workerExe = WORKER_PATH;
 if (!fs.existsSync(workerExe)) {
-  console.error(`缺 ${workerExe}\n先构建:cargo build --release -p psd-worker`);
+  console.error(`缺 ${workerExe}\n先构建:cargo build --release -p ${WORKER_CRATE} 或设置 EXOTIC_WORKER_PATH`);
   process.exit(1);
 }
 const workerBytes = fs.readFileSync(workerExe);
@@ -96,11 +104,11 @@ const { zipBytes } = buildPluginZip({
   keyId: RELEASE_KEY_ID,
   releaseKey,
   workerBytes,
-  workerName: 'psd-worker.exe',
-  formats: ['psd'],
-  capabilities: ['thumbnail'],
-  minHostVersion: '0.1.0',
-  complianceReviewId: 'internal-2026-07',
+  workerName: WORKER_NAME,
+  formats: FORMATS,
+  capabilities: CAPABILITIES,
+  minHostVersion: MIN_HOST_VERSION,
+  complianceReviewId: COMPLIANCE_REVIEW_ID,
 });
 const zipPath = path.join(regOut, `${PLUGIN_ID}.zip`);
 fs.writeFileSync(zipPath, zipBytes);
@@ -119,11 +127,11 @@ const { indexBytes, sigBytes } = signIndex({
       plugin_id: PLUGIN_ID,
       version,
       package_sequence: seq,
-      media_kind: 'image',
-      formats: ['psd'],
-      capabilities: ['thumbnail'],
-      sku: 'psd-engine-2026',
-      min_host_version: '0.1.0',
+      media_kind: MEDIA_KIND,
+      formats: FORMATS,
+      capabilities: CAPABILITIES,
+      sku: SKU,
+      min_host_version: MIN_HOST_VERSION,
       target: TARGET,
       package_url: `${REG_BASE}/${PLUGIN_ID}.zip`,
       package_size: zipBytes.length,

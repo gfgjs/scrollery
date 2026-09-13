@@ -1,13 +1,16 @@
-// scripts/generate-notice.mjs
 // 第三方依赖归属清单(NOTICE.md)+ SBOM(CycloneDX 1.5 JSON)生成器。
 // G3「基建/法务(发行前置)」中「NOTICE + SBOM 生成」项的落地(2026-07-05)。
 //
 // 覆盖范围 = 实际分发物的依赖闭包:
-//   Rust 侧:scrollery(主程序)+ ai-worker(随安装包同目录分发)+ psd-worker
-//           (插件商店分发)三棵 normal 依赖树的并集,按发货平台 x86_64-pc-windows-msvc
-//           解析(mac 发货后在 SHIP_TARGETS 加三元组即可);build/dev 依赖不分发、不计入。
-//   npm 侧:package-lock.json(v3)中非 dev 的生产依赖闭包(vite 打进前端 bundle 的部分;
-//           devDependencies 不随产品分发)。lockfile v3 每条目自带 license 字段,离线可用。
+//   Rust 侧:主程序、ai-worker、psd-worker，以及独立 workspace 的 raw-worker。
+//           raw-worker 用 x86_64-pc-windows-gnu 编译但随 Windows 安装包分发，不能漏扫。
+//   npm 侧:package-lock.json(v3)中非 dev 的生产依赖闭包，加上虽标为 devDependency、
+//           但其原生 DLL 被 build-ai-worker.mjs 抽取进安装包的 onnxruntime-node。
+//   运行时/内嵌侧:LibRaw、BtbN FFmpeg 等不由上述 lockfile 完整表达的实际发货组件，
+//           由下方手工登记表补上并进入 NOTICE/SBOM 与 strong-copyleft 门控。
+//   vendored 侧:非包管理器依赖(不在两份 lockfile),但源码 vendored 进仓、打进前端 bundle
+//           随产品分发(如 foliate-js)。此类无法从 lockfile 采集,由下方 VENDORED_FRONTEND
+//           手工登记表补上——新增/升级 vendored 源时须同步该表(见对应 VENDOR.md)。
 //
 // 产物:
 //   NOTICE.md(仓库根,tracked)——归属清单;内容完全由两份 lockfile 决定,无时间戳,
@@ -27,13 +30,117 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { VENDORED_VERSION_FIELDS, verifyVendoredArtifacts } from './lib/vendored-artifacts.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHECK_MODE = process.argv.includes('--check');
 
-// 发货二进制与发货平台(见文件头「覆盖范围」)。
-const SHIP_BINS = ['scrollery', 'ai-worker', 'psd-worker'];
-const SHIP_TARGETS = ['x86_64-pc-windows-msvc'];
+// 发货 Rust 根与平台。raw-worker 是独立 workspace，必须保留 manifest_path。
+const SHIP_RUST_ROOTS = [
+  { manifest: 'Cargo.toml', package: 'scrollery', target: 'x86_64-pc-windows-msvc' },
+  { manifest: 'Cargo.toml', package: 'ai-worker', target: 'x86_64-pc-windows-msvc' },
+  { manifest: 'Cargo.toml', package: 'psd-worker', target: 'x86_64-pc-windows-msvc' },
+  {
+    manifest: 'crates/exotic-workers/raw-worker/Cargo.toml',
+    package: null,
+    target: 'x86_64-pc-windows-gnu',
+  },
+];
+
+// 原生 DLL 实际来自 devDependency；只要它被复制进安装包，就不能继续按 dev 工具排除。
+const SHIPPED_NPM_RUNTIME_PACKAGES = new Set(['onnxruntime-node']);
+
+// ── vendored 第三方源码(手工登记)─────────────────────────────────────────────
+// 不经包管理器、但 vendored 进仓并打进前端 bundle 随产品分发的第三方源码。lockfile 采集不到,
+// 故在此手工登记归属;新增/升级 vendored 源时同步维护(权威细节见各自 VENDOR.md)。
+// 计入 license summary 与 strong-copyleft 门控(vendored 若混入 copyleft,门须能拦下)。
+const VENDORED_FRONTEND = [
+  {
+    name: 'foliate-js',
+    version: '78914ae', // 钉定 commit 短号(见 src/vendor/foliate-js/VENDOR.md)
+    license: 'MIT',
+    homepage: 'https://github.com/johnfactotum/foliate-js',
+    purl: 'pkg:github/johnfactotum/foliate-js@78914aef4466eb960965702401634c2cb348e9b1',
+    note: 'vendored at pinned commit; PDF backend stripped',
+  },
+  // Vditor 3.11.3 的发行物里 vendored 的两个独立上游编译件。二者都不在任何 lockfile:
+  // Graphviz 2.40.1 只以 Viz.js 2.1.2 的 Emscripten 单文件产物形式存在(EPL-1.0,未修改),
+  // Lute 1.7.6 只以 Go 编译产物 lute.min.js 形式存在(MulanPSL-2.0,未修改)。
+  // 版本由产物内声明坐实,并与 third-party/license-sources.json 的钉定值交叉校验:
+  // 版本常量、产物字节、上游正文三者不可能各自漂移(见 verifyPinnedVendoredArtifacts)。
+  {
+    name: 'Graphviz (embedded in Viz.js full.render.js)',
+    version: '2.40.1',
+    license: 'EPL-1.0',
+    homepage: 'https://gitlab.com/graphviz/graphviz',
+    purl: 'pkg:generic/graphviz@2.40.1',
+    note:
+      'Emscripten object code built by Viz.js 2.1.2 (MIT); unmodified upstream, ' +
+      'source availability entry recorded in legal/graphviz',
+  },
+  {
+    name: 'Lute (lute.min.js)',
+    version: '1.7.6',
+    license: 'MulanPSL-2.0',
+    homepage: 'https://github.com/88250/lute',
+    purl: 'pkg:github/88250/lute@v1.7.6',
+    note: 'Go object code shipped by Vditor 3.11.3; unmodified upstream, text in legal/lute',
+  },
+];
+
+// 不在根 lockfile 中、但会随产品或运行时分发的闭包成员。许可证表达式进入
+// NOTICE/SBOM；完整文本由 prepare-legal-resources.mjs 生成到安装包 legal/ 目录。
+const SHIPPED_RUNTIME_COMPONENTS = [
+  {
+    name: 'LibRaw (embedded by rsraw-sys)',
+    version: 'rsraw-sys-0.1.1',
+    license: 'CDDL-1.0 OR LGPL-2.1-only',
+    homepage: 'https://www.libraw.org',
+    purl: 'pkg:generic/LibRaw@rsraw-sys-0.1.1',
+    // 许可表达式为择一；本项目选 LGPL-2.1-only 分支，上游 CDDL-1.0 正文一并保留。
+    note:
+      'embedded in raw-worker; LGPL-2.1-only branch elected from CDDL-1.0 OR LGPL-2.1-only, ' +
+      'upstream texts kept under legal/LibRaw; the OSS source release ships no RAW binary, and a ' +
+      'future static-link distribution still owes LGPL-2.1 source/relink materials or the §3 ' +
+      'GPL-3.0 route — the installer is not thereby declared compliant',
+    eco: 'embedded-runtime',
+  },
+  {
+    name: 'FFmpeg (BtbN LGPL-shared runtime)',
+    version: 'autobuild-2026-07-24-13-32',
+    license: 'LGPL-2.1-or-later',
+    homepage: 'https://github.com/BtbN/FFmpeg-Builds',
+    purl: 'pkg:github/BtbN/FFmpeg-Builds@autobuild-2026-07-24-13-32',
+    note: 'downloaded on demand; fixed FFmpeg/BtbN license texts are emitted under legal/ffmpeg; source link is shown in the app',
+    eco: 'runtime-download',
+  },
+];
+
+// ── vendored 编译产物的版本/字节锚定 ─────────────────────────────────────────
+// 校验实现只有一处(scripts/lib/vendored-artifacts.mjs),这里只补最后一段接线:
+//   ① 登记表版本 = 钉定版本:VENDORED_FRONTEND 与 third-party/license-sources.json 不一致
+//      = 有人只改了一边;
+//   ②③ 产物尺寸/字节/版本标记由 verifyVendoredArtifacts 对磁盘产物逐项复核。
+// 目的不是判定许可兼容性,而是保证 NOTICE/legal 里写的版本确有所指。
+const PINNED_MANIFEST_PATH = path.join(repo, 'third-party', 'license-sources.json');
+const VENDORED_COMPONENT_BY_NAME = {
+  'Graphviz (embedded in Viz.js full.render.js)': 'graphviz',
+  'Lute (lute.min.js)': 'lute',
+};
+
+export function verifyPinnedVendoredArtifacts() {
+  for (const [name, component] of Object.entries(VENDORED_COMPONENT_BY_NAME)) {
+    const declared = VENDORED_FRONTEND.find((item) => item.name === name)?.version;
+    const pinned = VENDORED_VERSION_FIELDS[component];
+    if (declared !== pinned) {
+      throw new Error(
+        `vendored 版本与钉定清单不一致: ${name}\n` +
+          `VENDORED_FRONTEND ${declared ?? 'missing'} vs ${pinned ?? 'missing'}`,
+      );
+    }
+  }
+  return verifyVendoredArtifacts(JSON.parse(fs.readFileSync(PINNED_MANIFEST_PATH, 'utf8')), repo);
+}
 
 // ── cargo tree 行解析 ─────────────────────────────────────────────────────────
 // 输入格式(--prefix none --format "{p}~{l}"):
@@ -78,19 +185,22 @@ export function flagLicense(expr) {
 // ── 采集:Rust 三棵发货树并集 ─────────────────────────────────────────────────
 function collectRust() {
   const seen = new Map(); // key = name@version
-  for (const bin of SHIP_BINS) {
-    for (const target of SHIP_TARGETS) {
-      const out = execFileSync(
-        'cargo',
-        ['tree', '-p', bin, '-e', 'normal', '--locked', '--prefix', 'none',
-          '--color', 'never', '--target', target, '--format', '{p}~{l}'],
-        { cwd: repo, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
-      );
-      for (const line of out.split(/\r?\n/)) {
-        const dep = parseCargoLine(line);
-        if (!dep || dep.firstParty) continue;
-        seen.set(`${dep.name}@${dep.version}`, dep);
-      }
+  for (const root of SHIP_RUST_ROOTS) {
+    const args = ['tree', '--manifest-path', path.join(repo, root.manifest)];
+    if (root.package) args.push('-p', root.package);
+    args.push(
+      '-e', 'normal', '--locked', '--prefix', 'none',
+      '--color', 'never', '--target', root.target, '--format', '{p}~{l}'
+    );
+    const out = execFileSync('cargo', args, {
+      cwd: repo,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    for (const line of out.split(/\r?\n/)) {
+      const dep = parseCargoLine(line);
+      if (!dep || dep.firstParty) continue;
+      seen.set(`${dep.name}@${dep.version}`, dep);
     }
   }
   return [...seen.values()];
@@ -100,10 +210,17 @@ function collectRust() {
 export function collectNpmFromLock(lock) {
   const out = [];
   for (const [key, entry] of Object.entries(lock.packages || {})) {
-    if (key === '' || entry.dev) continue;
+    if (key === '' || (entry.dev && !SHIPPED_NPM_RUNTIME_PACKAGES.has(key.slice(key.lastIndexOf('node_modules/') + 'node_modules/'.length)))) continue;
     if (!key.includes('node_modules/')) continue;
     const name = key.slice(key.lastIndexOf('node_modules/') + 'node_modules/'.length);
-    out.push({ name, version: entry.version, license: (entry.license || '').trim() });
+    out.push({
+      name,
+      version: entry.version,
+      license: (entry.license || '').trim(),
+      note: SHIPPED_NPM_RUNTIME_PACKAGES.has(name)
+        ? 'devDependency; native DLLs are copied into the installer by build-ai-worker.mjs'
+        : '',
+    });
   }
   return out;
 }
@@ -119,6 +236,8 @@ function renderNotice(rustDeps, npmDeps, appVersion) {
   const all = [
     ...rustDeps.map((d) => ({ ...d, eco: 'crates.io' })),
     ...npmDeps.map((d) => ({ ...d, eco: 'npm' })),
+    ...VENDORED_FRONTEND.map((d) => ({ ...d, eco: 'vendored' })),
+    ...SHIPPED_RUNTIME_COMPONENTS,
   ];
   const licCount = new Map();
   for (const d of all) {
@@ -134,7 +253,7 @@ function renderNotice(rustDeps, npmDeps, appVersion) {
   const L = [];
   L.push('# Third-Party Notices');
   L.push('');
-  // NOTICE 署名头(Apache-2.0 §4(d) 的 attribution 载体;署名主体 2026-07-06 拍板为集体式,换法律主体零改动)
+  // NOTICE 署名头(第三方归属清单的分发载体;署名主体 2026-07-06 拍板为集体式,换法律主体零改动)
   L.push('Scrollery');
   L.push('Copyright 2026 The Scrollery Authors');
   L.push('');
@@ -144,7 +263,9 @@ function renderNotice(rustDeps, npmDeps, appVersion) {
   L.push('');
   L.push('本文件由 `scripts/generate-notice.mjs` 从 `Cargo.lock` / `package-lock.json` 生成,');
   L.push('**请勿手改**;依赖变更后重新生成(CI/发布流程以 `--check` 校验新鲜度)。');
-  L.push('完整 license 文本捆绑与上架前法务复核见文件末「Review notes」。');
+  L.push('完整 license 文本由 `scripts/prepare-legal-resources.mjs` 生成到安装包 `legal/`;');
+  L.push('包根未携带文本的条目使用仓库内固定 hash 的 SPDX 正文,映射记录在 `legal/MANIFEST.json`;');
+  L.push('构建阶段不联网,只校验并复制 `third-party/licenses/` 中的已固定材料。');
   L.push('');
   L.push(`Application version at generation time: ${appVersion}`);
   L.push('');
@@ -167,12 +288,34 @@ function renderNotice(rustDeps, npmDeps, appVersion) {
   L.push('');
   L.push(`## npm packages (${npmDeps.length}) — frontend bundle`);
   L.push('');
-  L.push('Production dependency closure from `package-lock.json` (dev tooling excluded).');
+  L.push('Production dependency closure from `package-lock.json`, plus explicitly shipped native runtime packages.');
   L.push('');
-  L.push('| Package | Version | License |');
-  L.push('| --- | --- | --- |');
+  L.push('| Package | Version | License | Shipping note |');
+  L.push('| --- | --- | --- | --- |');
   for (const d of [...npmDeps].sort(byName)) {
-    L.push(`| [${d.name}](https://www.npmjs.com/package/${d.name}) | ${d.version} | ${d.license || '—'} |`);
+    L.push(`| [${d.name}](https://www.npmjs.com/package/${d.name}) | ${d.version} | ${d.license || '—'} | ${d.note || ''} |`);
+  }
+  L.push('');
+  L.push(`## Vendored source (${VENDORED_FRONTEND.length}) — bundled into frontend`);
+  L.push('');
+  L.push('第三方源码以钉定版本 vendored 进本仓(不经包管理器),打进前端 bundle 随产品分发。');
+  L.push('对应源目录的许可证文件会进入安装包 `legal/`(见 VENDOR.md / LICENSE)。');
+  L.push('');
+  L.push('| Source | Version (pinned) | License | Notes |');
+  L.push('| --- | --- | --- | --- |');
+  for (const d of [...VENDORED_FRONTEND].sort(byName)) {
+    L.push(`| [${d.name}](${d.homepage}) | ${d.version} | ${d.license || '—'} | ${d.note || ''} |`);
+  }
+  L.push('');
+  L.push(`## Additional shipped runtimes (${SHIPPED_RUNTIME_COMPONENTS.length})`);
+  L.push('');
+  L.push('这些组件不由根 lockfile 的普通依赖闭包完整表达，但其代码或二进制会进入产品运行路径。');
+  L.push('完整许可证/归属材料由 `node scripts/prepare-legal-resources.mjs` 生成到安装包 `legal/`。');
+  L.push('');
+  L.push('| Component | Version | License | Notes |');
+  L.push('| --- | --- | --- | --- |');
+  for (const d of [...SHIPPED_RUNTIME_COMPONENTS].sort(byName)) {
+    L.push(`| [${d.name}](${d.homepage}) | ${d.version} | ${d.license || '—'} | ${d.note || ''} |`);
   }
   L.push('');
   L.push('## Review notes');
@@ -195,7 +338,7 @@ function renderNotice(rustDeps, npmDeps, appVersion) {
   }
   L.push('');
   L.push('生成物为归属清单,非法律意见。上架前人工环节(G3):license 兼容性终审、');
-  L.push('完整 license 文本捆绑(cargo-about 级)、各分发渠道政策核验。');
+  L.push('`legal/MANIFEST.json` 中的包级文件/SPDX 正文映射仍需按上游来源逐项复核、各分发渠道政策核验。');
   L.push('');
   return L.join('\n');
 }
@@ -220,6 +363,20 @@ function renderSbom(rustDeps, npmDeps, appVersion) {
       name: d.name,
       version: d.version,
       purl: purlNpm(d.name, d.version),
+      ...(normalizeSpdx(d.license) ? { licenses: [{ expression: normalizeSpdx(d.license) }] } : {}),
+    })),
+    ...VENDORED_FRONTEND.map((d) => ({
+      type: 'library',
+      name: d.name,
+      version: d.version,
+      purl: d.purl,
+      ...(normalizeSpdx(d.license) ? { licenses: [{ expression: normalizeSpdx(d.license) }] } : {}),
+    })),
+    ...SHIPPED_RUNTIME_COMPONENTS.map((d) => ({
+      type: 'library',
+      name: d.name,
+      version: d.version,
+      purl: d.purl,
       ...(normalizeSpdx(d.license) ? { licenses: [{ expression: normalizeSpdx(d.license) }] } : {}),
     })),
   ].sort((a, b) => cmp(a.purl, b.purl));
@@ -270,16 +427,24 @@ function selftest() {
       'node_modules/vue': { version: '3.5.0', license: 'MIT' },
       'node_modules/@scope/pkg/node_modules/inner': { version: '1.0.0', license: 'ISC' },
       'node_modules/devtool': { version: '1.0.0', dev: true, license: 'MIT' },
+      'node_modules/onnxruntime-node': { version: '1.26.0', dev: true, license: 'MIT' },
     },
   };
   const npm = collectNpmFromLock(lock);
-  assert(npm.length === 2, 'dev 排除 + 根排除');
+  assert(npm.length === 3, 'dev 排除 + 根排除 + shipped runtime 保留');
   assert(npm.find((p) => p.name === 'inner'), '嵌套 node_modules 取末段包名');
+  assert(npm.find((p) => p.name === 'onnxruntime-node'), 'native runtime devDependency 保留');
   assert(purlNpm('@tauri-apps/api', '2.0.0') === 'pkg:npm/%40tauri-apps/api@2.0.0', 'scoped purl 编码');
+  // vendored 登记表字段完整性(防有人加条目漏字段导致 NOTICE 渲染出空单元格/坏 purl)
+  assert(
+    VENDORED_FRONTEND.every((v) => v.name && v.version && v.license && v.homepage && v.purl),
+    'vendored 登记表字段完整(name/version/license/homepage/purl)'
+  );
 }
 
 // ── 主流程 ────────────────────────────────────────────────────────────────────
 selftest();
+verifyPinnedVendoredArtifacts();
 
 const appVersion = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version;
 const lock = JSON.parse(fs.readFileSync(path.join(repo, 'package-lock.json'), 'utf8'));
@@ -288,7 +453,7 @@ const npmDeps = collectNpmFromLock(lock);
 const notice = renderNotice(rustDeps, npmDeps, appVersion);
 const noticePath = path.join(repo, 'NOTICE.md');
 
-const strongCount = [...rustDeps, ...npmDeps].filter(
+const strongCount = [...rustDeps, ...npmDeps, ...VENDORED_FRONTEND, ...SHIPPED_RUNTIME_COMPONENTS].filter(
   (d) => flagLicense(normalizeSpdx(d.license)) === 'strong'
 ).length;
 
@@ -311,14 +476,14 @@ if (CHECK_MODE) {
     }
     process.exit(1);
   }
-  console.log(`✓ NOTICE.md 新鲜(rust ${rustDeps.length} + npm ${npmDeps.length};strong-copyleft 旗标 ${strongCount})`);
+  console.log(`✓ NOTICE.md 新鲜(rust ${rustDeps.length} + npm ${npmDeps.length} + vendored ${VENDORED_FRONTEND.length} + runtime ${SHIPPED_RUNTIME_COMPONENTS.length};strong-copyleft 旗标 ${strongCount})`);
 } else {
   fs.writeFileSync(noticePath, notice);
   const sbomDir = path.join(repo, 'target', 'sbom');
   fs.mkdirSync(sbomDir, { recursive: true });
   const sbomPath = path.join(sbomDir, 'scrollery.cdx.json');
   fs.writeFileSync(sbomPath, JSON.stringify(renderSbom(rustDeps, npmDeps, appVersion), null, 2) + '\n');
-  console.log(`NOTICE.md 已生成(rust ${rustDeps.length} + npm ${npmDeps.length} 个第三方包)`);
+  console.log(`NOTICE.md 已生成(rust ${rustDeps.length} + npm ${npmDeps.length} + vendored ${VENDORED_FRONTEND.length} + runtime ${SHIPPED_RUNTIME_COMPONENTS.length} 个第三方组件)`);
   console.log(`SBOM 已生成:${sbomPath}`);
   if (strongCount > 0) {
     console.warn(`⚠ 检出 ${strongCount} 个 strong-copyleft 旗标包——发布前必须人工法务复核(见 NOTICE.md Review notes)`);

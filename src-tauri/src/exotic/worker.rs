@@ -18,13 +18,24 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use exotic_protocol::{
-    read_frame, write_frame, EmbedItem, EmbedResult, FaceDet, FaceItem, FaceItemResult,
-    FailureBody, Frame, FrameType, HelloBody, ReadyBody, RequestBody, SuccessBody, WorkerErrorCode,
+    read_frame, write_frame, FailureBody, Frame, FrameType, HelloBody, ProgressBody, ReadyBody,
+    RequestBody, SuccessBody,
 };
+
+// U-P3(2026-07-16):outcome 类型与纯校验器拆至同级模块,此处 re-export 保住既有
+// `exotic::worker::{RawOutcome, TaskOutcome, validate_*, ...}` 引用路径(消费方零迁移)。
+pub use super::outcome::*;
+pub use super::validate::*;
 
 /// 在途任务取消轮询周期：`run_thumbnail` 等待响应期间每隔此间隔检查取消标志，
 /// 使 stop/App 退出能及时让 Supervisor kill 在途 Worker（v3.1 §4.1）。
 const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// 收到 Progress 帧(v3)即重置静默限时后,单请求仍受此**总上界**约束(防御:worker 心跳
+/// 线程活着但装载线程死锁的病态组合不至于让宿主永久等待)。取值 ≥ worker 最坏串行装载
+/// (5 池 × 单段 600s 后备上界远超实际;正常装载秒级、心跳只是在途证明)。
+/// 不发 Progress 的 op(thumbnail/embed 等)静默限时=总限时,行为与 v2 完全一致。
+pub(crate) const PROGRESS_TOTAL_CAP: Duration = Duration::from_secs(3600);
 
 /// 定位 PSD Worker 可执行文件（**仅测试**）。
 ///
@@ -68,46 +79,6 @@ pub struct WorkerLimits {
     pub max_output_pixels: u64,
     /// 请求档位之上允许的长边误差（缩放取整/比例换算的容差）。
     pub long_edge_tolerance: u32,
-}
-
-/// op 无关的原始请求结果(T15,D3 §4①)。`Success` **未经任何 op 特定校验**——
-/// thumbnail 的 WebP 复核在 [`WorkerConn::run_thumbnail`],embed/face 批的
-/// 维度×数量一致性在 [`validate_embed_batch_output`]/[`validate_face_batch_output`],
-/// 由调用方按 op 分派。进程级三态(TimedOut/Disconnected/Protocol)语义与
-/// [`TaskOutcome`] 一致(Supervisor 据此 kill 回收)。
-// SessionReady 回声字段(T16)使 Success 变体略超 clippy 阈值;本枚举按值单次传递、
-// 不进集合,变体大小差异无实际内存代价,故豁免而非 Box(免全链解引用噪音)。
-#[allow(clippy::large_enum_variant)]
-pub enum RawOutcome {
-    /// 收到 Success 帧(body+blob 原样交出,尚未按 op 校验)。
-    Success { body: SuccessBody, blob: Vec<u8> },
-    /// Worker 显式失败(item/fingerprint 核对属 op 语义,由调用方做)。
-    Failure(FailureBody),
-    /// 超时(Supervisor 应 kill)。
-    TimedOut,
-    /// 连接断开 / Worker 退出。
-    Disconnected,
-    /// 协议违例(错序 / 损坏帧 / 意外帧类型)。
-    Protocol(String),
-}
-
-/// 一次任务的结果。`Success` 已通过 Host 全部验证。
-pub enum TaskOutcome {
-    /// 验证通过的缩略图。
-    Success {
-        width: u32,
-        height: u32,
-        mime: String,
-        blob: Vec<u8>,
-    },
-    /// Worker 显式失败（已核对 item/fingerprint）。
-    Failure(FailureBody),
-    /// 超时（Supervisor 应 kill）。
-    TimedOut,
-    /// 连接断开 / Worker 退出（Supervisor 应 wait 回收）。
-    Disconnected,
-    /// 协议违例或输出非法（错序 / 错 id / 非法 WebP / 尺寸不符）→ terminal invalid_worker_output。
-    Protocol(String),
 }
 
 /// 以低优先级、隐藏窗口、管道 stdio 创建 Worker 子进程（§3.6 / R1）。
@@ -265,6 +236,54 @@ impl WorkerConn {
         timeout: Duration,
         cancelled: &dyn Fn() -> bool,
     ) -> RawOutcome {
+        // 缺省沿用 PROGRESS_TOTAL_CAP(3600s):既有 op(thumbnail/embed/face/session 等)行为
+        // 逐字节不变——回归锚 `progress_resets_silence_deadline_and_stale_ignored` 直调本方法保绿。
+        self.run_request_capped(req, timeout, PROGRESS_TOTAL_CAP, cancelled)
+    }
+
+    /// [`Self::run_request`] 的 per-op 总上界参数化版(视频格式扩展子系统 design.md §2.4)。
+    /// `timeout` 仍是**静默限时**(收 Progress 即重置);`total_cap` 为不可重置的**总上界**
+    /// (心跳线程活着但装载线程死锁的病态组合的最后防线)。video transcode 传
+    /// `max(2h, 探测时长 × 6)`(上限 12h);其余 op 由 [`Self::run_request`] 传缺省 3600s。
+    ///
+    /// 无观察者的薄委托(既有 AI/enhance/OCR 全部调用点走这条路,逻辑一行不动)——
+    /// 真正实现见 [`Self::run_request_observed`]。
+    pub fn run_request_capped(
+        &mut self,
+        req: &RequestBody,
+        timeout: Duration,
+        total_cap: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> RawOutcome {
+        self.run_request_observed(req, timeout, total_cap, cancelled, None)
+    }
+
+    /// 同 [`Self::run_request`],但在收到本请求的 Progress 帧时额外回调 `on_progress`
+    /// (per-tile 进度接线,深审 b:增强 EnhanceRun 借此把 tile 心跳上报队列状态)。
+    /// 视频线合并后统一委托到 [`Self::run_request_observed`] 并取缺省 total_cap——
+    /// 既有语义逐字节不变,仅换实现载体(观察者形参名不同,行为一致)。
+    pub fn run_request_with_progress(
+        &mut self,
+        req: &RequestBody,
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+        on_progress: Option<&mut dyn FnMut(&ProgressBody)>,
+    ) -> RawOutcome {
+        self.run_request_observed(req, timeout, PROGRESS_TOTAL_CAP, cancelled, on_progress)
+    }
+
+    /// [`Self::run_request_capped`] 的进度可观察版(视频格式扩展子系统 design.md §5.3):
+    /// 每收到一帧本请求的 Progress(非陈旧)即回调 `progress_observer`(若提供),
+    /// 静默重置 + 日志逻辑与 [`Self::run_request_capped`] 完全一致、逐字节不变——
+    /// 仅追加这一次回调,不改变任何既有分支/返回值。
+    pub fn run_request_observed(
+        &mut self,
+        req: &RequestBody,
+        timeout: Duration,
+        total_cap: Duration,
+        cancelled: &dyn Fn() -> bool,
+        mut progress_observer: Option<&mut dyn FnMut(&ProgressBody)>,
+    ) -> RawOutcome {
         let request_id = self.alloc_request_id();
         let frame = match Frame::control(FrameType::Request, request_id, req) {
             Ok(f) => f,
@@ -276,16 +295,53 @@ impl WorkerConn {
 
         // 可取消等待：每 CANCEL_POLL 检查一次取消标志，使 stop/App 退出能及时让 Supervisor kill
         // 在途 Worker（v3.1 §4.1：停止按取消协议终止在途，不等其自然完成；返回 Disconnected → kill）。
-        let deadline = Instant::now() + timeout;
+        // v3(加固批 A-2):`timeout` 语义 = **静默限时**——收到本请求的 Progress 帧即重置;
+        // 不发 Progress 的 op 永不重置,行为与旧「总限时」逐字节相同。总上界见 `total_cap`。
+        let started = Instant::now();
+        let hard_deadline = started + total_cap;
+        let mut deadline = started + timeout;
         let resp = loop {
             if cancelled() {
                 return RawOutcome::Disconnected;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let now = Instant::now();
+            if now >= deadline || now >= hard_deadline {
                 return RawOutcome::TimedOut;
             }
+            let remaining = deadline
+                .saturating_duration_since(now)
+                .min(hard_deadline.saturating_duration_since(now));
             match self.rx.recv_timeout(remaining.min(CANCEL_POLL)) {
+                Ok(Ok(f)) if f.frame_type == FrameType::Progress => {
+                    if f.request_id == request_id {
+                        match f.parse_json::<ProgressBody>() {
+                            Ok(p) => {
+                                tracing::info!(
+                                    "worker 进度[req={request_id}]:{}{} 已 {:.1}s",
+                                    p.stage,
+                                    p.detail
+                                        .as_deref()
+                                        .map(|d| format!("({d})"))
+                                        .unwrap_or_default(),
+                                    p.elapsed_ms as f64 / 1000.0
+                                );
+                                // per-tile 进度回调(深审 b + 视频 §5.3):除重置静默计时外通知上层。
+                                if let Some(obs) = progress_observer.as_deref_mut() {
+                                    obs(&p);
+                                }
+                            }
+                            Err(e) => tracing::warn!("Progress 帧 JSON 无效(忽略):{e}"),
+                        }
+                        deadline = Instant::now() + timeout; // 静默计时重置
+                    } else {
+                        // 迟到的陈旧进度(前一请求残留)不判违例——终态帧错配才是硬错误。
+                        tracing::warn!(
+                            "忽略陈旧 Progress:req {} != 在途 {request_id}",
+                            f.request_id
+                        );
+                    }
+                    continue;
+                }
                 Ok(Ok(f)) => break f,
                 Ok(Err(e)) => {
                     return if e.is_clean_eof() {
@@ -295,7 +351,7 @@ impl WorkerConn {
                         RawOutcome::Protocol(format!("响应帧损坏：{e}"))
                     };
                 }
-                Err(RecvTimeoutError::Timeout) => continue, // 轮询：再查取消 / 总超时
+                Err(RecvTimeoutError::Timeout) => continue, // 轮询：再查取消 / 静默或总超时
                 Err(RecvTimeoutError::Disconnected) => return RawOutcome::Disconnected,
             }
         };
@@ -370,320 +426,10 @@ impl WorkerConn {
     }
 }
 
-/// 验证缩略图 Success（§3.7）：core/request 核对 + 独立解码器验真尺寸 + 上限。返回 (w,h,mime)。
-///
-/// 用 `image` crate 解码 WebP（独立于 Worker 声明）得到**真实**尺寸——既验证 WebP 自洽，
-/// 又拿到与声明对照的实际宽高（Worker 声明不可信）。缩略图体积小，解码开销可忽略。
-pub fn validate_thumbnail_output(
-    req: &RequestBody,
-    body: &SuccessBody,
-    blob: &[u8],
-    limits: &WorkerLimits,
-) -> Result<(u32, u32, String), String> {
-    // 核对 item / fingerprint（防错序串扰）。
-    if body.item_id != req.item_id() {
-        return Err(format!(
-            "item_id 错配：{:?} != {:?}",
-            body.item_id,
-            req.item_id()
-        ));
-    }
-    if body.input_fingerprint.as_deref() != req.input_fingerprint() {
-        return Err("fingerprint 错配".into());
-    }
-    // mime 必须 image/webp。
-    let mime = body.mime.clone().unwrap_or_default();
-    if mime != "image/webp" {
-        return Err(format!("mime 非 image/webp：{mime}"));
-    }
-    // blob 非空且不超上限。
-    if blob.is_empty() {
-        return Err("blob 为空".into());
-    }
-    if blob.len() as u64 > limits.max_blob_len as u64 {
-        return Err(format!(
-            "blob 超限：{} > {}",
-            blob.len(),
-            limits.max_blob_len
-        ));
-    }
-    // WebP 魔数（RIFF....WEBP）。
-    if blob.len() < 12 || &blob[0..4] != b"RIFF" || &blob[8..12] != b"WEBP" {
-        return Err("WebP 魔数非法".into());
-    }
-    // 独立解码取真实尺寸（同时验证 WebP 自洽）。
-    let img = image::load_from_memory_with_format(blob, image::ImageFormat::WebP)
-        .map_err(|e| format!("WebP 独立解码失败：{e}"))?;
-    use image::GenericImageView;
-    let (aw, ah) = img.dimensions();
-    // 声明尺寸（若有）必须与实际一致。
-    if let Some(dw) = body.width {
-        if dw != aw {
-            return Err(format!("声明宽 {dw} != 实际 {aw}"));
-        }
-    }
-    if let Some(dh) = body.height {
-        if dh != ah {
-            return Err(format!("声明高 {dh} != 实际 {ah}"));
-        }
-    }
-    // 长边不超过请求档位 + 容差。
-    if let RequestBody::Thumbnail {
-        target_long_edge, ..
-    } = req
-    {
-        let long = aw.max(ah);
-        if long > target_long_edge.saturating_add(limits.long_edge_tolerance) {
-            return Err(format!(
-                "长边 {long} 超过档位 {target_long_edge}+容差 {}",
-                limits.long_edge_tolerance
-            ));
-        }
-    }
-    // 总像素不超上限。
-    let pixels = (aw as u64).saturating_mul(ah as u64);
-    if pixels > limits.max_output_pixels {
-        return Err(format!("像素 {pixels} 超上限 {}", limits.max_output_pixels));
-    }
-    Ok((aw, ah, mime))
-}
-
-/// 默认缩略图上限：64 MiB blob、4 兆像素（足够 960 档）、64px 长边容差。
-pub fn default_thumbnail_limits() -> WorkerLimits {
-    WorkerLimits {
-        max_blob_len: exotic_protocol::MAX_BLOB_LEN,
-        max_output_pixels: 4_000_000,
-        long_edge_tolerance: 64,
-    }
-}
-
-// ── v2 批量输出校验(T15,D3 §4①:「embed 批的输出校验 = 维度×数量一致性」)────────────
-// Host 不信任 Worker(§3.7)在 v2 上的延伸:results 严格同序同长、逐项 item/fingerprint
-// 核对、blob 长度精确等于 Ok 项载荷之和。任一不符 → Err(协议违例,调用方 kill 回收);
-// 逐项 Err 是数据结果、不判违例。T17 派发器直接消费这两个纯函数。
-
-/// EmbedBatch 单项的校验后结果(与请求 items 同序对齐)。
-#[derive(Debug)]
-pub enum EmbedItemOutcome {
-    /// 该项嵌入(已按 embed_dim 从 blob 切出,f32 LE)。
-    Ok(Vec<f32>),
-    /// 该项失败(worker 逐项报错,不连坐)。
-    Err(WorkerErrorCode),
-}
-
-/// 校验 EmbedBatch 的 Success 输出并切出各项嵌入。`embed_dim` 取自 SessionReady。
-pub fn validate_embed_batch_output(
-    items: &[EmbedItem],
-    body: &SuccessBody,
-    blob: &[u8],
-    embed_dim: usize,
-) -> Result<Vec<EmbedItemOutcome>, String> {
-    let batch = body
-        .embed
-        .as_ref()
-        .ok_or("EmbedBatch Success 缺 embed 应答体")?;
-    if batch.results.len() != items.len() {
-        return Err(format!(
-            "results 长度错配：{} != items {}",
-            batch.results.len(),
-            items.len()
-        ));
-    }
-    if embed_dim == 0 {
-        return Err("embed_dim 为 0".into());
-    }
-    let item_bytes = embed_dim * 4;
-    let ok_count = batch
-        .results
-        .iter()
-        .filter(|r| matches!(r, EmbedResult::Ok { .. }))
-        .count();
-    if blob.len() != ok_count * item_bytes {
-        return Err(format!(
-            "blob 长度错配：{} != {}×{}",
-            blob.len(),
-            ok_count,
-            item_bytes
-        ));
-    }
-
-    let mut out = Vec::with_capacity(items.len());
-    let mut off = 0usize;
-    for (i, r) in batch.results.iter().enumerate() {
-        let (rid, rfp) = match r {
-            EmbedResult::Ok {
-                item_id,
-                fingerprint,
-            }
-            | EmbedResult::Err {
-                item_id,
-                fingerprint,
-                ..
-            } => (*item_id, fingerprint.as_str()),
-        };
-        // 同序核对:错序/陈旧结果即违例(延续单项 input_fingerprint 核对语义到批量)。
-        if rid != items[i].item_id || rfp != items[i].fingerprint {
-            return Err(format!("第 {i} 项 item/fingerprint 错配"));
-        }
-        match r {
-            EmbedResult::Ok { .. } => {
-                let emb: Vec<f32> = blob[off..off + item_bytes]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                off += item_bytes;
-                out.push(EmbedItemOutcome::Ok(emb));
-            }
-            EmbedResult::Err { code, .. } => out.push(EmbedItemOutcome::Err(*code)),
-        }
-    }
-    Ok(out)
-}
-
-/// FaceDetectEmbed 单项的校验后结果(与请求 items 同序对齐)。
-#[derive(Debug)]
-pub enum FaceItemOutcome {
-    /// 几何 + 逐脸嵌入(faces 与 embeddings 同序同长;0 脸也是 Ok)。
-    Ok {
-        faces: Vec<FaceDet>,
-        embeddings: Vec<Vec<f32>>,
-        /// worker 实际解码尺寸(几何为该图像素坐标;归一化/quality 派生用)。
-        width: u32,
-        height: u32,
-    },
-    /// 该项失败(不连坐)。
-    Err(WorkerErrorCode),
-}
-
-/// 校验 FaceDetectEmbed 的 Success 输出并按「Ok 项序 × 项内脸序」切出嵌入。
-/// `face_embed_dim` 取自 SessionReady(未载人脸角色时本函数不应被调用)。
-pub fn validate_face_batch_output(
-    items: &[FaceItem],
-    body: &SuccessBody,
-    blob: &[u8],
-    face_embed_dim: usize,
-) -> Result<Vec<FaceItemOutcome>, String> {
-    let batch = body
-        .face
-        .as_ref()
-        .ok_or("FaceDetectEmbed Success 缺 face 应答体")?;
-    if batch.results.len() != items.len() {
-        return Err(format!(
-            "results 长度错配：{} != items {}",
-            batch.results.len(),
-            items.len()
-        ));
-    }
-    if face_embed_dim == 0 {
-        return Err("face_embed_dim 为 0".into());
-    }
-    let face_bytes = face_embed_dim * 4;
-    let total_faces: usize = batch
-        .results
-        .iter()
-        .map(|r| match r {
-            FaceItemResult::Ok { faces, .. } => faces.len(),
-            FaceItemResult::Err { .. } => 0,
-        })
-        .sum();
-    if blob.len() != total_faces * face_bytes {
-        return Err(format!(
-            "blob 长度错配：{} != {}×{}",
-            blob.len(),
-            total_faces,
-            face_bytes
-        ));
-    }
-
-    let mut out = Vec::with_capacity(items.len());
-    let mut off = 0usize;
-    for (i, r) in batch.results.iter().enumerate() {
-        let (rid, rfp) = match r {
-            FaceItemResult::Ok {
-                item_id,
-                fingerprint,
-                ..
-            }
-            | FaceItemResult::Err {
-                item_id,
-                fingerprint,
-                ..
-            } => (*item_id, fingerprint.as_str()),
-        };
-        if rid != items[i].item_id || rfp != items[i].fingerprint {
-            return Err(format!("第 {i} 项 item/fingerprint 错配"));
-        }
-        match r {
-            FaceItemResult::Ok {
-                faces,
-                width,
-                height,
-                ..
-            } => {
-                // 解码尺寸为 0 = 旧帧缺字段或 worker bug——归一化会除坏,按协议违例回收。
-                if *width == 0 || *height == 0 {
-                    return Err(format!("第 {i} 项解码尺寸为 0({width}×{height})"));
-                }
-                let mut embeddings = Vec::with_capacity(faces.len());
-                for _ in 0..faces.len() {
-                    let emb: Vec<f32> = blob[off..off + face_bytes]
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect();
-                    off += face_bytes;
-                    embeddings.push(emb);
-                }
-                out.push(FaceItemOutcome::Ok {
-                    faces: faces.clone(),
-                    embeddings,
-                    width: *width,
-                    height: *height,
-                });
-            }
-            FaceItemResult::Err { code, .. } => out.push(FaceItemOutcome::Err(*code)),
-        }
-    }
-    Ok(out)
-}
-
-/// 校验 EncodeText 的 Success 输出并切出各文本向量(T17)。全批原子(无逐项结构),
-/// 校验 = 应答体 count 与请求 texts 数一致 + blob 长度精确等于 count×embed_dim×4;
-/// 任一不符即协议违例(调用方 kill 回收),与 embed/face 批的「不信任 worker」同纪律。
-pub fn validate_encode_text_output(
-    text_count: usize,
-    body: &SuccessBody,
-    blob: &[u8],
-    embed_dim: usize,
-) -> Result<Vec<Vec<f32>>, String> {
-    let te = body
-        .text_embed
-        .as_ref()
-        .ok_or("EncodeText Success 缺 text_embed 应答体")?;
-    if te.count as usize != text_count {
-        return Err(format!("count 错配:{} != texts {}", te.count, text_count));
-    }
-    if embed_dim == 0 {
-        return Err("embed_dim 为 0".into());
-    }
-    let item_bytes = embed_dim * 4;
-    if blob.len() != text_count * item_bytes {
-        return Err(format!(
-            "blob 长度错配:{} != {}×{}",
-            blob.len(),
-            text_count,
-            item_bytes
-        ));
-    }
-    Ok(blob
-        .chunks_exact(item_bytes)
-        .map(|chunk| {
-            chunk
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
-        })
-        .collect())
-}
+// validate_thumbnail_output/default_thumbnail_limits/validate_embed_batch_output/
+// validate_face_batch_output/validate_encode_text_output 及 EmbedItemOutcome/
+// FaceItemOutcome/RawOutcome/TaskOutcome 已拆至 `super::validate`/`super::outcome`
+// (U-P3),经文件头 `pub use` 保旧路径;其测试随被测符号迁走。
 
 #[cfg(test)]
 mod tests {
@@ -714,81 +460,7 @@ mod tests {
         default_thumbnail_limits()
     }
 
-    #[test]
-    fn validate_accepts_good_output() {
-        let req = thumb_req(7, "fp", 480);
-        let webp = make_webp(480, 240);
-        let body = SuccessBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: Some(480),
-            height: Some(240),
-            ..Default::default()
-        };
-        let (w, h, mime) = validate_thumbnail_output(&req, &body, &webp, &limits()).unwrap();
-        assert_eq!((w, h), (480, 240));
-        assert_eq!(mime, "image/webp");
-    }
-
-    #[test]
-    fn validate_rejects_item_id_mismatch() {
-        let req = thumb_req(7, "fp", 480);
-        let webp = make_webp(100, 100);
-        let body = SuccessBody {
-            item_id: Some(999),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: Some(100),
-            height: Some(100),
-            ..Default::default()
-        };
-        assert!(validate_thumbnail_output(&req, &body, &webp, &limits()).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_declared_dims_mismatch() {
-        let req = thumb_req(7, "fp", 480);
-        let webp = make_webp(100, 100);
-        let body = SuccessBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: Some(480), // 谎报
-            height: Some(100),
-            ..Default::default()
-        };
-        assert!(validate_thumbnail_output(&req, &body, &webp, &limits()).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_oversized_long_edge() {
-        let req = thumb_req(7, "fp", 120);
-        let webp = make_webp(960, 100); // 长边 960 >> 120+容差
-        let body = SuccessBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: Some(960),
-            height: Some(100),
-            ..Default::default()
-        };
-        assert!(validate_thumbnail_output(&req, &body, &webp, &limits()).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_non_webp_blob() {
-        let req = thumb_req(7, "fp", 480);
-        let body = SuccessBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: None,
-            height: None,
-            ..Default::default()
-        };
-        assert!(validate_thumbnail_output(&req, &body, b"not a webp at all!!", &limits()).is_err());
-    }
+    // validate_* 的纯函数测试已随被测符号迁 `super::super::validate`(U-P3)。
 
     // ── WorkerConn 端到端（内存管道 + mock worker 线程，无真实子进程）──────────────────
 
@@ -852,6 +524,201 @@ mod tests {
         };
         let conn = WorkerConn::from_parts(Box::new(host_w), rx, ready);
         (conn, worker_r, worker_w)
+    }
+
+    /// RawOutcome 未派生 Debug(大变体);测试断言用变体名。
+    fn outcome_name(o: &RawOutcome) -> &'static str {
+        match o {
+            RawOutcome::Success { .. } => "Success",
+            RawOutcome::Failure(_) => "Failure",
+            RawOutcome::TimedOut => "TimedOut",
+            RawOutcome::Disconnected => "Disconnected",
+            RawOutcome::Protocol(_) => "Protocol",
+        }
+    }
+
+    /// v3 静默限时:Progress 帧重置计时——总时长远超 `timeout` 但拍间静默不超,必须成功;
+    /// 顺带覆盖「陈旧 Progress(错 req_id)只忽略不判违例」。
+    #[test]
+    fn progress_resets_silence_deadline_and_stale_ignored() {
+        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
+        let handle = std::thread::spawn(move || {
+            let frame = read_frame(&mut worker_r).unwrap();
+            let req_id = frame.request_id;
+            let stale = Frame::control(
+                FrameType::Progress,
+                req_id + 999,
+                &ProgressBody {
+                    stage: "stale".into(),
+                    detail: None,
+                    elapsed_ms: 0,
+                },
+            )
+            .unwrap();
+            write_frame(&mut worker_w, &stale).unwrap();
+            worker_w.flush().unwrap();
+            // 4 拍进度 × 100ms 间隔 = 总时长 ~500ms,远超 400ms 静默限时;
+            // 每拍间静默 100ms ≪ 400ms → 重置生效才能活到终态。
+            for i in 0..4u64 {
+                std::thread::sleep(Duration::from_millis(100));
+                let p = Frame::control(
+                    FrameType::Progress,
+                    req_id,
+                    &ProgressBody {
+                        stage: format!("stage{i}"),
+                        detail: None,
+                        elapsed_ms: i * 100,
+                    },
+                )
+                .unwrap();
+                write_frame(&mut worker_w, &p).unwrap();
+                worker_w.flush().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let ok = Frame::control(FrameType::Success, req_id, &SuccessBody::default()).unwrap();
+            write_frame(&mut worker_w, &ok).unwrap();
+            worker_w.flush().unwrap();
+        });
+        let out = conn.run_request(
+            &thumb_req(1, "fp", 480),
+            Duration::from_millis(400),
+            &|| false,
+        );
+        handle.join().unwrap();
+        assert_eq!(
+            outcome_name(&out),
+            "Success",
+            "进度帧应重置静默计时并被消费(非终态)"
+        );
+    }
+
+    /// 进度观察者(视频格式扩展子系统 design.md §5.3):`run_request_observed` 对每帧本请求的
+    /// Progress(非陈旧)回调一次;陈旧 Progress(错 req_id)不触发观察者——镜像上面回归锚的
+    /// 陈旧过滤断言,验证观察者挂载不改变既有陈旧帧处理逻辑。
+    #[test]
+    fn run_request_observed_calls_observer_for_each_progress_frame() {
+        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
+        let handle = std::thread::spawn(move || {
+            let frame = read_frame(&mut worker_r).unwrap();
+            let req_id = frame.request_id;
+            // 陈旧 Progress(错 req_id):不应触发观察者。
+            let stale = Frame::control(
+                FrameType::Progress,
+                req_id + 999,
+                &ProgressBody {
+                    stage: "stale".into(),
+                    detail: None,
+                    elapsed_ms: 0,
+                },
+            )
+            .unwrap();
+            write_frame(&mut worker_w, &stale).unwrap();
+            worker_w.flush().unwrap();
+            for i in 0..3u64 {
+                let p = Frame::control(
+                    FrameType::Progress,
+                    req_id,
+                    &ProgressBody {
+                        stage: format!("s{i}"),
+                        detail: Some(format!("{}%", i * 30)),
+                        elapsed_ms: i * 10,
+                    },
+                )
+                .unwrap();
+                write_frame(&mut worker_w, &p).unwrap();
+                worker_w.flush().unwrap();
+            }
+            let ok = Frame::control(FrameType::Success, req_id, &SuccessBody::default()).unwrap();
+            write_frame(&mut worker_w, &ok).unwrap();
+            worker_w.flush().unwrap();
+        });
+        let mut seen: Vec<(String, Option<String>)> = Vec::new();
+        let out = conn.run_request_observed(
+            &thumb_req(1, "fp", 480),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            &|| false,
+            Some(&mut |p: &ProgressBody| seen.push((p.stage.clone(), p.detail.clone()))),
+        );
+        handle.join().unwrap();
+        assert_eq!(outcome_name(&out), "Success");
+        assert_eq!(
+            seen,
+            vec![
+                ("s0".to_string(), Some("0%".to_string())),
+                ("s1".to_string(), Some("30%".to_string())),
+                ("s2".to_string(), Some("60%".to_string())),
+            ],
+            "观察者应逐帧收到非陈旧 Progress,陈旧帧不计入"
+        );
+    }
+
+    /// 不发 Progress 的 op:`timeout` 仍是事实上的总限时,行为与 v2 一致(回归锚)。
+    #[test]
+    fn silence_timeout_without_progress_unchanged() {
+        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
+        let handle = std::thread::spawn(move || {
+            let frame = read_frame(&mut worker_r).unwrap();
+            std::thread::sleep(Duration::from_millis(900));
+            let ok = Frame::control(
+                FrameType::Success,
+                frame.request_id,
+                &SuccessBody::default(),
+            )
+            .unwrap();
+            let _ = write_frame(&mut worker_w, &ok);
+        });
+        let out = conn.run_request(
+            &thumb_req(1, "fp", 480),
+            Duration::from_millis(200),
+            &|| false,
+        );
+        assert_eq!(outcome_name(&out), "TimedOut");
+        handle.join().unwrap();
+    }
+
+    /// 视频格式扩展 §2.4:显式 `total_cap` 生效——Progress 不断重置静默计时,但总上界到点
+    /// 仍强制 TimedOut(心跳活着装载死锁的病态组合的最后防线)。静默限时给足(2s,永不触发),
+    /// 唯一能终止等待的是 200ms 的总上界。
+    #[test]
+    fn total_cap_enforced_despite_continuous_progress() {
+        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
+        let handle = std::thread::spawn(move || {
+            let frame = read_frame(&mut worker_r).unwrap();
+            let req_id = frame.request_id;
+            // 每 30ms 一帧 Progress、永不发终态:静默计时被反复重置,只有 total_cap 能终止。
+            for i in 0..40u64 {
+                std::thread::sleep(Duration::from_millis(30));
+                let p = Frame::control(
+                    FrameType::Progress,
+                    req_id,
+                    &ProgressBody {
+                        stage: format!("s{i}"),
+                        detail: None,
+                        elapsed_ms: i * 30,
+                    },
+                )
+                .unwrap();
+                if write_frame(&mut worker_w, &p).is_err() {
+                    break; // host 已放弃等待(命中 total_cap)
+                }
+                let _ = worker_w.flush();
+            }
+        });
+        let started = Instant::now();
+        let out = conn.run_request_capped(
+            &thumb_req(1, "fp", 480),
+            Duration::from_secs(2),     // 静默限时给足,永不触发
+            Duration::from_millis(200), // 总上界:唯一能终止等待者
+            &|| false,
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(outcome_name(&out), "TimedOut", "总上界到点须强制 TimedOut");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "应在 ~200ms total_cap 处超时,而非等满 2s 静默限时:{elapsed:?}"
+        );
+        let _ = handle.join();
     }
 
     #[test]
@@ -998,272 +865,5 @@ mod tests {
         let out = conn.run_thumbnail(&req, &limits(), Duration::from_secs(5), &|| false);
         handle.join().unwrap();
         assert!(matches!(out, TaskOutcome::Protocol(_)));
-    }
-
-    // ── v2 批量输出校验(T15)────────────────────────────────────────────────────────
-
-    fn embed_items(n: usize) -> Vec<EmbedItem> {
-        (0..n)
-            .map(|i| EmbedItem {
-                item_id: i as i64 + 1,
-                cache_key: format!("k{i}"),
-                fingerprint: format!("fp{i}"),
-            })
-            .collect()
-    }
-
-    fn le_blob(embs: &[&[f32]]) -> Vec<u8> {
-        let mut b = Vec::new();
-        for e in embs {
-            for f in e.iter() {
-                b.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        b
-    }
-
-    #[test]
-    fn validate_embed_batch_happy_path_with_per_item_err() {
-        let items = embed_items(3);
-        let body = SuccessBody {
-            embed: Some(exotic_protocol::EmbedBatchSuccess {
-                results: vec![
-                    EmbedResult::Ok {
-                        item_id: 1,
-                        fingerprint: "fp0".into(),
-                    },
-                    EmbedResult::Err {
-                        item_id: 2,
-                        fingerprint: "fp1".into(),
-                        code: WorkerErrorCode::IoError,
-                    },
-                    EmbedResult::Ok {
-                        item_id: 3,
-                        fingerprint: "fp2".into(),
-                    },
-                ],
-            }),
-            ..Default::default()
-        };
-        // blob 只含两个 Ok 项(dim=2),按 Ok 项序连续。
-        let blob = le_blob(&[&[1.0, 2.0], &[3.0, 4.0]]);
-        let out = validate_embed_batch_output(&items, &body, &blob, 2).unwrap();
-        assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0], EmbedItemOutcome::Ok(v) if v == &vec![1.0, 2.0]));
-        assert!(matches!(
-            &out[1],
-            EmbedItemOutcome::Err(WorkerErrorCode::IoError)
-        ));
-        assert!(matches!(&out[2], EmbedItemOutcome::Ok(v) if v == &vec![3.0, 4.0]));
-    }
-
-    #[test]
-    fn validate_embed_batch_rejects_length_and_order_violations() {
-        let items = embed_items(2);
-        // ① results 少一项 → 违例。
-        let short = SuccessBody {
-            embed: Some(exotic_protocol::EmbedBatchSuccess {
-                results: vec![EmbedResult::Ok {
-                    item_id: 1,
-                    fingerprint: "fp0".into(),
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(validate_embed_batch_output(&items, &short, &le_blob(&[&[0.0, 0.0]]), 2).is_err());
-
-        // ② 错序(item_id 对调)→ 违例(陈旧/错位防护)。
-        let swapped = SuccessBody {
-            embed: Some(exotic_protocol::EmbedBatchSuccess {
-                results: vec![
-                    EmbedResult::Ok {
-                        item_id: 2,
-                        fingerprint: "fp1".into(),
-                    },
-                    EmbedResult::Ok {
-                        item_id: 1,
-                        fingerprint: "fp0".into(),
-                    },
-                ],
-            }),
-            ..Default::default()
-        };
-        let blob = le_blob(&[&[0.0, 0.0], &[0.0, 0.0]]);
-        assert!(validate_embed_batch_output(&items, &swapped, &blob, 2).is_err());
-
-        // ③ blob 长度与 Ok 项数不符 → 违例。
-        let good = SuccessBody {
-            embed: Some(exotic_protocol::EmbedBatchSuccess {
-                results: vec![
-                    EmbedResult::Ok {
-                        item_id: 1,
-                        fingerprint: "fp0".into(),
-                    },
-                    EmbedResult::Ok {
-                        item_id: 2,
-                        fingerprint: "fp1".into(),
-                    },
-                ],
-            }),
-            ..Default::default()
-        };
-        assert!(validate_embed_batch_output(&items, &good, &le_blob(&[&[0.0, 0.0]]), 2).is_err());
-        // ④ 缺 embed 应答体 → 违例。
-        assert!(validate_embed_batch_output(&items, &SuccessBody::default(), &[], 2).is_err());
-    }
-
-    #[test]
-    fn validate_encode_text_happy_path_and_violations() {
-        // 合法:count=2、blob=2×dim×4,按顺序切出两个向量。
-        let good = SuccessBody {
-            text_embed: Some(exotic_protocol::TextEmbedSuccess { count: 2 }),
-            ..Default::default()
-        };
-        let blob = le_blob(&[&[1.0, -2.0], &[0.5, 0.25]]);
-        let out = validate_encode_text_output(2, &good, &blob, 2).unwrap();
-        assert_eq!(out, vec![vec![1.0, -2.0], vec![0.5, 0.25]]);
-
-        // ① count 与请求 texts 数不符 → 违例。
-        assert!(validate_encode_text_output(1, &good, &blob, 2).is_err());
-        // ② blob 长度错配 → 违例。
-        assert!(validate_encode_text_output(2, &good, &le_blob(&[&[1.0, -2.0]]), 2).is_err());
-        // ③ 缺 text_embed 应答体(op 错配)→ 违例。
-        assert!(validate_encode_text_output(2, &SuccessBody::default(), &blob, 2).is_err());
-        // ④ embed_dim=0 → 违例(除零/空契约防御)。
-        assert!(validate_encode_text_output(2, &good, &blob, 0).is_err());
-    }
-
-    #[test]
-    fn validate_face_batch_happy_path_zero_and_multi_faces() {
-        let items = vec![
-            FaceItem {
-                item_id: 10,
-                cache_key: Some("aaa".into()),
-                source_path: None,
-                fingerprint: "f10".into(),
-            },
-            FaceItem {
-                item_id: 11,
-                cache_key: None,
-                source_path: Some("x.jpg".into()),
-                fingerprint: "f11".into(),
-            },
-        ];
-        let det = FaceDet {
-            bbox: [1.0, 2.0, 3.0, 4.0],
-            landmarks: [[0.0; 2]; 5],
-            score: 0.95,
-        };
-        let body = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![
-                    FaceItemResult::Ok {
-                        item_id: 10,
-                        fingerprint: "f10".into(),
-                        faces: vec![det.clone(), det.clone()],
-                        width: 640,
-                        height: 480,
-                    },
-                    // 0 张脸也是 Ok(协议明文)。
-                    FaceItemResult::Ok {
-                        item_id: 11,
-                        fingerprint: "f11".into(),
-                        faces: vec![],
-                        width: 320,
-                        height: 240,
-                    },
-                ],
-            }),
-            ..Default::default()
-        };
-        let blob = le_blob(&[&[0.5, 0.6], &[0.7, 0.8]]); // 2 脸 × dim 2
-        let out = validate_face_batch_output(&items, &body, &blob, 2).unwrap();
-        assert_eq!(out.len(), 2);
-        match &out[0] {
-            FaceItemOutcome::Ok {
-                faces,
-                embeddings,
-                width,
-                height,
-            } => {
-                assert_eq!(faces.len(), 2);
-                assert_eq!(embeddings, &vec![vec![0.5, 0.6], vec![0.7, 0.8]]);
-                assert_eq!((*width, *height), (640, 480));
-            }
-            _ => panic!("期望 Ok"),
-        }
-        match &out[1] {
-            FaceItemOutcome::Ok {
-                faces, embeddings, ..
-            } => {
-                assert!(faces.is_empty() && embeddings.is_empty());
-            }
-            _ => panic!("期望 0 脸 Ok"),
-        }
-    }
-
-    #[test]
-    fn validate_face_batch_rejects_zero_dims() {
-        // 旧帧缺 width/height 经 serde default 落 0——host 必须拒收(归一化会除坏),
-        // 该测试锁死「additive 字段的缺省值不可被静默接受」的契约。
-        let items = vec![FaceItem {
-            item_id: 10,
-            cache_key: Some("aaa".into()),
-            source_path: None,
-            fingerprint: "f10".into(),
-        }];
-        let body = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![FaceItemResult::Ok {
-                    item_id: 10,
-                    fingerprint: "f10".into(),
-                    faces: vec![],
-                    width: 0,
-                    height: 0,
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(validate_face_batch_output(&items, &body, &[], 2).is_err());
-    }
-
-    #[test]
-    fn validate_face_batch_rejects_blob_mismatch() {
-        let items = vec![FaceItem {
-            item_id: 10,
-            cache_key: Some("aaa".into()),
-            source_path: None,
-            fingerprint: "f10".into(),
-        }];
-        let body = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![FaceItemResult::Ok {
-                    item_id: 10,
-                    fingerprint: "f10".into(),
-                    faces: vec![FaceDet {
-                        bbox: [0.0; 4],
-                        landmarks: [[0.0; 2]; 5],
-                        score: 1.0,
-                    }],
-                    width: 640,
-                    height: 480,
-                }],
-            }),
-            ..Default::default()
-        };
-        // 1 脸 × dim 2 应为 8 字节,给 4 字节 → 违例。
-        assert!(validate_face_batch_output(&items, &body, &le_blob(&[&[0.5]]), 2).is_err());
-        // fingerprint 错配 → 违例。
-        let bad_fp = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![FaceItemResult::Err {
-                    item_id: 10,
-                    fingerprint: "WRONG".into(),
-                    code: WorkerErrorCode::IoError,
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(validate_face_batch_output(&items, &bad_fp, &[], 2).is_err());
     }
 }

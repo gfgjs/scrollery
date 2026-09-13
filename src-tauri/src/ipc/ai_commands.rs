@@ -1,141 +1,63 @@
-// src-tauri/src/ipc/ai_commands.rs
-//! IPC commands for AI inference engine management and semantic search.
 //! AI 推理引擎管理和语义搜索的 IPC 命令。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tauri::State;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ai::pipeline::start_ai_pipeline;
-use crate::ai::profile::{self, ModelProfile};
+use crate::ai::profile::{self};
 use crate::ai::remote_registry::{self, BatchKind};
+use crate::ai::runtime_config::{
+    active_profile, active_profile_with, models_dir, persist_provider_echo, variant_installed,
+};
 use crate::db::models::AiStatusSummary;
 use crate::db::queries::{
-    count_embeddings_for_model, count_total_ai_items, get_config, reset_ai_embeddings, set_config,
-    sync_ai_status_for_model,
+    count_embeddings_for_model, count_error_ai_items, count_total_ai_items, get_config,
+    reset_ai_embeddings, reset_error_ai_items, set_config, sync_ai_status_for_model,
 };
 use crate::error::{AppError, Result};
+use crate::ipc::model_download::{download_assets, DownloadProgress};
 use crate::state::AppState;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
-
-/// Get the models directory from app data.
-/// 从应用数据获取模型目录。
-pub(crate) fn models_dir(state: &AppState) -> PathBuf {
-    // We derive models_dir from the log_dir parent (= app_data_dir)
-    // 我们从 log_dir 的父目录（= app_data_dir）推导模型目录
-    let app_data_dir = state.log_dir.parent().unwrap_or(&state.log_dir);
-    app_data_dir.join("models")
-}
+// 跨层共享的运行时配置解析(models_dir/active_profile*/active_face_profile*/
+// variant_installed/persist_provider_echo/warn_legacy_ai_backend)已下沉
+// `ai::runtime_config`(U-P2-a):它们是 ai 核心层与多个 IPC 文件的共享底座,
+// 留在单一命令文件构成层次倒挂。本文件只保留命令私有 helper。
 
 /// tokio `spawn_blocking` 的 JoinError（后台阻塞任务 panic 或被取消）统一归为内部错误，
 /// 使所有 AI 命令的「任务调度失败」走同一稳定 code（Internal），而非各自拼裸字符串丢给前端。
 fn join_err(e: tokio::task::JoinError) -> AppError {
-    AppError::Internal(format!("后台任务异常 | blocking task failed: {e}"))
+    AppError::internal("后台任务异常 | blocking task failed", e)
 }
 
-/// `ai_backend` 配置退役(T16):行为恒 worker,读到遗留非 worker 值仅提示日志
-/// (保键忽略值,不做 schema 迁移;一个版本周期后随例行清理删键)。
-pub(crate) fn warn_legacy_ai_backend(state: &AppState) {
-    let legacy = state
-        .db_read_pool
-        .get()
-        .ok()
-        .and_then(|conn| get_config(&conn, "ai_backend").ok().flatten());
-    if let Some(v) = legacy {
-        if v != "worker" {
-            info!("配置 ai_backend={v} 已退役:推理恒经 ai-worker 子进程(T16),该值被忽略");
-        }
+/// 破坏性重置嵌入(重启分析 / 重建嵌入)的收尾契约(P1-3)。
+///
+/// `reset_ai_embeddings` 是**分批** DELETE + UPDATE 而非一整笔事务(db/queries/ai.rs),
+/// 后续批失败会留下「已删掉的向量 + 陈旧常驻快照 + 仍有效的旧在途票」。因此重置的结果先
+/// 存下来、不做 `?` 提前返回:无论重置成败,吊销在途请求、作废常驻快照、代次守卫擦库都
+/// 必须执行,最后才把重置的错误传播给调用方。这样崩溃/失败后重跑不会让旧向量空间的排名
+/// 继续可见,也不会让迟到的旧查询把结果写回。
+fn reset_embeddings_with_search_teardown(
+    db_writer: &crate::db::DbWriter,
+    search: &crate::ai::search_control::SearchControl,
+    model_id: &str,
+) -> Result<()> {
+    let reset = reset_ai_embeddings(db_writer, model_id);
+
+    let ticket = search.begin_clear();
+    search.invalidate_cache();
+    if let Err(e) = search.clear_if_current(&ticket, || {
+        let conn = db_writer.lock().unwrap_or_else(|e| e.into_inner());
+        crate::ai::search::wipe_search_results(&conn)
+    }) {
+        warn!("Search results wipe failed on embedding reset (revocation applied) | 重置嵌入时擦除搜索结果失败(在途请求已吊销): {e}");
     }
+
+    reset
 }
 
-/// worker 会话的 provider/gpu_name 回声落库(T16):EP 探测只发生在 worker 侧,host 写回
-/// 既有 `ai_provider`/`ai_gpu_name` 键——status 命令读法零改动;无会话/旧帧保留旧值。
-pub(crate) fn persist_provider_echo(state: &AppState) {
-    let echo = {
-        let client = state.ai_worker.lock().unwrap_or_else(|p| p.into_inner());
-        client.session().and_then(|d| {
-            d.provider
-                .clone()
-                .map(|p| (p, d.gpu_name.clone().unwrap_or_default()))
-        })
-    };
-    if let Some((provider, gpu_name)) = echo {
-        let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = set_config(&conn, "ai_provider", &provider);
-        let _ = set_config(&conn, "ai_gpu_name", &gpu_name);
-    }
-}
-
-/// Resolve the currently-active model profile from config (`ai_active_model`), falling back
-/// to the default. The id is also the `ai_embeddings.model_name` key for this model's vectors.
-/// 从配置（`ai_active_model`）解析当前激活的模型 profile，缺省回退默认。该 id 同时是本模型
-/// 向量在 `ai_embeddings.model_name` 的键。
-pub(crate) fn active_profile(state: &AppState) -> ModelProfile {
-    // 现在「激活模型」由两段配置组成：`ai_active_model`=架构 id（= 向量空间主键），
-    // `ai_active_image_file`=选中的图像 onnx 变体文件名（决定加载哪份图像塔，不改向量身份）。
-    // image_file 缺省时由 resolve_profile 取该架构的 dyn/fp16 缺省变体。
-    let (arch_id, image_file) = state
-        .db_read_pool
-        .get()
-        .ok()
-        .map(|conn| {
-            (
-                get_config(&conn, "ai_active_model").ok().flatten(),
-                get_config(&conn, "ai_active_image_file").ok().flatten(),
-            )
-        })
-        .unwrap_or((None, None));
-
-    arch_id
-        .as_deref()
-        .and_then(|a| profile::resolve_profile(a, image_file.as_deref()))
-        .unwrap_or_else(profile::default_profile)
-}
-
-/// Resolve the active face model profile from config (`face_model_active`), default fallback.
-/// Returns `None` when face feature is disabled (`face_enabled=0`) → engine skips loading face
-/// sessions entirely (saves load time/VRAM). The id is also the `faces.model_name` vector-space key.
-/// 从配置（`face_model_active`）解析当前激活的人脸模型 profile，缺省回退默认。人脸功能关闭
-/// （`face_enabled=0`）时返回 `None`，引擎完全跳过加载人脸 session（省加载时间/显存）。
-/// 该 id 同时是人脸向量在 `faces.model_name` 的键。
-pub(crate) fn active_face_profile(
-    state: &AppState,
-) -> Option<crate::ai::face_profile::FaceProfile> {
-    use crate::ai::face_profile;
-    let conn = state.db_read_pool.get().ok()?;
-    if get_config(&conn, "face_enabled").ok().flatten().as_deref() == Some("0") {
-        return None;
-    }
-    let id = get_config(&conn, "face_model_active")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| face_profile::DEFAULT_FACE_PROFILE_ID.to_string());
-    Some(face_profile::find_face_profile(&id).unwrap_or_else(face_profile::default_face_profile))
-}
-
-/// Whether a specific image-encoder variant is fully usable on disk: image onnx header + its
-/// external-data weights, the shared text encoder + its weights, and the vocab. Existence-only — a
-/// present-but-wrong-size file still counts (download re-fetches/repairs via size + sha256 checks).
-/// 某个图像编码器变体是否已就位可用：图像 onnx 头 + 其外部权重、共享文本塔 + 其权重、词表。
-/// 仅按存在判定 —— 存在但大小不符仍算已装（下载命令会按 大小+sha256 校验并按需重拉/修复）。
-fn variant_installed(models_dir: &std::path::Path, image_file: &str, text_file: &str) -> bool {
-    let needed = [
-        image_file.to_string(),
-        format!("{image_file}.extra_file"),
-        text_file.to_string(),
-        format!("{text_file}.extra_file"),
-        "vocab.txt".to_string(),
-    ];
-    needed.iter().all(|f| models_dir.join(f).exists())
-}
-
-/// Map an image-encoder variant filename back to its architecture metadata. The prefix before
-/// `.img.` plus the fp16/fp32 marker uniquely identifies the architecture (e.g. the two B/16
-/// archs share prefix `vit-b-16` but differ by fp16 vs fp32).
 /// 由图像变体文件名反查所属架构元数据。`.img.` 前缀 + fp16/fp32 标记唯一确定架构
 /// （两个 B/16 同前缀 `vit-b-16`，靠 fp16/fp32 区分）。
 fn arch_for_image_file(image_file: &str) -> Option<profile::ArchMeta> {
@@ -146,8 +68,6 @@ fn arch_for_image_file(image_file: &str) -> Option<profile::ArchMeta> {
         .find(|m| m.default_image_file.split(".img.").next() == prefix && m.fp16 == fp16)
 }
 
-/// The fixed batch size `k` (>1) of an image variant, or `None` for dynamic / single-batch — used
-/// to enforce the "configured batch must be ≥ k" rule and to clamp auto batch.
 /// 图像变体的固定 batch `k`（>1），动态/单批返回 `None` —— 用于「设置 batch 不得 < k」约束与自动 batch 兜底。
 fn variant_fixed_batch(image_file: &str) -> Option<u32> {
     match remote_registry::parse_batch(image_file) {
@@ -156,7 +76,21 @@ fn variant_fixed_batch(image_file: &str) -> Option<u32> {
     }
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────────
+/// get_status 的「资源等待」原因键（P1-1）：本端未运行、仍有剩余，而共享 GPU 分析会话被对端
+/// 持有。与前端 `useAnalysisController` 的 `ANALYSIS_BUSY_WAITING_KEY` 同值；两侧流水线
+/// （语义分析 / 人脸）共用这一套等待原因词汇，故在此定义、face_commands 复用，避免字面量漂移。
+pub const ANALYSIS_BUSY_WAITING_KEY: &str = "analysisBusy";
+
+/// 共享 GPU 分析会话当前是否被**对端**（人脸）持有——本端未运行时的等待原因判定。
+fn other_analysis_holds_gpu_session(state: &AppState) -> bool {
+    // 毒锁恢复(与全库 gpu_analysis_owner 访问点一致):门闩只是 Option<&'static str>.
+    *state
+        .gpu_analysis_owner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        == Some(crate::state::GPU_OWNER_FACE)
+}
+
 // ── 命令 ──────────────────────────────────────────────────────────────────────
 
 /// 返回最近一次 worker 会话回声的 provider/GPU(T16:探测发生在 worker SessionInit,
@@ -190,7 +124,6 @@ pub async fn detect_ai_provider(state: State<'_, Arc<AppState>>) -> Result<serde
     .map_err(join_err)?
 }
 
-/// Get comprehensive AI status for the UI status bar.
 /// 获取 UI 状态栏所需的综合 AI 状态。
 #[tauri::command]
 pub async fn get_ai_status(state: State<'_, Arc<AppState>>) -> Result<AiStatusSummary> {
@@ -206,14 +139,21 @@ pub async fn get_ai_status(state: State<'_, Arc<AppState>>) -> Result<AiStatusSu
             .unwrap_or_default()
             .unwrap_or_default();
 
-        let active_prof = active_profile(&state);
+        // B-1:全程只用头上这一个 conn(active_profile/resolve_batch_size 曾各自再取池,
+        // 状态轮询在读池紧张时自体饿死——它本该是诊断饥饿的观测面)。
+        // A2:两键均已迁往 config.toml,改传 `&state.config`(不再需要 conn)。
+        let active_prof = active_profile_with(&state.config);
         let active_model = active_prof.id.clone();
         // 当前图像变体若是固定 batch（k>1），向前端暴露 k 以驱动「设置 batch 不得 < k」约束。
         let active_fixed_batch = variant_fixed_batch(&active_prof.image_file);
         let total_items = count_total_ai_items(&conn).unwrap_or(0);
         // 搜索只依赖 ai_embeddings；Error 状态没有向量，不能算“可搜索的已分析”。
         let analyzed_items = count_embeddings_for_model(&conn, &active_model).unwrap_or(0);
-        let pending_items = total_items.saturating_sub(analyzed_items);
+        // A11:Error 项从 pending 拆出——此前被计入 pending,进度永远到不了 100% 且无解释。
+        let error_items = count_error_ai_items(&conn).unwrap_or(0);
+        let pending_items = total_items
+            .saturating_sub(analyzed_items)
+            .saturating_sub(error_items);
 
         let clip_loaded = {
             // T16:进程内引擎已删;「已加载」= worker 在载会话(SessionInit 后为真)。
@@ -221,10 +161,24 @@ pub async fn get_ai_status(state: State<'_, Arc<AppState>>) -> Result<AiStatusSu
             client.session().is_some()
         };
 
-        let is_analyzing = state.ai_analysis_token.lock().unwrap().is_some();
+        let is_analyzing = state.ai_analysis_token.is_running();
 
-        // "Desired" flag persisted across runs/restarts: set on start/resume/pause,
-        // cleared on stop or natural completion. Drives resume + auto-resume (问题7).
+        // 让步阻塞源快照(可观测性三修 #2):仅当流水线正在跑时才有意义,否则空——
+        // 避免「未运行」态下残留上一轮的阻塞源误导前端。
+        // P1-1:未运行但「仍有剩余 + 共享 GPU 分析会话被对端持有」时也报等待原因——前端据此把
+        // 「资源等待(本地已排队,对端释放即自动续跑)」与「用户手动暂停(不自动唤醒)」分开显示。
+        let waiting_on: Vec<String> = if is_analyzing {
+            state
+                .ai_yield_blockers()
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else if pending_items > 0 && other_analysis_holds_gpu_session(&state) {
+            vec![ANALYSIS_BUSY_WAITING_KEY.to_string()]
+        } else {
+            Vec::new()
+        };
+
         // 跨运行/重启持久化的「期望运行」标志：开始/续传/暂停时置位，停止或自然完成时清除。
         // 驱动续传与自动续传（问题7）。
         let analysis_active = get_config(&conn, "ai_analysis_active")
@@ -235,33 +189,13 @@ pub async fn get_ai_status(state: State<'_, Arc<AppState>>) -> Result<AiStatusSu
         let vram_bytes = crate::ai::provider::detect_vram_bytes();
         let vram_gb = vram_bytes.map(|b| (b / (1024 * 1024 * 1024)) as i64);
 
-        let batch_size_str = get_config(&conn, "ai_batch_size").unwrap_or_default();
-        let mut batch_size = if let Some(s) = batch_size_str {
-            s.parse::<i64>().unwrap_or(8)
-        } else {
-            let default_batch = if let Some(gb) = vram_gb {
-                if gb >= 8 {
-                    64
-                } else if gb >= 4 {
-                    32
-                } else if gb >= 2 {
-                    16
-                } else {
-                    8
-                }
-            } else {
-                8
-            };
-            let w_conn = state.db_writer.lock().unwrap();
-            let _ = set_config(&w_conn, "ai_batch_size", &default_batch.to_string());
-            default_batch
-        };
-        // 固定 batch 模型：有效 batch 不得小于 k（与 pipeline 内的 clamp 一致）。0=自动，保持原样。
-        if let Some(k) = active_fixed_batch {
-            if batch_size > 0 {
-                batch_size = batch_size.max(k as i64);
-            }
-        }
+        // 有效 batch 统一走 resolve_batch_size(2026-07-10 审查 A2):此处曾用另一套 VRAM
+        // 阶梯(≥8GB→64)算默认值并 set_config 落库——状态轮询必先于任何分析执行,自动档
+        // (≥12GB→256/≥8GB→128)从此被钉死 64,批吞吐砍 3/4。读命令不得有写副作用;
+        // 「0/缺省=自动」语义留在配置键里,本字段只报告解析后的有效值(含 256 上限与
+        // 固定 batch 模型抬到 ≥k,均在 resolve_batch_size 内)。
+        let batch_size =
+            crate::ai::pipeline::resolve_batch_size_with(&state.config, &active_prof) as i64;
 
         Ok(AiStatusSummary {
             provider,
@@ -273,29 +207,50 @@ pub async fn get_ai_status(state: State<'_, Arc<AppState>>) -> Result<AiStatusSu
             total_items,
             analyzed_items,
             pending_items,
+            error_items,
             is_analyzing,
             analysis_active,
+            waiting_on,
         })
     })
     .await
     .map_err(join_err)?
 }
 
-/// Perform semantic search using Chinese-CLIP text encoder.
 /// 使用 Chinese-CLIP 文本编码器执行语义搜索。
+///
+/// 返回 `None` = 本次请求已被更新的查询、清空或切模型取代(未写结果集)。前端据此保持
+/// 当前视图与 loading,不得当作「成功 0 结果」——那会把画廊刷成旧查询的布局。
 #[tauri::command]
 pub async fn semantic_search_cmd(
     query: String,
     limit: Option<usize>,
     state: State<'_, Arc<AppState>>,
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     let state = Arc::clone(&state);
     let top_k = limit.unwrap_or(50).min(1000);
 
-    tokio::task::spawn_blocking(move || -> Result<usize> {
+    // 入口登记(P1-3):代次与模型身份在进入阻塞池之前定下。active_profile 已是 ConfigManager
+    // 纯内存读,放异步入口不阻塞;若拖进 spawn_blocking,线程池调度会让「先发起的请求」后登记
+    // ——用户看到的次序就被调度运气改写。身份解析在控制面闸门内现读,切模型的配置写入与吊销
+    // 之间那扇窗也漏不出旧模型的登记。
+    // profile 与代次同一次解析取回:身份(向量主键)、维度与下文编码用的 spec 出自同一份快照,
+    // 不会出现「按新模型登记、拿旧模型的维度装载」。
+    let (ticket, prof) = state.ai_search.begin_request_with(|| {
+        let prof = active_profile(&state);
+        (prof.id.clone(), prof)
+    });
+    let dim = prof.embed_dim;
+
+    tokio::task::spawn_blocking(move || -> Result<Option<usize>> {
+        // 已被取代的请求就地退出:worker 编码是串行的(单一 ai_worker 锁),让一个已经作废的
+        // 查询占住编码槽,只会把当前查询排在它后面。过期判据与提交点同源(控制面闸门)。
+        if !state.ai_search.is_current(&ticket) {
+            info!("Semantic search superseded before encode | 语义搜索在编码前已被更新的请求取代");
+            return Ok(None);
+        }
         // T16 收束:查询向量恒经 ai-worker 的 EncodeText op 生成(host 零 ort/tokenizers)。
         // 首次搜索会触发 SessionInit(模型冷加载,与旧进程内懒加载语义一致)。
-        let prof = active_profile(&state);
         let spec = crate::ai::worker_client::build_session_spec(&state, prof.clone(), None);
         let mut vecs = {
             let mut client = state.ai_worker.lock().unwrap_or_else(|p| p.into_inner());
@@ -305,19 +260,60 @@ pub async fn semantic_search_cmd(
         let query_vec = vecs
             .pop()
             .ok_or_else(|| AppError::Internal("EncodeText 返回空向量集".into()))?;
-        crate::ai::search::semantic_search_with_vector(
-            &state,
+
+        // 装载源:读池全量嵌入行(维度过滤与打包在控制面内的 EmbeddingCache::pack)。
+        let outcome = crate::ai::search_control::run_search(
+            &state.ai_search,
+            &ticket,
             &query_vec,
             top_k,
-            &prof.id,
-            prof.embed_dim,
-        )
+            dim,
+            || {
+                let conn = state.db_read_pool.get().map_err(AppError::from)?;
+                crate::db::queries::get_all_embeddings(&conn, ticket.model())
+            },
+            |scored| {
+                // 提交闸门内的落库:检验「仍是最新请求」与整表事务同临界区(无 TOCTOU)。
+                let mut conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+                crate::ai::search::replace_search_results(&mut conn, scored)
+            },
+        )?;
+
+        match outcome {
+            crate::ai::search_control::SearchCommit::Committed(n) => Ok(Some(n)),
+            crate::ai::search_control::SearchCommit::Superseded => {
+                info!("Semantic search superseded by a newer request/clear/model switch | 语义搜索已被更新的请求取代");
+                Ok(None)
+            }
+        }
     })
     .await
     .map_err(join_err)?
 }
 
-/// Persist the "analysis desired" flag and launch the pipeline.
+/// 清空语义搜索结果集与在途请求。用户清空搜索或退出语义模式时调用。
+///
+/// 两段式(P1-3):**入口**当场登记清空代次并吊销在途请求——用户意图不排在磁盘动作后面;
+/// 擦库在阻塞段,且只在期间没有更新的登记时才执行。这样「清空 IPC 先到、工作线程晚跑、
+/// 期间用户又搜了一次」不会把新结果擦掉;而「查询先提交、清空后到」也照样被入口吊销拦下。
+#[tauri::command]
+pub async fn clear_semantic_search(state: State<'_, Arc<AppState>>) -> Result<()> {
+    let state_arc = Arc::clone(&state);
+    let clear_ticket = state_arc.ai_search.begin_clear();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        state_arc.ai_search.clear_if_current(&clear_ticket, || {
+            let conn = state_arc
+                .db_writer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::ai::search::wipe_search_results(&conn)
+        })?;
+        Ok(())
+    })
+    .await
+    .map_err(join_err)?
+}
+
 /// 持久化「期望运行」标志并启动流水线。
 /// R1-3：标志位落库下沉 blocking（保留 into_inner 毒锁恢复）；`start_ai_pipeline` 内部要
 /// `tokio::spawn`，须留在 async 上下文，故本函数整体改 async 而非塞进 spawn_blocking。
@@ -329,15 +325,11 @@ async fn launch_ai_pipeline(state: &Arc<AppState>) -> Result<()> {
     })
     .await
     .map_err(join_err)?;
-    let token = state.new_ai_analysis_token();
-    start_ai_pipeline(Arc::clone(state), token);
+    let (generation, token) = state.new_ai_analysis_token();
+    start_ai_pipeline(Arc::clone(state), generation, token);
     Ok(())
 }
 
-/// Start (or RESUME) the background AI analysis pipeline WITHOUT resetting existing
-/// embeddings — already-analysed images are skipped; only pending / interrupted items are
-/// processed. This is the "开始 / 继续" action and also what auto-resume calls (问题7).
-///
 /// 启动（或续传）后台 AI 分析流水线，且不重置已有嵌入向量——已分析的图片会跳过，只处理
 /// 待处理 / 被中断的项。这是「开始 / 继续」动作，也是自动续传调用的入口（问题7）。
 #[tauri::command]
@@ -365,14 +357,11 @@ pub async fn start_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
     // F5 互斥：占用共享 GPU 分析槽。若人脸分析持有则快速失败（CLIP 与人脸不能同跑——显存竞争）。
     // CLIP 已持有时可重入（运行中续传/开始）。放在上面幂等 sync 之后、cancel 之前，使被拒时不留半应用状态。
     if !state_arc.try_acquire_gpu_analysis(crate::state::GPU_OWNER_AI) {
-        // GPU 分析槽被人脸分析占用。用 System(消息直透) 保留这条可操作中文文案给 UI；
-        // 若未来前端要按类型分流「GPU 忙」，再升一个稳定 code 变体（见 no-contract-freeze）。
-        return Err(AppError::System(
-            "人脸分析正在进行，请先暂停后再开始语义分析".into(),
-        ));
+        // F5/P1-1：共享 GPU 分析槽被人脸分析占用。这是**可等待状态**，用稳定 code 交前端按类型
+        // 分流（排队等对端释放后自动续跑），不靠本地化文案识别（error.rs AnalysisBusy）。
+        return Err(AppError::AnalysisBusy);
     }
 
-    // Cancel any existing run, then resume (orphan recovery happens inside the pipeline).
     // 取消任何现有运行，然后续传（孤儿恢复在流水线内部完成）。
     state_arc.cancel_ai_analysis();
     info!("Starting/resuming AI analysis pipeline (no reset) | 启动/续传 AI 分析流水线（不重置）");
@@ -385,8 +374,6 @@ pub async fn start_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
     Ok(())
 }
 
-/// Restart analysis from scratch: clear ALL embeddings (ai_status → 0) then run. This is
-/// the "重新开始" action (问题7).
 /// 从零重新开始：清除所有嵌入向量（ai_status → 0）后运行。这是「重新开始」动作（问题7）。
 #[tauri::command]
 pub async fn restart_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
@@ -398,22 +385,21 @@ pub async fn restart_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> 
     // F5 互斥：在下面破坏性 reset 之前占用槽（使被拒时不会清空向量）。CLIP 已持有时可重入。
     // 若随后 reset 失败，释放槽以免泄漏。
     if !state_arc.try_acquire_gpu_analysis(crate::state::GPU_OWNER_AI) {
-        return Err(AppError::System(
-            "人脸分析正在进行，请先暂停后再重新开始语义分析".into(),
-        ));
+        // 同 start：稳定 code 交前端分流；但 restart 是破坏性重置，前端不排队重做（被拒即报错
+        // 交用户决定何时再来）。
+        return Err(AppError::AnalysisBusy);
     }
 
     state_arc.cancel_ai_analysis();
 
-    // Clear previous embeddings for a complete fresh run.
     // 清除之前的嵌入向量，保证全量重新分析。
     let reset_res = tokio::task::spawn_blocking({
         let s = Arc::clone(&state_arc);
         move || {
-            // Reset embeddings for the ACTIVE model only (vectors of other models are kept).
             // 仅重置当前激活模型的嵌入向量（其它模型的向量保留）。
             let model_id = active_profile(&s).id;
-            reset_ai_embeddings(&s.db_writer, &model_id)
+            // 重置与「吊销 + 作废 + 守卫擦库」在同一个收尾函数内,重置失败也照样收尾。
+            reset_embeddings_with_search_teardown(&s.db_writer, &s.ai_search, &model_id)
         }
     })
     .await
@@ -424,7 +410,6 @@ pub async fn restart_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> 
         return Err(e);
     }
 
-    state_arc.invalidate_embedding_cache();
     info!("Restarting AI analysis pipeline (full reset) | 重新开始 AI 分析流水线（全量重置）");
     // 同 start：launch 失败须释放 GPU 槽。
     if let Err(e) = launch_ai_pipeline(&state_arc).await {
@@ -435,9 +420,6 @@ pub async fn restart_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> 
     Ok(())
 }
 
-/// Pause the running analysis: cancel the pipeline but KEEP the active flag so it can be
-/// resumed later (incl. auto-resume on next launch). In-flight "processing" items are
-/// recovered to pending on the next run (问题7).
 /// 暂停运行中的分析：取消流水线但保留 active 标志，以便之后续传（含下次启动自动续传）。
 /// 在途的「处理中」项会在下次运行时恢复为待处理（问题7）。
 #[tauri::command]
@@ -461,8 +443,6 @@ pub async fn pause_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
     Ok(())
 }
 
-/// Stop the running AI analysis pipeline AND clear the resume flag (no auto-resume).
-/// Progress is preserved (embeddings kept) — only the auto-continue intent is dropped.
 /// 停止运行中的 AI 分析流水线并清除续传标志（不再自动续传）。进度保留（嵌入向量不删），
 /// 仅放弃「自动继续」的意图。
 #[tauri::command]
@@ -548,6 +528,10 @@ pub async fn reload_ai_engine(state: State<'_, Arc<AppState>>) -> Result<()> {
     let s = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         s.cancel_ai_analysis();
+        // cancel 后必须释放 GPU 分析槽(2026-07-10 审查 A1):完成回调仅自然完成时释放,
+        // 泄漏的槽因同 owner 可重入不困 CLIP 自身,却让人脸分析被「幽灵占用」永久拒绝。
+        // release 带 owner 校验,未持有时空操作,安全。
+        s.release_gpu_analysis(crate::state::GPU_OWNER_AI);
         s.ai_worker
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -558,21 +542,38 @@ pub async fn reload_ai_engine(state: State<'_, Arc<AppState>>) -> Result<()> {
     .map_err(join_err)?
 }
 
-/// Reset all embeddings and re-queue all images for analysis.
+/// 非破坏重试失败项(2026-07-10 审查 F9):`ai_status` Error → Pending 分批复位,返回复位数。
+/// 不触碰任何已完成向量——与 rebuild(清空重来)/restart(全量重置)语义严格区分;
+/// 复位后由前端走既有 start 复跑。
+#[tauri::command]
+pub async fn retry_failed_ai_items(state: State<'_, Arc<AppState>>) -> Result<i64> {
+    let s = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || -> Result<i64> {
+        let n = reset_error_ai_items(&s.db_writer)?;
+        if n > 0 {
+            info!("Retry failed AI items: {n} reset to pending | 重试失败项:{n} 项复位待处理");
+        }
+        Ok(n as i64)
+    })
+    .await
+    .map_err(join_err)?
+}
+
 /// 重置所有嵌入向量，将所有图像重新排入分析队列。
 #[tauri::command]
 pub async fn rebuild_embeddings(state: State<'_, Arc<AppState>>) -> Result<()> {
     let state_arc = Arc::clone(&state);
 
-    // Stop any running pipeline first
     // 首先停止任何正在运行的流水线
     state_arc.cancel_ai_analysis();
+    // cancel 后释放 GPU 分析槽(2026-07-10 审查 A1,理由见 reload_ai_engine)。
+    state_arc.release_gpu_analysis(crate::state::GPU_OWNER_AI);
 
     tokio::task::spawn_blocking(move || -> Result<()> {
         let model_id = active_profile(&state_arc).id;
-        reset_ai_embeddings(&state_arc.db_writer, &model_id)?;
-        state_arc.invalidate_embedding_cache();
-        Ok(())
+        // 同 restart:分批重置中途失败也必须先收尾(吊销在途票 + 作废快照 + 守卫擦库),
+        // 再把重置错误原样报给用户——否则残留的旧排名会与「重建失败」的提示自相矛盾。
+        reset_embeddings_with_search_teardown(&state_arc.db_writer, &state_arc.ai_search, &model_id)
     })
     .await
     .map_err(join_err)??;
@@ -620,22 +621,17 @@ fn scan_installed_image_files(models: &std::path::Path, meta: &profile::ArchMeta
 /// 并返回 `online: false`。
 #[tauri::command]
 pub async fn list_model_registry(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value> {
-    // 配置：激活架构 id、选中变体、镜像偏好。R1-3：读池 SQL 走 read_blocking。
-    let (active_arch, active_image_cfg, mirror_first) =
-        super::blocking::read_blocking(&state, |conn| {
-            let active_arch = get_config(conn, "ai_active_model")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| profile::DEFAULT_PROFILE_ID.to_string());
-            let active_image_cfg = get_config(conn, "ai_active_image_file").ok().flatten();
-            let mirror_first = get_config(conn, "ai_download_source")
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some("mirror");
-            Ok((active_arch, active_image_cfg, mirror_first))
-        })
-        .await?;
+    // A2:三键均为 schema 设置类,唯一真源已切到 ConfigManager(内存读,不必再借读池连接查 DB)。
+    let active_arch = state
+        .config
+        .get("ai_active_model")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| profile::DEFAULT_PROFILE_ID.to_string());
+    let active_image_cfg = state
+        .config
+        .get("ai_active_image_file")
+        .filter(|s| !s.is_empty());
+    let mirror_first = state.config.get("ai_download_source").as_deref() == Some("mirror");
 
     // 动态发现(async,置于 spawn_blocking 之外);带磁盘 L2(Part4-T8:冷启动免重复联网、
     // 断网用陈旧快照兜底)。语义微调:online=false 仅当「联网失败且无任何磁盘缓存」——
@@ -765,7 +761,6 @@ pub async fn set_active_model(image_file: String, state: State<'_, Arc<AppState>
     let state_arc = Arc::clone(&state);
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        // Refuse to switch to a variant whose files aren't present yet (download first).
         // 拒绝切换到文件尚未就位的变体（请先下载）。
         let models = models_dir(&state_arc);
         if !variant_installed(&models, &image_file, &text_file) {
@@ -777,20 +772,41 @@ pub async fn set_active_model(image_file: String, state: State<'_, Arc<AppState>
         }
 
         state_arc.cancel_ai_analysis();
+        // cancel 后释放 GPU 分析槽(2026-07-10 审查 A1,理由见 reload_ai_engine;face 侧对称
+        // 命令 set_active_face_model 一直有此释放,本处补齐对称性)。
+        state_arc.release_gpu_analysis(crate::state::GPU_OWNER_AI);
 
-        {
-            let conn = state_arc
-                .db_writer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // 架构 id = 向量主键；变体文件名仅决定加载哪份图像塔。两者一起持久化。
-            set_config(&conn, "ai_active_model", &arch_id)?;
-            set_config(&conn, "ai_active_image_file", &image_file)?;
+        // A2:两键均为 schema 设置类,唯一真源已切到 config.toml——原先的 DB `set_config` 写入
+        // 会被 `get_app_config`/`active_profile_with` 忽略(读侧已改走 ConfigManager),必须
+        // 同步改走 `ConfigManager::set_and_persist`,否则切换模型选择在重启/reload 后失效。
+        // 架构 id = 向量主键；变体文件名仅决定加载哪份图像塔。两者一起持久化。
+        //
+        // P1-3:整段「改配置 + 同步状态」先收进闭包取结果,不就地 `?` 提前返回——配置一旦写入
+        // 就可能已经生效(内存已改;第二次 set_and_persist 或随后的 sync 失败只是后续步骤失败),
+        // 此时若直接返回,旧模型的在途查询仍持有效票,会把旧向量空间的结果写回结果集。
+        let switch_result = (|| -> Result<()> {
+            state_arc
+                .config
+                .set_and_persist("ai_active_model", &arch_id)?;
+            state_arc
+                .config
+                .set_and_persist("ai_active_image_file", &image_file)?;
+            // ai_status 是全局列(非按模型)→ 重新指向新架构的向量覆盖(分批,批间自行取锁,R2-6)。
+            sync_ai_status_for_model(&state_arc.db_writer, &arch_id)
+        })();
+
+        // 共同收尾:只要**尝试过**改模型配置就必须执行,与上面成败无关。吊销在控制面闸门内
+        // 现读 profile:此刻若配置已变,读到的就是新模型——此前登记的请求(按旧模型解析)一律
+        // 作废,此后登记的读到新模型;若配置其实没变(第一步就失败),这次收尾也只是把上一轮
+        // 结果集清掉,无副作用地保守一次。
+        // 擦除失败只记警告:切换本身已生效或已尝试,为「旧结果多留一会儿」报错会误导用户以为
+        // 切换失败(同 restart/rebuild 的姿态);吊销与缓存作废无条件生效。
+        if let Err(e) = state_arc.ai_search.model_switched(|| {
+            let conn = state_arc.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+            crate::ai::search::wipe_search_results(&conn)
+        }) {
+            warn!("Search results wipe failed on model switch (revocation applied) | 切换模型时擦除搜索结果失败(在途请求已吊销): {e}");
         }
-        // ai_status is global (not per-model) → re-point it at the new arch's coverage.
-        // ai_status 是全局列(非按模型)→ 重新指向新架构的向量覆盖(分批,批间自行取锁,R2-6)。
-        sync_ai_status_for_model(&state_arc.db_writer, &arch_id)?;
-        state_arc.invalidate_embedding_cache();
 
         // 关闭 worker 在载会话:spec 含 profile,下次派发/搜索自动按新变体重 SessionInit。
         state_arc
@@ -798,6 +814,9 @@ pub async fn set_active_model(image_file: String, state: State<'_, Arc<AppState>
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .close_session();
+
+        // 收尾做完再传播首个错误(配置/同步失败仍要让调用方看见,前端据此报错给用户)。
+        switch_result?;
 
         info!(
             "Active AI model switched to {} (variant {}) | 已切换 AI 模型: {}（变体 {}）",
@@ -811,27 +830,9 @@ pub async fn set_active_model(image_file: String, state: State<'_, Arc<AppState>
 
 // ── Model download (Layer B) ────────────────────────────────────────────────────
 // ── 模型下载（Layer B）────────────────────────────────────────────────────────────
-
-/// Progress event streamed to the frontend over a `Channel` during a model download.
-/// 下载期间经 `Channel` 流式推给前端的进度事件。
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DownloadProgress {
-    pub model_id: String,
-    /// File currently being fetched (empty on the final `done` event).
-    /// 当前正在下载的文件（最终 `done` 事件时为空）。
-    pub current_file: String,
-    /// 1-based index of the current file.
-    pub file_index: usize,
-    pub file_count: usize,
-    /// Bytes received across ALL assets so far.
-    /// 迄今所有资产累计已接收字节数。
-    pub received: u64,
-    /// Total bytes across all assets.
-    pub total: u64,
-    pub done: bool,
-    pub error: Option<String>,
-}
+// 共享下载编排(DownloadProgress/download_assets/落盘名白名单)已迁兄弟模块
+// `ipc::model_download`(U-P2-b):它同时服务本文件与 face_commands,不该寄居
+// 单一命令文件。本文件只留 download_model 命令(资产清单构建 = 在线发现)。
 
 /// Download all assets for a model into the models dir, with per-file resume (HTTP Range),
 /// size + sha256 verification, mirror fallback, and progress streamed over `on_progress`.
@@ -864,15 +865,8 @@ pub async fn download_model(
     // (HuggingFace)优先。两种模式都会在首选源失败时自动回退到另一源，保证健壮性。
     // Preferred download source: `mirror` puts the China mirror first; anything else (incl.
     // default / `official`) puts the official source first. Either way we fall back to the other.
-    // R1-3：读池 SQL 走 read_blocking。
-    let mirror_first = super::blocking::read_blocking(&state, |conn| {
-        Ok(get_config(conn, "ai_download_source")
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some("mirror"))
-    })
-    .await?;
+    // A2:schema 设置类键,唯一真源已切到 ConfigManager(内存读)。
+    let mirror_first = state.config.get("ai_download_source").as_deref() == Some("mirror");
 
     // 构造下载清单：静态 fp16 = 已校验固定清单；动态架构 = 由在线发现拼出
     // 图像 onnx + 其 extra + 共享文本塔 onnx + 其 extra + vocab（均带 size/sha256 校验）。
@@ -883,9 +877,7 @@ pub async fn download_model(
             let disk_cache = models_dir(&state).join(remote_registry::DISK_CACHE_FILE);
             let archs = remote_registry::discover(mirror_first, Some(&disk_cache))
                 .await
-                .map_err(|e| {
-                    AppError::System(format!("获取在线模型列表失败 | discovery failed: {e}"))
-                })?;
+                .map_err(|e| AppError::internal("获取在线模型列表失败 | discovery failed", e))?;
             let arch = archs.iter().find(|a| a.folder == folder).ok_or_else(|| {
                 AppError::UnsupportedFormat(format!(
                     "仓库中找不到架构 | arch not in repo: {folder}"
@@ -925,12 +917,11 @@ pub async fn download_model(
     // R10：用通用引擎的安全 client（HTTPS 强制 + 重定向加固 + 大文件不设整体超时，避免 ~GB 模型
     // 被整体超时误杀）。HF `resolve/` 会 302 跳到 HTTPS CDN —— 安全策略只拒「降级到非 HTTPS」的跳转，故兼容。
     let client = crate::download::secure_client(crate::download::TimeoutPolicy::LargeFile)
-        .map_err(|e| AppError::System(format!("HTTP 客户端构建失败 | client build failed: {e}")))?;
+        .map_err(|e| AppError::internal("HTTP 客户端构建失败 | client build failed", e))?;
 
     // 逐资产下载循环已抽为共用函数 `download_assets`（人脸下载命令复用）。它仍返回 String
     // 以喂给 DownloadProgress.error（流式展示通道，非 IPC 契约）；命令边界把最终失败串包成
     // AppError::System（消息直透，保留「下载失败 <文件>: <原因>」这条可操作详情）。
-    // The per-asset loop is extracted into `download_assets` (reused by the face download command).
     download_assets(
         &client,
         &models,
@@ -943,161 +934,151 @@ pub async fn download_model(
     .map_err(AppError::System)
 }
 
-/// Download a fixed list of assets into `models`: per-file resume (HTTP Range), mirror fallback,
-/// size + sha256 verification, `.part` → atomic rename, and throttled progress over `on_progress`.
-/// Shared by CLIP `download_model` and face `download_face_model` — the only upstream difference is
-/// how the asset list is built (online discovery vs static profile assets).
-/// 把一组固定资产下载到 `models`：逐文件断点续传（HTTP Range）、镜像回退、size+sha256 校验、
-/// `.part`→原子改名、节流进度经 `on_progress`。CLIP 的 download_model 与人脸的 download_face_model
-/// 共用——上游差异仅在如何构建资产清单（在线发现 vs profile 静态资产）。
-pub(crate) async fn download_assets(
-    client: &reqwest::Client,
-    models: &std::path::Path,
-    assets: &[profile::ModelAsset],
-    mirror_first: bool,
-    on_progress: &tauri::ipc::Channel<DownloadProgress>,
-    download_id: &str,
-) -> std::result::Result<(), String> {
-    let total: u64 = assets.iter().map(|a| a.size_bytes).sum();
-    let file_count = assets.len();
+// download_assets/is_safe_model_file_name/DownloadProgress 及其安全测试已迁
+// `ipc::model_download`(U-P2-b),见该模块头注的层次边界说明。
 
-    let send = |current_file: &str,
-                file_index: usize,
-                received: u64,
-                done: bool,
-                error: Option<String>| {
-        let _ = on_progress.send(DownloadProgress {
-            model_id: download_id.to_string(),
-            current_file: current_file.to_string(),
-            file_index,
-            file_count,
-            received,
-            total,
-            done,
-            error,
-        });
-    };
+#[cfg(test)]
+mod p1_3_teardown_tests {
+    use super::*;
+    use crate::ai::search_control::{SearchCommit, SearchControl, SearchRequestId};
+    use crate::db::DbWriter;
+    use rusqlite::Connection;
 
-    let mut base_received: u64 = 0; // bytes contributed by already-completed files | 已完成文件累计
-
-    for (i, asset) in assets.iter().enumerate() {
-        let idx = i + 1;
-        let dest = models.join(&asset.dest);
-
-        // Skip files that are already present, correct size, and (if known) matching sha256.
-        // 跳过已存在、大小正确、且（若已知）sha256 匹配的文件。
-        // R1-3：sha256 校验要整读文件（模型可达 GB 级），下沉 blocking，别拖垮 tokio worker。
-        let already_ok = {
-            let dest = dest.clone();
-            let expect_size = asset.size_bytes;
-            let sha = asset.sha256.clone();
-            tokio::task::spawn_blocking(move || {
-                std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == expect_size
-                    && crate::download::sha256_matches(&dest, sha.as_deref())
-            })
-            .await
-            .map_err(|e| format!("后台任务异常 | blocking task failed: {e}"))?
-        };
-        if already_ok {
-            base_received += asset.size_bytes;
-            send(&asset.dest, idx, base_received, false, None);
-            continue;
-        }
-
-        let part = models.join(format!("{}.part", asset.dest));
-        let mut resume_from = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        // A stale .part bigger than the target → start over.
-        // 残留 .part 超过目标大小 → 重新开始。
-        if resume_from > asset.size_bytes {
-            let _ = std::fs::remove_file(&part);
-            resume_from = 0;
-        }
-
-        // 按用户偏好排序候选源：首选源在前，另一源作为失败回退在后。
-        // Order candidates by the user's preference; the other source stays as fallback.
-        let mut urls: Vec<&str> = Vec::with_capacity(2);
-        let mirror = asset.mirror_url.as_deref();
-        if mirror_first {
-            if let Some(m) = mirror {
-                urls.push(m);
-            }
-            urls.push(asset.url.as_str());
-        } else {
-            urls.push(asset.url.as_str());
-            if let Some(m) = mirror {
-                urls.push(m);
-            }
-        }
-
-        // R10：单文件流式下载（Range 续传）+ 镜像回退下沉通用引擎；进度回调把「本文件已收字节」
-        // 聚合到全局 received（base_received = 已完成文件累计）。
-        let on_bytes = |file_received: u64| {
-            send(&asset.dest, idx, base_received + file_received, false, None);
-        };
-        if let Err(e) = crate::download::download_with_fallback(
-            client,
-            &urls,
-            &part,
-            resume_from,
-            asset.size_bytes,
-            &on_bytes,
+    /// 造一个「已装载旧模型向量 + 已提交旧结果 + 有在途票」的现场:
+    /// 嵌入行 + 一条 image 媒体项(ai_status 非 0,使重置的 UPDATE 阶段有事可做)
+    /// + 结果表旧行 + 控制面常驻快照。
+    fn scene() -> (DbWriter, SearchControl, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::migration::run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, parent_id, rel_path, name, depth)
+                 VALUES (10, 1, NULL, 'A', 'A', 0);
+             INSERT INTO media_items
+                 (id, directory_id, file_name, file_size, file_mtime, file_format, media_type,
+                  width, height, sort_datetime, cache_key, is_favorited, is_deleted,
+                  is_live_photo, companion_of, ai_status)
+                 VALUES (1, 10, 'a.jpg', 0, 0, 'jpg', 'image', 0, 0, 0, 0, 0, 0, 0, NULL, 2);",
         )
-        .await
-        {
-            let msg = format!("下载失败 {} | download failed: {}", asset.dest, e);
-            send(&asset.dest, idx, base_received, false, Some(msg.clone()));
-            return Err(msg);
-        }
+        .unwrap();
+        let blob: Vec<u8> = [1.0f32, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        conn.execute(
+            "INSERT INTO ai_embeddings (item_id, model_name, embedding) VALUES (1, 'm1', ?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_search_results (file_id, similarity) VALUES (1, 0.9)",
+            [],
+        )
+        .unwrap();
 
-        // Verify size, then sha256 (if known).
-        // 校验大小，再校验 sha256（若已知）。
-        let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        if got != asset.size_bytes {
-            let _ = std::fs::remove_file(&part);
-            let msg = format!(
-                "{} 大小校验失败：期望 {} 实得 {} | size mismatch",
-                asset.dest, asset.size_bytes, got
-            );
-            send(&asset.dest, idx, base_received, false, Some(msg.clone()));
-            return Err(msg);
-        }
-        // R1-3：同上——下载后整文件 sha256 下沉 blocking。
-        let sha_ok = if asset.sha256.is_some() {
-            let part_c = part.clone();
-            let sha = asset.sha256.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::download::sha256_matches(&part_c, sha.as_deref())
-            })
-            .await
-            .map_err(|e| format!("后台任务异常 | blocking task failed: {e}"))?
-        } else {
-            true
-        };
-        if !sha_ok {
-            let _ = std::fs::remove_file(&part);
-            let msg = format!(
-                "{} sha256 校验失败（文件损坏或被篡改）| checksum mismatch",
-                asset.dest
-            );
-            send(&asset.dest, idx, base_received, false, Some(msg.clone()));
-            return Err(msg);
-        }
-
-        // Atomic-ish swap into place.
-        // 原子式就位。
-        let _ = std::fs::remove_file(&dest);
-        std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
-        base_received += asset.size_bytes;
-        send(&asset.dest, idx, base_received, false, None);
+        let writer: DbWriter = std::sync::Mutex::new(conn);
+        let search = SearchControl::new();
+        let warm = search.begin_request("m1");
+        search
+            .snapshot_for(&warm, 2, || Ok(vec![(1, blob.clone())]))
+            .unwrap();
+        assert!(search.resident_identity().is_some(), "前置:快照已常驻");
+        (writer, search, warm.seq() as i64)
     }
 
-    send("", file_count, total, true, None);
-    info!(
-        "Model downloaded: {} ({} files) | 模型下载完成: {}（{} 个文件）",
-        download_id, file_count, download_id, file_count
-    );
-    Ok(())
-}
+    /// 重置的第一阶段(删向量)成功、第二阶段(清 ai_status 的 UPDATE)失败:
+    /// 已删掉的向量不会回来,但搜索侧必须已经收尾——吊销在途票、作废快照、擦掉旧结果。
+    /// 这正是「分批非事务」留下的半完成态,不能让它带着旧排名继续可见。
+    #[test]
+    fn failed_reset_still_revokes_in_flight_search_and_drops_stale_cache() {
+        let (writer, search, _) = scene();
 
-// `download_file`（单文件流式下载 + Range 续传）与 `sha256_matches` 已下沉 `crate::download` 通用
-// 引擎（R10，Part6 §3.1.2），与 exotic 共用；此处不再重复实现。
+        // 在途票:重置前登记(应被吊销)。
+        let in_flight = search.begin_request("m1");
+        let in_flight_id = in_flight.id().clone();
+        search
+            .snapshot_for(&in_flight, 2, || Ok(Vec::new()))
+            .unwrap();
+
+        // 注入失败:UPDATE media_items 触发 ABORT(模拟后续批失败)。
+        {
+            let conn = writer.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER p1_3_fail_status BEFORE UPDATE ON media_items
+                 BEGIN SELECT RAISE(ABORT, 'injected status update failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let err = reset_embeddings_with_search_teardown(&writer, &search, "m1").unwrap_err();
+        assert!(
+            matches!(err, AppError::Db(_)),
+            "重置失败须原样传播给调用方,实际: {err:?}"
+        );
+
+        // 半完成态属实:向量确已删除(所以更不能再暴露旧排名)。
+        {
+            let conn = writer.lock().unwrap();
+            let left: i64 = conn
+                .query_row("SELECT count(*) FROM ai_embeddings", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "前置:第一阶段确已删掉向量(半完成态)");
+        }
+
+        // 收尾已生效:快照作废、在途票吊销、旧结果集擦净。
+        assert!(
+            search.resident_identity().is_none(),
+            "重置失败也必须作废常驻快照"
+        );
+        assert!(search.latest().is_none(), "重置失败也必须吊销在途票");
+        assert_eq!(
+            search.commit(&in_flight, || Ok(1)).unwrap(),
+            SearchCommit::Superseded,
+            "重置前登记的请求不得在失败后仍能提交"
+        );
+        assert_eq!(search.committed(), None, "旧结果集身份须已清除(表已擦)");
+        let conn = writer.lock().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM ai_search_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "旧搜索结果须被擦掉");
+
+        // 重置成功后登记的请求照常工作(新的向量空间)。
+        drop(conn);
+        {
+            let conn = writer.lock().unwrap();
+            conn.execute_batch("DROP TRIGGER p1_3_fail_status;")
+                .unwrap();
+        }
+        let fresh = search.begin_request("m1");
+        assert_eq!(
+            search.commit(&fresh, || Ok(3)).unwrap(),
+            SearchCommit::Committed(3),
+            "重置后登记的请求正常提交"
+        );
+        let _ = in_flight_id;
+    }
+
+    /// 成功路径对照:收尾照样执行(擦净旧结果),且错误为空——证明上面的断言不是「总是失败」。
+    #[test]
+    fn successful_reset_also_clears_old_results() {
+        let (writer, search, _) = scene();
+        let in_flight = search.begin_request("m1");
+        let _ = in_flight;
+
+        reset_embeddings_with_search_teardown(&writer, &search, "m1").unwrap();
+
+        assert!(search.resident_identity().is_none());
+        assert!(search.latest().is_none(), "重置前的在途票须被吊销");
+        assert_eq!(search.committed(), None);
+        let conn = writer.lock().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM ai_search_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        let status: i64 = conn
+            .query_row("SELECT ai_status FROM media_items WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, 0, "成功路径须把 ai_status 复位");
+        let _: Option<SearchRequestId> = None;
+    }
+}

@@ -59,22 +59,25 @@ function handleItemClick(item: ContextMenuItem) {
 .context-menu {
   position: absolute;
   min-width: 160px;
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
-  padding: 4px;
+  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--material-recipe-float-border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--material-recipe-float-box-shadow);
+  backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  padding: var(--spacing-xs);
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--spacing-2xs);
 }
 
 .context-menu__item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--spacing-sm);
   width: 100%;
-  padding: 6px 10px;
+  min-height: var(--control-size-compact);
+  padding: 0 var(--spacing-sm);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--color-text-primary);

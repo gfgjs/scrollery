@@ -1,21 +1,13 @@
 // src/utils/thumbhash.ts
-// ThumbHash decode: converts the ~28-byte hash to a 32×32 data URL for blur placeholder.
 // ThumbHash 解码：将大约 28 字节的哈希转换为 32×32 数据 URL 以用作模糊占位符。
-// Uses the thumbhash JS algorithm (port of the Rust thumbhash crate).
 // 使用 thumbhash JS 算法（Rust thumbhash crate 的移植）。
 
-/**
- * Decode a ThumbHash byte array to a data: URL (PNG or similar).
- * 将 ThumbHash 字节数组解码为 data: URL（PNG 或类似格式）。
- * `hash` is a `number[]` received from Rust as a serialized BLOB.
- * `hash` 是一个作为序列化 BLOB 从 Rust 接收的 `number[]`。
- */
+/** 将 ThumbHash 字节数组解码为 data: URL（PNG 或类似格式）。`hash` 是一个作为序列化 BLOB 从 Rust 接收的 `number[]`。 */
 export function thumbhashToDataURL(hash: number[] | Uint8Array): string {
   // canvas 渲染依赖 DOM;非浏览器环境(如 node 单测)直接空串,解码纯函数另行可测
   if (typeof document === 'undefined') return ''
   const bytes = hash instanceof Uint8Array ? hash : new Uint8Array(hash)
 
-  // thumbhash decode — inline implementation of the official thumbhash algorithm
   // thumbhash 解码 — 官方 thumbhash 算法的内联实现
   // See: https://github.com/evanw/thumbhash
   const rgba = thumbHashToRGBA(bytes)
@@ -35,7 +27,6 @@ export function thumbhashToDataURL(hash: number[] | Uint8Array): string {
   return canvas.toDataURL('image/png')
 }
 
-// ── ThumbHash decode (faithful port of the official implementation) ───────
 // ── ThumbHash 解码(官方实现的忠实移植) ──────────────────────────────────
 // 算法与常量逐行对齐 evanw/thumbhash(MIT)及后端编码所用的 thumbhash crate
 // (同算法的官方 Rust 移植);正确性由 thumbhash.spec.ts 以 Rust 编码器+解码器
@@ -49,9 +40,7 @@ export interface ThumbHashImage {
 }
 
 /**
- * Decode a ThumbHash to raw RGBA pixels (pure function, DOM-free, testable).
  * 将 ThumbHash 解码为原始 RGBA 像素(纯函数,不依赖 DOM,可单测)。
- * Returns null for malformed / truncated input (Rust side returns Err for the same cases).
  * 对畸形 / 截断输入返回 null(Rust 侧同场景返回 Err)。
  */
 export function thumbHashToRGBA(hash: Uint8Array): ThumbHashImage | null {
@@ -180,12 +169,7 @@ export function thumbHashToRGBA(hash: Uint8Array): ThumbHashImage | null {
   return { rgba, w, h }
 }
 
-/**
- * Extract the average RGB color from a ThumbHash.
- * 从 ThumbHash 中提取平均 RGB 颜色。
- * This is O(1) and extremely fast, ideal for solid color placeholders.
- * 这是 O(1) 的，速度极快，非常适合用作纯色占位符。
- */
+/** 从 ThumbHash 中提取平均 RGB 颜色。这是 O(1) 的，速度极快，非常适合用作纯色占位符。 */
 export function thumbhashToAverageColor(hash: number[] | Uint8Array): string {
   const bytes = hash instanceof Uint8Array ? hash : new Uint8Array(hash)
   if (bytes.length < 5) return '#333333'
@@ -207,18 +191,12 @@ export function thumbhashToAverageColor(hash: number[] | Uint8Array): string {
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`
 }
 
-/**
- * Create a CSS blur placeholder string from a thumbhash.
- * 从 thumbhash 创建 CSS 模糊占位符字符串。
- * Returns a `background-image: url(...)` value.
- * 返回一个 `background-image: url(...)` 值。
- */
+/** 从 thumbhash 创建 CSS 模糊占位符字符串。返回一个 `background-image: url(...)` 值。 */
 export function thumbhashToBackgroundImage(hash: number[] | Uint8Array): string {
   const url = thumbhashToDataURL(hash)
   return url ? `url(${url})` : ''
 }
 
-// ── Async / Idle Queue for Thumbhash Generation ───────────────────────────
 // ── Thumbhash 生成的异步 / 空闲队列 ─────────────────────────────────────────
 
 const bgCache = new Map<string, string>()
@@ -227,7 +205,6 @@ const pendingQueue: { hash: number[] | Uint8Array; key: string; resolve: (val: s
 let isIdleScheduled = false
 
 function processIdleQueue(deadline: IdleDeadline) {
-  // Process tasks as long as we have at least 2ms remaining in the idle frame
   // 只要空闲帧中至少还剩 2 毫秒，就处理任务
   while (pendingQueue.length > 0 && deadline.timeRemaining() > 2) {
     const task = pendingQueue.shift()!
@@ -247,12 +224,7 @@ function processIdleQueue(deadline: IdleDeadline) {
   }
 }
 
-/**
- * Lazily generates the thumbhash background image during browser idle periods.
- * 在浏览器空闲期间延迟生成 thumbhash 背景图像。
- * This completely eliminates main-thread stuttering during fast scrolling.
- * 这完全消除了快速滚动期间主线程的卡顿。
- */
+/** 在浏览器空闲期间延迟生成 thumbhash 背景图像。这完全消除了快速滚动期间主线程的卡顿。 */
 export function getThumbhashBgAsync(hash: number[] | Uint8Array): Promise<string> {
   const bytes = hash instanceof Uint8Array ? hash : new Uint8Array(hash)
   const key = bytes.join(',')

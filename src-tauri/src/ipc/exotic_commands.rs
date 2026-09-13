@@ -1,4 +1,3 @@
-// src-tauri/src/ipc/exotic_commands.rs
 //! 冷门格式插件 · 前端查询命令（Part1 §2.3）。
 //!
 //! 本卷只读：返回能力解析与（Part1 为空的）安装真相。处理控制命令
@@ -25,7 +24,7 @@ pub async fn list_exotic_format_resolutions(
     let state_arc = state.inner().clone();
     tokio::task::spawn_blocking(move || Ok(state_arc.exotic_host().list_resolutions()))
         .await
-        .map_err(|e| AppError::System(e.to_string()))?
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// 单个媒体项的 exotic 状态（可用态 + 处理态分离，对齐前端）。
@@ -83,7 +82,7 @@ pub async fn get_exotic_item_state(
         })
     })
     .await
-    .map_err(|e| AppError::System(e.to_string()))?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// 列出已安装插件（Part1 安装表为空 → 空列表）。
@@ -113,7 +112,7 @@ pub async fn get_plugin_entitlement(
             })
     })
     .await
-    .map_err(|e| AppError::System(e.to_string()))?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 // ── 处理控制命令（Part2 §4.5）──────────────────────────────────────────────────
@@ -226,7 +225,7 @@ pub async fn get_exotic_processing_status(
         })
     })
     .await
-    .map_err(|e| AppError::System(e.to_string()))?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// 处理详情行(商店进度「展开详情」,2026-07-05 内测需求):文件级任务投影。
@@ -298,7 +297,7 @@ pub async fn list_exotic_task_details(
             .collect())
     })
     .await
-    .map_err(|e| AppError::System(e.to_string()))?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// 重试单项（item + capability）：error → pending 并唤醒。
@@ -363,9 +362,13 @@ pub async fn activate_exotic_plugin(
 
     // 先验签后存；失败不覆盖现有有效 token。错误只回 code（不含 token 材料）。
     // 信任根不可用时组合根降级 FreeStub → activate 回稳定码 activation_unsupported（同样 fail-closed）。
-    state
-        .entitlement_provider()
-        .activate(&plugin_id, &sku, &token, now_secs())
+    // 2026-07-06 审查 R18:keyring 写是同步系统调用(Windows Credential Manager RPC,可阻塞数百 ms),
+    // 下沉 spawn_blocking 离开 tokio worker(与同文件 uninstall 路径对齐)。
+    let provider = state.entitlement_provider();
+    let (pid, sku_c, tok) = (plugin_id.clone(), sku.clone(), token.clone());
+    tokio::task::spawn_blocking(move || provider.activate(&pid, &sku_c, &tok, now_secs()))
+        .await
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
         .map_err(|e| AppError::Exotic {
             code: e.code(),
             message: format!("激活失败：{}", e.code()),
@@ -382,9 +385,12 @@ pub async fn deactivate_exotic_plugin(
     plugin_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    state
-        .entitlement_provider()
-        .deactivate(&plugin_id)
+    // R18:keyring 删除同步系统调用,下沉 spawn_blocking(与 uninstall 对齐)。
+    let provider = state.entitlement_provider();
+    let pid = plugin_id.clone();
+    tokio::task::spawn_blocking(move || provider.deactivate(&pid))
+        .await
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
         .map_err(|e| AppError::Exotic {
             code: e.code(),
             message: format!("移除授权失败：{}", e.code()),
@@ -416,6 +422,8 @@ fn builtin_keyset() -> Result<VerifyingKeyset> {
 #[serde(rename_all = "camelCase")]
 pub struct ExoticRegistryEntry {
     pub plugin_id: String,
+    /// 展示名（来自内置 Catalog；Catalog 未知时回退为 plugin_id）。
+    pub name: String,
     pub version: String,
     pub formats: Vec<String>,
     pub capabilities: Vec<String>,
@@ -451,12 +459,38 @@ fn registry_base_url() -> String {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistrySummary {
-    /// 本次接受的 index 中条目数（全新设备从 0 → N，N>0 即「装得了插件」）。
+    /// 本次接受且对当前用户可见（当前平台 + Catalog 已知）的条目数。
     pub plugin_count: usize,
     /// 已接受的 registry_sequence（单调防回滚基线）。
     pub sequence: u64,
     /// 该 index 是否已过期（过期仍写缓存供展示，但安装路径拒绝，§6.1）。
     pub expired: bool,
+}
+
+/// 判断 Registry 条目是否应当展示给当前用户：
+/// 1. target 必须匹配当前平台；
+/// 2. plugin_id 必须已登记在当前内置 Catalog（否则安装后也会 catalog_reject）。
+fn registry_entry_visible(
+    entry: &crate::exotic::registry::RegistryEntry,
+    catalog: &crate::exotic::CatalogSnapshot,
+) -> bool {
+    let target = crate::exotic::current_target_triple();
+    entry.target == target
+        && catalog
+            .iter_formats()
+            .any(|(_, o)| o.plugin_id == entry.plugin_id && o.supports_platform(target))
+}
+
+/// 取 Registry 条目的展示名：优先 Catalog 的 display_name，找不到则回退 plugin_id。
+fn registry_entry_name(
+    entry: &crate::exotic::registry::RegistryEntry,
+    catalog: &crate::exotic::CatalogSnapshot,
+) -> String {
+    catalog
+        .iter_formats()
+        .find(|(_, o)| o.plugin_id == entry.plugin_id)
+        .map(|(_, o)| o.display_name.clone())
+        .unwrap_or_else(|| entry.plugin_id.clone())
 }
 
 /// 🔴 P0 阻断修复：拉取远程签名 Registry → 验签 + 单调防回滚 → 原子写本地缓存。
@@ -491,8 +525,16 @@ pub async fn fetch_exotic_registry(state: State<'_, Arc<AppState>>) -> Result<Re
             message: format!("Registry 验签/接受失败：{}", e.code()),
         })?;
 
+    let catalog = state.exotic_catalog.snapshot();
+    let plugin_count = verified
+        .index
+        .plugins
+        .iter()
+        .filter(|e| registry_entry_visible(e, catalog.as_ref()))
+        .count();
+
     Ok(RegistrySummary {
-        plugin_count: verified.index.plugins.len(),
+        plugin_count,
         sequence: verified.index.sequence,
         expired: verified.expired,
     })
@@ -509,11 +551,14 @@ pub async fn list_exotic_registry(
         return Ok(Vec::new());
     };
     let expired = v.expired;
+    let catalog = state.exotic_catalog.snapshot();
     Ok(v.index
         .plugins
         .iter()
+        .filter(|e| registry_entry_visible(e, catalog.as_ref()))
         .map(|e| ExoticRegistryEntry {
             plugin_id: e.plugin_id.clone(),
+            name: registry_entry_name(e, catalog.as_ref()),
             version: e.version.clone(),
             formats: e.formats.clone(),
             capabilities: e.capabilities.clone(),
@@ -590,7 +635,7 @@ pub async fn install_exotic_plugin(
     // 重试安装天然复用(fetch 幂等跳过),不做回滚。直接落 models 目录(D1 Level A:
     // SessionInit 传路径即可用,不再过安装器)。
     if !entry.model_blobs.is_empty() {
-        let models = crate::ipc::ai_commands::models_dir(&state);
+        let models = crate::ai::runtime_config::models_dir(&state);
         std::fs::create_dir_all(&models).ok();
         for blob in &entry.model_blobs {
             let dest = models.join(&blob.file_name);
@@ -622,7 +667,7 @@ pub async fn install_exotic_plugin(
     // 3. quiesce → 安全安装 → resume。quiesce 超时（Worker 仍占句柄）即中止，**不**强行切目录。
     let (prev_paused, quiesced) = state.quiesce_exotic(QUIESCE_TIMEOUT).await;
     if !quiesced {
-        state.resume_after_quiesce(prev_paused);
+        state.resume_after_quiesce(prev_paused).await;
         let _ = std::fs::remove_file(&zip);
         return Err(AppError::Exotic {
             code: "worker_quiesce_timeout",
@@ -664,9 +709,10 @@ pub async fn install_exotic_plugin(
         })
         .await
     };
-    state.resume_after_quiesce(prev_paused);
+    state.resume_after_quiesce(prev_paused).await;
     let _ = std::fs::remove_file(&zip); // 无论成败清理已用 zip
-    let result = join_result.map_err(|e| AppError::System(e.to_string()))?;
+    let result =
+        join_result.map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
     // R1-4：透传 InstallError 的稳定码（open_zip/bad_signature/install_io/…），
     // 前端可按码区分 zip 损坏/签名失败/磁盘满，不再折叠为泛码 install_failed。
     result.map_err(|e| AppError::Exotic {
@@ -728,7 +774,7 @@ pub async fn repair_exotic_plugin(
         }
     })
     .await
-    .map_err(|e| AppError::System(e.to_string()))?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// 回滚到本机已验证 backup（§6.5）：quiesce → 目录换回 → 据已装 manifest 重建 DB 记录。
@@ -750,7 +796,7 @@ pub async fn rollback_exotic_plugin(
     // quiesce 超时即中止，不强行换目录（避免句柄占用致 current 丢失）。
     let (prev_paused, quiesced) = state.quiesce_exotic(QUIESCE_TIMEOUT).await;
     if !quiesced {
-        state.resume_after_quiesce(prev_paused);
+        state.resume_after_quiesce(prev_paused).await;
         return Err(AppError::Exotic {
             code: "worker_quiesce_timeout",
             message: "Worker 未在限期内停止，回滚中止（请重试）".into(),
@@ -804,8 +850,8 @@ pub async fn rollback_exotic_plugin(
         })
         .await
     };
-    state.resume_after_quiesce(prev_paused); // 单次 resume
-    join_result.map_err(|e| AppError::System(e.to_string()))??;
+    state.resume_after_quiesce(prev_paused).await; // 单次 resume
+    join_result.map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
     state.wake_exotic(WakeReason::PluginInstalled);
     Ok(())
 }
@@ -828,7 +874,7 @@ pub async fn uninstall_exotic_plugin(
     // quiesce 超时即中止（避免句柄占用致 remove_dir_all 失败留半删目录）。
     let (prev_paused, quiesced) = state.quiesce_exotic(QUIESCE_TIMEOUT).await;
     if !quiesced {
-        state.resume_after_quiesce(prev_paused);
+        state.resume_after_quiesce(prev_paused).await;
         return Err(AppError::Exotic {
             code: "worker_quiesce_timeout",
             message: "Worker 未在限期内停止，卸载中止（请重试）".into(),
@@ -847,9 +893,9 @@ pub async fn uninstall_exotic_plugin(
         })
         .await
     };
-    state.resume_after_quiesce(prev_paused);
+    state.resume_after_quiesce(prev_paused).await;
     join_result
-        .map_err(|e| AppError::System(e.to_string()))?
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
         .map_err(|e| AppError::Exotic {
             code: "uninstall_failed",
             message: format!("卸载失败：{e}"),

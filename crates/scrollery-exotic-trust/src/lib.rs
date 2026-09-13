@@ -12,10 +12,10 @@
 //!   `exotic-trust`（本 crate；依赖 plugin-api 拿 LicenseError/LicenseStatus）
 //!       ↑
 //!   `src-tauri`（KeyringLicenseStore + registry/package/install，经 `crate::exotic::crypto` 薄壳复用）
-//!   `pro`（③b：DirectEntitlement，单向依赖 plugin-api + exotic-trust，**不**依赖 src-tauri → 破环）
 //!
-//! **零密钥红线**：本 crate 只含公钥验签逻辑；真实**生产**公钥 `exotic-keyset-prod.json` + `builtin()`
-//! 生产构造随 pro 下沉（③b）。当前内置的是**占位**公钥（非生产密钥），不触红线。
+//! **零私钥红线**：本 crate 只含**公钥**验签逻辑，私钥离线/HSM、永不入仓亦不入二进制。内置 keyset
+//! 为占位公钥（私钥已弃），经 `PICASA_EXOTIC_KEYSET_FILE` 编译期注入可整组替换；registry 与
+//! license 两用途共用本集（唯一信任根，验签路径不分叉）。
 
 #![forbid(unsafe_code)]
 

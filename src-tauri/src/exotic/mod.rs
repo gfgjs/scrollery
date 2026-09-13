@@ -18,13 +18,18 @@ pub mod install;
 pub mod installer;
 pub mod license;
 pub mod limiter;
+pub mod outcome;
 pub mod package;
 pub mod pipeline;
 pub mod registry;
 pub mod sink;
 pub mod supervisor;
 pub mod task;
+pub mod tools;
+pub mod validate;
 pub mod worker;
+pub(crate) mod worker_log;
+pub mod worker_traits;
 
 use std::sync::Arc;
 
@@ -32,9 +37,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::connection::DbPool;
 pub use catalog::{Capability, CatalogOffering, CatalogSnapshot, CatalogStore, MediaKind};
+use channel_stubs::FreeStubEntitlement;
 pub use crypto::VerifyingKeyset;
 pub use license::{EntitlementProvider, LicenseStatus};
-use scrollery_free_stub::FreeStubEntitlement;
 pub use task::{ExoticTaskRow, ExoticTaskStatus};
 
 /// Host 语义版本（min_host_version 兼容门控用）。
@@ -72,10 +77,15 @@ pub struct FormatResolution {
     pub format: String,
     pub media_kind: MediaKind,
     pub plugin_id: Option<String>,
+    /// 展示名（来自 Catalog offering.display_name；无 offering 时回退为格式名）。
+    #[serde(default)]
+    pub display_name: String,
     pub capabilities: Vec<Capability>,
     pub availability: Availability,
     pub store_url: Option<String>,
     pub installed_version: Option<String>,
+    /// builtin offering(D-OCR-5):无安装包,直接验 license;前端据此免走「购买/安装」文案。
+    pub builtin: bool,
 }
 
 /// 已安装插件信息（安装真相投影；前端市场用）。Part1 安装表为空，命令返回空列表。
@@ -211,24 +221,18 @@ pub struct PluginEntitlement {
     pub store_url: Option<String>,
 }
 
-/// 组合根 · 授权 provider 装配点（Part6 §3.9 红线 **唯一 swap 点**）。
+/// 组合根 · 授权 provider 装配点（Part6 §3.9 **唯一 swap 点**）。
 ///
-/// **开源核心**：keyring 直销验签（[`license::KeyringLicenseStore`]）+ 内置信任根公钥集；
-/// builtin 解析失败即 fail-closed 降级 [`FreeStubEntitlement`]（授权一律拒绝，绝不放行）。
+/// **Part7-T12 渠道工厂化**:分发渠道 feature(互斥,lib.rs compile_error! 守卫)在编译期决定
+/// provider 家族——msstore/steam 现为 fail-closed 骨架桩(恒 Unlicensed,见 [`channel_stubs`]),
+/// 真实 StoreContext/DLC ownership 归 Part8 D5-D8;direct 走下方 keyring 直销装配。
+/// §3.6.2 的 DRM 物理排除因此有了工厂侧的选择点。
 ///
-/// 🔴 **商业构建**(③b,已落地 2026-07-05):私有树在本函数内的标记块早退构造闭源 `DirectEntitlement`
-/// (pro crate);Copybara 投影公开镜像时剥离该块,公开树回退下方开源装配。此处刻意收敛为**单点
-/// 单函数**,使红线 swap 只动一处、零扩散,且剥离后的开源核心**零 pro 编译期引用**(满足 cargo
-/// resolve-all 约束,§3.9.2)。
-///
-/// 开源默认裁决(2026-07-05):**保留 KeyringLicenseStore,不切 FreeStub,不删源**——公开树直销保持
-/// 可用(fork 可自建签发链);其内置信任根为占位集,对生产 token 恒验签失败,无泄权面。
-///
-/// **Part7-T12 渠道工厂化(2026-07-02)**:分发渠道 feature(互斥,lib.rs compile_error! 守卫)
-/// 在编译期决定授权 provider 家族——msstore/steam 现为 fail-closed 骨架桩(恒 Unlicensed,
-/// 见 [`channel_stubs`]),真实 StoreContext/DLC ownership 归 Part8 D5-D8;direct 维持原装配。
-/// 这使「四种渠道组合都能编译」成立,且 §3.6.2 的 DRM 物理排除有了工厂侧的选择点。
-/// 运行期信任根(exotic 验签统一入口):内置生产公钥集。
+/// direct = keyring 直销验签([`license::KeyringLicenseStore`]) + 信任根公钥集
+/// ([`trusted_keyset`]——registry 与 license 共用同一集,验签路径不分叉)。
+/// 随仓 keyset 只含占位公钥(私钥已弃);使用正式或自建签发链时，经
+/// `PICASA_EXOTIC_KEYSET_FILE` 编译期注入对应公钥。
+/// 信任根解析失败即 fail-closed 降级 [`FreeStubEntitlement`](授权一律拒绝,绝不放行)。
 /// 🔒 dev/test 旁路(仅 debug 构建编入,SEC-02 姿态,同 `EXOTIC_PSD_WORKER_PATH`):
 /// `PICASA_EXOTIC_DEV_KEYSET=<path>` 指向本地 keyset JSON 时**整组替换**——配合
 /// `scripts/exotic-dev-registry.mjs` 生成的 dev 签名链,开发期端到端测试插件商店
@@ -329,10 +333,12 @@ impl ExoticHost {
                 // 无 offering：无从得知媒体类。占位 Image，调用方仅对 catalog 已知格式调用本函数。
                 media_kind: MediaKind::Image,
                 plugin_id: None,
+                display_name: format.to_string(),
                 capabilities: Vec::new(),
                 availability: Availability::NoOffering,
                 store_url: None,
                 installed_version: None,
+                builtin: false,
             };
         };
         let installed = self.installed.get(&off.plugin_id);
@@ -342,10 +348,12 @@ impl ExoticHost {
             format: format.to_string(),
             media_kind: off.media_kind,
             plugin_id: Some(off.plugin_id.clone()),
+            display_name: off.display_name.clone(),
             capabilities: off.capabilities.clone(),
             availability,
             store_url: off.store_url.clone(),
             installed_version,
+            builtin: off.builtin,
         }
     }
 
@@ -366,6 +374,26 @@ impl ExoticHost {
         #[cfg(any(test, all(debug_assertions, feature = "exotic-dev-fixtures")))]
         if self.authorized_fixture.as_deref() == Some(off.plugin_id.as_str()) {
             return Availability::Authorized;
+        }
+        // builtin offering(D-OCR-5):无安装包,跳过安装态门,直接验 license。
+        if off.builtin {
+            // free 档(D-427 一期免费 RAW):显式判 license_tier=="free" 才放行,
+            // 不可用"无 sku 即放行"代替——否则会误放行 builtin 的 paid 插件(sku 缺失时应 fail-closed)。
+            if off.license_tier == "free" {
+                return Availability::Authorized;
+            }
+            let Some(sku) = off.sku.as_deref() else {
+                return Availability::InstalledUnlicensed;
+            };
+            return match self.licenses.evaluate(&off.plugin_id, sku, now_secs()) {
+                LicenseStatus::Authorized => Availability::Authorized,
+                LicenseStatus::Expired => Availability::LicenseExpired,
+                // 有意与 package 流(KeyringUnavailable→InstalledUnlicensed)分叉:builtin 无安装态可退,
+                // 统一投射为可购态(fail-closed,不误授权);keyring 瞬时故障恢复后下次查询自愈。
+                LicenseStatus::Unlicensed | LicenseStatus::KeyringUnavailable => {
+                    Availability::AvailableUninstalled
+                }
+            };
         }
         let Some(rec) = installed else {
             return Availability::AvailableUninstalled;
@@ -680,6 +708,88 @@ mod tests {
         );
     }
 
+    /// builtin offering 测试专用 catalog(distribution="builtin",与 local_catalog 平台策略同款)。
+    fn local_ocr_catalog() -> Arc<CatalogStore> {
+        let json = format!(
+            r#"{{"schema":1,"sequence":1,"offerings":[
+              {{"plugin_id":"exotic-ocr","name":"OCR","media_kind":"image","formats":["ocr"],
+               "capabilities":["text"],"license_tier":"paid","sku":"ocr-engine-2026",
+               "platforms":["{}"],"min_host_version":"0.1.0","distribution":"builtin"}}
+            ]}}"#,
+            current_target_triple()
+        );
+        Arc::new(CatalogStore::with_snapshot(
+            CatalogSnapshot::parse(&json).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn builtin_offering_no_token_is_available_uninstalled() {
+        // builtin:无安装真相输入(installed=None)也不判 AvailableUninstalled-by-install——
+        // 直接验 license;无 token → AvailableUninstalled(D-OCR-5)。
+        let host = ExoticHost::with_sources(
+            local_ocr_catalog(),
+            Arc::new(FakeInstalled(None)),
+            Arc::new(FakeLicense(LicenseStatus::Unlicensed)),
+        );
+        assert_eq!(
+            host.resolve_format("ocr").availability,
+            Availability::AvailableUninstalled
+        );
+    }
+
+    #[test]
+    fn builtin_offering_fixture_is_authorized() {
+        // dev fixture 对 builtin 分支同样生效(平台/版本门之后即命中,不经安装/授权真相)。
+        let host = ExoticHost::with_authorized_fixture(local_ocr_catalog(), "exotic-ocr");
+        assert_eq!(
+            host.resolve_format("ocr").availability,
+            Availability::Authorized
+        );
+    }
+
+    #[test]
+    fn builtin_offering_keyring_unavailable_diverges_from_package_flow() {
+        // 锁分叉:同一输入(KeyringUnavailable)下 package 流给 InstalledUnlicensed(见
+        // keyring_unavailable_is_unlicensed),builtin 流有意给 AvailableUninstalled——
+        // 防未来"统一"两分支回归。
+        let host = ExoticHost::with_sources(
+            local_ocr_catalog(),
+            Arc::new(FakeInstalled(None)),
+            Arc::new(FakeLicense(LicenseStatus::KeyringUnavailable)),
+        );
+        assert_eq!(
+            host.resolve_format("ocr").availability,
+            Availability::AvailableUninstalled
+        );
+    }
+
+    #[test]
+    fn builtin_offering_expired_license_maps_through() {
+        let host = ExoticHost::with_sources(
+            local_ocr_catalog(),
+            Arc::new(FakeInstalled(None)),
+            Arc::new(FakeLicense(LicenseStatus::Expired)),
+        );
+        assert_eq!(
+            host.resolve_format("ocr").availability,
+            Availability::LicenseExpired
+        );
+    }
+
+    /// 组合根装配冒烟:按渠道 feature 断言 source_tag——direct = keyring 直销(内置 keyset 可解析;
+    /// 解析失败会降级 FreeStubEntitlement 使标签变 "free",故本断言同时锁住 fail-closed 回退面),
+    /// msstore/steam = fail-closed 骨架桩。渠道 feature 互斥(lib.rs compile_error!),三选一。
+    #[test]
+    fn default_provider_matches_channel_feature() {
+        let p = default_entitlement_provider();
+        #[cfg(feature = "channel-msstore")]
+        assert_eq!(p.source_tag(), "ms_store");
+        #[cfg(feature = "channel-steam")]
+        assert_eq!(p.source_tag(), "steam");
+        #[cfg(feature = "channel-direct")]
+        assert_eq!(p.source_tag(), "direct");
+    }
 
     #[test]
     fn host_meets_min_version_compare() {

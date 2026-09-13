@@ -1,0 +1,14 @@
+[
+  {"brightness":0,"contrast":0,"saturation":0,"input":[0.2,0.45,0.75],"expected":[0.2,0.45,0.75],"expected8":[51,115,191],"expected16":[13107,29491,49151]},
+  {"brightness":100,"contrast":0,"saturation":0,"input":[0.2,0.4,0.6],"expected":[0.4,0.8,1],"expected8":[102,204,255],"expected16":[26214,52428,65535]},
+  {"brightness":-100,"contrast":0,"saturation":0,"input":[0.25,0.5,1],"expected":[0.125,0.25,0.5],"expected8":[32,64,128],"expected16":[8192,16384,32768]},
+  {"brightness":0,"contrast":50,"saturation":0,"input":[0.2,0.5,0.9],"expected":[0.05,0.5,1],"expected8":[13,128,255],"expected16":[3277,32768,65535]},
+  {"brightness":0,"contrast":-100,"saturation":0,"input":[0.1,0.6,0.9],"expected":[0.5,0.5,0.5],"expected8":[128,128,128],"expected16":[32768,32768,32768]},
+  {"brightness":0,"contrast":0,"saturation":-100,"input":[1,0,0],"expected":[0.213,0.213,0.213],"expected8":[54,54,54],"expected16":[13959,13959,13959]},
+  {"brightness":0,"contrast":0,"saturation":100,"input":[0.6,0.4,0.2],"expected":[0.7718,0.3718,0],"expected8":[197,95,0],"expected16":[50580,24366,0]},
+  {"brightness":0,"contrast":0,"saturation":73,"input":[0.4,0.4,0.4],"expected":[0.4,0.4,0.4],"expected8":[102,102,102],"expected16":[26214,26214,26214]},
+  {"brightness":25,"contrast":-30,"saturation":60,"input":[0.3,0.56,0.78],"expected":[0.289621002,0.635918114,0.928938747],"expected8":[74,162,237],"expected16":[18980,41675,60878]},
+  {"brightness":40,"contrast":20,"saturation":-80,"input":[0.9,0.1,0.5],"expected":[0.443613216,0.255281406,0.381954166],"expected8":[113,65,97],"expected16":[29072,16730,25031]},
+  {"brightness":-60,"contrast":35,"saturation":45,"input":[0,1,0.5],"expected":[0,0.798693421,0.152959237],"expected8":[0,204,39],"expected16":[0,52342,10024]},
+  {"brightness":15,"contrast":-15,"saturation":-25,"input":[0.034,0.514,0.969],"expected":[0.202710261,0.54223852,0.816160343],"expected8":[52,138,208],"expected16":[13285,35536,53487]}
+]

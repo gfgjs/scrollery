@@ -1,18 +1,15 @@
 // src/stores/faceStore.ts
-// Face store (F5) — face-recognition analysis status + pipeline controls.
 // 人脸 store（F5）——人脸识别分析状态 + 流水线控制。
-//
-// Mirrors aiStore's analysis-management half (status poll + start/pause/stop/restart +
-// auto-resume). Search/people-wall UI is deferred to F6.
 // 镜像 aiStore 的分析管理部分（状态轮询 + 开始/暂停/停止/重启 + 自动续传）。
 // 搜索/人物墙 UI 留待 F6。
 
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { Channel } from '@tauri-apps/api/core'
-import { invokeIpc } from '../utils/ipc'
+import { invokeIpc, ipcErrorMessage } from '../utils/ipc'
+import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
-import { useUiStore } from './uiStore'
+import { useToastStore } from './toastStore'
 import { useAnalysisController } from '../composables/useAnalysisController'
 import type { FaceStatusSummary, FaceModelInfo, FaceModelDownloadProgress } from '../types/face'
 
@@ -27,8 +24,10 @@ export const useFaceStore = defineStore('face', () => {
     pendingItems: 0,
     personCount: 0,
     faceCount: 0,
+    errorItems: 0,
     isAnalyzing: false,
     analysisActive: false,
+    waitingOn: [],
   })
 
   // 分析管理半部委托共享控制器（S6 去重，与 aiStore 共用 useAnalysisController）。face 专属:
@@ -46,11 +45,12 @@ export const useFaceStore = defineStore('face', () => {
     analyzedCount: () => status.value.processedItems,
     logTag: '[Face]',
     onError: (action, e) => {
-      // start/restart 的后端错误（模型未下载 / 与 CLIP 互斥）须用户可见 → toast；其余记 console。
+      // start/restart 的后端错误（模型未下载 / 与 CLIP 互斥）须用户可见 → toast；其余记 logger。
+      // 文案走 ipcErrorMessage（2026-07-10 审查 U7）:String(e) 会带 "IpcError: " 前缀。
       if (action === 'start' || action === 'restart') {
-        useUiStore().addToast('error', String(e))
+        useToastStore().addToast('error', ipcErrorMessage(e))
       } else {
-        console.error(`[Face] ${action} 分析出错 | analysis error:`, e)
+        logger.error(`[Face] ${action} 分析出错 | analysis error`, { error: e })
       }
     },
   })
@@ -58,6 +58,8 @@ export const useFaceStore = defineStore('face', () => {
     fetchStatus,
     analyzeProgress,
     providerLabel,
+    isWaitingBlocked,
+    waitingForSession,
     startAnalysis,
     pauseAnalysis,
     restartAnalysis,
@@ -65,20 +67,30 @@ export const useFaceStore = defineStore('face', () => {
     maybeAutoResume,
   } = analysis
 
-  /** List the built-in face-model tracks + install status (F7, read-only). | 列出内置人脸模型轨+安装状态（F7 只读）。 */
+  /** 非破坏重试失败项（审查 F9）：Error→Pending 复位后走既有 start 复跑。
+   *  与 restart（销毁本模型全部命名/确认）语义严格区分——这是零破坏的补跑通道。 */
+  async function retryFailedItems() {
+    try {
+      const n = await invokeIpc<number>(IPC.RETRY_FAILED_FACE_ITEMS)
+      if (n > 0) await startAnalysis()
+      await fetchStatus()
+    } catch (e) {
+      useToastStore().addToast('error', ipcErrorMessage(e))
+    }
+  }
+
+  /** 列出内置人脸模型轨+安装状态（F7 只读）。 */
   async function listFaceModels(): Promise<FaceModelInfo[]> {
     try {
       return await invokeIpc<FaceModelInfo[]>(IPC.LIST_FACE_MODEL_REGISTRY)
     } catch (e) {
-      console.error('[Face] listFaceModels failed:', e)
+      logger.error('[Face] listFaceModels failed', { error: e })
       return []
     }
   }
 
-  /** Download a face-model track's onnx files (verified size+sha256, resume), progress over a Channel.
-   *  Only downloadable tracks (default YuNet+SFace) succeed; SCRFD/ArcFace is manual-import only.
-   *  下载某人脸模型轨的 onnx（size+sha256 校验、断点续传），进度经 Channel 回传。仅可下载轨（默认
-   *  YuNet+SFace）成功；SCRFD/ArcFace 仅手动导入。 */
+  /** 下载某人脸模型轨的 onnx（size+sha256 校验、断点续传），进度经 Channel 回传。
+   *  仅可下载轨（默认 YuNet+SFace）成功；SCRFD/ArcFace 仅手动导入。 */
   function downloadFaceModel(
     profileId: string,
     onProgress: (p: FaceModelDownloadProgress) => void,
@@ -94,6 +106,8 @@ export const useFaceStore = defineStore('face', () => {
     // computed
     analyzeProgress,
     providerLabel,
+    isWaitingBlocked,
+    waitingForSession,
     // actions
     fetchStatus,
     startAnalysis,
@@ -101,6 +115,7 @@ export const useFaceStore = defineStore('face', () => {
     restartAnalysis,
     stopAnalysis,
     maybeAutoResume,
+    retryFailedItems,
     listFaceModels,
     downloadFaceModel,
   }

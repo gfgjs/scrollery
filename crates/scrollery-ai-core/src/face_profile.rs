@@ -1,9 +1,5 @@
 // crates/scrollery-ai-core/src/face_profile.rs
 //! 人脸模型契约（`FaceProfile`）+ 内置注册表。
-//! Face model contract + built-in registry — mirrors `profile.rs`(CLIP) so that "switching face
-//! models" is DATA, not CODE: detector/embedder kind, file names, geometry, embedding dim,
-//! alignment template, normalisation and the same-person threshold all come from a profile.
-//!
 //! 仿 [`crate::profile`]（CLIP）之法，把人脸推理路径与具体模型解耦：检测器/嵌入器种类、
 //! 文件名、几何尺寸、嵌入维度、对齐模板、归一化、同人阈值全部来自 profile 而非写死常量。
 //!
@@ -28,7 +24,6 @@ use serde::{Deserialize, Serialize};
 use crate::profile::ModelAsset;
 
 /// 人脸检测器种类（决定 onnx 输出的解码后处理）。
-/// Face detector kind (drives the onnx output decode/post-processing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectorKind {
@@ -41,7 +36,6 @@ pub enum DetectorKind {
 }
 
 /// 人脸嵌入器种类（决定对齐模板 + 输入归一化 + 输出维度）。
-/// Face embedder kind (drives alignment template + input normalisation + output dim).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbedderKind {
@@ -54,7 +48,6 @@ pub enum EmbedderKind {
 }
 
 /// 嵌入器输入归一化方式（对齐后 112×112 图 → 张量）。
-/// Embedder input normalisation (aligned 112×112 image → tensor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FaceNorm {
@@ -67,7 +60,6 @@ pub enum FaceNorm {
 }
 
 /// 完整人脸模型契约：检测 + 嵌入两段所需的一切 + 目录/许可元数据。
-/// A complete face model contract: everything the detect+embed path needs + catalogue metadata.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaceProfile {
@@ -126,7 +118,6 @@ pub struct FaceProfile {
 }
 
 /// 默认（商用友好）人脸 profile id —— 其 `faces.model_name` 向量须保持有效。
-/// Default (commercial-friendly) face profile id.
 pub const DEFAULT_FACE_PROFILE_ID: &str = "yunet-sface";
 
 /// InsightFace ArcFace 标准 5 点对齐模板（112×112，`arcface_dst`）。
@@ -140,7 +131,6 @@ const ARCFACE_DST: [[f32; 2]; 5] = [
 ];
 
 /// 所有已知人脸模型（第一条 = 默认）。
-/// All known face models (first = default).
 pub fn face_profiles() -> Vec<FaceProfile> {
     // mut 仅在 face-noncommercial 下被 push 用到;默认 build 精准豁免 unused_mut。
     #[cfg_attr(not(feature = "face-noncommercial"), allow(unused_mut))]
@@ -172,7 +162,6 @@ pub fn face_profiles() -> Vec<FaceProfile> {
             size_mb: 38,
             // 已校验直链（opencv_zoo raw；文件名带日期版本，上游不原地改）。size/sha256 实算自盘内文件，
             // download_file 的 size+sha256 校验是安全网：URL 错或 LFS 返回 pointer 文本即报错，绝不落坏文件。
-            // Verified direct links (opencv_zoo raw; date-versioned filenames are stable upstream).
             assets: vec![
                 ModelAsset {
                     url: "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx".to_string(),
@@ -230,13 +219,11 @@ pub fn face_profiles() -> Vec<FaceProfile> {
 }
 
 /// 按稳定 id 查人脸 profile。
-/// Look up a face profile by stable id.
 pub fn find_face_profile(id: &str) -> Option<FaceProfile> {
     face_profiles().into_iter().find(|p| p.id == id)
 }
 
 /// 默认人脸 profile（始终存在）。
-/// The default face profile (always present).
 pub fn default_face_profile() -> FaceProfile {
     find_face_profile(DEFAULT_FACE_PROFILE_ID)
         .expect("default face profile must exist | 默认人脸 profile 必须存在")

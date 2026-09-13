@@ -8,8 +8,8 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { convertFileSrc } from '@tauri-apps/api/core'
 import { ScanFace } from '@lucide/vue'
+import { buildThumbUrl } from '../../composables/useThumbLoader'
 
 const props = withDefaults(
   defineProps<{
@@ -27,19 +27,12 @@ const props = withDefaults(
   { size: 72 },
 )
 
-// 路径 → Tauri asset:// URL（仿 PersonsView.coverSrc：status=1 相对缓存 / 3 绝对源）。
+// 路径 → Tauri asset:// URL(status=1 相对缓存 / 3 绝对源)。
+// 构造逻辑收敛到 buildThumbUrl 单源(useThumbLoader),防内联版漂移。
 const src = computed<string | null>(() => {
-  const path = props.thumbPath
-  if (!path) return null
+  if (props.thumbStatus === 1 && !props.cacheDir) return null
   try {
-    if (props.thumbStatus === 1) {
-      if (!props.cacheDir) return null
-      return convertFileSrc(`${props.cacheDir}/thumbnails/${path}`.replace(/\\/g, '/'))
-    }
-    if (props.thumbStatus === 3) {
-      return convertFileSrc(path.replace(/\\/g, '/'))
-    }
-    return null
+    return buildThumbUrl(props.thumbStatus ?? 0, props.thumbPath, props.cacheDir)
   } catch {
     return null
   }

@@ -1,5 +1,3 @@
-// src-tauri/src/ipc/search_commands.rs
-//! Phase 1 file-name LIKE search (§ 6.1 — search).
 //! 阶段 1：文件名 LIKE 搜索（§ 6.1 — 搜索）。
 
 use std::sync::Arc;
@@ -11,12 +9,9 @@ use crate::db::queries as q;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
-/// Search media items by file name (LIKE query).
 /// 通过文件名搜索媒体项（LIKE 查询）。
-/// Phase 3 will migrate to FTS5.
 /// 阶段 3 将迁移到 FTS5。
 ///
-/// Frontend must debounce calls by 150ms (in AppToolbar.vue).
 /// 前端必须进行 150 毫秒的调用防抖（在 AppToolbar.vue 中）。
 #[tauri::command]
 pub async fn search_media(
@@ -26,6 +21,8 @@ pub async fn search_media(
     limit: Option<i64>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<SearchResult>> {
+    // span 埋点(W1,D-312 info 档:LIKE 扫库可达秒级,真实 DB 工作)。
+    let _span = crate::logging::SpanTimer::info("ipc:search_media");
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
@@ -42,5 +39,5 @@ pub async fn search_media(
         q::search_media(&pool, &query, &filter, limit.unwrap_or(100))
     })
     .await
-    .map_err(|e| AppError::System(e.to_string()))?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }

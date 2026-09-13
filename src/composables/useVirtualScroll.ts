@@ -1,55 +1,34 @@
 // src/composables/useVirtualScroll.ts
-// Row-level virtual scrolling with coordinate translation (§10.3 + B1)
 // 行级虚拟滚动 + 坐标平移 (§10.3 + B1)
 //
-// Why coordinate translation:
 // 为什么需要坐标平移：
-//   Chromium/WebView2 clamp a single element's height at ~16.7M px. A million-photo
-//   gallery is ~40M px tall, which would break the native scrollbar (can't reach the
-//   bottom, fires endless scroll events). So when the LOGICAL layout height exceeds a
-//   safe ceiling we cap the PHYSICAL scroll spacer at SAFE_MAX and map between the two
-//   coordinate systems linearly.
-//
 //   Chromium/WebView2 会把单个元素高度钳制在约 1677 万 px。百万张图库约 4000 万 px 高，
 //   会击穿原生滚动条（到不了底、滚动事件无限触发）。因此当逻辑布局高度超过安全上限时，
 //   我们把物理滚动占位高度封顶在 SAFE_MAX，并在两套坐标系间做线性映射。
 //
-// Model:
 // 模型：
 //   physicalScrollTop ∈ [0, physMax]      ← native container.scrollTop
 //   logicalScrollTop  = physicalScrollTop / physMax * logMax
-//   Rows render inside a "render layer". A row at logical y is placed at
-//   (row.y - renderAnchor) inside the layer (small, precision-safe), and the layer is
-//   translated by  contentOffset = renderAnchor + (physicalScrollTop - logicalScrollTop)
-//   to pin the visible window to the viewport. In normal mode (height ≤ SAFE_MAX) δ = 0
-//   and the layer offset is constant between fetches, so native scrolling behaves exactly
-//   as before.
-//
 //   行渲染在一个"渲染层"内。逻辑 y 的行被放在层内 (row.y - renderAnchor) 处（数值小、精度安全），
 //   层整体平移 contentOffset = renderAnchor + (physicalScrollTop - logicalScrollTop) 以把可视窗口
 //   钉到视口。普通模式（高度 ≤ SAFE_MAX）下 δ = 0，层偏移在两次取数之间恒定，原生滚动与此前一致。
 //
-// The layer transform is applied IMPERATIVELY (direct style write) so that fast scrolling
-// in translated mode does not trigger a Vue re-render of the row list every frame.
 // 层 transform 以命令式（直接写 style）应用，避免平移模式下快速滚动每帧都触发行列表的 Vue 重渲染。
 
 import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import type { LayoutRow } from '../types/layout'
 import { DEFAULTS } from '../constants/defaults'
+import { logger } from '../utils/logger'
+import { canvasPrefetchCoveragePx } from '../utils/galleryPrefetchWindow'
 
 const LOG = '[VirtualScroll]'
 
-/// Off-screen render buffer bounds (logical px). The actual buffer is
-/// `rowHeight * SCROLL_BUFFER_ROWS` clamped to [MIN, MAX], so the number of
-/// buffered ROWS stays roughly constant instead of ballooning at tiny row heights
-/// (a fixed px buffer rendered ~16 rows at 60px but only ~4 at 240px).
 /// 离屏渲染缓冲边界（逻辑像素）。实际缓冲 = `rowHeight * SCROLL_BUFFER_ROWS` 钳制到
 /// [MIN, MAX]，使缓冲“行数”大致恒定，而非在极小行高时膨胀（固定像素缓冲在 60px 时
 /// 渲染约 16 行，240px 时仅约 4 行）。
 const MIN_BUFFER_PX = 400
 const MAX_BUFFER_PX = 1200
 
-/// Physical scroll-spacer ceiling. Comfortably under the ~16.7M px element-height clamp.
 /// 物理滚动占位上限，安全地低于约 1677 万 px 的元素高度钳制阈值。
 /// 平移模式（逻辑高度 > 此值）的核心修复 `overflow:hidden`（MediaGrid `.media-grid__content`）
 /// 已落地——`scrollHeight==spacerHeight` 不变量维持，原「滚动错位」根因已治。约 25 万项
@@ -67,7 +46,7 @@ export function resolveSafeMax(): number {
       const raw = localStorage.getItem('scrollery.debug.safeMax')
       const o = raw == null ? NaN : Number(raw)
       if (Number.isFinite(o) && o > 0) {
-        console.info(LOG, `SAFE_MAX overridden → ${o} (debug, T6 §3.6.1)`)
+        logger.info(`${LOG} SAFE_MAX overridden → ${o} (debug, T6 §3.6.1)`)
         return o
       }
     }
@@ -84,40 +63,37 @@ interface UseVirtualScrollOptions {
   totalRows: () => number
   fetchRowsByY: (topY: number, bottomY: number) => Promise<LayoutRow[]>
   containerRef: () => HTMLElement | null
-  /// The render-layer element whose transform pins the visible window.
   /// 渲染层元素，其 transform 把可视窗口钉到视口。
   layerRef: () => HTMLElement | null
-  /// Current target grid row height (px) — drives the adaptive scroll buffer.
   /// 当前网格目标行高（px）—— 驱动自适应滚动缓冲。
   rowHeight: () => number
   /// 双引擎互斥开关(T16 方案B):false = 本引擎休眠——不取数、不写 transform、不挂
   /// wheel 补偿(强制退出平移态)。缺省恒 true,单引擎用法行为零变化。
   enabled?: () => boolean
+  /// Canvas 渲染模式开关(可选,T16 §4.3 S3):true 时取行窗至少覆盖位图预取几何范围
+  /// (前 1.25 屏 + 行级余量,两侧同宽兜方向反转)。此时宿主渲染的是 canvas,行集只作数据源,
+  /// 不产生 DOM 行;DOM 分支运行时本开关恒 false(两者互斥),故既有缓冲语义零变化。
+  canvasMode?: () => boolean
 }
 
 export function useVirtualScroll(opts: UseVirtualScrollOptions) {
   const containerHeight = ref(0)
   const visibleRows = ref<LayoutRow[]>([])
   const startIndex = ref(0)
-  const paddingTop = ref(0) // retained for API compatibility (rows are absolutely positioned)
+  const paddingTop = ref(0) // 保留以兼容旧 API(行本身已用绝对定位)
   const paddingBottom = ref(0)
   const isFetching = ref(false)
 
-  // ── Coordinate-translation state ───────────────────────────────────────
   // ── 坐标平移状态 ───────────────────────────────────────
-  /// Physical height of the scroll spacer (capped at SAFE_MAX). Reactive — bound to the
-  /// spacer div height; changes only when the layout changes.
+  /// 滚动占位的物理高度(封顶 SAFE_MAX)。响应式——绑定占位 div 的高度；仅在布局变化时改变。
   const spacerHeight = ref(0)
-  /// Logical y that row offsets are measured from for the current window. Reactive —
-  /// bound to each row's transform; changes only on fetch.
+  /// 当前窗口内行偏移的度量起点(逻辑 y)。响应式——绑定各行的 transform；仅在取数时改变。
   const renderAnchor = ref(0)
-  /// Current logical scroll position (consumers use this instead of scrollTop). Read in
-  /// JS only (not a hot render binding), so per-frame updates don't re-render.
+  /// 当前逻辑滚动位置(消费方用它代替 scrollTop)。仅 JS 内读取(非热渲染绑定)，故逐帧更新不触发重渲染。
   const logicalScrollTop = ref(0)
-  /// True when the layout is taller than SAFE_MAX and translation is active.
+  /// 布局高度超过 SAFE_MAX、平移生效时为 true。
   const isTranslated = ref(false)
 
-  /// Last transform applied to the layer — change-guard to skip redundant style writes.
   /// 上次施加到层的 transform —— 变更守卫，跳过冗余的 style 写入。
   let lastAppliedOffset = Number.NaN
 
@@ -132,10 +108,8 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
 
   const isEnabled = () => opts.enabled?.() ?? true
 
-  // ── Geometry helpers ───────────────────────────────────────────────────
   // ── 几何辅助 ───────────────────────────────────────────────────
 
-  /// Compute the physical→logical mapping for the current container + layout.
   /// 计算当前容器 + 布局的物理→逻辑映射。
   function geometry() {
     const container = opts.containerRef()
@@ -153,7 +127,6 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     return (physicalTop / physMax) * logMax
   }
 
-  /// Convert a logical y to the physical scrollTop that brings it to the viewport top.
   /// 将逻辑 y 转换为能把它带到视口顶部的物理 scrollTop。
   function logicalToPhysical(logicalY: number): number {
     const { physMax, logMax } = geometry()
@@ -161,8 +134,6 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     return (Math.max(0, logicalY) / logMax) * physMax
   }
 
-  /// Imperatively pin the render layer to the viewport for the current scroll position.
-  /// Runs on every scroll frame; cheap and skips redundant writes.
   /// 命令式地把渲染层钉到当前滚动位置对应的视口；每帧运行，开销小且跳过冗余写入。
   function syncTransform() {
     const container = opts.containerRef()
@@ -178,20 +149,16 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     }
   }
 
-  // ── Scroll handler (called by host @scroll) ────────────────────────────
   // ── 滚动处理程序（由宿主 @scroll 调用） ────────────────────────────
 
   function onScroll() {
     if (!isEnabled()) return
-    // Keep the render layer glued to the viewport on every frame (matters in
-    // translated mode where native scroll moves at the wrong logical rate).
     // 每帧把渲染层钉在视口上（平移模式下原生滚动的逻辑速率不对，必须每帧修正）。
     syncTransform()
     scheduleUpdate()
   }
 
-  // ── Wheel inertia compensation (T6 §3.6.2，仅平移模式) ──────────────────────
-  // ── 滚轮惯性补偿（仅平移模式） ──────────────────────────────────────────────
+  // ── 滚轮惯性补偿(T6 §3.6.2，仅平移模式) ──────────────────────────────────────
   /// 平移模式下物理滚动条被压缩（spacerHeight=SAFE_MAX ≪ 逻辑高度），故 1 物理 px = `ratio`
   /// 逻辑 px（`ratio=logMax/physMax`，可达 2–4×）。原生 wheel 按物理 px 滚 → 内容以 `ratio` 倍速
   /// 漂移（触摸板惯性尤甚，一甩滑过大量行）。补偿：拦 wheel，把物理步进缩成 `dy/ratio`，使「逻辑
@@ -247,12 +214,17 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     })
   }
 
+  // Canvas 模式翻转(DOM↔Canvas 一键切换)按新窗即时重取:否则残留的窄取行窗会把画面
+  // 卡在「位图够远、行数据不够」的错配态,直到下一次滚动才自愈(§4.3 S3)。
+  if (opts.canvasMode) {
+    watch(opts.canvasMode, () => scheduleUpdate(true))
+  }
+
   function scheduleUpdate(force = false) {
     if (force) {
       lastFetchedTop = -1
     }
 
-    // If a fetch is already in flight, flag that we need another update after it finishes
     // 如果获取操作已经在进行中，则标记我们需要在它完成后进行另一次更新
     if (isFetching.value) {
       pendingUpdate = true
@@ -261,13 +233,12 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
 
     if (!ticking) {
       ticking = true
-      requestAnimationFrame(async () => {
-        // Await the fetch so we don't start overlapping requests
+      // rAF id 存账(2026-07-06 审查 F2):原先从未写入 rafId,卸载时 cancelAnimationFrame 恒 no-op。
+      rafId = requestAnimationFrame(async () => {
         // 等待获取，这样我们就不会开始重叠的请求
         await updateVisible(false)
         ticking = false
 
-        // If the user kept scrolling while we were fetching, run it again to catch up
         // 如果用户在获取时保持滚动，请再次运行它以赶上
         if (pendingUpdate) {
           pendingUpdate = false
@@ -277,7 +248,6 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     }
   }
 
-  // ── Compute visible window ─────────────────────────────────────────────
   // ── 计算可见窗口 ─────────────────────────────────────────────
 
   async function updateVisible(force: boolean = false) {
@@ -289,14 +259,13 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
 
     const container = opts.containerRef()
     if (!container) {
-      console.warn(LOG, 'updateVisible: containerRef is null, skipping')
+      logger.warn(`${LOG} updateVisible: containerRef is null, skipping`)
       return
     }
 
     const { viewH, logicalTotal, physicalTotal, logMax } = geometry()
     const totalR = opts.totalRows()
 
-    // Keep the physical spacer height + translated flag in sync with the layout.
     // 让物理占位高度 + 平移标志与布局保持同步。
     spacerHeight.value = physicalTotal
     isTranslated.value = logicalTotal > SAFE_MAX
@@ -313,28 +282,32 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     }
 
     if (viewH === 0) {
-      console.warn(LOG, 'updateVisible: containerHeight is 0, skipping')
+      logger.warn(`${LOG} updateVisible: containerHeight is 0, skipping`)
       return
     }
 
-    // Work entirely in LOGICAL coordinates for fetching.
     // 取数完全在逻辑坐标系中进行。
     const physicalTop = container.scrollTop
     const scrollY = physicalToLogical(physicalTop)
     logicalScrollTop.value = scrollY
 
-    // Adaptive buffer: keep a roughly constant number of buffered rows so tiny
-    // row heights don't over-render (see MIN/MAX_BUFFER_PX note above).
     // 自适应缓冲：保持缓冲行数大致恒定，避免极小行高时过度渲染（见上方 MIN/MAX 说明）。
     const rh = Math.max(40, opts.rowHeight())
-    const bufferH = Math.min(
-      MAX_BUFFER_PX,
-      Math.max(MIN_BUFFER_PX, rh * DEFAULTS.SCROLL_BUFFER_ROWS),
-    )
-    const topY = Math.max(0, scrollY - bufferH)
-    const bottomY = Math.min(logMax + viewH, scrollY + viewH + bufferH)
+    // 极密(compact,<100px)收窗(方案 §7.2):缓冲行数 8→4 且下限 400→240px,单屏外缓冲格数减半——
+    // 60px 下 480→240px/侧,直击「快滚 churn」的挂载/卸载量。快滚瞬白由 thumbhash 占位兜底(§8)。
+    // 仅方案 A 生效;bucket 引擎(默认)走固定段 margin,不经此路径。
+    const compactBuf = rh < 100
+    const bufferRows = compactBuf ? 4 : DEFAULTS.SCROLL_BUFFER_ROWS
+    const bufferFloor = compactBuf ? 240 : MIN_BUFFER_PX
+    const bufferH = Math.min(MAX_BUFFER_PX, Math.max(bufferFloor, rh * bufferRows))
+    // 取行窗:canvas 模式下至少覆盖位图预取的几何范围(两侧同宽,兜方向反转)。该行集由
+    // canvas 消费、DOM 分支不渲染,故不额外挂节点(DOM 运行时 canvasMode 恒 false,走 bufferH)。
+    const fetchBufferH = opts.canvasMode?.()
+      ? Math.max(bufferH, canvasPrefetchCoveragePx(viewH, rh).aheadPx)
+      : bufferH
+    const topY = Math.max(0, scrollY - fetchBufferH)
+    const bottomY = Math.min(logMax + viewH, scrollY + viewH + fetchBufferH)
 
-    // Skip if the visible range hasn't actually shifted outside our last fetched bounding box
     // 如果可见范围实际上没有移出我们上次获取的边界框，则跳过
     if (
       lastFetchedTop !== -1 &&
@@ -345,10 +318,9 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
       return
     }
 
-    // We need a new superset. Fetch a slightly larger logical box.
     // 我们需要一个新的超集。获取一个稍大的逻辑框。
-    const requestTop = Math.max(0, scrollY - bufferH * 1.2)
-    const requestBottom = scrollY + viewH + bufferH * 1.2
+    const requestTop = Math.max(0, scrollY - fetchBufferH * 1.2)
+    const requestBottom = scrollY + viewH + fetchBufferH * 1.2
 
     lastFetchedTop = requestTop
     lastFetchedBottom = requestBottom
@@ -359,14 +331,11 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     try {
       const rows = await opts.fetchRowsByY(requestTop, requestBottom)
 
-      // If a newer fetch was started while we were waiting, discard this one
       // 如果在我们等待时开始了更新的获取，则丢弃这个
       if (myFetchId !== currentFetchId) return
 
       visibleRows.value = rows
 
-      // Anchor row offsets to the window top so per-row transforms stay small
-      // (precision-safe at the 40M px logical scale), then re-pin the layer.
       // 把行偏移锚定到窗口顶部，使逐行 transform 保持很小（在 4000 万 px 逻辑尺度下
       // 仍精度安全），随后重新钉住渲染层。
       renderAnchor.value = Math.floor(requestTop)
@@ -383,24 +352,40 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
       } else {
         paddingTop.value = requestTop
         paddingBottom.value = Math.max(0, logicalTotal - paddingTop.value)
-        console.warn(LOG, `  0 rows returned`)
+        logger.warn(`${LOG}   0 rows returned`)
       }
     } catch (err) {
-      console.error(LOG, 'fetchRowsByY FAILED:', err)
+      logger.error(`${LOG} fetchRowsByY FAILED`, { error: err })
+      // 失败不毒化跳过框(2026-07-06 审查 F1):原先失败前已写入 lastFetchedTop/Bottom 且
+      // catch 不回滚 → 同窗滚动永不重试,空白区持续到滚出边界框。方案 A 是官方回退引擎,
+      // 不应带病上路。仅当前批失败才回滚(迟到的旧批失败不得作废新批的框)。
+      if (myFetchId === currentFetchId) {
+        lastFetchedTop = -1
+      }
     } finally {
       if (myFetchId === currentFetchId) {
         isFetching.value = false
+        // 消费在途期间积压的更新(2026-07-06 审查 P1-12):pendingUpdate 原先只在 scheduleUpdate
+        // 自己的 rAF 回调尾部消费;宿主直调 updateVisible(布局 watcher/compute 后)在途时,
+        // onScroll → scheduleUpdate 置起的标志无人消费,视口停在旧位置的行窗口直到下一次滚动
+        // 事件才自愈。统一在收尾消费,直调与调度路径共用。注意不能经 scheduleUpdate 重派——
+        // 调度路径走到这里时 ticking 仍为 true,会被其守卫挡掉而白白清掉标志。
+        if (pendingUpdate) {
+          pendingUpdate = false
+          rafId = requestAnimationFrame(() => {
+            void updateVisible(false)
+          })
+        }
       }
     }
   }
 
-  // ── Lifecycle ──────────────────────────────────────────────────────────
   // ── 生命周期 ──────────────────────────────────────────────────────────
 
   onMounted(() => {
     const el = opts.containerRef()
     if (!el) {
-      console.warn(LOG, 'onMounted: containerRef is null')
+      logger.warn(`${LOG} onMounted: containerRef is null`)
       return
     }
 
@@ -411,7 +396,6 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
 
       if (h > 0 && Math.abs(h - containerHeight.value) > 1) {
         containerHeight.value = h
-        // Container was resized — re-fetch visible rows for new viewport
         // 容器已调整大小 — 重新获取新视口的可见行
         scheduleUpdate(true)
       }
@@ -441,7 +425,6 @@ export function useVirtualScroll(opts: UseVirtualScrollOptions) {
     startIndex,
     isFetching,
     containerHeight,
-    // Coordinate-translation surface (bind these in the host template):
     // 坐标平移接口（在宿主模板中绑定）：
     spacerHeight,
     renderAnchor,

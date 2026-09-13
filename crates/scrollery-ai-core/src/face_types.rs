@@ -6,7 +6,6 @@
 //! `faces_to_records`,quality 派生同源)。路径兼容:face.rs 以 `pub use` 原位再导出。
 
 /// 一张检测到的人脸，坐标均在**输入 `DecodedImage` 的像素坐标系**。
-/// A detected face; all coords are in the input `DecodedImage` pixel space.
 #[derive(Clone, Debug)]
 pub struct DetectedFace {
     /// 框 [x, y, w, h]（左上角 + 宽高，像素）。

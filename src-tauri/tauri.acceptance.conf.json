@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Scrollery Acceptance",
+  "identifier": "com.scrollery.app.acceptance",
+  "bundle": {
+    "windows": {
+      "wix": {
+        "upgradeCode": "1d8abb02-f080-5c9a-9e16-27a43ed6a008"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

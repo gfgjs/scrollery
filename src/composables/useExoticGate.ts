@@ -1,9 +1,8 @@
 // src/composables/useExoticGate.ts
 // Exotic 逐项 gate（Part5 T12 增量3）：把某媒体项映射为 PluginGate 可消费的授权态，并封装激活。
-// Per-item exotic gate (Part5 T12 inc.3): resolve a media item into a gate-consumable entitlement.
 //
-// 🔴 开源/闭源边界（Part0 §10）：本 composable 只向后端取「格式解析 / 逐项状态」并适配为展示 DTO，
-//    **不持任何验签逻辑**——可用态与激活验签全在后端（open free-stub 恒 Unlicensed）。
+// 前后端职责：本 composable 只向后端取「格式解析 / 逐项状态」并适配为展示 DTO，
+//    **不持任何验签逻辑**——可用态与激活验签全在后端。
 //
 // 触点用法：详情覆盖层等打开某项时调 `resolveForItem(itemId, fileFormat)`；普通格式（非 exotic
 // catalog）直接返回 false 且**不发** item-state IPC——避免为绝大多数 jpg/png 空跑一次往返。
@@ -65,6 +64,7 @@ export function useExoticGate() {
   const entitlement = ref<PluginEntitlement | null>(null)
   const loading = ref(false)
   const activating = ref(false)
+  let resolveGeneration = 0
 
   /**
    * 为某项解析 gate 授权态。
@@ -72,21 +72,26 @@ export function useExoticGate() {
    *          普通格式返回 false 且不发 item-state IPC。
    */
   async function resolveForItem(itemId: number, fileFormat: string): Promise<boolean> {
+    const generation = ++resolveGeneration
     entitlement.value = null
+    loading.value = false
     const formats = await loadExoticFormats()
+    if (generation !== resolveGeneration) return false
     if (!formats.has(fileFormat.toLowerCase())) return false
 
     loading.value = true
     try {
       const st = await invokeIpc<ExoticItemState>(IPC.GET_EXOTIC_ITEM_STATE, { itemId })
+      if (generation !== resolveGeneration) return false
       // resolution=null 表示后端也认为非 catalog 格式（与格式集缓存竞态时的兜底）→ 放行。
       entitlement.value = st.resolution ? resolutionToEntitlement(st.resolution) : null
       return entitlement.value !== null
     } catch {
+      if (generation !== resolveGeneration) return false
       entitlement.value = null
       return false
     } finally {
-      loading.value = false
+      if (generation === resolveGeneration) loading.value = false
     }
   }
 
@@ -105,7 +110,9 @@ export function useExoticGate() {
 
   /** 关闭触点时清态。 */
   function reset(): void {
+    resolveGeneration++
     entitlement.value = null
+    loading.value = false
   }
 
   return { entitlement, loading, activating, resolveForItem, activate, reset }

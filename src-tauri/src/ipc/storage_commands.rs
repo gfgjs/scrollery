@@ -1,10 +1,4 @@
-// src-tauri/src/ipc/storage_commands.rs
-//! Storage-backend IPC (network drives, P5 8B, §3.8). 存储后端 IPC（网络盘，P5 8B，§3.8）。
-//!
-//! CRUD + connectivity test for storage backends. Passwords live in the OS keyring (account
-//! `storage_backend_<id>`), never in the DB — only a `cred_ref` is persisted (mirrors the
-//! proofread-key pattern). `test_backend` builds the backend and lists its base dir; under Lite
-//! (no `netfs`) a WebDAV test returns a clear "needs perf variant" message (degrade to 8A).
+//! 存储后端 IPC（网络盘，P5 8B，§3.8）。
 //!
 //! 存储后端的 CRUD + 连通性测试。密码存系统 keyring（账户 `storage_backend_<id>`），绝不入 DB ——
 //! 仅持久化 `cred_ref`（与校对 key 同模式）。`test_backend` 构建后端并列其 base 目录；轻量版
@@ -17,7 +11,7 @@ use tauri::State;
 
 use crate::db::models::StorageBackendInfo;
 use crate::db::queries as q;
-use crate::error::AppError;
+use crate::error::{AppError, Result};
 use crate::state::AppState;
 use crate::storage::{build_backend, BackendConfig};
 
@@ -27,11 +21,12 @@ fn cred_account(id: i64) -> String {
     format!("storage_backend_{id}")
 }
 
-fn keyring_entry(account: &str) -> std::result::Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| e.to_string())
+// keyring 是 OS 凭据库,其错误映射为 AppError::System(稳定 code=System,P1-8:此前裸 String)。
+fn keyring_entry(account: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, account)
+        .map_err(|e| AppError::internal("凭据库访问失败 | keyring access failed", e))
 }
 
-/// Connection params from the add/test form. Password is in-memory only (→ keyring on save).
 /// 来自添加/测试表单的连接参数。密码仅在内存（保存时 → keyring）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,48 +51,38 @@ impl BackendInput {
     }
 }
 
-/// List all configured storage backends (§3.8). Passwords are never returned.
 /// 列出所有已配置的存储后端（§3.8）。密码绝不返回。
 #[tauri::command]
-pub async fn list_backends(
-    state: State<'_, Arc<AppState>>,
-) -> std::result::Result<Vec<StorageBackendInfo>, String> {
+pub async fn list_backends(state: State<'_, Arc<AppState>>) -> Result<Vec<StorageBackendInfo>> {
     let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(
-        move || -> std::result::Result<Vec<StorageBackendInfo>, String> {
-            let pool = s.db_read_pool.get().map_err(|e| e.to_string())?;
-            q::list_storage_backends(&pool).map_err(|e| e.to_string())
-        },
-    )
+    tokio::task::spawn_blocking(move || -> Result<Vec<StorageBackendInfo>> {
+        let pool = s.db_read_pool.get()?;
+        q::list_storage_backends(&pool)
+    })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// Test connectivity/credentials for a backend BEFORE saving (§3.8). Returns the number of
-/// entries listed at the base path on success. Runs in `spawn_blocking` (the WebDAV backend
-/// block_on's internally and must not nest inside the async runtime).
 /// 保存前测试后端的连通性/凭据（§3.8）。成功时返回 base 路径下的项数。在 `spawn_blocking` 运行
 /// （WebDAV 后端内部 block_on，不能套在异步运行时内）。
 #[tauri::command]
-pub async fn test_backend(input: BackendInput) -> std::result::Result<usize, String> {
-    tokio::task::spawn_blocking(move || -> std::result::Result<usize, String> {
-        let backend = build_backend(&input.to_config()).map_err(|e: AppError| e.to_string())?;
-        let entries = backend.list_dir("").map_err(|e| e.to_string())?;
+pub async fn test_backend(input: BackendInput) -> Result<usize> {
+    tokio::task::spawn_blocking(move || -> Result<usize> {
+        let backend = build_backend(&input.to_config())?;
+        let entries = backend.list_dir("")?;
         Ok(entries.len())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// Add a storage backend (§3.8): persist the row, then store the password in the keyring under
-/// `storage_backend_<id>` and record that account as `cred_ref`. Returns the saved row.
 /// 添加存储后端（§3.8）：持久化行，再把密码存入 keyring（账户 `storage_backend_<id>`）并把该账户
 /// 记为 `cred_ref`。返回已保存的行。
 #[tauri::command]
 pub async fn add_backend(
     input: BackendInput,
     state: State<'_, Arc<AppState>>,
-) -> std::result::Result<StorageBackendInfo, String> {
+) -> Result<StorageBackendInfo> {
     let name = input
         .name
         .clone()
@@ -107,7 +92,7 @@ pub async fn add_backend(
 
     // R1-3：DB 写 + keyring 存密（同步系统调用）+ 回读，整段离开 tokio worker。
     let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> std::result::Result<StorageBackendInfo, String> {
+    tokio::task::spawn_blocking(move || -> Result<StorageBackendInfo> {
         let id = {
             let conn = s.db_writer.lock().unwrap_or_else(|e| e.into_inner());
             q::insert_storage_backend(
@@ -119,64 +104,60 @@ pub async fn add_backend(
                 input.username.as_deref(),
                 None, // cred_ref filled in below once we know the id
                 None,
-            )
-            .map_err(|e| e.to_string())?
+            )?
         };
 
-        // Store the password in the keyring and link it via cred_ref (never in the DB).
         // 把密码存入 keyring 并经 cred_ref 关联（绝不入 DB）。
         if let Some(pw) = input.password.as_deref().filter(|p| !p.is_empty()) {
             let account = cred_account(id);
             keyring_entry(&account)?
                 .set_password(pw)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| AppError::internal("写入凭据失败 | credential write failed", e))?;
             let conn = s.db_writer.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "UPDATE storage_backends SET cred_ref = ?1 WHERE id = ?2",
                 rusqlite::params![account, id],
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
         }
 
         let backends = {
-            let pool = s.db_read_pool.get().map_err(|e| e.to_string())?;
-            q::list_storage_backends(&pool).map_err(|e| e.to_string())?
+            let pool = s.db_read_pool.get()?;
+            q::list_storage_backends(&pool)?
         };
-        backends
-            .into_iter()
-            .find(|b| b.id == id)
-            .ok_or_else(|| "backend not found after insert | 插入后未找到后端".to_string())
+        backends.into_iter().find(|b| b.id == id).ok_or_else(|| {
+            AppError::System("backend not found after insert | 插入后未找到后端".into())
+        })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// Remove a storage backend (§3.8): delete the row and purge its keyring credential.
 /// 移除存储后端（§3.8）：删除行并清理其 keyring 凭据。
 #[tauri::command]
-pub async fn remove_backend(
-    id: i64,
-    state: State<'_, Arc<AppState>>,
-) -> std::result::Result<(), String> {
+pub async fn remove_backend(id: i64, state: State<'_, Arc<AppState>>) -> Result<()> {
     // R1-3：DB 写 + keyring 清理整段离开 tokio worker。
     let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let cred_ref = {
             let conn = s.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-            q::delete_storage_backend(&conn, id).map_err(|e| e.to_string())?
+            q::delete_storage_backend(&conn, id)?
         };
         if let Some(account) = cred_ref {
-            // Purge the credential; NoEntry is fine (idempotent).
             // 清理凭据；NoEntry 视为成功（幂等）。
             if let Ok(entry) = keyring_entry(&account) {
                 match entry.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => {}
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => {
+                        return Err(AppError::internal(
+                            "删除凭据失败 | credential delete failed",
+                            e,
+                        ))
+                    }
                 }
             }
         }
         Ok(())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }

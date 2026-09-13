@@ -22,18 +22,21 @@ export const MIN_THUMB_PX = 32
 /**
  * 逻辑位 → 拇指几何。内容不足一屏(无需滚动)或轨道尺寸无效时返回 null(隐藏拇指)。
  * 拇指高被钳制后,位置仍按「可行程比例」计算——顶/底恰好贴轨道两端。
+ * fixedThumb(固定指针模式):提供且 >0 时高度恒为该值(钳到轨道高为上限),
+ * 跳过比例/最小高计算——指针尺寸恒定,但位置仍按可行程比例计算,行为与比例拇指一致。
  */
 export function thumbGeometry(
   logicalY: number,
   totalHeight: number,
   trackHeight: number,
   minThumb: number = MIN_THUMB_PX,
+  fixedThumb?: number,
 ): ThumbGeometry | null {
   if (!(trackHeight > 0) || !(totalHeight > trackHeight)) return null
-  const height = Math.min(
-    trackHeight,
-    Math.max(minThumb, (trackHeight / totalHeight) * trackHeight),
-  )
+  const height =
+    fixedThumb !== undefined && fixedThumb > 0
+      ? Math.min(trackHeight, fixedThumb)
+      : Math.min(trackHeight, Math.max(minThumb, (trackHeight / totalHeight) * trackHeight))
   const maxY = totalHeight - trackHeight
   const frac = Math.min(1, Math.max(0, logicalY / maxY))
   return { top: frac * (trackHeight - height), height }

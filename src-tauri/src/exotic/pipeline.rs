@@ -9,7 +9,8 @@
 //! ```
 //!
 //! 关键不变量：
-//!   - **原子领取 + 租约**（R2）：claim 一句 UPDATE...RETURNING；finish/fail 带 `status=1 AND lease_owner`。
+//!   - **原子领取 + 租约**（R2）：claim 一句 UPDATE...RETURNING；finish/fail 带 `status=1 AND lease_owner`，
+//!     finish 还校验 claim 后读取的 `(source_revision, cache_key)` 快照。
 //!   - **让步**（R1）：Claimer 派发新任务前 `should_yield_exotic()`（scan/thumbnail/interaction）；
 //!     在途解码不 sleep 抢占，只自然完成或超时 kill。
 //!   - **公平后台重活池**（R4）：每次 run 前取 `BackgroundHeavyLimiter` permit（与 derivation 同预算）。
@@ -34,9 +35,12 @@ use crate::db::queries as q;
 use crate::exotic::fingerprint::thumbnail_fingerprint;
 use crate::exotic::limiter::BackgroundHeavyLimiter;
 use crate::exotic::sink::write_thumbnail_atomic;
-use crate::exotic::worker::{
-    default_thumbnail_limits, RawOutcome, TaskOutcome, WorkerConfig, WorkerLimits, WorkerSpec,
-};
+use crate::exotic::worker::{default_thumbnail_limits, TaskOutcome, WorkerLimits};
+
+// U-P3(2026-07-16):Worker trait 分类学拆至 `super::worker_traits`(EmbedWorker 只服务
+// AI 层,流水线用不到);此处 re-export 保住既有 `exotic::pipeline::{WorkerTask, ...}`
+// 引用路径(消费方零迁移)。
+pub use super::worker_traits::*;
 
 // ── 常量 ───────────────────────────────────────────────────────────────────────
 /// 单任务超时（PSD 缩略图很快；给足余量覆盖大画布）。
@@ -58,120 +62,6 @@ const MAX_ATTEMPTS: i64 = 3;
 const STRIKE_THRESHOLD: u32 = 5;
 /// Worker 池上限（Part2：PSD 快，permits 已封顶并发，进程数无需多）。
 const MAX_POOL: usize = 2;
-
-// ── Worker 抽象（便于 mock 单测）─────────────────────────────────────────────────
-
-/// Worker 生命周期公共面(T15 拆分,Part6 §3.4.2 C5):thumbnail 与 embed 两类 worker
-/// 共享的簿记能力;各自的任务方法在子 trait。
-pub trait WorkerTask: Send {
-    fn worker_version(&self) -> String;
-    fn is_alive(&self) -> bool;
-    fn shutdown(self: Box<Self>, grace: Duration);
-}
-
-/// 缩略图 Worker 行为（[`crate::exotic::supervisor::WorkerSupervisor`] 实现；测试用 mock）。
-pub trait ThumbnailWorker: WorkerTask {
-    fn run_thumbnail(
-        &mut self,
-        req: &RequestBody,
-        limits: &WorkerLimits,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> TaskOutcome;
-}
-
-/// 嵌入/人脸 Worker 行为(C5;会话生命周期 + 批量 op)。消费方 = T17 的
-/// [`crate::ai::worker_client::AiWorkerClient`];批结果校验用 worker.rs 的 validate_*。
-pub trait EmbedWorker: WorkerTask {
-    /// 当前已加载会话的快照;None = 未加载。派批前 host 据此比对目标模型,
-    /// 不符则先 close 再 init(切换语义,D3 §4②)。
-    fn session(&self) -> Option<&crate::exotic::supervisor::SessionDescriptor>;
-    /// SessionInit(记录会话快照);超时用 op_timeouts::SESSION_INIT 档。
-    fn init_session(
-        &mut self,
-        req: &RequestBody,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> RawOutcome;
-    /// SessionClose(幂等;host 主导卸载)。
-    fn close_session(&mut self, timeout: Duration, cancelled: &dyn Fn() -> bool) -> RawOutcome;
-    /// EmbedBatch / FaceDetectEmbed / EncodeText 批请求(Success 未经 op 校验,调用方分派验证)。
-    fn run_batch(
-        &mut self,
-        req: &RequestBody,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> RawOutcome;
-}
-
-impl WorkerTask for crate::exotic::supervisor::WorkerSupervisor {
-    fn worker_version(&self) -> String {
-        crate::exotic::supervisor::WorkerSupervisor::worker_version(self).to_string()
-    }
-    fn is_alive(&self) -> bool {
-        crate::exotic::supervisor::WorkerSupervisor::is_alive(self)
-    }
-    fn shutdown(self: Box<Self>, grace: Duration) {
-        crate::exotic::supervisor::WorkerSupervisor::shutdown(*self, grace)
-    }
-}
-
-impl ThumbnailWorker for crate::exotic::supervisor::WorkerSupervisor {
-    fn run_thumbnail(
-        &mut self,
-        req: &RequestBody,
-        limits: &WorkerLimits,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> TaskOutcome {
-        crate::exotic::supervisor::WorkerSupervisor::run_thumbnail(
-            self, req, limits, timeout, cancelled,
-        )
-    }
-}
-
-impl EmbedWorker for crate::exotic::supervisor::WorkerSupervisor {
-    fn session(&self) -> Option<&crate::exotic::supervisor::SessionDescriptor> {
-        crate::exotic::supervisor::WorkerSupervisor::session(self)
-    }
-    fn init_session(
-        &mut self,
-        req: &RequestBody,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> RawOutcome {
-        crate::exotic::supervisor::WorkerSupervisor::init_session(self, req, timeout, cancelled)
-    }
-    fn close_session(&mut self, timeout: Duration, cancelled: &dyn Fn() -> bool) -> RawOutcome {
-        crate::exotic::supervisor::WorkerSupervisor::close_session(self, timeout, cancelled)
-    }
-    fn run_batch(
-        &mut self,
-        req: &RequestBody,
-        timeout: Duration,
-        cancelled: &dyn Fn() -> bool,
-    ) -> RawOutcome {
-        crate::exotic::supervisor::WorkerSupervisor::run_request(self, req, timeout, cancelled)
-    }
-}
-
-/// Worker 工厂：按需创建新 Worker 实例（崩溃后补充池）。
-pub trait WorkerFactory: Send + Sync {
-    fn spawn(&self) -> Result<Box<dyn ThumbnailWorker>, String>;
-}
-
-/// 真实工厂：从 [`WorkerSpec`] + [`WorkerConfig`] 创建 [`WorkerSupervisor`]。
-pub struct SupervisorFactory {
-    pub spec: WorkerSpec,
-    pub cfg: WorkerConfig,
-}
-
-impl WorkerFactory for SupervisorFactory {
-    fn spawn(&self) -> Result<Box<dyn ThumbnailWorker>, String> {
-        let sup = crate::exotic::supervisor::WorkerSupervisor::spawn(&self.spec, &self.cfg)?;
-        Ok(Box::new(sup))
-    }
-}
 
 // ── 流水线依赖与统计 ─────────────────────────────────────────────────────────────
 
@@ -263,6 +153,7 @@ pub(crate) fn recover_stale_exotic_leases(writer: &Mutex<Connection>) -> usize {
 struct ClaimedTask {
     task_id: i64,
     item_id: i64,
+    source_revision: i64,
     cache_key: i64,
     fingerprint: String,
     tier: u32,
@@ -499,6 +390,7 @@ fn claimer_loop(
             let task = ClaimedTask {
                 task_id: row.id,
                 item_id: row.item_id,
+                source_revision: src.source_revision,
                 cache_key: src.cache_key,
                 fingerprint: fp.fingerprint,
                 tier: fp.tier,
@@ -712,6 +604,16 @@ fn finalize_success(
     instance_id: &str,
     blob: &[u8],
 ) -> crate::error::Result<bool> {
+    // 0. 先做短快照预检并立即释放 writer 锁。source_revision/cache_key 已变化时，
+    // 直接丢弃迟到结果，避免它先覆盖同一 cache_key 的文件；最终 DB CAS 仍在落盘后复核。
+    let source_current = {
+        let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
+        q::is_exotic_source_current(&conn, task.item_id, task.source_revision, task.cache_key)?
+    };
+    if !source_current {
+        return Ok(false);
+    }
+
     // 1. 先文件：原子落盘 + Host 计算 thumbhash。
     let sink = write_thumbnail_atomic(&deps.cache_dir, task.tier, task.cache_key, blob)?;
 
@@ -723,38 +625,46 @@ fn finalize_success(
             &tx,
             task.task_id,
             instance_id,
+            task.source_revision,
+            task.cache_key,
             &task.fingerprint,
             &sink.thumb_db_path,
             worker_version,
         )?;
-        if ok {
-            q::update_thumb_result(
+        let thumb_applied = if ok {
+            q::update_thumb_result_if_current(
                 &tx,
                 task.item_id,
+                task.source_revision,
+                task.cache_key,
                 1,
                 Some(&sink.thumb_db_path),
                 Some(&sink.thumbhash),
-            )?;
-        }
+            )? == 1
+        } else {
+            false
+        };
         tx.commit()?;
-        ok
+        (ok, thumb_applied)
     };
 
     // 3. 同步 items 取数缓存（S3：布局行仅存几何，出口拼装自 items 缓存取载荷——
     //    patch 单点即可使产物在滚出再滚回时立即可见，无需整表重算）。
-    if committed {
+    if committed.0 && committed.1 {
         let thumb = crate::db::models::ThumbResult {
             item_id: task.item_id,
             thumb_status: 1,
             thumb_path: Some(sink.thumb_db_path),
             thumbhash: Some(sink.thumbhash),
+            source_revision: task.source_revision,
+            cache_key: task.cache_key,
         };
         crate::layout::items_cache::apply_thumb_results(
             deps.items_cache,
             std::slice::from_ref(&thumb),
         );
     }
-    Ok(committed)
+    Ok(committed.0)
 }
 
 /// 失败路径：条件 fail（retryable 计退避，terminal 不退避）。
@@ -808,10 +718,16 @@ impl<'a> PipelineDeps<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exotic::worker::{WorkerConfig, WorkerSpec};
     use exotic_protocol::FailureBody;
     use std::io::Cursor;
 
     const PID: &str = "exotic-image-psd";
+
+    /// 测试用请求档位：绑 THUMB_TIERS 事实源。管线内部对 requested_size 做 snap_to_tier 后
+    /// 落盘，thumb_path 又会断言档位合法——硬编码数值在 b554aa5「档位重定」后即失效
+    /// （详见 exotic/fingerprint.rs 测试模块的同名常量注释）。取梯上已有值 → snap 后即自身。
+    const TIER: u32 = crate::thumbnail::generator::THUMB_TIERS[3];
 
     /// mock Worker 行为。
     #[derive(Clone)]
@@ -937,7 +853,7 @@ mod tests {
             token,
             items_cache: test_items_cache(),
             cache_dir,
-            requested_size: 480,
+            requested_size: TIER,
             plugin_id: PID.to_string(),
             on_progress: Arc::new(|| {}),
             should_yield: Arc::new(|| false),
@@ -983,8 +899,82 @@ mod tests {
         assert_eq!(thumb_status, 1, "media_items thumb_status 应回填 1");
         assert!(has_path);
         // 产物文件落盘。
-        let p = crate::thumbnail::cache::thumb_path(&cache_dir, 480, cache_key);
+        let p = crate::thumbnail::cache::thumb_path(&cache_dir, TIER, cache_key);
         assert!(p.exists(), "缩略图文件应已落盘");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn stale_source_snapshot_cannot_finalize_or_patch_cover() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _cache_key) = setup_db(&conn);
+        let claimed = q::claim_exotic_tasks(&conn, PID, CAPABILITY, 1, "old-worker", 1000)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let source = q::exotic_item_source(&conn, item_id).unwrap();
+        let task = ClaimedTask {
+            task_id: claimed.id,
+            item_id,
+            source_revision: source.source_revision,
+            cache_key: source.cache_key,
+            fingerprint: "old-fingerprint".into(),
+            tier: TIER,
+            request: RequestBody::Thumbnail {
+                item_id,
+                source_path: source.abs_path,
+                target_long_edge: TIER,
+                input_fingerprint: "old-fingerprint".into(),
+            },
+            attempts: claimed.attempts,
+        };
+
+        // 在旧 Worker 已读取快照后模拟扫描推进新源代次。
+        conn.execute(
+            "UPDATE media_items
+             SET source_revision=source_revision+1, cache_key=cache_key+1,
+                 thumb_status=0, thumb_path=NULL, thumbhash=NULL
+             WHERE id=?1",
+            rusqlite::params![item_id],
+        )
+        .unwrap();
+
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let cache_dir =
+            std::env::temp_dir().join(format!("exotic-pl-stale-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let d = deps(&writer, &limiter, &token, cache_dir.clone());
+
+        assert!(
+            !finalize_success(&d, &task, "mock-1.0.0", "old-worker", &make_webp(480, 240),)
+                .unwrap()
+        );
+
+        let conn = writer.lock().unwrap();
+        let task_status: i64 = conn
+            .query_row(
+                "SELECT status FROM exotic_tasks WHERE id=?1",
+                rusqlite::params![claimed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (thumb_status, thumb_path): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT thumb_status, thumb_path FROM media_items WHERE id=?1",
+                rusqlite::params![item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task_status, 1, "旧快照不得完成任务");
+        assert_eq!(thumb_status, 0, "旧快照不得写入新源封面");
+        assert!(thumb_path.is_none());
+        drop(conn);
+        assert!(
+            !crate::thumbnail::cache::thumb_path(&cache_dir, TIER, task.cache_key).exists(),
+            "过期快照应在落盘前被丢弃"
+        );
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
@@ -1207,7 +1197,7 @@ mod tests {
         let stats = run_exotic_pipeline_blocking(&d, &factory);
         assert_eq!(stats.done, 1, "真实 Worker 应出图 1 张");
         assert_eq!(task_status(&writer.lock().unwrap(), item_id), 2);
-        assert!(crate::thumbnail::cache::thumb_path(&cache_dir, 480, cache_key).exists());
+        assert!(crate::thumbnail::cache::thumb_path(&cache_dir, TIER, cache_key).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1,5 +1,4 @@
-// src-tauri/src/ipc/hgallery_commands.rs
-//! H-Lab(横向画廊实验)IPC 命令(plan-docs/2026-07-02-horizontal-gallery-lab.md §4)。
+//! H-Lab(横向画廊实验)IPC 命令(docs/designs/2026-07-02-horizontal-gallery-lab.md §4)。
 //! 与生产 layout_commands 平行:同款「查询 + CPU 布局同入一个 spawn_blocking」纪律、
 //! 同款 AppError 错误契约;缓存/版本完全独立,互不可见。
 
@@ -45,6 +44,8 @@ pub async fn compute_h_layout(
     params: ComputeHLayoutParams,
     state: State<'_, Arc<AppState>>,
 ) -> Result<HLayoutSummary> {
+    // span 埋点(W1,D-312 debug 档:compute_layout 同类视口热路径查询,默认 info 档不刷屏)。
+    let _span = crate::logging::SpanTimer::debug("ipc:compute_h_layout");
     state.note_interaction();
 
     let filter = {
@@ -84,7 +85,7 @@ pub async fn compute_h_layout(
             Ok((compute_horizontal_layout(&items, &h_params), total))
         })
         .await
-        .map_err(|e| AppError::System(e.to_string()))??;
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
     let compute_ms = started.elapsed().as_millis() as u64;
 
     let block_count = blocks.len();

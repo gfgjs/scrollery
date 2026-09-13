@@ -29,7 +29,13 @@ pub const MAGIC: [u8; 4] = *b"EXOT";
 /// item 字段 Option 化。帧结构与 FrameType **不变**(D3 裁决:零新帧,SessionReady =
 /// SessionInit 的 Success 响应;D2 裁决:GPU 令牌留主进程不进协议)。帧层硬等值校验
 /// → psd-worker 与协议同波重编译,无混版(Part6 §8.2 C1)。
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v3(2026-07-11,事故加固批 A):新增 [`FrameType::Progress`] 帧(Worker→Host,
+/// 长操作期间的阶段回执+心跳),宿主 watchdog 由「猜总时长」改「静默限时」。
+/// 新帧型是线上不兼容变更(旧端 read_frame 判 UnknownFrameType 即杀 worker),
+/// 故升版本让陈旧二进制在握手层收到明确的版本错而非中途「协议损坏」;
+/// WorkerErrorCode +3(ort dylib/装载阶段化,见 message.rs)。
+/// 版本号变更须同步 scripts/check-exotic-protocol-sync.mjs(跨语言同步门禁)。
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// JSON 段最大字节（1 MiB）。控制字段不应接近此值；超限即协议异常 → 杀 Worker。
 pub const MAX_JSON_LEN: u32 = 1 << 20;
@@ -56,6 +62,10 @@ pub enum FrameType {
     Failure = 5,
     /// Host→Worker：请关闭（优雅退出；超时再 kill）。
     Shutdown = 6,
+    /// Worker→Host（v3）：在途请求的阶段回执/心跳（ProgressBody）。**非终态**——
+    /// Host 读循环消费后重置静默计时并继续等待,终态仍只有 Success/Failure。
+    /// request_id 必须等于在途请求;不匹配的 Progress 由 Host 忽略并告警(不判违例)。
+    Progress = 7,
 }
 
 impl FrameType {
@@ -71,6 +81,7 @@ impl FrameType {
             4 => FrameType::Success,
             5 => FrameType::Failure,
             6 => FrameType::Shutdown,
+            7 => FrameType::Progress,
             _ => return None,
         })
     }
@@ -292,6 +303,21 @@ mod tests {
         let mut cur = Cursor::new(buf);
         assert_eq!(read_frame(&mut cur).unwrap(), f1);
         assert_eq!(read_frame(&mut cur).unwrap(), f2);
+    }
+
+    #[test]
+    fn progress_frame_roundtrip() {
+        // v3 新帧型:Progress 与既有帧同一编解码路径,回环无损。
+        let f = Frame {
+            frame_type: FrameType::Progress,
+            request_id: 42,
+            json: br#"{"stage":"clip_image_load","elapsed_ms":1500}"#.to_vec(),
+            blob: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &f).unwrap();
+        let mut cur = Cursor::new(buf);
+        assert_eq!(read_frame(&mut cur).unwrap(), f);
     }
 
     #[test]

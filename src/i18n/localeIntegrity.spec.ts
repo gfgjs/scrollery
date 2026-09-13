@@ -11,24 +11,28 @@ import enUS from './locales/en-US'
 // 局限:动态键(t(`a.${b}`) 模板串、t('prefix' + x) 拼接)无法静态提取,不在本测试覆盖面内
 // ——正则要求字面量是完整实参(后随 , 或 )),拼接前缀不会被误提为完整键。
 
-type LocaleTree = { [key: string]: string | LocaleTree }
+// 叶子可为字符串,或字符串数组(如 guide.chapters.*.points:多条要点)。数组按索引展成
+// path.0/path.1… 独立叶子,使「zh 5 条、en 4 条」这类只补一边的数组也被键树对拍抓住。
+type LocaleLeaf = string | string[]
+type LocaleTree = { [key: string]: LocaleLeaf | LocaleTree }
 
-/** 深度展开键路径:{a:{b:'x'}} → ['a.b']。 */
+/** 深度展开键路径:{a:{b:'x'}} → ['a.b'];数组 {p:['x','y']} → ['p.0','p.1']。 */
 function flattenKeys(tree: LocaleTree, prefix = ''): string[] {
   const keys: string[] = []
   for (const [k, v] of Object.entries(tree)) {
     const path = prefix ? `${prefix}.${k}` : k
     if (typeof v === 'string') keys.push(path)
+    else if (Array.isArray(v)) v.forEach((_, i) => keys.push(`${path}.${i}`))
     else keys.push(...flattenKeys(v, path))
   }
   return keys
 }
 
-/** 按点路径取值;任一段缺失返回 undefined。 */
-function resolvePath(tree: LocaleTree, path: string): string | LocaleTree | undefined {
-  let node: string | LocaleTree | undefined = tree
+/** 按点路径取值;任一段缺失返回 undefined。数组/字符串视为终点,再下探即缺失。 */
+function resolvePath(tree: LocaleTree, path: string): LocaleLeaf | LocaleTree | undefined {
+  let node: LocaleLeaf | LocaleTree | undefined = tree
   for (const seg of path.split('.')) {
-    if (node === undefined || typeof node === 'string') return undefined
+    if (node === undefined || typeof node === 'string' || Array.isArray(node)) return undefined
     node = node[seg]
   }
   return node
@@ -80,5 +84,50 @@ describe('locale 完整性', () => {
       }
     }
     expect(problems, '所有 t() 字面量键须在两份字典中解析为字符串').toEqual([])
+  })
+
+  it('settingsMap.ts 与 cacheStats 行的 label/descKey/labelKey 属性值都存在于两份字典且为字符串叶子', () => {
+    // settingsMap.ts 的 SettingSpec.label/descKey 与选项 labelKey、SettingsView.vue 的
+    // cacheStats 行 labelKey,均是运行时经 t(spec.label) 之类动态解析的属性值,不落在上面
+    // t() 字面量提取器覆盖面内(实参不是字符串字面量,是变量/属性访问)。只在这两个已知落点
+    // 扫描 `(label|descKey|labelKey): '...'` 形态的属性;用「含点号」过滤掉 SettingOptionSpec.label
+    // 的原文展示值(如 '简体中文'/'English',不含点、非 i18n key 形态,故意不当 key 处理)。
+    const sources = import.meta.glob('../**/*.{vue,ts}', {
+      query: '?raw',
+      import: 'default',
+      eager: true,
+    }) as Record<string, string>
+
+    const propPattern = /\b(?:label|descKey|labelKey):\s*'([^']+)'/g
+
+    const used = new Map<string, string[]>()
+    for (const [path, text] of Object.entries(sources)) {
+      if (!path.endsWith('constants/settingsMap.ts') && !path.endsWith('views/SettingsView.vue')) {
+        continue
+      }
+      for (const m of text.matchAll(propPattern)) {
+        const key = m[1]
+        if (!key.includes('.')) continue
+        if (!used.has(key)) used.set(key, [])
+        used.get(key)!.push(path)
+      }
+    }
+    expect(
+      used.size,
+      '至少应提取到一个 settingsMap/cacheStats 属性键(提取器自检)'
+    ).toBeGreaterThan(0)
+
+    const problems: string[] = []
+    for (const [key, files] of used) {
+      for (const [name, dict] of [
+        ['zh-CN', zhCN],
+        ['en-US', enUS],
+      ] as const) {
+        const v = resolvePath(dict as LocaleTree, key)
+        if (v === undefined) problems.push(`缺键 ${key}(${name})← ${files[0]}`)
+        else if (typeof v !== 'string') problems.push(`非叶子 ${key}(${name})← ${files[0]}`)
+      }
+    }
+    expect(problems, '所有 settingsMap/cacheStats 属性键须在两份字典中解析为字符串').toEqual([])
   })
 })

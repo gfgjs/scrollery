@@ -1,0 +1,412 @@
+/* ── Header actions:窄侧栏适配 ─────────────────────────────────────────────
+   全局 .btn-icon 是 32px 触达目标,5 控件并排 ~200px,默认 260px 侧栏就会把标题
+   「文件夹」挤剩「文」。头部操作钮压成 24px 紧凑档;侧栏窄于 224px 时进一步藏起
+   两个低频钮(展开/折叠全部、新建空白文件夹)——拖宽侧栏即复现,功能不丢失。 */
+.folders-action {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 4px;
+}
+@container sidebar (max-width: 223px) {
+  .folders-action--narrow-hide {
+    display: none;
+  }
+}
+
+/* ── Header "show all" pill ────────────────────────────────────────────────── */
+.show-all-btn {
+  font-size: var(--font-size-2xs);
+  min-height: 24px;
+  padding: 0 var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+  /* 显式列举过渡属性(勿用 transition:all——会把 padding/border 等布局属性也卷进补间)。 */
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.show-all-btn:hover {
+  background: var(--color-sidebar-hover-bg, var(--color-bg-hover));
+  color: var(--color-text-primary);
+}
+.show-all-btn.active {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
+  border-color: transparent;
+}
+
+/* ── 「显示内容」三态菜单 ──────────────────────────────────────────────────────
+   UiPopover 统一持有 float 表面；此处只保留菜单布局与尺寸。 */
+.scope-menu {
+  min-width: 232px;
+  padding: var(--spacing-xs);
+}
+.scope-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-sm);
+  width: 100%;
+  min-height: var(--control-size-compact);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.scope-item:hover {
+  background: var(--color-bg-hover);
+}
+.scope-item:focus-visible,
+.tree-category-action:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-focus-ring);
+  outline-offset: -1px;
+}
+.scope-check {
+  flex: none;
+  margin-top: 2px;
+  color: var(--color-accent);
+}
+.scope-check-spacer {
+  flex: none;
+  width: 14px;
+}
+.scope-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.scope-label {
+  font-size: var(--font-size-sm);
+}
+.scope-hint {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  /* 说明文字换行而非省略:三态的差别全在这句话里,截断了菜单就等于没写。 */
+  white-space: normal;
+}
+.scope-item--plain .scope-check {
+  color: var(--color-text-tertiary);
+}
+.scope-sep {
+  height: 1px;
+  margin: var(--spacing-xs) var(--spacing-2xs);
+  background: var(--color-divider);
+}
+
+/* ── 文件树五类筛选 ─────────────────────────────────────────────────────────── */
+.tree-category-group {
+  padding: 4px 0;
+}
+.tree-category-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 2px;
+}
+.tree-category-heading .scope-hint {
+  text-align: right;
+}
+.tree-category-subheading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 2px 30px;
+}
+.tree-category-subheading--other {
+  margin-top: 4px;
+  border-top: 1px solid var(--color-border);
+}
+.tree-category-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 4px 30px;
+}
+.tree-category-action {
+  padding: 2px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+.tree-category-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.tree-category-action:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+.tree-category-action:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.tree-category-item {
+  align-items: center;
+}
+.tree-category-icon {
+  flex: none;
+  color: var(--color-text-tertiary);
+}
+.tree-category-item--other-registered .tree-category-icon,
+.tree-category-item--other-registered .scope-label {
+  color: var(--color-text-tertiary);
+}
+
+/* ── Empty state ───────────────────────────────────────────────────────────── */
+.empty {
+  padding: var(--spacing-md);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-tertiary);
+  text-align: center;
+}
+
+/* ── Folder tree ───────────────────────────────────────────────────────────── */
+.tree {
+  padding: 0 var(--spacing-xs);
+  position: relative; /* 粘性头覆盖层 + 绝对定位滚动层的定位上下文(T1-b) */
+}
+/* 键盘焦点环画在 active 行而非容器整框(activedescendant 惯例)——outline:none 是
+   「有替代」的移除,替代即下方行级 box-shadow 环;仅容器键盘聚焦期间显示。 */
+.tree:focus-visible {
+  outline: none;
+}
+.tree:focus-visible .kb-active {
+  box-shadow: inset 0 0 0 2px var(--color-accent);
+}
+/* 滚动内容层脱离普通流(absolute),使粘性头覆盖层作为普通流首子不占位、不下推本层;
+   本层始终从 .tree 顶(padding 盒)起,由 translateY(offsetY) 定位可视窗口(T1-b)。 */
+.tree-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+/* 粘性目录头栈:sticky 钉在共享滚动区顶,z-index 压过绝对定位的滚动层(DOM 在其前)。
+   top 由内联样式给出(= 粘顶区块标题堆叠高 stackTopPx),避免整链藏在不透明标题栈底下。 */
+.tree-sticky {
+  position: sticky;
+  z-index: 2;
+}
+.sticky-item {
+  /* 复用 .tree-item 视觉,补不透明底色遮住其下滚过的行;末层加下沿分隔与轻投影表明是浮层。 */
+  background-color: var(--color-bg-secondary);
+}
+.sticky-item--last {
+  box-shadow:
+    0 1px 0 var(--color-border),
+    0 2px 6px rgba(0, 0, 0, 0.06);
+}
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background-color var(--transition-fast);
+  overflow: hidden;
+  background-color: var(--color-bg-secondary);
+}
+.tree-item:hover {
+  background-image: linear-gradient(var(--color-sidebar-hover-bg), var(--color-sidebar-hover-bg));
+  color: var(--color-text-primary);
+}
+.tree-item.active {
+  background-image: linear-gradient(var(--color-sidebar-active-bg), var(--color-sidebar-active-bg));
+  color: var(--color-sidebar-active-text);
+}
+.tree-item.drag-over {
+  background-image: linear-gradient(var(--color-sidebar-active-bg), var(--color-sidebar-active-bg));
+  box-shadow: inset 0 0 0 1px var(--color-accent);
+}
+.tree-item.drag-source,
+.file-item.drag-source {
+  opacity: 0.45;
+}
+/* 隐藏项(「所有文件+隐藏项」模式,R-06):淡化**文字与图标**,不动背景 —— 背景填充语义已被
+   「选中/拖拽」占用(active/drag-over),正交通道才不会再混淆(真机问题 1 的 UX 侧)。
+   注意与 .drag-source 的整行 opacity 区分:这里只作用于内容 span。 */
+.tree-item.is-hidden .tree-label,
+.tree-item.is-hidden .tree-icon,
+.file-item.is-hidden .file-label,
+.file-item.is-hidden .file-icon {
+  opacity: 0.55;
+}
+
+/* ── File leaf row ─────────────────────────────────────────────────────────────
+   Not sticky — scrolls under the pinned folder header. Slightly smaller/dimmer
+   than folder rows. | 文件叶子行——非粘性，从钉住的文件夹标题下方滚过。比目录行
+   略小、略暗。 */
+.file-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: background-color var(--transition-fast);
+  overflow: hidden;
+}
+.file-item:hover {
+  background: var(--color-sidebar-hover-bg);
+  color: var(--color-text-primary);
+}
+/* 文件行选中态(真机问题 2 方案 A①):单击「只选中」此前唯一反馈是 .kb-active,而它被
+   `:focus-visible` 门在鼠标路径下恒不显示 → 「单击没反应」。选中底色沿用 active 语义变量,
+   与目录行 active 同通道;键盘焦点环(.kb-active)仍在其上叠加。 */
+.file-item.selected {
+  background: var(--color-sidebar-active-bg);
+  color: var(--color-text-primary);
+}
+.file-icon {
+  width: 18px;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+}
+.file-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left; /* 同 .tree-label:抵消 <button> 默认居中 */
+}
+.file-fav {
+  flex-shrink: 0;
+  margin-right: 4px;
+  color: var(--color-accent);
+}
+
+/* ── 「加载更多」行(T2 分页)──────────────────────────────────────────────────
+   高度须与 .tree-item/.file-item 同为 28px(ROW_H),否则虚拟化定高窗口错位。 */
+.more-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-accent);
+  cursor: pointer;
+  transition: background-color var(--transition-fast);
+  overflow: hidden;
+}
+.more-item:hover:not(:disabled) {
+  background: var(--color-sidebar-hover-bg);
+}
+.more-item:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.more-icon {
+  width: 18px;
+  display: inline-flex;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.more-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.spin-anim {
+  animation: spin var(--duration-spin) linear infinite; /* keyframes 来自全局 animations.css */
+}
+
+.tree-arrow {
+  width: 16px;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--color-text-tertiary);
+}
+.tree-chevron {
+  transition: transform var(--transition-fast);
+  flex-shrink: 0;
+}
+.tree-chevron.expanded {
+  transform: rotate(90deg);
+}
+.tree-chevron-spacer {
+  width: 14px;
+  flex-shrink: 0;
+}
+.tree-icon {
+  width: 18px;
+  display: inline-flex;
+  justify-content: center;
+}
+.tree-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 行是 <button>,UA 默认 text-align:center 会让 flex:1 的 label 文字浮在中间(截图实证)。 */
+  text-align: left;
+}
+.tree-count {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-tertiary);
+  margin-right: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Floating drag preview ─────────────────────────────────────────────────── */
+.drag-ghost {
+  position: fixed;
+  z-index: 10001;
+  pointer-events: none; /* 关键：不能挡住 elementFromPoint */
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  max-width: 240px;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-primary);
+  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--material-recipe-float-border-color);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--material-recipe-float-box-shadow);
+  backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+}
+.drag-ghost__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drag-ghost__mode {
+  flex-shrink: 0;
+  font-size: var(--font-size-2xs);
+  padding: var(--spacing-2xs) var(--spacing-xs);
+  border-radius: var(--radius-full);
+  background: var(--color-accent-subtle);
+  color: var(--color-accent-text);
+}

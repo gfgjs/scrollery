@@ -1,8 +1,7 @@
 // src/composables/useExoticStore.ts
 // 插件商店数据层（Part5 T11，消费 Part6 registry/install/processing 命令）。
-// Plugin-store data layer (Part5 T11), consuming the Part6 registry/install/processing IPC.
 //
-// 🔴 开源/闭源边界（Part0 §10）：本 composable 只做「取列表 / 触发安装生命周期 / 读进度」的薄封装；
+// 前后端职责：本 composable 只做「取列表 / 触发安装生命周期 / 读进度」的薄封装；
 //    验签 / 防回滚 / 安装完整性校验全在后端（命令只接受已校验 pluginId，绝不接受 URL/路径/hash）。
 //    前端不解析包、不碰下载坐标、不持验签逻辑。
 
@@ -13,6 +12,7 @@ import type {
   ExoticInstallState,
   ExoticProcessingStatus,
   ExoticRegistryEntry,
+  FormatResolution,
   InstalledExoticPlugin,
   RegistrySummary,
 } from '../types/exotic'
@@ -25,6 +25,8 @@ import { invokeIpc, type IpcError } from '../utils/ipc'
  */
 export interface StorePluginRow {
   pluginId: string
+  /** 展示名（来自 Registry/Catalog；旧数据回退 pluginId）。 */
+  name: string | null
   /** registry 可安装版本（未在 registry 时为 null）。 */
   availableVersion: string | null
   /** 已安装版本（未安装时为 null）。 */
@@ -36,6 +38,22 @@ export interface StorePluginRow {
   registryExpired: boolean
   /** 已装且 registry 有更高 packageSequence → 可升级。 */
   upgradable: boolean
+}
+
+/**
+ * 将按格式返回的内置解析结果折叠为插件商店展示行。
+ * 同一 offering 声明多个格式时只展示一张卡片；保留首条结果即可，因为同一插件的可用态共享。
+ */
+export function dedupeBuiltinOfferings(resolutions: FormatResolution[]): FormatResolution[] {
+  const seenPluginIds = new Set<string>()
+
+  return resolutions.filter((resolution) => {
+    if (!resolution.builtin) return false
+    if (!resolution.pluginId) return true
+    if (seenPluginIds.has(resolution.pluginId)) return false
+    seenPluginIds.add(resolution.pluginId)
+    return true
+  })
 }
 
 /**
@@ -51,6 +69,7 @@ export function mergeStorePlugins(
   for (const r of registry) {
     byId.set(r.pluginId, {
       pluginId: r.pluginId,
+      name: r.name ?? r.pluginId,
       availableVersion: r.version,
       installedVersion: null,
       installState: null,
@@ -76,6 +95,7 @@ export function mergeStorePlugins(
       // 已装但当前 registry 无此条目（下架/平台不匹配）：仍展示以支持卸载/修复。
       byId.set(inst.pluginId, {
         pluginId: inst.pluginId,
+        name: inst.pluginId,
         availableVersion: null,
         installedVersion: inst.version,
         installState: inst.installState,
@@ -95,6 +115,8 @@ export function useExoticStore() {
   const registry = ref<ExoticRegistryEntry[]>([])
   const installed = ref<InstalledExoticPlugin[]>([])
   const status = ref<ExoticProcessingStatus | null>(null)
+  /** 内置能力插件（builtin offering，如 OCR）：无安装包，单独一区展示（T11）。 */
+  const builtinOfferings = ref<FormatResolution[]>([])
   const loading = ref(false)
   const error = ref<IpcError | null>(null)
 
@@ -113,12 +135,20 @@ export function useExoticStore() {
     status.value = await invokeIpc<ExoticProcessingStatus>(IPC.GET_EXOTIC_PROCESSING_STATUS)
   }
 
-  /** 一次性刷新商店三态（列表 + 已装 + 进度）。失败置 `error` 不抛（列表视图容错）。 */
+  /**
+   * 列内置能力 offering（过滤非 builtin，并按 pluginId 折叠多格式结果）。
+   */
+  async function loadBuiltin(): Promise<void> {
+    const all = await invokeIpc<FormatResolution[]>(IPC.LIST_EXOTIC_FORMAT_RESOLUTIONS)
+    builtinOfferings.value = dedupeBuiltinOfferings(all)
+  }
+
+  /** 一次性刷新商店三态（列表 + 已装 + 进度 + 内置能力）。失败置 `error` 不抛（列表视图容错）。 */
   async function loadAll(): Promise<void> {
     loading.value = true
     error.value = null
     try {
-      await Promise.all([loadRegistry(), loadInstalled(), loadStatus()])
+      await Promise.all([loadRegistry(), loadInstalled(), loadStatus(), loadBuiltin()])
     } catch (e) {
       error.value = e as IpcError
     } finally {
@@ -188,11 +218,13 @@ export function useExoticStore() {
     registry,
     installed,
     status,
+    builtinOfferings,
     loading,
     error,
     loadRegistry,
     loadInstalled,
     loadStatus,
+    loadBuiltin,
     loadAll,
     refreshRegistry,
     install,

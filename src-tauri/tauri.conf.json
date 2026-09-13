@@ -3,27 +3,14 @@
   "productName": "Scrollery",
   "identifier": "com.scrollery.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run prepare:legal && cargo build -p ai-worker && npm run build:video-worker:dev && npm run build:raw-worker && npm run dev",
 
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run prepare:legal && npm run build && npm run build:raw-worker && npm run build:ai-worker && npm run build:video-worker",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
-      {
-        "label": "splashscreen",
-        "url": "splashscreen.html",
-        "title": "Scrollery",
-        "width": 400,
-        "height": 280,
-        "decorations": false,
-        "resizable": false,
-        "center": true,
-        "visible": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true
-      },
       {
         "label": "main",
         "title": "Scrollery",
@@ -32,30 +19,39 @@
         "minWidth": 800,
         "minHeight": 560,
         "decorations": true,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 16, "y": 13 },
         "resizable": true,
         "center": true,
         "visible": false
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob:; frame-src 'self' blob: data:",
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost blob: data:; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; frame-src 'self' blob: data:",
       "assetProtocol": {
         "enable": true,
-        "scope": [
-          "$APPDATA/**",
-          "$PICTURE/**",
-          "$DESKTOP/**",
-          "$DOCUMENT/**",
-          "$DOWNLOAD/**",
-          "$VIDEO/**",
-          "$AUDIO/**"
-        ]
+        "scope": ["$APPDATA/**"]
       }
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": ["binaries/raw-worker", "binaries/ai-worker", "binaries/video-worker"],
+    "resources": {
+      "binaries/onnxruntime.dll": "onnxruntime.dll",
+      "binaries/DirectML.dll": "DirectML.dll",
+      "binaries/dxcompiler.dll": "dxcompiler.dll",
+      "binaries/dxil.dll": "dxil.dll",
+      "../LICENSE": "LICENSE",
+      "../NOTICE.md": "NOTICE.md",
+      "../SOURCE.md": "SOURCE.md",
+      "../COMMERCIAL.md": "COMMERCIAL.md",
+      "../ADDITIONAL-PERMISSION.md": "ADDITIONAL-PERMISSION.md",
+      "../target/legal": "legal"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
