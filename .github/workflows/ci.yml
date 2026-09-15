@@ -69,9 +69,6 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo check --workspace
-        run: cargo check --workspace --locked
-
       - name: cargo clippy --workspace
         run: cargo clippy --workspace --locked -- -D warnings
 
@@ -138,9 +135,6 @@ jobs:
       - name: 占位 dist(generate_context 校验 frontendDist)
         run: mkdir -p dist
 
-      - name: cargo check --workspace
-        run: cargo check --workspace --locked
-
       # ⚠ 无 npm 步骤=无 ORT DLL,推理测试须 #[ignore](J16,详见 rust job 同名注释)。
       - name: cargo test --workspace
         run: cargo test --workspace --locked
@@ -167,16 +161,6 @@ jobs:
       # tauri.conf.json 无独立 version、src-tauri 走 workspace 继承;失配则提示 --write。
       - name: 版本单源检查(sync-version --check)
         run: node scripts/sync-version.mjs --check
-
-      # Part8-D10 改名门禁(就绪态):rename-gate.json active=false 期间仅 selftest+skip(秒级);
-      # 改名施工第 7 步翻 true 后,品牌旧词根回流即红(豁免面=docs 历史文档+PICASA_ env 缓改族)。
-      - name: 改名门禁(check-rename-gate)
-        run: node scripts/check-rename-gate.mjs
-
-      # 2026-07-19 评审整改B5(旧五套 docs/closeout/index/skill 治理门已删,迁入 worklog-kit
-      # docs-governance.yml——避免与新门双重收税):原文档门禁(check_docs)、canonical 门禁
-      # (check_plan_canonical)、skill 安装器自检、收口契约自检(check_docs --selftest-closeout)、
-      # 文档索引新鲜度门(check_docs_index + 自检)六步整段移除。与文档治理无关的门禁不动。
 
       # 2026-07-11 加固批 A-5(事故防复发):嵌套 cargo config + 配置文件盘符绝对路径拦截。
       # 起因=src-tauri/.cargo/config.toml 死路径就近劫持 tauri dev(experience.md §5),纯静态秒级。

@@ -553,11 +553,18 @@ describe('computeHoverRect', () => {
   })
   it('原位态(k=1)不钳位:贴视口缘的格保持在原格上(DOM 模式 hover 从不挪格)', () => {
     // 首行滚出视口顶 → 旧实现会把卡推到 y=0,卡与画格错位 = 关闭放大仍位移的几何来源。
+    // 未缩放态逐坐标复刻画格(卡下即 canvas 同格位图),任何钳位平移都是可见位移。
     const top = computeHoverRect({ x: 100, y: -30, w: 200, h: 200 }, 800, 600, 120, 1.06, 1.2, false)
     expect(top).toEqual({ x: 100, y: -30, w: 200, h: 200, scale0: 1, originX: 100, originY: 100 })
     // 尾行探出视口底同理(旧实现 y 被钳到 viewH-h,整格上移)。
     const bottom = computeHoverRect({ x: 100, y: 550, w: 200, h: 200 }, 800, 600, 120, 1.06, 1.2, false)
-    expect(bottom.y).toBe(550)
+    expect(bottom).toEqual({ x: 100, y: 550, w: 200, h: 200, scale0: 1, originX: 100, originY: 100 })
+    // 左/右缘越界同理:钳位只在放大态(k>1)生效,未缩放态 x 不得被推回视口。
+    const left = computeHoverRect({ x: -40, y: 100, w: 200, h: 200 }, 800, 600, 120, 1.06, 1.2, false)
+    expect(left).toEqual({ x: -40, y: 100, w: 200, h: 200, scale0: 1, originX: 100, originY: 100 })
+    const right = computeHoverRect({ x: 740, y: 100, w: 200, h: 200 }, 800, 600, 120, 1.06, 1.2, false)
+    expect(right.x).toBe(740)
+    expect(right.x + right.w).toBe(940) // 越过视口右缘也不内推
   })
   it('放大态贴视口缘仍钳位(向视口内推挤),与原位态区分', () => {
     const r = computeHoverRect({ x: 100, y: -30, w: 200, h: 200 }, 800, 600)

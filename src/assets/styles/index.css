@@ -347,7 +347,29 @@
   opacity: var(--opacity-disabled);
 }
 
-/* ── Custom Select ───────────────────────────────────────────── */
+/* ── Native & Custom Select ──────────────────────────────────── */
+
+select {
+  color-scheme: inherit;
+}
+
+[data-color-scheme='dark'] select {
+  color-scheme: dark;
+}
+
+[data-color-scheme='light'] select {
+  color-scheme: light;
+}
+
+select option,
+select optgroup {
+  background-color: var(--color-bg-elevated);
+  color: var(--color-text-primary);
+}
+
+select option:disabled {
+  color: var(--color-text-tertiary);
+}
 
 .select {
   position: relative;

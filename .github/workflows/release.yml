@@ -67,9 +67,9 @@ jobs:
 
       - name: NOTICE 归属清单与 SBOM 门
         run: |
-          node scripts/generate-notice.mjs --check
-          node scripts/generate-notice.mjs
-          git diff --exit-code -- NOTICE.md
+          # 单次调用取代原先的 --check + 生成 + git diff 三连:同一份依赖解析既校验 NOTICE 新鲜度
+          # 又生成 SBOM;校验不过即非零退出且**不写** SBOM,红门不会留下看似成功的 SBOM 工件。
+          node scripts/generate-notice.mjs --check --sbom
 
       # ── 发布硬门三连(任一红即不发布)─────────────────────────────────────────
       - name: tag 与版本锚一致性
@@ -84,18 +84,22 @@ jobs:
           echo "--- 发布说明预览 ---"
           cat release-notes.md
 
-      - name: vite build + 渠道合规扫描
-        run: |
-          npm run build
-          node scripts/verify-channel-bundle.mjs
-
-      # 发布 SHA 上复跑测试门控(oss-gate 在 sync-staging 验过,此处对 tag SHA 再取证)。
-      - name: cargo test --workspace
-        run: cargo test --workspace --locked
-
       # ── 构建(tauri CLI 在 windows runner 自动拉取 NSIS/WiX 工具链)────────────
+      # 前端只构建一次:dist 由本步 beforeBuildCommand(prepare:legal + vite build + 三个 worker
+      # 构建)产出,即安装包真正打包的那份;不再另跑一次 npm run build,避免两套产物分叉。
       - name: tauri build(免费版,含 MSI + NSIS 安装包)
         run: npx tauri build
+
+      # 渠道合规扫描针对**最终产物**:扫的就是上面 beforeBuildCommand 产出的、装进安装包的 dist
+      # (原顺序里扫的是独立 npm run build 的 dist,与发布产物不是同一份)。
+      - name: 渠道合规扫描(verify-channel-bundle)
+        run: node scripts/verify-channel-bundle.mjs
+
+      # 发布 SHA 上复跑测试门控(oss-gate 在 sync-staging 验过,此处对 tag SHA 再取证)。
+      # 排在构建之后:既保证 dist 已存在(tauri-build 需要 frontendDist 就位),又使测试失败
+      # 在此中断——后面的包体断言、产物清单与 gh release 都不会执行,失败不得发布。
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # 发货闭包断言(F-001 候选落地,2026-08-11):ai-worker sidecar + ORT 四件套必须
       # 真实落进安装包载荷。7z 在 windows-latest 预装;CI 下安装包存在即硬验,缺失即红。

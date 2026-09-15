@@ -21,6 +21,7 @@
 // 用法:
 //   node scripts/generate-notice.mjs           # 生成 NOTICE.md + SBOM
 //   node scripts/generate-notice.mjs --check   # 只重算并与现有 NOTICE.md 比对,漂移即非零退出
+//   node scripts/generate-notice.mjs --check --sbom  # 比对通过后再产出 SBOM(不写 NOTICE.md)
 //
 // 法务边界(如实):本工具产出的是**归属清单与机器可读物料**,不是法律意见;
 // license 兼容性终审、完整 license 文本捆绑(cargo-about 级)与各商店政策核验
@@ -34,6 +35,8 @@ import { VENDORED_VERSION_FIELDS, verifyVendoredArtifacts } from './lib/vendored
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHECK_MODE = process.argv.includes('--check');
+// SBOM 产出:默认模式本来就写;--check 下须显式 --sbom(校验通过才写,校验失败不写)。
+const SBOM_MODE = !CHECK_MODE || process.argv.includes('--sbom');
 
 // 发货 Rust 根与平台。raw-worker 是独立 workspace，必须保留 manifest_path。
 const SHIP_RUST_ROOTS = [
@@ -443,6 +446,14 @@ function selftest() {
 }
 
 // ── 主流程 ────────────────────────────────────────────────────────────────────
+function writeSbom(rustDeps, npmDeps, appVersion) {
+  const sbomDir = path.join(repo, 'target', 'sbom');
+  fs.mkdirSync(sbomDir, { recursive: true });
+  const sbomPath = path.join(sbomDir, 'scrollery.cdx.json');
+  fs.writeFileSync(sbomPath, JSON.stringify(renderSbom(rustDeps, npmDeps, appVersion), null, 2) + '\n');
+  return sbomPath;
+}
+
 selftest();
 verifyPinnedVendoredArtifacts();
 
@@ -477,14 +488,11 @@ if (CHECK_MODE) {
     process.exit(1);
   }
   console.log(`✓ NOTICE.md 新鲜(rust ${rustDeps.length} + npm ${npmDeps.length} + vendored ${VENDORED_FRONTEND.length} + runtime ${SHIPPED_RUNTIME_COMPONENTS.length};strong-copyleft 旗标 ${strongCount})`);
+  if (SBOM_MODE) console.log(`SBOM 已生成:${writeSbom(rustDeps, npmDeps, appVersion)}`);
 } else {
   fs.writeFileSync(noticePath, notice);
-  const sbomDir = path.join(repo, 'target', 'sbom');
-  fs.mkdirSync(sbomDir, { recursive: true });
-  const sbomPath = path.join(sbomDir, 'scrollery.cdx.json');
-  fs.writeFileSync(sbomPath, JSON.stringify(renderSbom(rustDeps, npmDeps, appVersion), null, 2) + '\n');
   console.log(`NOTICE.md 已生成(rust ${rustDeps.length} + npm ${npmDeps.length} + vendored ${VENDORED_FRONTEND.length} + runtime ${SHIPPED_RUNTIME_COMPONENTS.length} 个第三方组件)`);
-  console.log(`SBOM 已生成:${sbomPath}`);
+  console.log(`SBOM 已生成:${writeSbom(rustDeps, npmDeps, appVersion)}`);
   if (strongCount > 0) {
     console.warn(`⚠ 检出 ${strongCount} 个 strong-copyleft 旗标包——发布前必须人工法务复核(见 NOTICE.md Review notes)`);
   }

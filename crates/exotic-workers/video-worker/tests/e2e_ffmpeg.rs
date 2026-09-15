@@ -2,7 +2,15 @@
 //! 真 ffmpeg 端到端(视频格式扩展子系统 design.md §8 V3 验收)。
 //!
 //! **门控**:环境变量 `SCROLLERY_TEST_FFMPEG` 指向 ffmpeg.exe(同目录须有 ffprobe)。
-//! 未设即 skip(打印原因)。fixture 用 lavfi(testsrc2/sine)运行时合成到 temp,不入库大二进制。
+//! 两测试均 `#[ignore]`,默认 `cargo test` 只报 ignored;显式运行须先设该变量,未设或路径
+//! 不存在即失败(不再静默假通过):
+//!
+//! ```text
+//! set SCROLLERY_TEST_FFMPEG=D:\path\to\ffmpeg.exe
+//! cargo test -p video-worker --test e2e_ffmpeg -- --ignored --nocapture
+//! ```
+//!
+//! fixture 用 lavfi(testsrc2/sine)运行时合成到 temp,不入库大二进制。
 //!
 //! 本文件含两类覆盖,**层级不同,如实分开说明**(V3 深审修复批 #11)。
 //!
@@ -26,15 +34,21 @@ use exotic_protocol::{
     MAX_BLOB_LEN, PROTOCOL_VERSION,
 };
 
-/// 取 ffmpeg 路径(env 门控);None = skip。
-fn ffmpeg_path() -> Option<PathBuf> {
-    let p = std::env::var("SCROLLERY_TEST_FFMPEG").ok()?;
-    let p = PathBuf::from(p);
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
-    }
+/// 取 ffmpeg 路径(env `SCROLLERY_TEST_FFMPEG`)。
+///
+/// 本测试是被 `#[ignore]` 门控的专项测试:显式 `--ignored` 跑即表示依赖已就位,故未设
+/// env 或路径不是文件时直接失败,不返回 None、不静默跳过。
+fn ffmpeg_path() -> PathBuf {
+    let raw = std::env::var("SCROLLERY_TEST_FFMPEG").expect(
+        "未设 SCROLLERY_TEST_FFMPEG:本测试需显式 --ignored 运行,先将其设为 ffmpeg.exe 路径",
+    );
+    let p = PathBuf::from(raw);
+    assert!(
+        p.is_file(),
+        "SCROLLERY_TEST_FFMPEG 应指向存在的 ffmpeg 文件,实得 {}",
+        p.display()
+    );
+    p
 }
 
 fn ffprobe_path(ffmpeg: &Path) -> PathBuf {
@@ -114,14 +128,11 @@ fn probe_json(ffprobe: &Path, src: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
+/// 参数级链路:见文件顶部说明。需 `SCROLLERY_TEST_FFMPEG`,显式 `--ignored` 运行。
 #[test]
+#[ignore = "需 SCROLLERY_TEST_FFMPEG 指向 ffmpeg.exe;设好后 --ignored 显式运行"]
 fn e2e_probe_remux_transcode_frames() {
-    let Some(ffmpeg) = ffmpeg_path() else {
-        eprintln!(
-            "SKIP e2e_probe_remux_transcode_frames:未设 SCROLLERY_TEST_FFMPEG(指向 ffmpeg.exe)"
-        );
-        return;
-    };
+    let ffmpeg = ffmpeg_path();
     let ffprobe = ffprobe_path(&ffmpeg);
     assert!(
         ffprobe.is_file(),
@@ -312,14 +323,11 @@ fn e2e_probe_remux_transcode_frames() {
 /// Hello/Ready 握手 + VideoSessionInit(真 ffmpeg 路径 + sha256)+ VideoProbe 一条完整
 /// 协议帧链路。协议帧读写样板抄 `exotic-protocol` 本 crate 的帧测试样式(`frame.rs`
 /// `#[cfg(test)]` roundtrip 用法)与 host 侧 `worker.rs` 的 spawn 握手流程。
+/// 需 `SCROLLERY_TEST_FFMPEG`,显式 `--ignored` 运行。
 #[test]
+#[ignore = "需 SCROLLERY_TEST_FFMPEG 指向 ffmpeg.exe;设好后 --ignored 显式运行"]
 fn e2e_worker_process_hello_ready_probe() {
-    let Some(ffmpeg) = ffmpeg_path() else {
-        eprintln!(
-            "SKIP e2e_worker_process_hello_ready_probe:未设 SCROLLERY_TEST_FFMPEG(指向 ffmpeg.exe)"
-        );
-        return;
-    };
+    let ffmpeg = ffmpeg_path();
     let work = temp_dir("proc");
 
     // 探针 fixture:mpeg4 是 LGPL-shared ffmpeg 构建里几乎恒在的原生编码器,不依赖

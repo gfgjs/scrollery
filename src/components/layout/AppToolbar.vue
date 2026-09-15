@@ -628,8 +628,9 @@ function toggleSearchMode() {
   background: var(--color-input-bg);
   border: 1px solid var(--color-input-border);
   border-radius: var(--radius-sm);
-  padding: 0 var(--spacing-sm);
+  padding: 0 var(--spacing-sm) 0 var(--spacing-xs);
   width: clamp(220px, 26vw, 320px);
+  box-sizing: border-box;
   transition:
     background-color var(--transition-fast),
     border-color var(--transition-fast),
@@ -748,18 +749,18 @@ function toggleSearchMode() {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: var(--control-size-compact);
-  height: var(--control-size-compact);
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--color-border);
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-xs);
+  border: none;
   background: transparent;
   color: var(--color-text-tertiary);
   cursor: pointer;
   flex-shrink: 0;
   transition:
     background-color var(--transition-fast),
-    border-color var(--transition-fast),
-    color var(--transition-fast);
+    color var(--transition-fast),
+    opacity var(--transition-fast);
   padding: 0;
 }
 .toolbar__search-mode-btn .mode-text {
@@ -768,27 +769,24 @@ function toggleSearchMode() {
   letter-spacing: 0.5px;
 }
 .toolbar__search-mode-btn:hover {
-  border-color: var(--color-accent);
-  color: var(--color-accent);
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
 }
 .toolbar__search-mode-btn.mode-mixed {
   background: var(--color-accent-subtle);
-  border-color: transparent;
   color: var(--color-accent-text);
 }
 .toolbar__search-mode-btn.mode-semantic {
   background: var(--color-accent);
-  border-color: var(--color-accent);
   color: var(--color-text-on-accent);
-  box-shadow: none;
 }
 .toolbar__search-mode-btn.mode-normal {
-  border-color: var(--color-border);
   background: transparent;
   color: var(--color-text-tertiary);
 }
-.toolbar__search-mode-btn:hover {
-  opacity: 0.8;
+.toolbar__search-mode-btn.mode-mixed:hover,
+.toolbar__search-mode-btn.mode-semantic:hover {
+  opacity: 0.85;
 }
 
 /* Mixed Search Dropdown */

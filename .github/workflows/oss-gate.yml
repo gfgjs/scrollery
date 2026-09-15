@@ -72,10 +72,8 @@ jobs:
       - name: cargo check(raw-worker 独立 workspace)
         run: cargo check --manifest-path crates/exotic-workers/raw-worker/Cargo.toml --locked
 
-      # 强制门:公开投影树必须能用**同步来的原锁**解析+编译(Cargo.lock 随投影同步,不重生)。
-      - name: cargo check --workspace --locked
-        run: cargo check --workspace --locked
-
+      # 强制门:公开投影树必须能用**同步来的原锁**解析+编译(Cargo.lock 随投影同步,不重生);
+      # 解析+编译面由下方的 cargo test 覆盖(原单列 cargo check 与 ci.yml 同步去重)。
       # 附加断言:项目测试多为 rusqlite 内存 DB/逻辑单测,可 headless 跑。
       # 🔴 显式串行(--test-threads=1):不依赖 runner 默认并行度,换取确定性。
       - name: cargo test --workspace --locked
