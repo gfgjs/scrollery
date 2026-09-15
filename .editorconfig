@@ -1,0 +1,8 @@
+# 编辑器/IDE 的换行约定与根 .gitattributes 对齐。
+root = true
+
+[*]
+end_of_line = lf
+
+[*.{bat,cmd}]
+end_of_line = crlf
