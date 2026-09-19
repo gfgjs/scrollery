@@ -22,7 +22,6 @@ tauri-build = { version = "2", features = [] }
 tauri          = { version = "2", features = ["protocol-asset", "unstable", "tray-icon"] }
 tauri-plugin-dialog       = "2"
 tauri-plugin-shell        = "2"
-tauri-plugin-window-state = "2"
 # os:自绘标题栏(WindowChrome)按平台分叉窗口装饰,前端经 @tauri-apps/plugin-os 的 platform()
 # 同步判定 mac/windows(顶栏重构 L0,设计文档 §4.1)。JS 侧对应 os:default capability。
 tauri-plugin-os           = "2"
@@ -32,9 +31,9 @@ tauri-plugin-os           = "2"
 # 校验 rootId+relPath 后在 Rust 内部调用 —— JS 侧完全够不着,ACL 面为零。
 # 顺带:该函数在 Android/iOS 返回 Error::UnsupportedPlatform,正好兑现 D-001 的移动端契约。
 tauri-plugin-opener       = "2"
-# updater 仅 direct 渠道(经 [features] channel-direct 绑定;Store 渠道政策禁自更新,
-# msstore/steam 构建不链接本 crate,Part7 §3.5/§8.4)。
-tauri-plugin-updater      = { version = "2", optional = true }
+# updater 属直销(direct)发布面(Part7 §3.5):唯一渠道 = 直销,故为普通依赖;运行期按
+# 「编译进 context 的最终配置是否带 plugins.updater」决定是否注册(lib.rs:133)。
+tauri-plugin-updater      = "2"
 
 # ── Async runtime ────────────────────────────────────────────────────────────
 tokio      = { version = "1", features = ["full"] }
@@ -63,7 +62,7 @@ exotic-protocol = { path = "../crates/exotic-protocol" }
 
 # ── 插件平台契约叶 crate（Part6 §3.9.1a 去环叶 crate）───────────────────────────────
 # plugin-api：EntitlementProvider/LicenseStatus/LicenseError 抽象（零密钥、零门控逻辑）。
-# 未授权回退桩 FreeStubEntitlement 与渠道桩同住主机 channel_stubs 模块（桩恒 Unlicensed，无需独立 crate）。
+# 未授权回退桩 FreeStubEntitlement 住主机 exotic::license 模块（恒 Unlicensed，无需独立 crate）。
 scrollery-plugin-api = { path = "../crates/scrollery-plugin-api" }
 
 # ── 信任根验签叶 crate（Part6 §3.9.1a 去环 ③a）──────────────────────────────────────
@@ -246,7 +245,7 @@ harness = false
 [features]
 # Lite 为默认变体（极致轻量，零大体积 native 捆绑）。custom-protocol 为 Tauri 生产构建所需。
 # 见 docs/archive/feature_expansion_plan_v1.md §1.4：包体积由编译期决定 → 主开关必须是 Cargo feature。
-default = ["custom-protocol", "lite", "channel-direct"]
+default = ["custom-protocol", "lite"]
 custom-protocol = ["tauri/custom-protocol"]
 # devtools:release 诊断开关(debug 构建无需——Tauri v2 默认自带)。此前为空 feature 未接
 # tauri/devtools,形同虚设;接线后 release 默认无 inspector,按需显式开启。
@@ -277,18 +276,11 @@ netfs = ["dep:reqwest_dav"]
 # T15 起转发至 ai-core(SCRFD/ArcFace 代码已随推理核迁出,cfg 门控单一事实源在彼处)。
 face-noncommercial = ["scrollery-ai-core/face-noncommercial"]
 
-# ── 分发渠道维度(Part7-T10 / Part7 §3.6.1;与 lite/perf 变体正交)──────────────────────
-# 渠道 = 谁授权 + 如何分发;default 走 channel-direct(直销)。三渠道互斥由 lib.rs 顶部
-# compile_error! 编译期强制(Cargo feature 是叠加语义,仅文档约定「互斥」不够)。
-# 🔴 构建命令铁律:msstore/steam 构建必须 --no-default-features 并显式带全所需 feature:
-#    cargo build --no-default-features --features "custom-protocol,lite,channel-msstore"
-# channel-direct = ["dep:tauri-plugin-updater"](§3.5.1 定稿形态,T7 已落 2026-07-04):
-# 经 optional dep 绑定,非 direct 渠道二进制不链接 updater(crate 已 2026-07-02 预取,2.10.1)。
-# msstore:授权走 StoreContext,DRM/updater 物理排除(MS Store Policy 10.2.2,§3.6.2);
-# steam:授权查 DLC ownership,同样物理排除。真实 Provider 归 Part8(Part7-T12 先接 stub)。
-channel-direct = ["dep:tauri-plugin-updater"]
-channel-msstore = []
-channel-steam = []
+# ── 发布渠道(Part7 §3.5)────────────────────────────────────────────────────────
+# 唯一渠道 = 直销(direct):keyring 授权 + 签名 Registry 验签 + HTTPS 下载,这是当前唯一已实现
+# 的授权/分发形态。渠道 feature 维度已整体退役(P16,2026-09-15):channel-msstore/steam 空渠道、
+# lib.rs 互斥门、渠道桩、InstallSource 多值枚举、CI 三渠道依赖树断言同批删除;updater 因此
+# 由 optional dep 转为普通依赖(唯一渠道 = 直销,无常开 feature 需要绑定)。
 
 # ── 构建 profile 已迁至 workspace 根 Cargo.toml ────────────────────────────────
 # cargo 只认 workspace 根的 [profile.*]，member 内声明会被忽略并告警。

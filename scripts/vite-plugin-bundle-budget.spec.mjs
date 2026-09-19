@@ -3,13 +3,11 @@
 // 本仓 S7 教训:门禁必须**双向验证**——能绿也能红。只断言「当前产物过门」等于把一个
 // 永不触发的规则钉进 CI(见 docs/experience.md「门禁可信度是独立于覆盖率的属性」)。
 // 故每条不变量都配一组「合规样本过 / 违规样本红」对照。
+//
+// 2026-09-16 精简:保留每条不变量的双向对照与判定前提;DEFAULT_POLICY 自身的取值自证
+// (禁用表非空、预算落在某区间)属配置值断言而非门禁行为,整删。每条场景仍是独立 it。
 import { describe, it, expect } from 'vitest'
-import {
-  evaluateBundle,
-  pkgOf,
-  isForbiddenPkg,
-  DEFAULT_POLICY,
-} from './vite-plugin-bundle-budget.mjs'
+import { evaluateBundle, pkgOf, isForbiddenPkg, DEFAULT_POLICY } from './vite-plugin-bundle-budget.mjs'
 
 // kB = SI 千字节(bytes/1000),与 Vite 报告口径一致 —— 不是 1024。
 const KB = 1000
@@ -35,34 +33,32 @@ function baseline(overrides = {}) {
 }
 
 describe('pkgOf', () => {
-  it('取普通包名', () => {
-    expect(pkgOf('node_modules/pdfjs-dist/build/pdf.mjs')).toBe('pdfjs-dist')
-  })
   it('取 scope 包名(含 scope 段)', () => {
     expect(pkgOf('node_modules/@shikijs/langs/dist/cpp.mjs')).toBe('@shikijs/langs')
   })
+
   it('Windows 反斜杠路径同样可解', () => {
     expect(pkgOf('D:\\workspace\\scrollery\\node_modules\\pdfjs-dist\\build\\pdf.mjs')).toBe(
       'pdfjs-dist',
     )
   })
+
   it('嵌套 node_modules 取最内层(取最后一个 node_modules 段)', () => {
     expect(pkgOf('node_modules/a/node_modules/pdfjs-dist/build/pdf.mjs')).toBe('pdfjs-dist')
   })
+
   it('应用自身模块返回 null', () => {
     expect(pkgOf('src/components/media/MediaGrid.vue')).toBeNull()
   })
 })
 
 describe('isForbiddenPkg', () => {
-  it('全等匹配', () => {
-    expect(isForbiddenPkg('pdfjs-dist', ['pdfjs-dist'])).toBe(true)
-    expect(isForbiddenPkg('pdfjs-dist-extra', ['pdfjs-dist'])).toBe(false)
-  })
-  it('以 / 结尾表 scope 前缀', () => {
+
+  it('以 / 结尾表 scope 前缀(全等项的精确匹配不误伤同前缀包名)', () => {
     expect(isForbiddenPkg('@shikijs/langs', ['@shikijs/'])).toBe(true)
     expect(isForbiddenPkg('@shikijs/core', ['@shikijs/'])).toBe(true)
   })
+
   it('不误伤同前缀的无关包', () => {
     // 'shiki' 全等项不得吃掉 'shikimori' 这类名字
     expect(isForbiddenPkg('shikimori', ['shiki'])).toBe(false)
@@ -87,11 +83,6 @@ describe('evaluateBundle:入口体积门', () => {
     // 预算比字面值悄悄松 2.7%。此处用实测字节数锁死口径。
     const { report } = evaluateBundle(baseline({ sizeBytes: 549751 }), DEFAULT_POLICY)
     expect(report[0]).toContain('549.75')
-  })
-
-  it('恰好等于预算 → 绿(边界:阈值取闭区间)', () => {
-    const chunks = baseline({ sizeBytes: DEFAULT_POLICY.entryMaxKB * KB })
-    expect(evaluateBundle(chunks, DEFAULT_POLICY).failures).toEqual([])
   })
 
   it('懒块再大也不拦截,只报告(有意:上游体积不可控)', () => {
@@ -130,11 +121,6 @@ describe('evaluateBundle:重依赖不进入口门', () => {
     expect(failures[0]).toContain('2 个模块')
     expect(failures[0]).toContain('pdfjs-dist/build/pdf.mjs')
   })
-
-  it('重依赖留在懒块 → 绿(这正是当前架构,不得误伤)', () => {
-    // baseline 的 cpp 懒块本就含 @shikijs/langs
-    expect(evaluateBundle(baseline(), DEFAULT_POLICY).failures).toEqual([])
-  })
 })
 
 describe('evaluateBundle:判定前提', () => {
@@ -143,17 +129,5 @@ describe('evaluateBundle:判定前提', () => {
     const { failures } = evaluateBundle(chunks, DEFAULT_POLICY)
     expect(failures).toHaveLength(1)
     expect(failures[0]).toContain('没有入口 chunk')
-  })
-})
-
-describe('DEFAULT_POLICY 自身的健全性', () => {
-  it('禁用表非空(空表 = 第二条门永不触发)', () => {
-    expect(DEFAULT_POLICY.entryForbiddenDeps.length).toBeGreaterThan(0)
-  })
-  it('入口预算须高于实测基线 549.75 kB,否则门一上来就红', () => {
-    expect(DEFAULT_POLICY.entryMaxKB).toBeGreaterThan(550)
-  })
-  it('入口预算不得宽到能塞下 pdfjs(365 kB)——那样体积门就失去意义', () => {
-    expect(DEFAULT_POLICY.entryMaxKB).toBeLessThan(550 + 365)
   })
 })

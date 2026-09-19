@@ -1,89 +1,99 @@
 // src-tauri/src/storage/webdav.rs
-//! Native WebDAV `StorageBackend` (P5 8B, feature `netfs`) via `reqwest_dav` (pure Rust, rustls).
-//! No OS mount required — connect/list/stat/ranged-read straight over HTTP(S).
+//! 原生 WebDAV 连接测试（P5 8B，feature `netfs`），基于 `reqwest_dav`（纯 Rust，rustls）。
+//! 无需 OS 挂载 —— 直接经 HTTP(S) 列出 base 目录并计数。
 //!
-//! 原生 WebDAV `StorageBackend`（P5 8B，feature `netfs`），基于 `reqwest_dav`（纯 Rust，rustls）。
-//! 无需 OS 挂载 —— 直接经 HTTP(S) 连接/列目录/stat/按范围读取。
-//!
-//! 同步 trait 桥接：本结构持有一个 current-thread tokio 运行时，`block_on` 异步 `reqwest_dav`，
-//! 使 WebDAV 能像 `LocalFs` 一样被同步的 scanner 使用。**注意**：其方法必须在无环境运行时的线程
-//! 调用（即 IPC 层用 `spawn_blocking`），否则 `block_on` 会因「运行时套运行时」而 panic。
+//! 同步桥接：本模块持有一个 current-thread tokio 运行时以 `block_on` 异步 `reqwest_dav`。
+//! **注意**：必须在无环境运行时的线程调用（即 IPC 层用 `spawn_blocking`），否则 `block_on` 会因
+//! 「运行时套运行时」而 panic。
 
-use reqwest_dav::re_exports::reqwest;
 use reqwest_dav::types::list_cmd::ListEntity;
-use reqwest_dav::{Auth, Client, ClientBuilder, Depth};
+use reqwest_dav::{Auth, ClientBuilder, Depth};
 use tokio::runtime::Runtime;
 
 use crate::error::{AppError, Result};
-use crate::storage::{BackendConfig, RemoteEntry, StorageBackend};
-
-/// A `StorageBackend` over a remote WebDAV server (e.g. Nextcloud, Apache mod_dav).
-/// 远程 WebDAV 服务器（如 Nextcloud、Apache mod_dav）的 `StorageBackend`。
-pub struct WebDavBackend {
-    rt: Runtime,
-    client: Client,
-    /// Base path under the host (forward-slash, no leading/trailing slash). | host 下的 base 路径。
-    base: String,
-}
+use crate::storage::ConnParams;
 
 fn map_err(e: reqwest_dav::Error) -> AppError {
     AppError::internal("WebDAV 操作失败 | WebDAV operation failed", e)
 }
 
-impl WebDavBackend {
-    pub fn new(cfg: &BackendConfig) -> Result<Self> {
-        let host = cfg
-            .host
-            .clone()
-            .filter(|h| !h.trim().is_empty())
-            .ok_or_else(|| {
-                AppError::System("WebDAV host/base_url missing | 缺少 WebDAV 地址".into())
-            })?;
-        let host = host.trim().trim_end_matches('/').to_string();
-        if !(host.starts_with("http://") || host.starts_with("https://")) {
-            return Err(AppError::System(
-                "WebDAV base_url must be http(s) | WebDAV 地址须为 http(s)".into(),
-            ));
-        }
+/// 连接可达性 + 凭据检查：列出 base 目录并返回直属项数（跳过被列目录自身）。
+pub fn count_entries(p: &ConnParams<'_>) -> Result<usize> {
+    let host = p
+        .host
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| {
+            AppError::System("WebDAV host/base_url missing | 缺少 WebDAV 地址".into())
+        })?;
+    let host = host.trim_end_matches('/').to_string();
+    if !(host.starts_with("http://") || host.starts_with("https://")) {
+        return Err(AppError::System(
+            "WebDAV base_url must be http(s) | WebDAV 地址须为 http(s)".into(),
+        ));
+    }
 
-        // current-thread 运行时，使 block_on 在 spawn_blocking 内可用（无环境运行时）。
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(AppError::from)?;
+    // current-thread 运行时，使 block_on 在 spawn_blocking 内可用（无环境运行时）。
+    let rt: Runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(AppError::from)?;
 
-        let auth = match (&cfg.username, &cfg.password) {
-            (Some(u), Some(p)) if !u.is_empty() => Auth::Basic(u.clone(), p.clone()),
-            _ => Auth::Anonymous,
-        };
+    let auth = match (p.username, p.password) {
+        (Some(u), Some(pw)) if !u.is_empty() => Auth::Basic(u.to_string(), pw.to_string()),
+        _ => Auth::Anonymous,
+    };
+    let client = ClientBuilder::new()
+        .set_host(host)
+        .set_auth(auth)
+        .build()
+        .map_err(map_err)?;
 
-        let client = ClientBuilder::new()
-            .set_host(host)
-            .set_auth(auth)
-            .build()
+    // base 规范化：去首尾斜杠（空 = 服务器根）。
+    let base = p
+        .base_path
+        .unwrap_or_default()
+        .trim_matches('/')
+        .to_string();
+    let path = server_path(&base, "");
+    // 首项通常是被列目录自身 —— 与请求路径同源比较后再跳过。
+    let self_rel = path
+        .trim_matches('/')
+        .strip_prefix(base.as_str())
+        .unwrap_or("")
+        .trim_matches('/')
+        .to_string();
+
+    rt.block_on(async {
+        let entities = client
+            .list(&path, Depth::Number(1))
+            .await
             .map_err(map_err)?;
+        let mut n = 0;
+        for ent in entities {
+            let (name, rel) = match ent {
+                ListEntity::File(f) => rel_from_href(&f.href, &base),
+                ListEntity::Folder(d) => rel_from_href(&d.href, &base),
+            };
+            if rel == self_rel || name.is_empty() {
+                continue;
+            }
+            n += 1;
+        }
+        Ok(n)
+    })
+}
 
-        let base = cfg
-            .base_path
-            .clone()
-            .unwrap_or_default()
-            .trim_matches('/')
-            .to_string();
-
-        Ok(Self { rt, client, base })
-    }
-
-    /// 把 base + 后端相对路径拼为服务器路径（前导斜杠、规范化）。
-    fn server_path(&self, rel_path: &str) -> String {
-        let rel = rel_path.trim_matches('/');
-        let joined = match (self.base.is_empty(), rel.is_empty()) {
-            (true, true) => String::new(),
-            (true, false) => rel.to_string(),
-            (false, true) => self.base.clone(),
-            (false, false) => format!("{}/{}", self.base, rel),
-        };
-        format!("/{joined}")
-    }
+/// 把 base + 后端相对路径拼为服务器路径（前导斜杠、规范化）。
+fn server_path(base: &str, rel_path: &str) -> String {
+    let rel = rel_path.trim_matches('/');
+    let joined = match (base.is_empty(), rel.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => rel.to_string(),
+        (false, true) => base.to_string(),
+        (false, false) => format!("{base}/{rel}"),
+    };
+    format!("/{joined}")
 }
 
 /// 由 WebDAV `href` 与 base 前缀推导项名 + 后端相对路径。
@@ -128,131 +138,29 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-impl StorageBackend for WebDavBackend {
-    fn kind(&self) -> &'static str {
-        "webdav"
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 请求 URL 与路径边界（纯函数，无需网络）。
+    #[test]
+    fn server_path_joins_base_and_rel() {
+        assert_eq!(server_path("dav", "/photos"), "/dav/photos");
+        assert_eq!(server_path("", "photos"), "/photos");
+        assert_eq!(server_path("dav", ""), "/dav");
+        assert_eq!(server_path("", ""), "/");
     }
 
-    fn list_dir(&self, rel_path: &str) -> Result<Vec<RemoteEntry>> {
-        let path = self.server_path(rel_path);
-        let base = self.base.clone();
-        let entities = self
-            .rt
-            .block_on(self.client.list(&path, Depth::Number(1)))
-            .map_err(map_err)?;
-
-        // 首项通常是被列目录自身 —— 跳过等于请求路径的项。
-        let self_rel = path
-            .trim_matches('/')
-            .strip_prefix(base.as_str())
-            .unwrap_or("")
-            .trim_matches('/')
-            .to_string();
-        let mut out = Vec::new();
-        for ent in entities {
-            let (name, rel, is_dir, size, mtime) = match ent {
-                ListEntity::File(f) => {
-                    let (n, r) = rel_from_href(&f.href, &base);
-                    (
-                        n,
-                        r,
-                        false,
-                        f.content_length.max(0) as u64,
-                        f.last_modified.timestamp(),
-                    )
-                }
-                ListEntity::Folder(d) => {
-                    let (n, r) = rel_from_href(&d.href, &base);
-                    (n, r, true, 0u64, d.last_modified.timestamp())
-                }
-            };
-            if rel == self_rel || name.is_empty() {
-                continue;
-            }
-            out.push(RemoteEntry {
-                name,
-                rel_path: rel,
-                is_dir,
-                size,
-                mtime,
-            });
-        }
-        Ok(out)
-    }
-
-    fn stat(&self, rel_path: &str) -> Result<RemoteEntry> {
-        let path = self.server_path(rel_path);
-        let base = self.base.clone();
-        let entities = self
-            .rt
-            .block_on(self.client.list(&path, Depth::Number(0)))
-            .map_err(map_err)?;
-        let ent = entities.into_iter().next().ok_or_else(|| {
-            AppError::System(format!("WebDAV stat not found: {rel_path} | 未找到"))
-        })?;
-        Ok(match ent {
-            ListEntity::File(f) => {
-                let (name, rel) = rel_from_href(&f.href, &base);
-                RemoteEntry {
-                    name,
-                    rel_path: rel,
-                    is_dir: false,
-                    size: f.content_length.max(0) as u64,
-                    mtime: f.last_modified.timestamp(),
-                }
-            }
-            ListEntity::Folder(d) => {
-                let (name, rel) = rel_from_href(&d.href, &base);
-                RemoteEntry {
-                    name,
-                    rel_path: rel,
-                    is_dir: true,
-                    size: 0,
-                    mtime: d.last_modified.timestamp(),
-                }
-            }
-        })
-    }
-
-    fn read_range(&self, rel_path: &str, start: u64, len: Option<u64>) -> Result<Vec<u8>> {
-        let path = self.server_path(rel_path);
-        self.rt.block_on(async {
-            let mut req = self
-                .client
-                .start_request(reqwest::Method::GET, &path)
-                .await
-                .map_err(map_err)?;
-            // Range 头用于部分读取（流式代理 / 远程大原图，§3.8）。
-            if let Some(n) = len {
-                let end = start + n.saturating_sub(1);
-                req = req.header("Range", format!("bytes={start}-{end}"));
-            } else if start > 0 {
-                req = req.header("Range", format!("bytes={start}-"));
-            }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| AppError::internal("WebDAV 读取失败 | WebDAV GET failed", e))?;
-            // 状态码校验(2026-07-06 审查 R8):不校验则 404/500 的错误体会被当成文件数据返回。
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(AppError::System(format!(
-                    "WebDAV GET 非成功状态 {status} | non-success status"
-                )));
-            }
-            // 带 Range 请求时,服务器应回 206 Partial Content;若回 200 说明它忽略了 Range、
-            // 返回整个文件——调用方拿到的字节会远超请求窗口,宁可报错也不返错误数据。
-            let ranged = len.is_some() || start > 0;
-            if ranged && status != reqwest::StatusCode::PARTIAL_CONTENT {
-                return Err(AppError::System(format!(
-                    "WebDAV 忽略 Range(状态 {status},期望 206)| server ignored Range header"
-                )));
-            }
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| AppError::internal("WebDAV 响应体读取失败 | body read failed", e))?;
-            Ok(bytes.to_vec())
-        })
+    #[test]
+    fn rel_from_href_strips_base_and_decodes() {
+        assert_eq!(
+            rel_from_href("/dav/photos/%E5%9B%BE%20a.jpg", "dav/photos"),
+            ("图 a.jpg".to_string(), "图 a.jpg".to_string())
+        );
+        // 无 base 前缀时退回整段（不静默截断）。
+        assert_eq!(
+            rel_from_href("/other/x.jpg", "dav/photos"),
+            ("x.jpg".to_string(), "other/x.jpg".to_string())
+        );
     }
 }

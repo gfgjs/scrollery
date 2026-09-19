@@ -455,7 +455,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-xl);
   overflow: hidden;
   background: var(--color-bg-surface);
-  box-shadow: var(--material-shadow-shell);
+  box-shadow: var(--shadow-sm);
   flex: 0 0 auto;
 }
 .audio-player__cover img {

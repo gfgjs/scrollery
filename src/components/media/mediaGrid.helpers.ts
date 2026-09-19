@@ -2,6 +2,7 @@
 // MediaGrid 纯逻辑辅助(抽出便于单测,不碰组件状态)。
 
 import type { MediaMeta } from '../../types/layout'
+import type { DemoInfoText } from '../../utils/demoAlias'
 
 // ── 查看器返回时的侧栏几何守卫 ────────────────────────────────────────────────
 
@@ -60,32 +61,35 @@ export interface ThumbInfoItemFields {
  * 组装缩略图信息浮窗的文本行(按用户勾选的 elements 过滤):文件名/日期/分辨率/路径/GPS/
  * 相机/拍摄参数。轻量字段读 item(常驻布局行),重型字段读 meta(可视区懒加载,未到达时
  * 对应行缺席,数据到达后由调用方重渲染/重绘补上)。
+ * demo(2026-09-16 演示打码):非空时把敏感字段的**文本**换成示例值,而每行的**存在性**判定
+ * 仍走真实数据(不新增原来没有的行)。DOM 画廊不传此参,行为逐字不变。
  */
 export function buildThumbInfoLines(
   item: ThumbInfoItemFields,
   meta: MediaMeta | undefined,
   elements: readonly string[],
+  demo?: DemoInfoText | null,
 ): string[] {
   const lines: string[] = []
   if (elements.includes('filename') && meta?.fileName) {
-    lines.push(meta.fileName)
+    lines.push(demo ? demo.fileName : meta.fileName)
   }
   if (elements.includes('date') && item.sortDatetime) {
-    lines.push(new Date(item.sortDatetime * 1000).toLocaleString())
+    lines.push(demo ? demo.date : new Date(item.sortDatetime * 1000).toLocaleString())
   }
   if (elements.includes('resolution') && item.originalWidth && item.originalHeight) {
-    lines.push(`${item.originalWidth} × ${item.originalHeight}`)
+    lines.push(demo ? demo.resolution : `${item.originalWidth} × ${item.originalHeight}`)
   }
   if (elements.includes('path') && meta?.dirPath) {
-    lines.push(meta.dirPath)
+    lines.push(demo ? demo.dirPath : meta.dirPath)
   }
   if (elements.includes('geo') && meta?.gpsLat != null && meta?.gpsLng != null) {
-    lines.push(`${meta.gpsLat.toFixed(4)}, ${meta.gpsLng.toFixed(4)}`)
+    lines.push(demo ? demo.geo : `${meta.gpsLat.toFixed(4)}, ${meta.gpsLng.toFixed(4)}`)
   }
   if (elements.includes('camera') && (meta?.exifMake || meta?.exifModel)) {
     const make = meta?.exifMake || ''
     const model = meta?.exifModel || ''
-    lines.push(`${make} ${model}`.trim())
+    lines.push(demo ? demo.camera : `${make} ${model}`.trim())
   }
   if (elements.includes('params') && meta) {
     const params = []
@@ -93,7 +97,7 @@ export function buildThumbInfoLines(
     if (meta.exifAperture) params.push(`f/${meta.exifAperture}`)
     if (meta.exifShutter) params.push(`${meta.exifShutter}s`)
     if (meta.exifIso) params.push(`ISO${meta.exifIso}`)
-    if (params.length > 0) lines.push(params.join(' '))
+    if (params.length > 0) lines.push(demo ? demo.params : params.join(' '))
   }
   return lines
 }

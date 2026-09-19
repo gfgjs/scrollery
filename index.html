@@ -6,18 +6,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <title>Scrollery</title>
-    <!-- 防 FOUC 脚本外置(见 public/theme-snapshot.js 头注):经典脚本、必须阻塞解析,不可加 type="module"/defer/async。 -->
-    <script src="/theme-snapshot.js"></script>
+    <!-- 防 FOUC 脚本外置(见 src/themes/bootstrapScript.ts 头注):经典脚本、必须阻塞解析,
+         不可加 type="module"/defer/async;该 URL 由 vite 插件按同一份生成结果在 dev/build 交付。 -->
+    <script src="/theme-bootstrap.js"></script>
     <style>
       /* 样式刻意自包含：模块样式表在 HTML 首帧之后才到达，静态层必须先覆盖恢复后的完整主窗口。 */
       :root {
-        /* 各主题块内的 --startup-bg/--startup-(text|muted) 是 color-mix 浓度缩放(与 themes/*.css
-           的底色 wash/文字 ramp 同配方,分别消费 --theme-tint-scale/--theme-text-scale;未设置时
-           回退满浓度 1),保证首帧底色与文字观感与水合后一致。 */
-        --startup-bg: #edf5f1;
-        --startup-text: color-mix(in oklch, #132a22 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-muted: color-mix(in oklch, #3d594e calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-accent: #0b7c52;
+        /* 启动层与应用窗口同底:颜色一律取主题色板变量——默认值来自构建期注入的默认主题 CSS
+           (:root / html[data-color-scheme='dark']),有首帧缓存时由 bootstrap 以 inline 变量覆盖。
+           此处不再有六套主题分支与浓度表达式,故启动层不会先露旧主题再跳到新主题。 */
+        --startup-bg: var(--color-bg-primary);
+        --startup-text: var(--color-text-primary);
+        --startup-muted: var(--color-text-secondary);
+        --startup-accent: var(--color-accent);
       }
 
       html,
@@ -40,43 +41,6 @@
         -webkit-app-region: drag;
         opacity: 1;
         transition: opacity 320ms cubic-bezier(0.16, 1, 0.3, 1);
-      }
-
-      html[data-theme='fresh-dark'] {
-        --startup-bg: color-mix(in oklch, #0d1512 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #0d1512 l 0 h));
-        --startup-text: color-mix(in oklch, #edf7f2 calc(var(--theme-text-scale, 1) * 100%), oklch(from #edf7f2 l 0 h));
-        --startup-muted: color-mix(in oklch, #a4c2b4 calc(var(--theme-text-scale, 1) * 100%), oklch(from #a4c2b4 l 0 h));
-        --startup-accent: #34d399;
-      }
-      html[data-theme='fresh-light'] {
-        --startup-bg: color-mix(in oklch, #edf5f1 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
-        --startup-text: color-mix(in oklch, #132a22 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-muted: color-mix(in oklch, #3d594e calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-accent: #0b7c52;
-      }
-      html[data-theme='minimal-light'] {
-        --startup-bg: color-mix(in oklch, #f1f3f5 calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
-        --startup-text: color-mix(in oklch, #18181b calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-muted: color-mix(in oklch, #52525b calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-accent: #27272a;
-      }
-      html[data-theme='tech-light'] {
-        --startup-bg: color-mix(in oklch, #ebf1fa calc(var(--theme-tint-scale, 1) * 100%), #ffffff);
-        --startup-text: color-mix(in oklch, #111f38 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-muted: color-mix(in oklch, #3d5073 calc(var(--theme-text-scale, 1) * 100%), #ffffff);
-        --startup-accent: #2563eb;
-      }
-      html[data-theme='minimal-dark'] {
-        --startup-bg: color-mix(in oklch, #121214 calc(var(--theme-tint-scale, 1) * 100%), oklch(from #121214 l 0 h));
-        --startup-text: color-mix(in oklch, #f4f4f5 calc(var(--theme-text-scale, 1) * 100%), oklch(from #f4f4f5 l 0 h));
-        --startup-muted: color-mix(in oklch, #a1a1aa calc(var(--theme-text-scale, 1) * 100%), oklch(from #a1a1aa l 0 h));
-        --startup-accent: #e4e4e7;
-      }
-      html[data-theme='tech-dark'] {
-        --startup-bg: color-mix(in oklch, #0e131b calc(var(--theme-tint-scale, 1) * 100%), oklch(from #0e131b l 0 h));
-        --startup-text: color-mix(in oklch, #eff4fc calc(var(--theme-text-scale, 1) * 100%), oklch(from #eff4fc l 0 h));
-        --startup-muted: color-mix(in oklch, #a2b4cf calc(var(--theme-text-scale, 1) * 100%), oklch(from #a2b4cf l 0 h));
-        --startup-accent: #60a5fa;
       }
 
       html[data-glass] #startup-layer {

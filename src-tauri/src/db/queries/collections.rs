@@ -214,7 +214,7 @@ mod hidden_root_collection_tests {
     /// 显式封面钉在 root2 的图 2 上(专测 COALESCE 短路泄漏)。
     fn two_roots_favorited() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES

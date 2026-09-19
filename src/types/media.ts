@@ -262,15 +262,6 @@ export interface VideoMeta {
   hasAudio: boolean
 }
 
-export interface SearchResult {
-  id: number
-  fileName: string
-  mediaType: MediaType
-  thumbPath: string | null
-  thumbhash: number[] | null
-  thumbStatus: ThumbStatus
-}
-
 export interface AppStats {
   totalItems: number
   totalImages: number

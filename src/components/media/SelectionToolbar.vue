@@ -73,7 +73,7 @@ onDeactivated(() => {
 })
 
 // 拖拽位置持久化(C4):live 位移用本地 offsetX/Y 驱动 transform(拖拽期每帧更新,不落库);
-// 初值取持久化 offset(useSelectionBarMode 单例,localStorage 支撑),拖拽结束/恢复/resize 时钳制并回写。
+// 初值取设置里的 offset(useSelectionBarMode 单例,存 config.toml),拖拽结束/恢复/resize 时钳制并回写。
 const wrapperEl = ref<HTMLElement | null>(null)
 const pillEl = ref<HTMLElement | null>(null)
 const offsetX = ref(mode.offset.value.x)
@@ -103,7 +103,7 @@ function clampToBounds() {
   )
   offsetX.value = clamped.x
   offsetY.value = clamped.y
-  // 仅在钳制真的改变了值时回写,避免无谓的 localStorage 写。
+  // 仅在钳制真的改变了值时回写,避免无谓的写盘请求。
   if (clamped.x !== mode.offset.value.x || clamped.y !== mode.offset.value.y) {
     mode.setOffset(clamped)
   }
@@ -142,6 +142,18 @@ function onDragEnd(e: PointerEvent) {
   // 拖拽结束:钳制并持久化(不再退出选区即复位——持久化语义与 reset-on-exit 互斥,有意的行为变更)。
   clampToBounds()
 }
+
+// 后端只应用:权威 offset 变化(启动水合 / 恢复默认 / 外部改文件)→ 同步本地拖拽位移。
+// 拖拽中不打断手势(以本地位移为准),结束后由 clampToBounds 归位;钳制幂等,不产生循环回写。
+watch(
+  () => [mode.offset.value.x, mode.offset.value.y] as const,
+  ([x, y]) => {
+    if (isDragging.value) return
+    offsetX.value = x
+    offsetY.value = y
+    nextTick(clampToBounds)
+  },
+)
 
 // 恢复:条出现时(选区态且非 docked)钳制持久化位置——防「大窗口拖到角落 → 小窗口打开后条在屏外失踪」。
 watch(
@@ -221,12 +233,12 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: var(--spacing-sm);
   padding: var(--spacing-sm) var(--spacing-md) var(--spacing-sm) var(--spacing-sm);
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   color: var(--color-text-primary);
 }
 
@@ -255,7 +267,7 @@ onBeforeUnmount(() => {
 
 .selection-toolbar.is-dragging {
   transition: none; /* disable transition while dragging */
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
 }
 
 .slide-up-enter-active,

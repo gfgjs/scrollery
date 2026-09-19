@@ -88,9 +88,6 @@ pub struct RegistryEntry {
     /// 旧 index 无此字段 → 默认空(向后兼容)。
     #[serde(default)]
     pub model_blobs: Vec<ModelBlob>,
-    /// 多渠道预留(T13/§8.4):Steam DLC AppID(SteamDepot 分发面);旧 index 无此字段 → None。
-    #[serde(default)]
-    pub steam_dlc_app_id: Option<u32>,
 }
 
 /// 单个模型权重 blob(Part4 §3.7.1/T12)。
@@ -145,6 +142,8 @@ pub struct VerifiedRegistry {
 /// 校验 + 解析 index（**验签先于一切解析/使用**）。
 ///
 /// 顺序：大小 → 验签(release 用途，原始 bytes) → 解析 → schema → 逐条目校验 → 过期标志。
+/// 验签与解析严格分离:验签对象恒为**收到的原始 bytes**(缓存亦原样落盘 index.json/.sig),
+/// 解析结果只读、绝不重新序列化回写;故 index 中多出的未知字段被 serde 忽略,不影响验签结论。
 /// `min_accepted_sequence`：本地已接受的最高 registry_sequence；收到更小者拒绝（防回滚）。
 pub fn verify_and_parse(
     index_bytes: &[u8],

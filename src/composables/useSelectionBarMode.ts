@@ -1,16 +1,25 @@
 // src/composables/useSelectionBarMode.ts
-// 选区操作条「分离(浮动) / 合并(docked)」形态偏好 + 拖拽位置——模块级响应式单例 + localStorage 持久化。
+// 选区操作条「分离(浮动) / 合并(docked)」形态偏好 + 拖拽位置——模块级响应式单例,值来自中央设置。
 //
 // 分离(默认):浮动可拖胶囊(拖拽位置持久化);合并(docked):动作条 Teleport 进 AppStatusBar,替换式
 //   共存(28px 恒高、不可拖)。默认分离=零惊讶(浮动可拖是现状且被裁决为核心能力,docked 是新增选项)。
 //   与 useTitlebarMode 默认合并的不对称是有意的(各自被推翻/保留的「原设计」不同)。
-// 状态经本模块级单例共享(SelectionToolbar 形态分支 + AppStatusBar 让位判断 + 设置页开关同源),localStorage 持久。
-import { ref } from 'vue'
+// 状态经本模块级单例共享(SelectionToolbar 形态分支 + AppStatusBar 让位判断 + 设置页开关同源)。
+//
+// 存储(设置集中保存,批次B):selection_bar_docked(bool) / selection_bar_offset(内联表 {x,y}) /
+// selection_bar_align(枚举)三键均在后端 schema 注册;offset 在 IPC 上是规范 JSON 文本,形状校验
+// 复用 parseStoredOffset(纯函数,spec 穷举)。本文件不再自持 localStorage,重置后经中央快照回落默认。
+import { computed, ref } from 'vue'
+import { readSetting, settingsReady, writeSettings } from '../stores/settingsPersistence'
 import type { BarAlign } from './useToolbarAlign'
+import { readSettingBool, readSettingEnum } from './settingsValues'
 
 const DOCKED_KEY = 'selection_bar_docked'
 const OFFSET_KEY = 'selection_bar_offset'
 const ALIGN_KEY = 'selection_bar_align'
+
+/** 三态候选集(schema 已限定枚举;此处仅用于快照未到/异常文本时的回落判定)。 */
+const BAR_ALIGNS = ['center', 'left', 'right'] as const
 
 /** 胶囊底边距(与 .selection-toolbar-wrapper 的 bottom:32px 同源;竖向钳制以此为基线)。 */
 const BOTTOM_INSET = 32
@@ -25,18 +34,9 @@ export interface SelectionBarOffset {
   y: number
 }
 
-function readDocked(): boolean {
-  try {
-    // 缺省/非法一律回落 false(分离=现状,零惊讶);仅显式 '1' 走 docked。
-    return localStorage.getItem(DOCKED_KEY) === '1'
-  } catch {
-    return false
-  }
-}
-
 /**
- * 解析 localStorage 里的 offset 串:非法/残缺/非有限数/解析失败一律回落原点(相对居中基线)。
- * 纯函数(不触 localStorage),便于 spec 穷举各类残缺输入。
+ * 解析 offset 的规范 JSON 文本:非法/残缺/非有限数/解析失败一律回落原点(相对居中基线)。
+ * 纯函数(不触存储),便于 spec 穷举各类残缺输入。
  */
 export function parseStoredOffset(raw: string | null): SelectionBarOffset {
   if (!raw) return { x: 0, y: 0 }
@@ -57,70 +57,37 @@ export function parseStoredOffset(raw: string | null): SelectionBarOffset {
   }
 }
 
-function readOffset(): SelectionBarOffset {
-  try {
-    return parseStoredOffset(localStorage.getItem(OFFSET_KEY))
-  } catch {
-    // localStorage 不可用(如 SSR/测试 node 环境):回落原点。
-    return { x: 0, y: 0 }
-  }
-}
-
-/** 合法值守卫:持久化串被篡改/旧值一律回落 'center'(默认居中,零惊讶)。 */
-function isBarAlign(v: unknown): v is BarAlign {
-  return v === 'center' || v === 'left' || v === 'right'
-}
-
-function readAlign(): BarAlign {
-  try {
-    const raw = localStorage.getItem(ALIGN_KEY)
-    return isBarAlign(raw) ? raw : 'center'
-  } catch {
-    return 'center'
-  }
-}
-
-// 模块级单例:多消费者共享同一响应式态。
-const docked = ref<boolean>(readDocked())
-const offset = ref<SelectionBarOffset>(readOffset())
+// 模块级单例:多消费者共享同一响应式态(均为只读计算值,写入经下方 setter 显式提交)。
+const docked = computed(() => readSettingBool(DOCKED_KEY, false))
+const offset = computed(() => parseStoredOffset(readSetting(OFFSET_KEY) ?? null))
 // 浮动胶囊水平对齐(居中默认/靠左/靠右)——决定胶囊静止基位,拖拽 offset 叠加其上(用户裁决:
 // 对齐=默认位、拖拽仍可覆盖)。与顶栏对齐(useToolbarAlign)各自独立(两栏各一设置)。
-const align = ref<BarAlign>(readAlign())
+const align = computed(() => readSettingEnum<BarAlign>(ALIGN_KEY, BAR_ALIGNS, 'center'))
 
 // 宿主(MediaGrid)KeepAlive 活跃度:由 SelectionToolbar 在 onActivated/onDeactivated 写入。
 // docked 条的 Teleport gate 与 AppStatusBar 的 info 让位共读此信号,确保二者同条件同步——
 // 否则「选区残留进查看器(MediaGrid deactivate)」时会出现「info 已让位但 outlet 空」的空白。
-// 初值 true 兼容非 KeepAlive 上下文。
+// 初值 true 兼容非 KeepAlive 上下文。运行期信号,不入设置。
 const hostActive = ref(true)
 function setHostActive(value: boolean) {
   hostActive.value = value
 }
 
 function setDocked(value: boolean) {
-  docked.value = value
-  try {
-    localStorage.setItem(DOCKED_KEY, value ? '1' : '0')
-  } catch {
-    // localStorage 不可用只损失持久化,本次会话切换仍生效,静默降级(同 useTitlebarMode)。
-  }
+  writeSettings({ [DOCKED_KEY]: String(value) }).catch(() => {})
 }
 
 function setOffset(value: SelectionBarOffset) {
-  offset.value = value
-  try {
-    localStorage.setItem(OFFSET_KEY, JSON.stringify(value))
-  } catch {
-    // 同上,静默降级。
-  }
+  // 权威快照未到达前读到的 offset 是占位默认值(原点),此刻回写会把用户真实位置抹成 {0,0};
+  // 故未就绪一律不采集、不提交,等快照到达后由组件重新钳制。
+  if (!settingsReady.value) return
+  // 拖拽结束/resize 钳制回写:连续操作走防抖合并,避免拖动期逐次落盘。
+  // 写盘失败由中央服务统一提示;此处 catch 只为收掉 promise。
+  writeSettings({ [OFFSET_KEY]: JSON.stringify(value) }, { debounce: true }).catch(() => {})
 }
 
 function setAlign(value: BarAlign) {
-  align.value = value
-  try {
-    localStorage.setItem(ALIGN_KEY, value)
-  } catch {
-    // 同上,静默降级。
-  }
+  writeSettings({ [ALIGN_KEY]: value }).catch(() => {})
 }
 
 /**

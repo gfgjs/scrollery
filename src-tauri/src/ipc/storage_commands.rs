@@ -13,7 +13,7 @@ use crate::db::models::StorageBackendInfo;
 use crate::db::queries as q;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use crate::storage::{build_backend, BackendConfig};
+use crate::storage::{count_entries, ConnParams};
 
 use scrollery_plugin_api::KEYRING_SERVICE;
 
@@ -40,13 +40,13 @@ pub struct BackendInput {
 }
 
 impl BackendInput {
-    fn to_config(&self) -> BackendConfig {
-        BackendConfig {
-            kind: self.kind.clone(),
-            host: self.host.clone(),
-            base_path: self.base_path.clone(),
-            username: self.username.clone(),
-            password: self.password.clone(),
+    /// 连接测试参数：借用本结构字段，不做 clone 透传。
+    fn conn_params(&self) -> ConnParams<'_> {
+        ConnParams {
+            host: self.host.as_deref(),
+            base_path: self.base_path.as_deref(),
+            username: self.username.as_deref(),
+            password: self.password.as_deref(),
         }
     }
 }
@@ -64,13 +64,11 @@ pub async fn list_backends(state: State<'_, Arc<AppState>>) -> Result<Vec<Storag
 }
 
 /// 保存前测试后端的连通性/凭据（§3.8）。成功时返回 base 路径下的项数。在 `spawn_blocking` 运行
-/// （WebDAV 后端内部 block_on，不能套在异步运行时内）。
+/// （WebDAV 客户端内部 block_on，不能套在异步运行时内）。
 #[tauri::command]
 pub async fn test_backend(input: BackendInput) -> Result<usize> {
     tokio::task::spawn_blocking(move || -> Result<usize> {
-        let backend = build_backend(&input.to_config())?;
-        let entries = backend.list_dir("")?;
-        Ok(entries.len())
+        count_entries(&input.kind, &input.conn_params())
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?

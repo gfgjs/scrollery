@@ -30,7 +30,7 @@ impl Fixture {
         std::fs::create_dir_all(&root_a).unwrap();
         std::fs::create_dir_all(&root_b).unwrap();
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
         // 与既有 DB 测试同姿态：关外键，直接手工造目录/媒体行。
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         // 两个已登记卷：A 为「源卷」（可离线），B 为在线目标卷；volume_subpath 非空，

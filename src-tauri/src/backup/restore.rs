@@ -21,7 +21,8 @@ use crate::exotic::package::is_safe_relative_path;
 
 // ── 稳定错误码(方案 §9;透到 IPC `code` 供前端分流)────────────────────────────────
 pub const CODE_FORMAT_UNSUPPORTED: &str = "restore_format_unsupported";
-pub const CODE_SCHEMA_TOO_NEW: &str = "restore_schema_too_new";
+/// 备份库结构非当前格式:过旧与过新**一律不接受**,统一此稳定码(无 old/new 分支)。
+pub const CODE_SCHEMA_INCOMPATIBLE: &str = "restore_schema_incompatible";
 pub const CODE_CORRUPT: &str = "restore_corrupt";
 pub const CODE_PATH_INVALID: &str = "restore_path_invalid";
 pub const CODE_SIZE_LIMIT: &str = "restore_size_limit";
@@ -81,8 +82,6 @@ pub struct RestoreStageResult {
     pub staging_dir: String,
     /// 暂存库(迁移后)的 schema 版本(== runtime CURRENT_VERSION)。
     pub schema_version: u32,
-    /// 包内 schema 老于 runtime,已在暂存副本上迁移。
-    pub needs_migration: bool,
     pub kind: String,
     pub created_at_utc: String,
     pub counts: Counts,
@@ -137,9 +136,9 @@ pub fn restore_stage(
     let cleanup = StagingGuard(Some(staging.clone()));
     extract_and_verify(&mut archive, &manifest, &staging)?;
 
-    // 4. 暂存库校验(quick_check/foreign_key_check/schema 门)+ 老版迁移。
+    // 4. 暂存库校验(quick_check / foreign_key_check)+ 格式标识必须等于当前格式。
     let staged_db = staging.join(ENTRY_DB);
-    let (schema_version, needs_migration) = validate_and_migrate_staged_db(&staged_db)?;
+    let schema_version = validate_staged_db(&staged_db)?;
 
     // 5. §3.2 abs_path 跨机 rebase + 每行版本文件在包内交叉核对。
     let appdata_document_count =
@@ -157,7 +156,6 @@ pub fn restore_stage(
         backup_id: manifest.backup_id,
         staging_dir: staging.to_string_lossy().to_string(),
         schema_version,
-        needs_migration,
         kind: manifest.kind.file_infix().to_string(),
         created_at_utc: manifest.created_at_utc,
         counts,
@@ -328,31 +326,23 @@ fn copy_hashing(src: &mut impl Read, dst: &mut impl Write, declared: u64) -> Res
     Ok((total, crate::utils::hash::to_hex_lower(&hasher.finalize())))
 }
 
-/// 暂存库校验 + 老版迁移(方案 §6.1)。返回 (迁移后版本, 是否迁移过)。
-/// 包内版本新于本二进制 → `restore_schema_too_new`;老于 → 在暂存副本迁移后再 quick/fk check。
+/// 暂存库校验(方案 §6.1):quick_check / 外键检查 / **格式标识必须等于当前格式**。返回库内格式标识。
 ///
-/// TODO(审查 #10,加固,待独立处理):此处对**不可信**暂存库直接跑 `run_migrations`。恶意包可携
-/// 触发器/视图,在迁移 DML 期间执行攻击者 SQL(quick_check/fk_check 不覆盖此面)。稳健加固(受限
-/// 连接 DEFENSIVE/TRUSTED_SCHEMA、迁移前剥离非规范触发器/视图、或 schema 指纹比对)落在迁移关键
-/// 路径,可能破坏自家迁移或 FTS 影子表,须专门跑全迁移套件验证——故本轮不硬塞,留此显式记号。
-/// 利用门槛较高(用户须主动选攻击者的包)。
-fn validate_and_migrate_staged_db(staged_db: &Path) -> Result<(u32, bool)> {
+/// 包内格式与本程序当前格式不等(过旧或过新)→ CODE_SCHEMA_INCOMPATIBLE:不接受,也不在暂存副本上
+/// 做任何结构变更(没有迁移桥)。因此不再存在「对不可信暂存库跑迁移」的攻击面,原 TODO(审查 #10)
+/// 随迁移退役消失;quick_check / fk_check 仍对不可信包执行。
+fn validate_staged_db(staged_db: &Path) -> Result<u32> {
     let conn = Connection::open(staged_db).map_err(db_err)?;
     quick_check(&conn)?;
     foreign_key_check(&conn)?;
-    let pkg_version = crate::db::migration::read_schema_version(&conn);
-    let runtime = crate::db::migration::current_schema_version();
-    if pkg_version > runtime {
-        return Err(err(CODE_SCHEMA_TOO_NEW, "备份 schema 新于本程序"));
+    let pkg_version = crate::db::schema::read_schema_version(&conn);
+    if pkg_version != crate::db::schema::SCHEMA_VERSION {
+        return Err(err(
+            CODE_SCHEMA_INCOMPATIBLE,
+            "备份库结构非当前格式,请用当前版本重新导出备份",
+        ));
     }
-    let needs_migration = pkg_version < runtime;
-    if needs_migration {
-        crate::db::migration::run_migrations(&conn).map_err(|_| corrupt("暂存库迁移失败"))?;
-        quick_check(&conn)?;
-        foreign_key_check(&conn)?;
-    }
-    let final_version = crate::db::migration::read_schema_version(&conn);
-    Ok((final_version, needs_migration))
+    Ok(pkg_version)
 }
 
 fn quick_check(conn: &Connection) -> Result<()> {
@@ -498,7 +488,7 @@ mod tests {
         std::fs::create_dir_all(app_data).unwrap();
         let db_path = app_data.join("scrollery.db");
         let conn = Connection::open(&db_path).unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
         let item_id = 42i64;
         conn.execute(
             "INSERT INTO scan_roots (id, path, alias, is_hidden) VALUES (1, ?1, '照片库', 0)",
@@ -564,11 +554,7 @@ mod tests {
 
         let res = restore_stage(&pkg, &tgt_app).expect("restore_stage 应成功");
         assert_eq!(res.backup_id, "bk-rebase-1");
-        assert_eq!(
-            res.schema_version,
-            crate::db::migration::current_schema_version()
-        );
-        assert!(!res.needs_migration, "同版本包无需迁移");
+        assert_eq!(res.schema_version, crate::db::schema::SCHEMA_VERSION);
         assert_eq!(res.appdata_document_count, 1);
         assert_eq!(res.roots.len(), 1);
 
@@ -740,27 +726,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// schema 新于本二进制 → restore_schema_too_new(直接单测暂存库校验函数)。
+    /// 备份库格式非当前:过旧与过新走**同一条**拒绝路径 → 统一 restore_schema_incompatible,
+    /// 且拒绝路径绝不改动暂存库(不「修好」标识、不建结构)。直接单测暂存库校验函数。
     #[test]
-    fn staged_db_newer_schema_is_rejected() {
-        let root = unique_dir("toonew");
-        let db = root.join("scrollery.db");
-        let conn = Connection::open(&db).unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
-        // 把版本改成 runtime+1(伪装成更新的库)。
-        let too_new = crate::db::migration::current_schema_version() + 1;
-        conn.execute(
-            "UPDATE app_config SET value=?1 WHERE key='schema_version'",
-            params![too_new.to_string()],
-        )
-        .unwrap();
-        drop(conn);
+    fn staged_db_other_format_is_rejected() {
+        for bogus in [
+            crate::db::schema::SCHEMA_VERSION + 1,
+            crate::db::schema::SCHEMA_VERSION - 1,
+        ] {
+            let root = unique_dir("otherfmt");
+            let db = root.join("scrollery.db");
+            let conn = Connection::open(&db).unwrap();
+            crate::db::schema::initialize_schema(&conn).unwrap();
+            conn.execute(
+                "UPDATE app_config SET value=?1 WHERE key='schema_version'",
+                params![bogus.to_string()],
+            )
+            .unwrap();
+            drop(conn);
 
-        let e = validate_and_migrate_staged_db(&db);
-        match e {
-            Err(AppError::Restore { code, .. }) => assert_eq!(code, CODE_SCHEMA_TOO_NEW),
-            other => panic!("期望 restore_schema_too_new,得 {other:?}"),
+            match validate_staged_db(&db) {
+                Err(AppError::Restore { code, .. }) => {
+                    assert_eq!(code, CODE_SCHEMA_INCOMPATIBLE, "标识 {bogus}")
+                }
+                other => panic!("期望 restore_schema_incompatible(标识 {bogus}),得 {other:?}"),
+            }
+            // 拒绝路径不得「修好」标识,也不得建立任何结构。
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(crate::db::schema::read_schema_version(&conn), bogus);
+            drop(conn);
+            let _ = std::fs::remove_dir_all(&root);
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

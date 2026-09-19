@@ -150,7 +150,8 @@
   min-height: 32px;
   font-size: var(--font-size-sm);
   font-weight: 600;
-  color: var(--color-text-primary);
+  /* 组标题直接坐在画廊底上:取画廊底派生的正文色(显式 gallery 可与窗口底色反极性)。 */
+  color: var(--color-canvas-text);
   align-items: center;
   padding-left: 0;
   background: transparent;
@@ -180,11 +181,11 @@
   margin-left: calc(var(--spacing-sm) * -1);
   font-size: var(--font-size-xs);
   font-weight: 400;
-  color: var(--color-text-secondary);
+  color: var(--color-canvas-text-secondary);
 }
 
 :deep(.separator-icon) {
-  color: var(--color-text-secondary);
+  color: var(--color-canvas-text-secondary);
 }
 
 /* 重复组头(§6.1):复用 .separator-content 布局,仅补 h2 浏览器默认样式复位
@@ -249,7 +250,7 @@
   padding-left: 19px;
   font-size: var(--font-size-2xs);
   font-weight: 400;
-  color: var(--color-text-secondary);
+  color: var(--color-canvas-text-secondary);
 }
 
 /* 重复镜头组内位次角标(§6.2,M/N):右上角,scrim 底与 MediaThumb 徽标体系同源
@@ -561,15 +562,15 @@
   width: 44px;
   height: 44px;
   border-radius: 50%;
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   color: var(--color-text-primary);
   font-size: 20px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
   transition:
     background 0.2s,
     box-shadow 0.2s,
@@ -581,7 +582,7 @@
 .fab-btn:focus-visible {
   background: var(--color-bg-hover);
   opacity: 1;
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
 }
 
 /* 选择模式：抑制悬停缩放以避免与选择遮罩的视觉冲突 */
@@ -607,9 +608,9 @@
   font-size: var(--font-size-xs);
   color: var(--color-text-on-accent);
   background: var(--color-accent);
-  border: 1px solid var(--material-recipe-float-border-color);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
   opacity: 0;
   transition: opacity 120ms ease;
   will-change: transform;

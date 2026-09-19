@@ -4,6 +4,7 @@ import vue from '@vitejs/plugin-vue'
 import bundleBudget from './scripts/vite-plugin-bundle-budget.mjs'
 // @ts-expect-error 构建期脚本为 .mjs 无类型声明,仅在 Node 侧运行,不进产物
 import devCsp from './scripts/vite-plugin-dev-csp.mjs'
+import themeDefaultCssPlugin from './scripts/vite-plugin-theme-default-css'
 
 // @ts-expect-error process is a nodejs global
 // @ts-expect-error process 是一个 nodejs 全局变量
@@ -12,7 +13,8 @@ const host = process.env.TAURI_DEV_HOST
 // https://vite.dev/config/
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [vue(), bundleBudget(), devCsp()],
+  // themeDefaultCss:注入默认主题 CSS 并交付首帧脚本(与运行时同源,见插件头注)。
+  plugins: [themeDefaultCssPlugin(), vue(), bundleBudget(), devCsp()],
 
   build: {
     // 关掉 Rollup 的无差别体积告警,由 bundleBudget 插件的两条**可行动**不变量取代

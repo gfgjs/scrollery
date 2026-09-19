@@ -82,7 +82,7 @@
           class="tree-item sticky-item"
           :class="{ 'sticky-item--last': i === stickyRows.length - 1 }"
           :style="{ paddingLeft: node.depth * 16 + TREE_INDENT + 'px' }"
-          :title="node.relPath"
+          :title="dirTooltip(node)"
           @click="scrollTreeToNodeKey(node.nodeKey)"
         >
           <span class="tree-arrow" @click.stop="folderTree.toggleNode(node)">
@@ -95,7 +95,7 @@
             <span v-else class="tree-chevron-spacer" />
           </span>
           <span class="tree-icon"><Folder :size="15" /></span>
-          <span class="tree-label">{{ node.name }}</span>
+          <span class="tree-label">{{ dirLabel(node) }}</span>
           <span v-if="node.mediaCount !== null" class="tree-count">{{ node.mediaCount }}</span>
         </button>
       </div>
@@ -145,7 +145,7 @@
               <span v-else class="tree-chevron-spacer" />
             </span>
             <span class="tree-icon"><Folder :size="15" /></span>
-            <span class="tree-label" :title="row.node.relPath">{{ row.node.name }}</span>
+            <span class="tree-label" :title="dirTooltip(row.node)">{{ dirLabel(row.node) }}</span>
             <span v-if="row.node.mediaCount !== null" class="tree-count">{{
               row.node.mediaCount
             }}</span>
@@ -166,7 +166,7 @@
             }"
             :data-file-id="row.file.id"
             :style="{ paddingLeft: row.depth * 16 + TREE_INDENT + 'px' }"
-            :title="fileTitle(row.file)"
+            :title="fileTooltip(row.file)"
             @click="onFileClick(row.file, startIndex + i)"
             @dblclick="onFileDblClick(row.file)"
             @pointerdown="onFilePointerDown(row.file, $event)"
@@ -174,7 +174,7 @@
             <span class="file-icon"
               ><component :is="fileIcon(row.file.mediaType)" :size="14"
             /></span>
-            <span class="file-label">{{ row.file.fileName }}</span>
+            <span class="file-label">{{ fileLabel(row.file) }}</span>
             <Heart v-if="row.file.isFavorited" :size="11" class="file-fav" />
           </button>
 
@@ -365,7 +365,7 @@
       :style="{ left: ghost.x + 12 + 'px', top: ghost.y + 8 + 'px' }"
     >
       <Folder :size="13" />
-      <span class="drag-ghost__name">{{ ghost.label }}</span>
+      <span class="drag-ghost__name">{{ ghostLabel }}</span>
       <span class="drag-ghost__mode">{{ ghost.copy ? t('common.copy') : t('common.move') }}</span>
     </div>
   </Teleport>
@@ -422,6 +422,12 @@ import {
   TREE_OTHER_CATEGORY_DESCRIPTOR,
 } from '../../../constants/mediaCategoryDescriptors'
 import { openMediaRoute } from '../../../utils/mediaRoute'
+import {
+  demoFileAliasById,
+  demoFileAliasOfFile,
+  demoFolderAliasOfNode,
+} from '../../../utils/demoAlias'
+import { useDemoPrivacy } from '../../../composables/useDemoPrivacy'
 import { folderToPath } from '../../../utils/viewRoute'
 import {
   flattenFolderRows,
@@ -439,6 +445,9 @@ import { summarizeTreeCategories } from './treeCategoryMenu.helpers'
 defineProps<{ order: number }>()
 
 const ui = useUiStore()
+// 演示打码(2026-09-16):这里只接**显示出口**——行的名字、原生 title 路径、拖动浮标文案。
+// 真实 node.name / relPath / fileName 原样保留在数据里,点击、右键、拖拽、IPC 一律不受影响。
+const { demoPrivacyEnabled } = useDemoPrivacy()
 const viewStore = useViewStore()
 const treeFilter = useTreeFilterStore()
 const toast = useToastStore()
@@ -566,10 +575,40 @@ function onFileDblClick(file: DirFile) {
   )
 }
 
-// 文件行 tooltip:去状态化后的 fileTitle 纯函数需要 t,组件侧原样包一层保持模板调用签名不变。
-function fileTitle(file: DirFile): string {
-  return fileTitleImpl(file, t)
+// 文件行 tooltip(未打码时)在 fileTooltip 内直接走 fileTitleImpl:去状态化的纯函数需要 t,
+// 组件侧不再单独包一层(原 fileTitle 包装的调用点已全部由 fileTooltip 接管)。
+
+// ── 显示别名(演示打码)─────────────────────────────────────────────────────
+// 目录别名按 absPath 建键(absPath = scan root 路径 + relPath,与画廊分隔头、信息浮窗的目录
+// 显示路径同一口径),故同一目录在树/画廊/浮窗三处恒得同一个号。
+function dirLabel(node: DirNode): string {
+  return demoPrivacyEnabled.value ? demoFolderAliasOfNode(node) : node.name
 }
+function dirTooltip(node: DirNode): string {
+  return demoPrivacyEnabled.value ? demoFolderAliasOfNode(node) : node.relPath
+}
+function fileLabel(file: DirFile): string {
+  return demoPrivacyEnabled.value ? demoFileAliasOfFile(file) : file.fileName
+}
+function fileTooltip(file: DirFile): string {
+  return demoPrivacyEnabled.value ? demoFileAliasOfFile(file) : fileTitleImpl(file, t)
+}
+
+// 拖动浮标:打码态下换成同一别名。目录从 dragId 经实体索引取节点;文件只有 media id,
+// 回查该行已分配的别名文本(拿不到扩展名就不现场造号),查不到则退中性通用词。
+const ghostLabel = computed(() => {
+  if (!demoPrivacyEnabled.value) return ghost.value.label
+  const dirId = dragId.value
+  if (dirId != null) {
+    const node = nodesById.value.get(dirId)
+    return node ? demoFolderAliasOfNode(node) : t('demoPrivacy.aliasFolder')
+  }
+  const fileId = dragFileId.value
+  if (fileId != null) return demoFileAliasById(fileId) ?? t('demoPrivacy.aliasFile')
+  // 末尾不留原名:打码态下凡是要显示的幽灵文案都必须被替换,身份不明就给中性通用词
+  // (真实原点仍照常完成移动/复制——这里只改显示)。
+  return t('demoPrivacy.aliasFile')
+})
 
 // ── Tree node click / selection ─────────────────────────────────────────────
 // ── 树节点点击 / 选择 ─────────────────────────────────────────────────────────

@@ -85,8 +85,7 @@ describe('backupStore IPC 契约', () => {
     await store.restoreArm({
       backupId: 'abc',
       stagingDir: 'C:/app/restore-staging/abc',
-      schemaVersion: 21,
-      needsMigration: false,
+      schemaVersion: 34,
       kind: 'backup',
       createdAtUtc: '2026-07-19T00:00:00Z',
       counts: { items: 1, albums: 2, tags: 3, namedPersons: 4 },

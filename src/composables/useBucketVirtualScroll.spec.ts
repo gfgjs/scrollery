@@ -136,7 +136,6 @@ function makeHarness(init?: {
   /// 视口高(px):默认 1000(既有用例);高视口用例传 2160。
   viewportHeight?: number
 }) {
-  const enabled = ref(true)
   const version = ref(1)
   const totalHeight = ref(init?.totalHeight ?? 15_000)
   const canvas = ref(init?.canvasMode ?? false)
@@ -154,7 +153,6 @@ function makeHarness(init?: {
   const state = { useDeferred: init?.deferred ?? false, rowsToReturn: init?.rows ?? [] }
 
   const bs = useBucketVirtualScroll({
-    enabled: () => enabled.value,
     totalHeight: () => totalHeight.value,
     layoutVersion: () => version.value,
     fetchBucketRows: (s, e) => {
@@ -171,7 +169,7 @@ function makeHarness(init?: {
     canvasMode: () => canvas.value,
   })
 
-  return { bs, enabled, version, totalHeight, container, fetchCalls, pendingFetches, state, canvas }
+  return { bs, version, totalHeight, container, fetchCalls, pendingFetches, state, canvas }
 }
 
 describe('useBucketVirtualScroll:有界最新优先/丢弃/换代', () => {
@@ -299,26 +297,6 @@ describe('useBucketVirtualScroll:有界最新优先/丢弃/换代', () => {
     h.version.value = 2
     await nextTick()
     await flush()
-    expect(h.bs.segments.value[0].state).toBe('ready')
-  })
-
-  it('enabled=false → 段表清空、滚动不取数;重开 → 重建', async () => {
-    const h = makeHarness()
-    await flush()
-    expect(h.bs.segments.value.length).toBe(1)
-
-    h.enabled.value = false
-    await nextTick()
-    expect(h.bs.segments.value.length).toBe(0)
-    const calls = h.fetchCalls.length
-    h.bs.onScroll() // 休眠期滚动
-    await flush()
-    expect(h.fetchCalls.length).toBe(calls)
-
-    h.enabled.value = true
-    await nextTick()
-    await flush()
-    expect(h.bs.segments.value.length).toBe(1)
     expect(h.bs.segments.value[0].state).toBe('ready')
   })
 
@@ -477,15 +455,10 @@ describe('whenSettled', () => {
     expect(settled).toBe(true)
   })
 
-  it('引擎停用(愿望集清空)兑现等待者——引擎切换瞬间的 FLIP 不悬挂', async () => {
-    const h = makeHarness({ deferred: true })
+  it('无愿望段(空视图)兑现等待者——不悬挂', async () => {
+    const h = makeHarness({ totalHeight: 0 })
     let settled = false
     void h.bs.whenSettled().then(() => (settled = true))
-    await flush()
-    expect(settled).toBe(false)
-
-    h.enabled.value = false
-    await nextTick()
     await flush()
     expect(settled).toBe(true)
   })
@@ -689,5 +662,38 @@ describe('映射态(B3):段级坐标映射', () => {
     await h.bs.scrollToLogicalY(5000)
     expect(h.container.scrollTop).toBe(5000)
     expect(h.bs.anchorDelta.value).toBe(0)
+  })
+
+  // ── 长距恢复与换代几何(P22 单引擎收敛后的必要表征)─────────────────────────
+
+  it('映射态长距恢复:scrollToLogicalY(缓存逻辑位)落点与逻辑位自洽,愿望窗口即达目标段', async () => {
+    const h = makeHarness({ totalHeight: 40_000_000 })
+    await flush()
+    // 模拟 scrollCache 恢复链:进入画廊直接跳到远端的缓存逻辑位。
+    const saved = 35_000_000
+    await h.bs.scrollToLogicalY(saved)
+    expect(h.bs.logicalScrollTop.value).toBe(saved)
+    // 物理落点 + 锚差 = 逻辑位(段级映射的落点自洽性)。
+    expect(h.container.scrollTop + h.bs.anchorDelta.value).toBeCloseTo(saved, 5)
+    // 视口起点必须被某个已愿望段覆盖,否则恢复后首帧是空洞。
+    const covering = h.bs.segments.value.find((s) => s.start <= saved && s.end > saved)
+    expect(covering).toBeDefined()
+    expect(covering!.start).toBeLessThanOrEqual(saved)
+  })
+
+  it('换代总高缩水回非映射态:anchorDelta 归零、spacer 随新几何(不越界)', async () => {
+    const h = makeHarness({ totalHeight: 40_000_000 })
+    await flush()
+    h.container.scrollTop = 8_000_000
+    h.bs.onScroll() // 比例重锚 → 锚差非零
+    expect(h.bs.anchorDelta.value).toBeGreaterThan(0)
+
+    // 布局换代:总高缩回非映射区间(< 16M spacer 上限)。
+    h.totalHeight.value = 15_000
+    h.version.value++
+    await nextTick()
+    await flush()
+    expect(h.bs.anchorDelta.value).toBe(0)
+    expect(h.bs.spacerHeight.value).toBe(15_000)
   })
 })

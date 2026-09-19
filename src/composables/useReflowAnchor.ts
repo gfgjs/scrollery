@@ -22,9 +22,7 @@ export interface ReflowAnchorDeps {
   activeRows: () => LayoutRow[]
   currentLogicalY: () => number
   getViewKey: () => string
-  bucketActive: () => boolean
   scrollToLogicalY: (y: number) => Promise<void>
-  logicalToPhysical: (y: number) => number
 }
 
 export function useReflowAnchor(deps: ReflowAnchorDeps) {
@@ -70,18 +68,11 @@ export function useReflowAnchor(deps: ReflowAnchorDeps) {
     const anchor = pendingAnchor
     try {
       const y = await invokeIpc<number | null>(IPC.GET_ITEM_Y_BY_ID, { itemId: anchor.id })
-      const el = deps.gridRef()
-      if (y !== null && el) {
+      if (y !== null && deps.gridRef()) {
         const targetY = Math.max(0, y - anchor.screenOffset)
-        if (deps.bucketActive()) {
-          // bucket:统一入口(B3 映射态重锚自处理);缓存存逻辑 y(映射态物理位不自足)。
-          await deps.scrollToLogicalY(targetY)
-          scrollCache.set(deps.getViewKey(), targetY)
-        } else {
-          const physY = deps.logicalToPhysical(targetY)
-          el.scrollTop = physY
-          scrollCache.set(deps.getViewKey(), physY)
-        }
+        // 统一入口(B3 映射态重锚自处理);缓存存逻辑 y(映射态物理位不自足)。
+        await deps.scrollToLogicalY(targetY)
+        scrollCache.set(deps.getViewKey(), targetY)
         return true
       }
     } catch (e) {

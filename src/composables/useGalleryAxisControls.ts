@@ -22,7 +22,8 @@ export function useGalleryAxisControls() {
   const showRenderModeDebug =
     import.meta.env.DEV && localStorage.getItem('scrollery.debug.renderMode') === '1'
   // DOM↔Canvas 渲染引擎偏好(画廊 + 时间轴)提升至 useRenderMode 共享单例,与设置页「实验性」开关
-  // 同源——设置改动 live 生效、无需刷新;dev 药丸(showRenderModeDebug 门控)仍可快切。仍 localStorage 持久。
+  // 同源——设置改动 live 生效、无需刷新;dev 药丸(showRenderModeDebug 门控)仍可快切。
+  // 存储(设置集中保存,批次B):两项偏好存 config.toml(gallery_render_mode / timeline_render_mode)。
   // canvas 是原型:galleryRenderMode='canvas' 时若 canvasCapable 不满足(iOS/超大库)仍自动回退 DOM(见 canvasMode)。
   const { galleryRenderMode, timelineRenderMode, setGalleryRenderMode, setTimelineRenderMode } =
     useRenderMode()

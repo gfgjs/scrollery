@@ -157,7 +157,7 @@ pub fn run_backup(p: &BackupParams, cancel: &CancellationToken) -> Result<Backup
     if !super::dbread::integrity_ok(&sconn).map_err(db_io)? {
         return Err(err(CODE_IO, "备份快照完整性校验未通过"));
     }
-    let schema_version = crate::db::migration::read_schema_version(&sconn);
+    let schema_version = crate::db::schema::read_schema_version(&sconn);
     let counts = super::dbread::read_counts(&sconn).map_err(db_io)?;
     let roots = super::dbread::read_roots(&sconn).map_err(db_io)?;
     let external_document_versions = super::dbread::read_external_count(&sconn).map_err(db_io)?;
@@ -522,7 +522,8 @@ mod tests {
         std::fs::create_dir_all(app_data).unwrap();
         let db_path = app_data.join("scrollery.db");
         let conn = Connection::open(&db_path).unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
+
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); // 免造 media_items 满列行
 
         conn.execute(
@@ -649,7 +650,7 @@ mod tests {
         assert_eq!(manifest.kind, BackupKind::Manual);
         assert_eq!(
             manifest.schema_version,
-            crate::db::migration::current_schema_version(),
+            crate::db::schema::SCHEMA_VERSION,
             "schema 版本须运行时读,等于当前"
         );
         assert_eq!(manifest.external_document_versions, 1, "external 版本计数");

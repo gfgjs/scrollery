@@ -25,7 +25,7 @@ export interface PluginEntitlement {
   pluginId: string
   /** 折叠后的可用态（平台 / 版本 / 安装 / 授权门控结果）。 */
   availability: Availability
-  /** 授权来源渠道（'direct' / 'free'，后续 'ms_store' / 'steam'），取自后端 EntitlementProvider。 */
+  /** 授权来源渠道（'direct' = keyring 直销 / 'free' = 未授权回退桩），取自后端 EntitlementProvider。 */
   sourceTag: string
   /** 付费插件的 sku（免费 / 无 sku 插件为 null）。 */
   sku: string | null

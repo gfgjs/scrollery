@@ -1,7 +1,6 @@
 import {
   Sun,
   Globe,
-  Layers,
   Type,
   Maximize,
   XSquare,
@@ -81,35 +80,13 @@ export const SETTINGS_MAP = {
     descKey: 'settings.themeDesc',
     section: 'general',
     control: 'select',
-    // 特例行:设置页控件为下方 ThemePicker;select 声明仅供侧栏钉住区 compact 控件使用。
+    // 特例行:设置页控件为下方 ThemeSettings;select 声明仅供侧栏钉住区 compact 控件使用。
     customRow: true,
     options: [
       { value: 'system', labelKey: 'settings.themeSystem' },
       { value: 'light', labelKey: 'settings.themeLight' },
       { value: 'dark', labelKey: 'settings.themeDark' },
     ],
-  },
-  // 主题色浓度(2026-09-06):底色 wash token 的 color-mix 缩放,100=满浓度出厂锚点,
-  // 默认 60(用户反馈出厂偏深,默认即调浅);调小底色越接近中性。见 src/themes/strength.ts。
-  themeTintStrength: {
-    icon: Palette,
-    label: 'settings.themeTintStrength',
-    descKey: 'settings.themeTintStrengthDesc',
-    section: 'general',
-    control: 'number',
-    min: 0,
-    max: 100,
-  },
-  // 文字浓度(2026-09-06):文字 ramp 的 color-mix 缩放,100=满浓度出厂文字色,默认 75
-  // (用户反馈出厂文字对比过强);调小文字越接近底色、观感越柔。见 src/themes/strength.ts。
-  themeTextStrength: {
-    icon: Type,
-    label: 'settings.themeTextStrength',
-    descKey: 'settings.themeTextStrengthDesc',
-    section: 'general',
-    control: 'number',
-    min: 40,
-    max: 100,
   },
   language: {
     icon: Globe,
@@ -123,76 +100,8 @@ export const SETTINGS_MAP = {
     ],
   },
   // 窗口材质(毛玻璃,2026-08-24):仅 Windows 生效(Rust 侧 DWM 背板,与 uiStore
-  // applyWindowMaterial 的 css 层配对)。mica 采样壁纸(Win10 自动退化 blur)、
-  // acrylic 实时透出窗口背后内容(拖动可能卡顿)、none 不透明(观感与现状逐像素一致)。
-  windowMaterial: {
-    icon: Layers,
-    label: 'settings.windowMaterial',
-    descKey: 'settings.windowMaterialDesc',
-    section: 'general',
-    control: 'select',
-    options: [
-      { value: 'mica', labelKey: 'settings.windowMaterialMica' },
-      { value: 'acrylic', labelKey: 'settings.windowMaterialAcrylic' },
-      { value: 'none', labelKey: 'settings.windowMaterialNone' },
-    ],
-  },
-  glassChromeOpacity: {
-    icon: Layers,
-    label: 'settings.glassChromeOpacity',
-    descKey: 'settings.glassChromeOpacityDesc',
-    section: 'general',
-    control: 'number',
-    min: 20,
-    max: 120,
-  },
-  glassStickyOpacity: {
-    icon: Layers,
-    label: 'settings.glassStickyOpacity',
-    descKey: 'settings.glassStickyOpacityDesc',
-    section: 'general',
-    control: 'number',
-    min: 20,
-    max: 120,
-  },
-  glassSurfaceOpacity: {
-    icon: Layers,
-    label: 'settings.glassSurfaceOpacity',
-    descKey: 'settings.glassSurfaceOpacityDesc',
-    section: 'general',
-    control: 'number',
-    min: 20,
-    max: 120,
-  },
-  glassControlOpacity: {
-    icon: Layers,
-    label: 'settings.glassControlOpacity',
-    descKey: 'settings.glassControlOpacityDesc',
-    section: 'general',
-    control: 'number',
-    min: 20,
-    max: 120,
-  },
-  // 内容底面缩放(2026-09-06):文字密集视图根(设置/收藏/人物/插件商店/文档阅读器)
-  // 的承重面,基准约 90% 主题色;120 起 color-mix 钳到全不透明(调大=更实)。
-  glassContentOpacity: {
-    icon: Layers,
-    label: 'settings.glassContentOpacity',
-    descKey: 'settings.glassContentOpacityDesc',
-    section: 'general',
-    control: 'number',
-    min: 20,
-    max: 120,
-  },
-  glassGalleryOpacity: {
-    icon: Layers,
-    label: 'settings.glassGalleryOpacity',
-    descKey: 'settings.glassGalleryOpacityDesc',
-    section: 'general',
-    control: 'number',
-    min: 0,
-    max: 100,
-  },
+  // 窗口材质、不透明度与两套配色同属一份主题草稿,控件在 ThemeSettings 内整体呈现;
+  // 旧窗口玻璃浓度项(glass*Opacity)随浓度模型一并删除,不再在注册表登记。
   uiFontSize: {
     icon: Type,
     label: 'settings.uiFontSize',
@@ -297,13 +206,6 @@ export const SETTINGS_MAP = {
     icon: Play,
     label: 'settings.hoverAutoplay',
     descKey: 'settings.hoverAutoplayDesc',
-    section: 'general',
-    control: 'toggle',
-  },
-  bucketScroll: {
-    icon: Rows3,
-    label: 'settings.bucketScroll',
-    descKey: 'settings.bucketScrollDesc',
     section: 'general',
     control: 'toggle',
   },
@@ -528,7 +430,7 @@ export const SETTINGS_MAP = {
 
   /* ── 开发者工具 debug(非破坏性诊断项)──────────────────────── */
   // 画廊 / 时间轴 DOM↔Canvas 渲染引擎(实验性):canvas 为原型,超大库 / iOS 会自动回退 DOM。
-  // 状态经 useRenderMode 共享单例(localStorage 持久),切换 live 生效。
+  // 状态经 useRenderMode 共享单例(存 config.toml),切换 live 生效。
   performancePanel: {
     icon: Gauge,
     label: 'settings.performancePanel',
@@ -625,8 +527,8 @@ export const SETTINGS_MAP = {
   },
   clearSettings: {
     icon: Settings,
-    label: 'settings.clearSettings',
-    descKey: 'settings.clearSettingsDesc',
+    label: 'settings.resetSettings',
+    descKey: 'settings.resetSettingsDesc',
     section: 'danger',
     control: 'button',
   },

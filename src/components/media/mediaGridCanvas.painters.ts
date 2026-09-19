@@ -320,6 +320,7 @@ export interface LensFolderHeaderLines {
  * 文件夹头(§7.2/§11.2,canvas 对齐 DOM MediaGridRow 的 h3 分支):簇首三行(簇头行/路径行/
  * 三桶统计行)、其余两行;行内 sticky 只钳文字 y,不铺底板(标题行与画廊底融合,2026-09-12
  * 用户裁决);内容高于 36px 行盒时 clampStickyLabelY 自然回退为随行滚动(与 DOM sticky 行为一致)。
+ * demoLabel(2026-09-16 演示打码):非空时替换路径行文本(路径行的 separatorLabel 是目录显示路径)。
  */
 export function drawLensFolderSeparator(
   ctx: CanvasRenderingContext2D,
@@ -327,6 +328,7 @@ export function drawLensFolderSeparator(
   sy: number,
   palette: Palette,
   lines: LensFolderHeaderLines | null,
+  demoLabel?: string | null,
 ) {
   const padX = 8
   const iconSize = 13
@@ -353,7 +355,7 @@ export function drawLensFolderSeparator(
   drawSeparatorIcon(ctx, padX, y + 1, iconSize, 'folder', palette)
   ctx.font = '600 12px system-ui, -apple-system, sans-serif'
   ctx.fillStyle = palette.textPrimary
-  ctx.fillText(row.separatorLabel, padX + iconSize + iconGap, y + pathLineH / 2 + 1)
+  ctx.fillText(demoLabel ?? row.separatorLabel, padX + iconSize + iconGap, y + pathLineH / 2 + 1)
   y += pathLineH
   // 统计行(§7.2 第二行):三桶文案,左缩进对齐路径文本,次要色弱化层级。
   if (lines) {
@@ -372,14 +374,19 @@ export function drawSeparator(
   count?: number,
   lensFolder?: LensFolderHeaderLines | null,
   lensGroupLabel?: string | null,
+  /** 演示打码(2026-09-16):非空时替换路径类标签(folder 分组 / 镜头文件夹头的显示路径)。 */
+  demoLabel?: string | null,
 ) {
   // 文件夹头(folders 镜头)独立分支:两/三行结构,与通用单行分隔符不同构。
   if (row.separatorKind === 'duplicateFolder') {
-    drawLensFolderSeparator(ctx, row, sy, palette, lensFolder ?? null)
+    drawLensFolderSeparator(ctx, row, sy, palette, lensFolder ?? null, demoLabel ?? null)
     return
   }
   const isDupGroup = row.separatorKind === 'duplicateGroup'
-  const label = isDupGroup ? lensGroupLabel ?? row.separatorLabel : row.separatorLabel
+  // 组头标签是结构化数字文本(不含路径),不受演示打码影响;路径类标签才走 demoLabel。
+  const label = isDupGroup
+    ? (lensGroupLabel ?? row.separatorLabel)
+    : (demoLabel ?? row.separatorLabel)
   const iconSize = 16
   const gap = 8
   const contentH = 20

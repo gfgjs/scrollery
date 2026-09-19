@@ -32,9 +32,9 @@
 // 与方案 A 行级每帧补偿的本质区别:1:1 路径零干预,重锚只发生在拖动/远跳/停稳这些
 // 低频或本就非连续的事件上。
 //
-// 与方案 A 的关系:双引擎并存(ui.bucketSegmentedScroll,B0-B3.2 真机验收后**默认开**),
-// 各自 enabled() 互斥激活,运行时即切即生效(T16 评估文档 §5 迁移策略);方案 A 保留为
-// 回退引擎(设置关闭即回退)。
+// 与方案 A 的关系:P22 收敛后本引擎是画廊唯一虚拟滚动实现(方案 A 线性平移引擎及其
+// enabled 开关已删)——其 SAFE_MAX 平移态由本引擎的 B3 段级映射态覆盖,且本引擎额外覆盖
+// 滚轮/键盘/触摸的输入源分类。
 
 import {
   shallowRef,
@@ -163,8 +163,6 @@ export function desiredSegmentRange(
 }
 
 interface UseBucketVirtualScrollOptions {
-  /// 双引擎互斥开关:false 时本引擎休眠(段表清空、取数泵停转)。
-  enabled: () => boolean
   totalHeight: () => number
   /// 布局版本:变化即换代重建段表,在途应答按代/按对象丢弃。
   layoutVersion: () => number
@@ -299,7 +297,6 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// B3:逻辑位 = scrollTop + anchorDelta;远跳时 scrollTop 尚未落位,经 logicalOverride
   /// 显式传入目标逻辑位。
   function syncDesired(force = false, logicalOverride?: number) {
-    if (!opts.enabled()) return
     const el = opts.containerRef()
     if (!el) return
     const logicalTop = logicalOverride ?? el.scrollTop + anchorDelta.value
@@ -399,7 +396,6 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
    * 连续横扫最多积压 2 个请求，其中任一落定后都会重新挑当前最近段，不追历史队列。
    */
   function pumpFetch() {
-    if (!opts.enabled()) return
     while (true) {
       const limit = activeFetches.size === 0 || hasActiveDesiredFetch() ? 1 : 2
       if (activeFetches.size >= limit) return
@@ -542,7 +538,6 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// 以 1:1 继续滚到真正的逻辑边缘(修复真机「到边一跳一跳还能继续滚」:旧的钉边立即偿债
   /// 在手势中改 scrollTop,与拖拽/惯性互搏)。永不 preventDefault,对原生滚动零干预。
   function onWheel(e: WheelEvent) {
-    if (!opts.enabled()) return
     oneToOneUntil = Date.now() + ONE_TO_ONE_STICKY_MS
     const g = geometry()
     if (!g.mapped) return
@@ -571,14 +566,12 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
 
   /// 宿主 @keydown 转发入口(B3.1):滚动键盖 1:1 印记(与滚轮同权)。
   function onKeydown(e: KeyboardEvent) {
-    if (!opts.enabled()) return
     if (ONE_TO_ONE_KEYS.has(e.key)) oneToOneUntil = Date.now() + ONE_TO_ONE_STICKY_MS
   }
 
   /// 宿主 @touchmove.passive 转发入口(B3.1):触屏平移盖 1:1 印记(平移中持续刷新,
   /// 抬指后的惯性滚动由手势链续接分类)。
   function onTouchmove() {
-    if (!opts.enabled()) return
     oneToOneUntil = Date.now() + ONE_TO_ONE_STICKY_MS
   }
 
@@ -626,29 +619,8 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     return out
   }
 
-  // 开关翻转 / 布局换代 → 重建或清空段表。immediate:挂载时若开关已开(持久化配置)即建。
-  watch(
-    () => [opts.enabled(), opts.layoutVersion()] as const,
-    ([on]) => {
-      if (!on) {
-        generation++
-        desired.clear()
-        lastRangeKey = ''
-        anchorDelta.value = 0
-        lastP = 0
-        lastScrollTs = -Infinity
-        oneToOneUntil = -Infinity
-        gestureOneToOne = false
-        scrollVelocityPxMs = 0
-        lastVelocityTs = 0
-        publish()
-        flushSettled() // 空愿望集 = 已稳定,释放等待者(如引擎切换瞬间的 FLIP)
-        return
-      }
-      rebuild()
-    },
-    { immediate: true },
-  )
+  // 布局换代 → 重建段表。immediate:挂载时即按当前视口建段(生产唯一形态)。
+  watch(() => opts.layoutVersion(), rebuild, { immediate: true })
 
   // Canvas 模式翻转(一键切换 DOM↔Canvas)按新边距**即时**重算愿望窗口:否则可能出现
   // 「位图想预取 1.25 屏、行数据只到 1000px」的旧窗残留,要等下一次滚动才补齐(S3 的

@@ -19,13 +19,13 @@ mod exotic_seed_gate_tests {
            "platforms":[],"min_host_version":"0.1.0","distribution":"builtin"},
           {"plugin_id":"exotic-image-psd","name":"PSD","media_kind":"image","formats":["psd"],
            "capabilities":["thumbnail"],"license_tier":"paid","sku":"psd-engine-2026",
-           "platforms":[],"min_host_version":"0.1.0"},
+           "platforms":[],"min_host_version":"0.1.0","worker_id":"psd-worker"},
           {"plugin_id":"exotic-raw","name":"RAW","media_kind":"image","formats":["cr2"],
            "capabilities":["thumbnail"],"license_tier":"free",
-           "platforms":[],"min_host_version":"0.1.0","distribution":"builtin"},
+           "platforms":[],"min_host_version":"0.1.0","distribution":"builtin","worker_id":"raw-worker"},
           {"plugin_id":"video-extended","name":"VIDEO","media_kind":"video","formats":["rmvb"],
            "capabilities":["thumbnail"],"license_tier":"free",
-           "platforms":[],"min_host_version":"0.1.0","distribution":"builtin"}
+           "platforms":[],"min_host_version":"0.1.0","distribution":"builtin","worker_id":"video-worker"}
         ]}"#;
         CatalogSnapshot::parse(json).expect("fixture catalog 应可解析")
     }
@@ -94,7 +94,7 @@ mod finalize_tests {
     /// 内存库 + 一个 scan_root(id=1)/目录(id=10)/卷=5，一项在线媒体(id=100，未在 seen)。
     fn db_with_one_missing_candidate() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1');
@@ -181,7 +181,7 @@ mod dir_baseline_tests {
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
 
         let mut c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, ?1, 'R')",
@@ -229,7 +229,7 @@ mod dir_baseline_tests {
     #[test]
     fn set_directory_media_counts_overwrites() {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
@@ -277,7 +277,7 @@ mod quick_scan_tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, ?1, 'R')",
@@ -421,7 +421,7 @@ mod quick_scan_tests {
             .unwrap();
 
         let mut c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, ?1, 'R')",
@@ -564,7 +564,7 @@ mod quick_scan_tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         let mut c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, ?1, 'R')",
@@ -635,7 +635,7 @@ mod p1_4_freshness_tests {
     /// 内存库 + scan_root(id=1) 指向 `root`。FK 关闭：本域不构造卷/父目录链（与既有扫描测试同款）。
     fn db_for_root(root: &Path) -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, ?1, 'R')",

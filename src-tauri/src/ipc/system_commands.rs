@@ -197,13 +197,66 @@ pub async fn log_frontend_events(events: Vec<FrontendLogEvent>) -> Result<()> {
     Ok(())
 }
 
-/// 明确退出应用程序。
+/// 前端回报一次设置 flush 的结果(设计 §5.4 的退出协议)。
+///
+/// 后端在退出或关窗前向全部存活窗口发 settings-flush-requested 事件,前端把在途设置提交与写盘
+/// 结束后调本命令回执。request_id 用于丢弃迟到或跨轮次的回执;ok 为 false 表示有设置未保存成功,
+/// 后端据此保留窗口并让用户选择重试或明确放弃,不假装已保存。
 #[tauri::command]
-pub async fn exit_app(app: tauri::AppHandle) {
+pub async fn settings_flush_done(window: tauri::WebviewWindow, request_id: String, ok: bool) {
+    if !crate::lifecycle::acknowledge_settings_flush(window.label(), &request_id, ok) {
+        tracing::debug!(
+            request_id,
+            ok,
+            "收到过时或未知的设置 flush 回执,已丢弃 | stale settings flush ack ignored"
+        );
+    }
+}
+
+/// 明确退出应用程序。
+///
+/// 语义(设计 §5.4):**不再直接退出** —— 先等前端在途设置提交与后端窗口待保存几何落盘,成功才
+/// 真正退出。写盘失败时返回稳定错误码,窗口保持可用,由前端提示「重试 / 放弃未保存修改并退出」;
+/// 用户明确放弃时带 force 参数再调一次即可退出。前端失联(没有窗口能回执)时不阻塞退出,与关闭
+/// 路径的既有取舍一致。
+#[tauri::command]
+pub async fn exit_app(app: tauri::AppHandle, force: Option<bool>) -> Result<()> {
+    if force.unwrap_or(false) {
+        tracing::info!(
+            "exit_app(force):用户已确认放弃未保存设置,直接退出 | exiting without waiting for settings flush"
+        );
+        // 先置「本次退出已允许」:随后的 ExitRequested 必须放行,不能再拦下一次(那会让「放弃」
+        // 变成又一轮 flush + 确认框)。
+        crate::lifecycle::allow_exit();
+        app.exit(0);
+        return Ok(());
+    }
+
+    // 退出前把前端在途提交与后端自持的窗口待保存几何一起结清(失败批次会还原,不丢值)。
+    if !crate::lifecycle::flush_settings_before_exit(&app)
+        .await
+        .saved
+    {
+        tracing::warn!(
+            "exit_app:设置尚未保存成功,已保留待保存值并拒绝退出 | settings not saved yet, exit refused"
+        );
+        // 稳定码 settings_flush_failed 供前端分流成「重试 / 放弃未保存修改并退出」两个动作;
+        // message 是固定面向用户文案,不透传内部异常串(硬约束)。
+        return Err(AppError::Config {
+            code: "settings_flush_failed",
+            message:
+                "部分设置尚未保存成功,可重试或放弃未保存的修改 | some settings could not be saved"
+                    .to_string(),
+        });
+    }
+
     tracing::info!(
         "exit_app called from frontend, terminating process. | 前端调用了 exit_app，正在终止进程。"
     );
+    // 同上:已明确退出,先允许再请求,避免 ExitRequested 再拦一次。
+    crate::lifecycle::allow_exit();
     app.exit(0);
+    Ok(())
 }
 
 /// 隐藏主窗口（最小化到托盘）。

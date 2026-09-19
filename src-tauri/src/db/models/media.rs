@@ -215,18 +215,3 @@ pub struct VideoMeta {
     pub rotation: i64,
     pub has_audio: bool,
 }
-
-// ── 搜索结果 ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchResult {
-    pub id: i64,
-    pub file_name: String,
-    pub media_type: String,
-    pub width: i64,
-    pub height: i64,
-    pub thumb_path: Option<String>,
-    pub thumbhash: Option<Vec<u8>>,
-    pub thumb_status: i64,
-}

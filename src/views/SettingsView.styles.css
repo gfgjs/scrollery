@@ -152,10 +152,10 @@
   max-height: min(480px, 60vh);
   overflow-y: auto;
   padding: var(--spacing-xs);
-  border: 1px solid var(--material-recipe-float-border-color);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  background: var(--material-recipe-float-background-color);
-  box-shadow: var(--material-recipe-float-box-shadow);
+  background: var(--color-bg-elevated);
+  box-shadow: var(--shadow-lg);
 }
 
 .settings-search-result {
@@ -406,7 +406,7 @@
   padding: 0 var(--spacing-sm);
   border: 1px solid color-mix(in srgb, var(--color-error) 45%, var(--color-border));
   border-radius: var(--radius-lg);
-  background: var(--material-recipe-surface-background-color);
+  background: var(--color-bg-surface);
 }
 
 .settings-section :deep(.settings-card__info) {

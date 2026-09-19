@@ -96,6 +96,11 @@ pub enum CatalogError {
     #[error("offering {0} 的 capabilities 为空")]
     EmptyCapabilities(String),
     #[error(
+        "offering {0} 声明 thumbnail 能力但缺 worker_id（或为空串）：外部 Catalog 边界拒绝,\
+不静默落默认映射;OCR/Enhance 等无 thumbnail 的 offering 不受此约束"
+    )]
+    ThumbnailWithoutWorkerId(String),
+    #[error(
         "offering {0} 声明 override_common=true（该权限只存在于主程序内置审核表，客户端拒绝）"
     )]
     OverrideCommonNotAllowed(String),
@@ -132,12 +137,6 @@ struct RawOffering {
     override_common: bool,
     #[serde(default)]
     store_url: Option<String>,
-    /// 多渠道预留(T13/§3.11):MS Store 商品 ID(Part8 MsStoreProvider 消费)。
-    #[serde(default)]
-    store_product_id: Option<String>,
-    /// 多渠道预留(T13/§3.11):Steam DLC AppID(展示;分发面在 RegistryEntry)。
-    #[serde(default)]
-    steam_dlc_app_id: Option<u32>,
     /// 分发形态(D-OCR-5):`"builtin"` = 无安装包,`availability_of` 跳过安装态门直接验 license;
     /// 缺省/其它值按常规 package 处理。
     #[serde(default)]
@@ -166,10 +165,6 @@ pub struct CatalogOffering {
     /// 授权 SKU（§5.2）；None=无 SKU（不可验签）。
     pub sku: Option<String>,
     pub store_url: Option<String>,
-    /// 多渠道预留(T13/§3.11):MS Store 商品 ID;旧 catalog 无此字段 → None。
-    pub store_product_id: Option<String>,
-    /// 多渠道预留(T13/§3.11):Steam DLC AppID(展示;分发面在 RegistryEntry)。
-    pub steam_dlc_app_id: Option<u32>,
     /// builtin offering(D-OCR-5):无安装包,`availability_of` 跳过安装态门直接验 license。
     pub builtin: bool,
     /// 运行期调度信息:worker 握手期望的 worker_id。None 表示不进入 exotic 调度。
@@ -232,6 +227,19 @@ impl CatalogSnapshot {
             if off.capabilities.is_empty() {
                 return Err(CatalogError::EmptyCapabilities(off.plugin_id));
             }
+            // 外部 Catalog 边界的唯一校验点(P17):thumbnail 能力的 worker_id 必须显式声明。
+            // Coordinator 只消费显式值(不再有 PSD/RAW/video 硬编码 fallback),故缺失时必须在
+            // 加载/解析边界明确失败——否则该 offering 会静默退出调度、缩略图无产出且无错误。
+            // OCR/Enhance 这类独立服务不在 task 队列(host 直持 supervisor),允许 None。
+            let declares_thumbnail = off.capabilities.contains(&Capability::Thumbnail);
+            let has_worker_id = off
+                .worker_id
+                .as_deref()
+                .map(|w| !w.trim().is_empty())
+                .unwrap_or(false);
+            if declares_thumbnail && !has_worker_id {
+                return Err(CatalogError::ThumbnailWithoutWorkerId(off.plugin_id));
+            }
 
             let builtin = match off.distribution.as_deref() {
                 Some("builtin") => true,
@@ -277,8 +285,6 @@ impl CatalogSnapshot {
                 min_host_version: off.min_host_version,
                 sku: off.sku,
                 store_url: off.store_url,
-                store_product_id: off.store_product_id,
-                steam_dlc_app_id: off.steam_dlc_app_id,
                 builtin,
                 worker_id: off.worker_id,
                 uses_gpu: off.uses_gpu.unwrap_or(false),
@@ -451,9 +457,9 @@ mod tests {
     fn reject_duplicate_format() {
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"a","name":"A","media_kind":"image","formats":["psd"],
-           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"},
+           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0","worker_id":"w"},
           {"plugin_id":"b","name":"B","media_kind":"image","formats":["psd"],
-           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"}
+           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0","worker_id":"w"}
         ]}"#;
         assert!(matches!(
             CatalogSnapshot::parse(json),
@@ -465,7 +471,7 @@ mod tests {
     fn reject_invalid_format() {
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"a","name":"A","media_kind":"image","formats":["PSD"],
-           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"}
+           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0","worker_id":"w"}
         ]}"#;
         assert!(matches!(
             CatalogSnapshot::parse(json),
@@ -480,7 +486,7 @@ mod tests {
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"exotic-image-raw","name":"RAW","media_kind":"image","formats":["cr2"],
            "capabilities":["thumbnail"],"license_tier":"free","platforms":[],
-           "min_host_version":"0.1.0","distribution":"builtin"}
+           "min_host_version":"0.1.0","distribution":"builtin","worker_id":"raw-worker"}
         ]}"#;
         let snap = CatalogSnapshot::parse(json).expect("builtin 叠加 offering 应放行");
         let off = snap.resolve_format("cr2").expect("cr2 应可解析到 offering");
@@ -494,7 +500,7 @@ mod tests {
         // 装机插件模型(如 PSD)不受本次豁免影响。
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"a","name":"A","media_kind":"image","formats":["cr2"],
-           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"}
+           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0","worker_id":"w"}
         ]}"#;
         assert!(matches!(
             CatalogSnapshot::parse(json),
@@ -526,7 +532,7 @@ mod tests {
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"video-extended","name":"VIDEO","media_kind":"video","formats":["rmvb","vob"],
            "capabilities":["thumbnail"],"license_tier":"free","platforms":[],
-           "min_host_version":"0.1.0","distribution":"builtin"}
+           "min_host_version":"0.1.0","distribution":"builtin","worker_id":"video-worker"}
         ]}"#;
         let snap = CatalogSnapshot::parse(json).expect("builtin video 叠加 offering 应放行");
         for ext in ["rmvb", "vob"] {
@@ -562,7 +568,7 @@ mod tests {
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"a","name":"A","media_kind":"image","formats":["psd"],
            "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],
-           "min_host_version":"0.1.0","override_common":true}
+           "min_host_version":"0.1.0","override_common":true,"worker_id":"w"}
         ]}"#;
         assert!(matches!(
             CatalogSnapshot::parse(json),
@@ -577,7 +583,7 @@ mod tests {
             let json = format!(
                 r#"{{"schema":1,"sequence":1,"offerings":[
                   {{"plugin_id":"a","name":"A","media_kind":"image","formats":["{fmt}"],
-                   "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"}}
+                   "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0","worker_id":"w"}}
                 ]}}"#
             );
             assert!(
@@ -599,11 +605,52 @@ mod tests {
         ));
     }
 
+    /// P17 边界锁:thumbnail 能力的 worker_id 必须在 **Catalog 解析**这一外部输入边界显式给出
+    /// (缺失/空串 → 整表拒绝,不静默落任何默认映射);无 thumbnail 的独立服务(OCR/Enhance)允许 None。
+    #[test]
+    fn thumbnail_offering_requires_explicit_worker_id() {
+        let bad_suffixes = [
+            // 缺字段
+            "\"license_tier\":\"paid\",\"platforms\":[],\"min_host_version\":\"0.1.0\"",
+            // 空串
+            "\"license_tier\":\"paid\",\"platforms\":[],\"min_host_version\":\"0.1.0\",\"worker_id\":\"\"",
+            // 纯空白
+            "\"license_tier\":\"paid\",\"platforms\":[],\"min_host_version\":\"0.1.0\",\"worker_id\":\"  \"",
+        ];
+        for suffix in bad_suffixes {
+            let json = format!(
+                r#"{{"schema":1,"sequence":1,"offerings":[
+                  {{"plugin_id":"a","name":"A","media_kind":"image","formats":["psd"],
+                   "capabilities":["thumbnail"],{suffix}}}
+                ]}}"#
+            );
+            assert!(
+                matches!(
+                    CatalogSnapshot::parse(&json),
+                    Err(CatalogError::ThumbnailWithoutWorkerId(_))
+                ),
+                "thumbnail offering 缺显式 worker_id 必须拒绝整表:{suffix}"
+            );
+        }
+
+        // 无 thumbnail 能力 → 允许缺 worker_id(OCR/Enhance 由 host 直持 supervisor,不进 task 队列)。
+        let json = r#"{"schema":1,"sequence":1,"offerings":[
+          {"plugin_id":"exotic-ocr","name":"OCR","media_kind":"image","formats":["ocr"],
+           "capabilities":["text"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"}
+        ]}"#;
+        let off = CatalogSnapshot::parse(json)
+            .expect("无 thumbnail 的 offering 不要求 worker_id")
+            .resolve_format("ocr")
+            .cloned()
+            .expect("ocr 应可解析");
+        assert!(off.worker_id.is_none());
+    }
+
     #[test]
     fn reject_invalid_plugin_id() {
         let json = r#"{"schema":1,"sequence":1,"offerings":[
           {"plugin_id":"Bad_ID","name":"A","media_kind":"image","formats":["psd"],
-           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0"}
+           "capabilities":["thumbnail"],"license_tier":"paid","platforms":[],"min_host_version":"0.1.0","worker_id":"w"}
         ]}"#;
         assert!(matches!(
             CatalogSnapshot::parse(json),

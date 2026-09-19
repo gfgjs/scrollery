@@ -10,9 +10,9 @@
     </UiIconButton>
     <!-- 三态循环 亮→暗→跟随系统(P2 修复:原二态循环使 system 从此处不可达)。
          图标显示当前模式本身(Sun=亮/Moon=暗/Monitor=跟随系统),而非"将切换到"的目标。 -->
-    <UiIconButton :label="$t('sidebar.toggleTheme')" @click="ui.cycleAppearance()">
-      <Sun v-if="ui.appearance === 'light'" :size="18" />
-      <Moon v-else-if="ui.appearance === 'dark'" :size="18" />
+    <UiIconButton :label="$t('sidebar.toggleTheme')" @click="theme.cycleAppearance()">
+      <Sun v-if="theme.appearance === 'light'" :size="18" />
+      <Moon v-else-if="theme.appearance === 'dark'" :size="18" />
       <Monitor v-else :size="18" />
     </UiIconButton>
   </div>
@@ -21,10 +21,11 @@
 <script setup lang="ts">
 import { Settings, Sun, Moon, Monitor } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useUiStore } from '../../stores/uiStore'
+import { useThemeStore } from '../../stores/themeStore'
 import UiIconButton from '../ui/UiIconButton.vue'
 
-const ui = useUiStore()
+// 外观模式归主题域(与主题参数、材质同一份偏好),不再经 uiStore 转发。
+const theme = useThemeStore()
 const route = useRoute()
 const router = useRouter()
 

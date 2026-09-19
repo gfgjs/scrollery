@@ -32,10 +32,8 @@ use crate::state::AppState;
 
 /// 首发唯一插件 + 能力（Part2）。
 pub const PSD_PLUGIN_ID: &str = "exotic-image-psd";
-const PSD_WORKER_ID: &str = "psd-worker";
 /// RAW 图像缩略图解码插件（builtin 叠加豁免，见 catalog.rs CommonFormatConflict 例外）。
 pub const RAW_PLUGIN_ID: &str = "exotic-image-raw";
-const RAW_WORKER_ID: &str = "raw-worker";
 /// 视频格式扩展插件（builtin+free，design.md §4.1）。**Service 型 worker**：remux/转码/
 /// 缩略图均由 host 侧 `VideoWorkerService` 直持 supervisor（同 OCR/Enhance 先例，§2.1）。
 ///
@@ -123,31 +121,19 @@ pub(crate) struct PluginDescriptor {
     pub uses_gpu: bool,
 }
 
-/// 运行注册表(Part6 §3.3:Catalog + 运行时支持信息构建)。capabilities 取自
-/// Catalog(权威);worker_id/uses_gpu 是运行时支持信息,Catalog 与插件 manifest
-/// 尚无此数据(Part8 扩展 manifest 字段后改为全数据驱动)。ai/face worker 化
-/// descriptor 随 T15 加入。新插件加入 = 在 Catalog 中声明 worker_id/uses_gpu，调度代码无需再改。
+/// 运行注册表(Part6 §3.3):capabilities/worker_id/uses_gpu 全部取自 Catalog 的显式声明
+/// (单一事实来源;P17 起无 Rust 侧硬编码 fallback)。新插件加入 = 在 Catalog 中声明
+/// worker_id/uses_gpu，调度代码无需再改。
 fn plugin_descriptors(snap: &crate::exotic::catalog::CatalogSnapshot) -> Vec<PluginDescriptor> {
-    // 运行注册表改为优先读取 Catalog 里显式声明的 worker_id/uses_gpu：
-    // 新插件只要在 catalog 中声明 worker_id 即可被调度，不必再改这段 Rust 注册表。
-    // 兼容旧 catalog：PSD/RAW/video-extended 仍保留内置 fallback，避免老数据/测试断链。
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (_, off) in snap.iter_formats() {
         if !seen.insert(off.plugin_id.clone()) {
             continue;
         }
-        let worker_id = off
-            .worker_id
-            .clone()
-            .or_else(|| match off.plugin_id.as_str() {
-                PSD_PLUGIN_ID => Some(PSD_WORKER_ID.to_string()),
-                RAW_PLUGIN_ID => Some(RAW_WORKER_ID.to_string()),
-                VIDEO_PLUGIN_ID => Some(VIDEO_WORKER_ID.to_string()),
-                _ => None,
-            });
-        let Some(worker_id) = worker_id else {
-            // 未声明 worker_id 的 offering 不进入 exotic 调度（如 OCR/Enhance 独立服务）。
+        let Some(worker_id) = off.worker_id.clone() else {
+            // 未声明 worker_id 的 offering 不进入 exotic 调度:OCR/Enhance 等独立服务由 host 侧
+            // 直持 supervisor,本就不走任务队列——属正常形态,非坏数据。
             continue;
         };
         out.push(PluginDescriptor {
@@ -610,7 +596,7 @@ mod tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c
     }
@@ -621,10 +607,7 @@ mod tests {
     fn mem_config() -> crate::config::ConfigManager {
         let dir = tempfile::tempdir().unwrap().keep();
         let path = dir.join("config.toml");
-        let conn = mem_db();
-        crate::config::ConfigManager::load_or_init(path, &conn)
-            .unwrap()
-            .0
+        crate::config::ConfigManager::load_or_init(path).unwrap().0
     }
 
     /// 平台无关 Catalog 夹具(2026-07-05 Linux CI 面):本组测试验证 coordinator 的
@@ -638,7 +621,8 @@ mod tests {
                 "plugin_id":"exotic-image-psd","name":"PSD 图像引擎","media_kind":"image",
                 "formats":["psd"],"capabilities":["thumbnail"],"license_tier":"paid",
                 "sku":"psd-engine-2026","platforms":["{}"],"min_host_version":"0.1.0",
-                "override_common":false,"store_url":"https://example.invalid/plugins/psd"}}]}}"#,
+                "override_common":false,"store_url":"https://example.invalid/plugins/psd",
+                "worker_id":"psd-worker"}}]}}"#,
             crate::exotic::current_target_triple()
         );
         Arc::new(CatalogStore::with_snapshot(
@@ -662,6 +646,12 @@ mod tests {
         let descs = plugin_descriptors(&store.snapshot());
         // PSD + RAW + video-extended(rmvb/vob 缩略图收编,D-444③)三项。
         assert_eq!(descs.len(), 3);
+        assert!(
+            !descs
+                .iter()
+                .any(|d| d.plugin_id == "exotic-ocr" || d.plugin_id == "exotic-enhance"),
+            "未声明 worker_id 的 offering(OCR/Enhance 独立服务)不得生成 descriptor"
+        );
         let d = descs
             .iter()
             .find(|d| d.plugin_id == PSD_PLUGIN_ID)

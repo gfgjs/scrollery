@@ -201,7 +201,7 @@ async function main() {
     })
     const availParam =
       scenario === 'offline' || scenario === 'missing' ? `&availRatio=${availRatio}` : ''
-    const url = `${DEV_ORIGIN}/?ui-harness=gallery&items=${items}&rowHeight=${rowHeight}&bucket=1${
+    const url = `${DEV_ORIGIN}/?ui-harness=gallery&items=${items}&rowHeight=${rowHeight}${
       SCENARIO_URL_PARAMS[scenario]
     }${availParam}`
     await S('Page.navigate', { url })

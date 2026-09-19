@@ -52,7 +52,6 @@ export interface RestoreStageResult {
   backupId: string
   stagingDir: string
   schemaVersion: number
-  needsMigration: boolean
   kind: BackupKind
   createdAtUtc: string
   counts: BackupCounts

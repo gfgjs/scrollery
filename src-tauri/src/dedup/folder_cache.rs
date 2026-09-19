@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn cache_reuses_same_identity_and_rebuilds_on_version_change() {
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
         let cache = DedupFolderStatsCache::new();
         let first = cache.get_or_build(&conn, 1, 1, 1, false, false).unwrap();
         let second = cache.get_or_build(&conn, 1, 1, 1, false, false).unwrap();

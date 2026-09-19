@@ -61,12 +61,6 @@ const router = createRouter({
       meta: { title: 'sidebar.plugins' },
     },
     {
-      // 旧独立重复页退役(2026-09-02 方案 §4.3):兼容重定向进主画廊 groups 镜头,旧书签仍可达。
-      // 不设 component/meta——afterEach 以重定向后的目标路由(/)解析标题,自然走 routes.allMedia。
-      path: '/duplicates',
-      redirect: { path: '/', query: { duplicates: 'groups' } },
-    },
-    {
       // 设置属于页面级信息架构，不再由全局 boolean 伪装成全屏 modal。
       path: '/settings/:section?',
       component: () => import('../views/SettingsView.vue'),

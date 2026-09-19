@@ -53,12 +53,12 @@ const ocr = useOcr()
   max-height: 60vh;
   display: flex;
   flex-direction: column;
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   color: var(--color-text-primary);
   z-index: 20;
   overflow: hidden;

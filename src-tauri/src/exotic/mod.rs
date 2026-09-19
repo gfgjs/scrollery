@@ -9,7 +9,6 @@
 //! 本卷（Part1）**不**启动 Worker、不下载、不验签。
 
 pub mod catalog;
-pub mod channel_stubs;
 pub mod coordinator;
 pub mod crypto;
 pub mod fetch;
@@ -37,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::connection::DbPool;
 pub use catalog::{Capability, CatalogOffering, CatalogSnapshot, CatalogStore, MediaKind};
-use channel_stubs::FreeStubEntitlement;
 pub use crypto::VerifyingKeyset;
+use license::FreeStubEntitlement;
 pub use license::{EntitlementProvider, LicenseStatus};
 pub use task::{ExoticTaskRow, ExoticTaskStatus};
 
@@ -113,9 +112,6 @@ pub struct InstalledPluginRecord {
     pub install_state: String,
     pub installed_at: i64,
     pub updated_at: i64,
-    /// 安装来源渠道(T13 多渠道预留):direct / steam_depot / store_bundled(现恒 direct;
-    /// 与 DB `entitlement_source` 列同值域,见 installer::InstallSource)。
-    pub entitlement_source: String,
 }
 
 /// 安装状态常量（与 DB `exotic_plugins.install_state` 列一致）。
@@ -213,7 +209,8 @@ pub struct PluginEntitlement {
     pub plugin_id: String,
     /// 折叠后的可用态（平台 / 版本 / 安装 / 授权门控结果）。
     pub availability: Availability,
-    /// 授权来源渠道（"direct" / "free"，后续 "ms_store" / "steam"），取自 [`EntitlementProvider::source_tag`]。
+    /// 授权来源渠道（`"direct"` = keyring 直销 / `"free"` = fail-closed 回退桩），
+    /// 取自 [`EntitlementProvider::source_tag`]。
     pub source_tag: String,
     /// 付费插件的 sku（免费 / 无 sku 插件为 None）。
     pub sku: Option<String>,
@@ -223,10 +220,7 @@ pub struct PluginEntitlement {
 
 /// 组合根 · 授权 provider 装配点（Part6 §3.9 **唯一 swap 点**）。
 ///
-/// **Part7-T12 渠道工厂化**:分发渠道 feature(互斥,lib.rs compile_error! 守卫)在编译期决定
-/// provider 家族——msstore/steam 现为 fail-closed 骨架桩(恒 Unlicensed,见 [`channel_stubs`]),
-/// 真实 StoreContext/DLC ownership 归 Part8 D5-D8;direct 走下方 keyring 直销装配。
-/// §3.6.2 的 DRM 物理排除因此有了工厂侧的选择点。
+/// 当前唯一渠道 = 直销(direct),即下方 keyring 装配(空渠道 msstore/steam 已删,P16 2026-09-15)。
 ///
 /// direct = keyring 直销验签([`license::KeyringLicenseStore`]) + 信任根公钥集
 /// ([`trusted_keyset`]——registry 与 license 共用同一集,验签路径不分叉)。
@@ -251,13 +245,6 @@ pub(crate) fn trusted_keyset() -> Result<VerifyingKeyset, crypto::CryptoError> {
 }
 
 pub fn default_entitlement_provider() -> Arc<dyn EntitlementProvider> {
-    #[cfg(feature = "channel-msstore")]
-    return Arc::new(channel_stubs::MsStoreEntitlementStub);
-
-    #[cfg(feature = "channel-steam")]
-    return Arc::new(channel_stubs::SteamEntitlementStub);
-
-    #[cfg(feature = "channel-direct")]
     match trusted_keyset() {
         Ok(ks) => Arc::new(license::KeyringLicenseStore::new(Arc::new(ks))),
         Err(e) => {
@@ -550,7 +537,7 @@ mod tests {
             r#"{{"schema":1,"sequence":1,"offerings":[
               {{"plugin_id":"exotic-image-psd","name":"PSD","media_kind":"image","formats":["psd"],
                "capabilities":["thumbnail"],"license_tier":"paid","sku":"psd-engine-2026",
-               "platforms":["{}"],"min_host_version":"0.1.0"}}
+               "platforms":["{}"],"min_host_version":"0.1.0","worker_id":"psd-worker"}}
             ]}}"#,
             current_target_triple()
         );
@@ -568,7 +555,6 @@ mod tests {
             install_state: state.into(),
             installed_at: 1,
             updated_at: 1,
-            entitlement_source: "direct".into(),
         }
     }
 
@@ -777,17 +763,11 @@ mod tests {
         );
     }
 
-    /// 组合根装配冒烟:按渠道 feature 断言 source_tag——direct = keyring 直销(内置 keyset 可解析;
-    /// 解析失败会降级 FreeStubEntitlement 使标签变 "free",故本断言同时锁住 fail-closed 回退面),
-    /// msstore/steam = fail-closed 骨架桩。渠道 feature 互斥(lib.rs compile_error!),三选一。
+    /// 组合根装配冒烟:直销 provider 的 source_tag = "direct"(内置 keyset 可解析;解析失败会降级
+    /// FreeStubEntitlement 使标签变 "free",故本断言同时锁住 fail-closed 回退面)。
     #[test]
-    fn default_provider_matches_channel_feature() {
+    fn default_provider_is_direct() {
         let p = default_entitlement_provider();
-        #[cfg(feature = "channel-msstore")]
-        assert_eq!(p.source_tag(), "ms_store");
-        #[cfg(feature = "channel-steam")]
-        assert_eq!(p.source_tag(), "steam");
-        #[cfg(feature = "channel-direct")]
         assert_eq!(p.source_tag(), "direct");
     }
 

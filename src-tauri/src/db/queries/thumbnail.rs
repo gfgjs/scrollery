@@ -234,7 +234,7 @@ mod reset_by_evicted_paths_tests {
 
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -545,7 +545,7 @@ mod update_thumb_result_tests {
 
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -714,7 +714,7 @@ mod cover_thumb_pipeline_tests {
     /// 建 schema + 覆盖各流水线归属的 item/派生行。
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -838,7 +838,7 @@ mod cover_thumb_pipeline_tests {
             .unwrap();
 
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(&format!(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -902,7 +902,7 @@ mod hidden_root_pipeline_tests {
     /// root1(dir10)可见、root2(dir20)待隐。
     fn two_roots_pending() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r1'), (20, 2, '', 'r2');

@@ -6,7 +6,6 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 // 跨域定向引用(§4.3):选区分批口径由 selection owner(layout)定义。
 use super::layout::SELECTION_BATCH_CHUNK;
-use super::scan::EXCLUDE_HIDDEN_ROOTS;
 use crate::db::models::{AppStats, ImageMeta, MediaDetail, MediaItem, MediaMeta, VideoMeta};
 use crate::error::{AppError, Result};
 use crate::utils::path::resolve_media_path;
@@ -91,7 +90,7 @@ mod duplicate_media_item_tests {
     #[allow(clippy::type_complexity)]
     fn copies_user_and_content_fields_but_resets_location_fields() {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES
@@ -450,7 +449,7 @@ mod playback_position_tests {
     #[test]
     fn set_playback_position_roundtrip_stores_value_as_given() {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'd');
@@ -548,64 +547,13 @@ pub fn restore_items(conn: &Connection, item_ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
-pub fn get_trash(conn: &Connection, offset: i64, limit: i64) -> Result<Vec<MediaItem>> {
-    // 隐藏根排除(V21):回收站画廊实际走 ViewScope::Trash(layout,已排除),本函数当前无前端
-    // 调用方——但 IPC `get_trash` 仍注册,口径对齐防将来接线时泄漏(与 get_app_stats 的
-    // total_deleted 同口径:隐藏根的回收站项不可见)。
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, directory_id, file_name, file_size, file_mtime, file_format,
-                media_type, width, height, duration_ms, sort_datetime, cache_key,
-                thumb_status, thumb_path, thumbhash, is_favorited, is_deleted,
-                deleted_at, rating, is_live_photo, has_embedded_video, companion_of,
-                content_hash, created_at, updated_at, color_label, view_rotation,
-                playback_position_ms, source_revision
-         FROM media_items WHERE is_deleted=1 {EXCLUDE_HIDDEN_ROOTS}
-         ORDER BY deleted_at DESC, id DESC
-         LIMIT ?1 OFFSET ?2"
-    ))?;
-    let rows = stmt.query_map(params![limit, offset], map_media_item)?;
-    rows.map(|r| r.map_err(AppError::from)).collect()
-}
-
-/// 回收站 keyset seek 翻页（取代 OFFSET：百万行 `OFFSET 1e6` 要扫过百万行，keyset 恒定 <5ms）。
-/// `cursor` = 上一页**最后一项**的 `(deleted_at, id)`，首页传 `None`；复合序 `(deleted_at DESC, id DESC)`，
-/// 走 `idx_media_trash`。SQLite 行值比较 `(a,b) < (c,d)` 原生支持。
-/// 注：回收站项的 `deleted_at` 在软删时即写入（非空），故 keyset 比较不需 COALESCE（保索引可用）。
-pub fn get_trash_keyset(
-    conn: &Connection,
-    cursor: Option<(i64, i64)>,
-    limit: i64,
-) -> Result<Vec<MediaItem>> {
-    // has_cursor=0 时 OR 短路放行全部（首页）；=1 时按行值游标 seek 下一页。
-    let (cur_da, cur_id, has_cursor): (i64, i64, i64) = match cursor {
-        Some((da, id)) => (da, id, 1),
-        None => (0, 0, 0),
-    };
-    // 隐藏根排除(V21):同 get_trash(死路径口径对齐)。
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, directory_id, file_name, file_size, file_mtime, file_format,
-                media_type, width, height, duration_ms, sort_datetime, cache_key,
-                thumb_status, thumb_path, thumbhash, is_favorited, is_deleted,
-                deleted_at, rating, is_live_photo, has_embedded_video, companion_of,
-                content_hash, created_at, updated_at, color_label, view_rotation,
-                playback_position_ms, source_revision
-         FROM media_items
-         WHERE is_deleted = 1 {EXCLUDE_HIDDEN_ROOTS}
-           AND (?1 = 0 OR (deleted_at, id) < (?2, ?3))
-         ORDER BY deleted_at DESC, id DESC
-         LIMIT ?4"
-    ))?;
-    let rows = stmt.query_map(params![has_cursor, cur_da, cur_id, limit], map_media_item)?;
-    rows.map(|r| r.map_err(AppError::from)).collect()
-}
-
 #[cfg(test)]
 mod source_revision_mapping_tests {
     use super::*;
 
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -621,66 +569,10 @@ mod source_revision_mapping_tests {
     }
 
     #[test]
-    fn media_and_trash_mappings_keep_source_revision() {
+    fn media_mapping_keeps_source_revision() {
         let c = seeded();
 
         assert_eq!(get_media_item(&c, 1).unwrap().source_revision, 7);
-        assert_eq!(get_trash(&c, 0, 10).unwrap()[0].source_revision, 8);
-        assert_eq!(
-            get_trash_keyset(&c, None, 10).unwrap()[0].source_revision,
-            8
-        );
-    }
-}
-
-// ── 隐藏根排除(V21 回收站死路径)──────────────────────────────────────────────
-// get_trash/get_trash_keyset 当前无前端调用方(回收站画廊走 ViewScope::Trash 经 layout
-// 排除),但 IPC 仍注册——口径对齐防将来接线泄漏,并与 get_app_stats.total_deleted 一致。
-#[cfg(test)]
-mod hidden_root_trash_tests {
-    use super::super::scan::set_scan_root_hidden;
-    use super::*;
-
-    fn two_roots_trashed() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES
-                 (10, 1, '', 'r1'), (20, 2, '', 'r2');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, is_deleted, deleted_at) VALUES
-                 (1, 10, 'a.jpg', 1, 1, 'jpg', 'image', 0, 0, 100, 0, 1, 500),
-                 (2, 20, 'b.jpg', 1, 1, 'jpg', 'image', 0, 0, 200, 0, 1, 600);",
-        )
-        .unwrap();
-        c
-    }
-
-    #[test]
-    fn trash_listings_exclude_hidden_root() {
-        let c = two_roots_trashed();
-        let ids = |v: Vec<MediaItem>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
-        assert_eq!(ids(get_trash(&c, 0, 10).unwrap()), vec![2, 1]);
-        assert_eq!(ids(get_trash_keyset(&c, None, 10).unwrap()), vec![2, 1]);
-
-        set_scan_root_hidden(&c, 2, true).unwrap();
-        assert_eq!(
-            ids(get_trash(&c, 0, 10).unwrap()),
-            vec![1],
-            "OFFSET 版排隐藏根"
-        );
-        assert_eq!(
-            ids(get_trash_keyset(&c, None, 10).unwrap()),
-            vec![1],
-            "keyset 版排隐藏根"
-        );
-
-        set_scan_root_hidden(&c, 2, false).unwrap();
-        assert_eq!(
-            ids(get_trash_keyset(&c, None, 10).unwrap()),
-            vec![2, 1],
-            "unhide 恢复"
-        );
     }
 }
 
@@ -766,63 +658,6 @@ pub fn get_item_cache_key(conn: &Connection, item_id: i64) -> Result<Option<i64>
     .map_err(AppError::from)
 }
 
-#[cfg(test)]
-mod trash_keyset_tests {
-    use super::*;
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
-        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); // 免构造 directory 链
-        c
-    }
-
-    fn add_trashed(c: &Connection, id: i64, deleted_at: i64) {
-        c.execute(
-            "INSERT INTO media_items
-                (id, directory_id, file_name, file_size, file_mtime, file_format,
-                 media_type, width, height, sort_datetime, cache_key, is_deleted, deleted_at)
-             VALUES (?1, 1, ?2, 0, 0, 'jpg', 'image', 0, 0, 0, 0, 1, ?3)",
-            params![id, format!("{id}.jpg"), deleted_at],
-        )
-        .unwrap();
-    }
-
-    /// keyset 逐页拼接 == 全量 (deleted_at DESC, id DESC) 序，无重叠无遗漏；同 deleted_at 时 id 次键生效。
-    #[test]
-    fn keyset_pages_match_full_order() {
-        let c = mem_db();
-        add_trashed(&c, 1, 100);
-        add_trashed(&c, 2, 100); // 与 id=1 同 deleted_at → 靠 id 次键定序
-        add_trashed(&c, 3, 200);
-        add_trashed(&c, 4, 50);
-        // 期望 (deleted_at DESC, id DESC)：(200,3),(100,2),(100,1),(50,4) → [3,2,1,4]
-        let expected = vec![3i64, 2, 1, 4];
-
-        // 基线：一页取全。
-        let all = get_trash_keyset(&c, None, 100).unwrap();
-        assert_eq!(
-            all.iter().map(|m| m.id).collect::<Vec<_>>(),
-            expected,
-            "全量序错"
-        );
-
-        // size=2 keyset 翻页。
-        let mut got = Vec::new();
-        let mut cursor: Option<(i64, i64)> = None;
-        loop {
-            let page = get_trash_keyset(&c, cursor, 2).unwrap();
-            if page.is_empty() {
-                break;
-            }
-            let last = page.last().unwrap();
-            cursor = Some((last.deleted_at.unwrap_or(0), last.id));
-            got.extend(page.iter().map(|m| m.id));
-        }
-        assert_eq!(got, expected, "keyset 逐页拼接应等于全量序，无重叠无遗漏");
-    }
-}
-
 /// T18 S3：`expand_companions` + soft-delete/restore 的 Live Photo companion 连带（D5 孤儿 bug 修复）。
 #[cfg(test)]
 mod companion_expand_tests {
@@ -831,7 +666,7 @@ mod companion_expand_tests {
     /// seed：id1 静图 + id2 其 companion(companion_of=1) + id3 独立项。FK OFF 免构造目录链。
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c.execute_batch(
             "INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, companion_of)
@@ -929,7 +764,7 @@ mod r2_6_query_tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         // root1 → A(顶层) → A/B(子);C(顶层,无子)。
         c.execute_batch(

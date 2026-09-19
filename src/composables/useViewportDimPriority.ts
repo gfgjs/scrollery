@@ -7,8 +7,9 @@
 // 锚定不跳。
 //
 // 无模板耦合、不向外漏 state：自持去重集 requestedDimIds + 定时器 + 在途标志，仅靠注入的
-// visibleRows / isScrolling（输入）与 recompute / refresh（回调）工作，resetKey 变化（切视图）
-// 时清去重集。故是真解耦的 feature 抽取，而非耦合搬运。
+// visibleRows / isScrolling（输入）与 recompute（回调）工作，resetKey 变化（切视图）时清去重集。
+// 故是真解耦的 feature 抽取，而非耦合搬运。补全尺寸后的行回填由布局换代（layoutVersion）
+// 驱动引擎重建段表，本 feature 不需另开刷新缝。
 
 import { watch, type Ref } from 'vue'
 import type { LayoutRow } from '../types/layout'
@@ -23,8 +24,6 @@ interface UseViewportDimPriorityOptions {
   isScrolling: Ref<boolean>
   /** 补全尺寸后重算布局（使占位项贴回正确比例）。 */
   recompute: () => Promise<void>
-  /** 重算后刷新可视窗口。 */
-  refresh: () => void
   /** 视图标识 getter；变化（切文件夹/相册）即清去重集，允许新视图重新测量。 */
   resetKey: () => unknown
 }
@@ -66,7 +65,6 @@ export function useViewportDimPriority(opts: UseViewportDimPriorityOptions) {
       const measured = await invokeIpc<number>(IPC.PRIORITIZE_DIMENSIONS, { itemIds: ids })
       if (measured > 0) {
         await opts.recompute()
-        opts.refresh()
       }
     } catch (e) {
       for (const id of ids) requestedDimIds.delete(id) // allow a later retry | 允许之后重试

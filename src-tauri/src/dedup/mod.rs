@@ -3,7 +3,6 @@
 //! 该模块由 crate 根公开接线，调用方可直接使用这里 re-export 的 API。
 //! `utils::hash::content_fingerprint` 仍然保留其扫描变更指纹语义，不在此模块中复用。
 
-pub mod folder;
 pub mod folder_cache;
 pub mod hash;
 pub mod task;

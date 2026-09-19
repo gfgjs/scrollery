@@ -38,8 +38,7 @@
 // 进度用 "cfi:<epubcfi>" 前缀（epub 及 txt 合成 book 的 foliate 原生 CFI 均走此路，存量兼容）。
 //
 // 已交付：epub（R2-2，真机验平价）；txt 经 SyntheticBook 入统一管线（R2-4，textSource prop）。
-// 待做：md 感知分章（R2-4b）；loc1 canonical 精密重锚（跨字号/重排/简繁仍精准）；fraction 页脚
-// /scrolled 双流/TOC 面板（R2-3）；排版/主题注入（R2-5）。
+// 待做：md 感知分章（R2-4b）；fraction 页脚/scrolled 双流/TOC 面板（R2-3）；排版/主题注入（R2-5）。
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ChevronLeft, ChevronRight } from '@lucide/vue'
@@ -57,16 +56,14 @@ import { relayKeyboardEvents, relayPointerMoves } from '../../utils/keyRelay'
 import { denyScriptResources } from '../../utils/epubScriptGate'
 import { notifyPointerFromFrame } from '../../composables/useChromeReveal'
 import { highlightMarkdownHtml, isDarkColor } from '../../utils/shikiHighlight'
-import { resolveTokenColor } from '../../utils/cssColor'
 import {
   buildReaderCSS,
   type ReaderColors,
   type ReaderFontFamily,
   type ReaderTextAlign,
 } from '../../utils/readerStyles'
-import { getTheme } from '../../themes/registry'
 import { getReaderTheme, READER_THEME_FOLLOW } from '../../themes/readerThemes'
-import { useUiStore } from '../../stores/uiStore'
+import { useThemeStore } from '../../stores/themeStore'
 import type { TextBookIndex, TextChapterContent, ZhConvertConfig } from '../../types/reader'
 import type {
   FoliateView,
@@ -81,7 +78,7 @@ const props = defineProps<{
   url?: string
   /** txt 文本源（R2-4）：提供时构造 SyntheticBook 走统一管线，优先于 url。版本/编码在后端 seam 解析，前端只认 itemId。 */
   textSource?: { itemId: number; isMarkdown: boolean; reflow?: boolean }
-  /** 上次阅读位置（"cfi:<cfi>" 或旧 txt 的 "scroll:<ratio>"；loc1 精密重锚为后续增强）。 */
+  /** 上次阅读位置（"cfi:<cfi>"）。 */
   initial: string | null
   /** 替换规则函数（§5.2）；每章文档载入后对其文本节点就地应用。 */
   replacer?: (t: string) => string
@@ -149,7 +146,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const ui = useUiStore()
+const theme = useThemeStore()
 
 const hostEl = ref<HTMLElement | null>(null)
 const curlEl = ref<HTMLElement | null>(null)
@@ -286,25 +283,20 @@ watch(
   () => startAutoScroll(),
 )
 
-// 读当前 app 主题的正文/背景色（iframe 不继承 app 的 CSS 变量，须解析后内联进注入 CSS）。
+// 读当前 app 主题的正文/背景色(iframe 不继承 app 的 CSS 变量,须内联进注入 CSS)。
+// 直接取主题生成的当前色板:它与写入 DOM 的 --color-* 同源,无需再回读 computed style,
+// 也不再受浓度表达式影响(浓度已收归生成函数)。
 function readThemeColors(): ReaderColors {
-  return {
-    // 文字是含 var() 的 color-mix 浓度表达式(2026-09-06 文字浓度),与底色一样须解成
-    // 具体色再内联——注入 iframe 的 CSS 解析不到 app 的 --theme-text-scale。
-    text: resolveTokenColor(document.body, '--color-text-primary', '#1a1a1a'),
-    // 底色是含 var() 的 color-mix 浓度表达式(2026-09-06):必须解成具体色再内联——
-    // 注入 iframe 的 CSS 解析不到 app 的 --theme-tint-scale,直接写会落满浓度与宿主底色不一致。
-    background: resolveTokenColor(document.body, '--color-bg-primary', '#ffffff'),
-  }
+  const palette = theme.currentPalette
+  return { text: palette.textPrimary, background: palette.background }
 }
 
 // 解析生效的阅读颜色（R3）：据 app 当前明暗择日/夜槽 → 每书覆盖（kind 相符才生效）→ 落到阅读主题色；
 // FOLLOW/未知一律回落 app 颜色（= readThemeColors，与 R2 行为逐像素一致）。texture 随选中主题带出。
 function resolveReaderColors(): { colors: ReaderColors; texture: boolean } {
   const appColors = readThemeColors()
-  // app 明暗优先取注册表 kind；注册表未命中（异常）时以背景亮度兜底。
-  const appKind =
-    getTheme(ui.resolvedThemeId)?.kind ?? (isDarkColor(appColors.background) ? 'dark' : 'light')
+  // app 明暗取主题 store 的有效模式(与 Canvas/DOM 同一份;预览配色时同步)。
+  const appKind = theme.isDark ? 'dark' : 'light'
   let pick =
     appKind === 'dark'
       ? (props.readerThemeDark ?? READER_THEME_FOLLOW)
@@ -356,11 +348,11 @@ watch(
   },
   { deep: true },
 )
-// 主题切换 / 浓度调整（uiStore 写 data-theme 与 --theme-tint-scale/--theme-text-scale）→
-// 重读主题色重注（R2-6b：换主题阅读页实时重着色）。R3：app 明暗变化也会改「据 kind 择槽」
-// 的结果，故同一 watch 覆盖。
+// 主题/配色/外观模式切换 → 色板换代 → 重读主题色重注(R2-6b:换主题阅读页实时重着色)。
+// R3:app 明暗变化也会改「据 kind 择槽」的结果,故同一 watch 覆盖。currentPalette 是 computed,
+// 参数不变时引用不变,不因无关设置或每帧发布而重排。
 watch(
-  () => [ui.resolvedThemeId, ui.themeTintStrength, ui.themeTextStrength] as const,
+  () => theme.currentPalette,
   () => applyReaderStyles(),
 )
 // 阅读主题槽位 / 每书主题覆盖变更（R3）→ 重解析颜色重注（foliate 自动重排，不 remount）。
@@ -397,7 +389,7 @@ function onLoad(e: Event) {
       /* 单章替换失败不阻断渲染 */
     }
   }
-  // 简繁转换（R4）：仅在选了档位时调后端。纯显示层变换，不改后端 canonical（loc1 偏移空间不受影响）。
+  // 简繁转换（R4）：仅在选了档位时调后端。纯显示层变换，不改后端 canonical。
   // 转换在渲染后异步写回，故每章至多一次短暂闪烁（section load 按章触发，章内翻页不重载）。
   const cfg = props.zhConvert
   if (cfg) {
@@ -448,7 +440,7 @@ function getCurrentLocation(): { locator: string; label: string; fraction: numbe
   if (!lastCfi) return null
   return { locator: `cfi:${lastCfi}`, label: lastLabel, fraction: lastFraction }
 }
-// 跳到书签位置：剥去 "cfi:" 前缀后交 view.goTo（未来 "loc1:" 前缀可在此分支扩展）。
+// 跳到书签位置：剥去 "cfi:" 前缀后交 view.goTo。
 function goToLocator(locator: string) {
   const target = locator.startsWith('cfi:') ? locator.slice(4) : locator
   view?.goTo(target)
@@ -509,7 +501,6 @@ async function resolveOpenTarget(): Promise<FoliateBook | string> {
 
 // 从上次位置恢复：
 //  - "cfi:<cfi>"：epub 及 txt 合成 book 的 foliate 原生 CFI（fake-CFI）→ init 直接解析。
-//  - "scroll:<ratio>"（旧 TextReader 存量，仅 txt）：整文档滚动比 ≈ 全书 fraction → 迁移为 goToFraction。
 //  - 其它/缺省：从首章起（保留封面/前言，与旧 EpubReader 同）。
 async function restorePosition() {
   if (!view) return
@@ -524,17 +515,6 @@ async function restorePosition() {
   } catch {
     if (destroyed) return
     await view.init({})
-  }
-  if (destroyed || cfi) return
-  if (props.textSource && init?.startsWith('scroll:')) {
-    const r = parseFloat(init.slice('scroll:'.length))
-    if (Number.isFinite(r) && r > 0) {
-      try {
-        await view.goToFraction(Math.min(1, r))
-      } catch {
-        /* 存量比例迁移失败则留在开头，不阻断打开 */
-      }
-    }
   }
 }
 
@@ -639,15 +619,15 @@ onBeforeUnmount(() => {
   width: 40px;
   height: 40px;
   padding: 0;
-  border: 1px solid var(--material-recipe-float-border-color);
+  border: 1px solid var(--color-border-strong);
   border-radius: 50%;
-  background: var(--material-recipe-float-background-color);
+  background: var(--color-bg-elevated);
   color: var(--color-text-secondary);
   cursor: pointer;
   opacity: 0.45;
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   transition:
     opacity var(--transition-fast),
     background var(--transition-fast),

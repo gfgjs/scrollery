@@ -30,9 +30,7 @@ const FOCUS_RETRY_DELAY_MS = 16
 
 export interface LensFocusRestoreDeps {
   gridRef: () => HTMLElement | null
-  bucketActive: () => boolean
   scrollToLogicalY: (y: number) => Promise<void>
-  logicalToPhysical: (y: number) => number
   getViewKey: () => string
 }
 
@@ -95,8 +93,7 @@ export function useLensFocusRestore(deps: LensFocusRestoreDeps) {
     if (y === null) {
       // 焦点项已不在新布局（§8.1）:回顶部 + 聚焦主标题。返回 true 短路 scrollCache 回退——
       // 旧镜头键可能有历史缓存位,不能让它把「回顶部」顶掉。
-      if (deps.bucketActive()) await deps.scrollToLogicalY(0)
-      else el.scrollTop = 0
+      await deps.scrollToLogicalY(0)
       scrollCache.set(deps.getViewKey(), 0)
       void focusTitleFallback()
       return true
@@ -104,14 +101,8 @@ export function useLensFocusRestore(deps: LensFocusRestoreDeps) {
 
     // 滚动位:把该项钉回其切换前的屏幕纵向位置;顺带写入新镜头键的滚动缓存（与重排锚点同惯例）。
     const targetY = Math.max(0, y - screenOffset)
-    if (deps.bucketActive()) {
-      await deps.scrollToLogicalY(targetY)
-      scrollCache.set(deps.getViewKey(), targetY)
-    } else {
-      const physY = deps.logicalToPhysical(targetY)
-      el.scrollTop = physY
-      scrollCache.set(deps.getViewKey(), physY)
-    }
+    await deps.scrollToLogicalY(targetY)
+    scrollCache.set(deps.getViewKey(), targetY)
     void focusItemWhenRendered(id)
     return true
   }

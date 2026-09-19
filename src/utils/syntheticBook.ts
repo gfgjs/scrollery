@@ -48,8 +48,8 @@ export function escapeXml(s: string): string {
 /**
  * 把一章（标题 + 段落）构造为良构 XHTML 字符串。
  * txt：标题 → `<h1>`，每段 → `<p>`（文本转义）。缩进 / 段间距由渲染层 CSS（R2-5）施加，不在此加空白。
- * 段落文本是 canonical（替换规则 / 简繁转换是 DOM 层后置变换，见 ReaderLocator 文档）。
- * `data-sate-chapter` 标记 = 将来 loc1 精密重锚（DOM-range ↔ canonical 偏移映射）的定位钩子。
+ * 段落文本是 canonical（替换规则 / 简繁转换是 DOM 层后置变换，不改 canonical）。
+ * `data-sate-chapter` 标记章 section 本体。
  */
 export function buildChapterXHTML(chapter: TextChapterContent, opts?: { lang?: string }): string {
   const lang = opts?.lang ?? 'zh'
@@ -87,7 +87,7 @@ export interface TextSyntheticBookOptions {
 /**
  * 构造 txt 的合成 BookModel。章 = section；section.load() 按需拉章并转 XHTML blob URL（缓存，
  * unload / destroy 回收，防泄漏）。进度 / 定位交给 foliate 原生 CFI（合成 book 走 fake-CFI，
- * 确定性 DOM → 跨重启可恢复）；loc1 canonical 重锚是后续增强（跨字号 / 重排 / 简繁变更仍精准）。
+ * 确定性 DOM → 跨重启可恢复）。
  */
 export function buildTextSyntheticBook(opts: TextSyntheticBookOptions): FoliateBook {
   const {

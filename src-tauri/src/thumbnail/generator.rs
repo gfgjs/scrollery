@@ -119,42 +119,6 @@ pub enum DecodeResult {
     },
 }
 
-// 同 DecodeResult：单实例分派消息、不批量收集，变体尺寸差可忽略。
-#[allow(clippy::large_enum_variant)]
-pub enum ThumbResultOrDeferred {
-    Done(ThumbResult),
-    Deferred {
-        item: crate::db::models::MediaItem,
-        abs_path: std::path::PathBuf,
-    },
-}
-
-pub fn generate_thumbnail(
-    item: &crate::db::models::MediaItem,
-    abs_path: &Path,
-    arena: &EngineArena,
-    config: &ThumbConfig,
-) -> Result<ThumbResultOrDeferred> {
-    let mut snapped_config = config.clone();
-    snapped_config.size = snap_to_tier(config.size);
-    let config = &snapped_config;
-
-    match decode_media_step(item, abs_path, arena, config)? {
-        DecodeResult::Ready(res) => Ok(ThumbResultOrDeferred::Done(res)),
-        DecodeResult::ToEncode {
-            item_id,
-            source_revision,
-            cache_key,
-            decoded,
-        } => Ok(ThumbResultOrDeferred::Done(
-            encode_media_step_with_snapshot(item_id, source_revision, cache_key, decoded, config)?,
-        )),
-        DecodeResult::DeferredToCpu { item, abs_path } => {
-            Ok(ThumbResultOrDeferred::Deferred { item, abs_path })
-        }
-    }
-}
-
 pub fn process_deferred_cpu(
     item: &crate::db::models::MediaItem,
     abs_path: &Path,

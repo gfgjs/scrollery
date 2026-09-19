@@ -90,7 +90,12 @@ pub async fn enhance_status(state: State<'_, Arc<AppState>>) -> Result<EnhanceSt
                 id: p.id,
             })
             .collect();
-        let provider = state.config.get("ai_provider");
+        // P24:ai_provider 是 DB STATE_KEYS(worker 会话回声),不在 config.toml schema 内——
+        // 从 ConfigManager 读恒 None,必须回真源 DB(app_config 表),否则增强状态永远缺 provider。
+        let provider = {
+            let pool = state.db_read_pool.get().map_err(AppError::from)?;
+            crate::db::queries::get_config(&pool, "ai_provider")?
+        };
         Ok(EnhanceStatusDto {
             availability: resolution.availability,
             store_url: resolution.store_url,

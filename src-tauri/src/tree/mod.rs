@@ -662,7 +662,7 @@ mod tests {
         // DB：只登记扫描器会收的那些（已注册格式、非隐藏）。
         // 有意**不**登记 _scratch（模拟 FS-only 目录）与 readme.unknownext/_tmp.bin(未注册)。
         let c = rusqlite::Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, parent_id, rel_path, name) VALUES

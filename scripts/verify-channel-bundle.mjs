@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-// Part7-T11 / §3.6.5⑤ 渠道合规联合扫描 —— conf / capability / dist(JS bundle)三面。
-// (第四面 Rust 依赖树断言 = ci.yml rust job 的 cargo tree 步,metadata 级不编译。)
+// Part7 §3.6.5⑤ 发布合规联合扫描 —— conf / capability / dist(JS bundle)三面。
+// (原「第四面 Rust 依赖树断言」随空渠道 channel-msstore/steam 一起退役,P16 2026-09-15。)
 //
-// 背景:cargo feature 只作用 Rust 编译链,不排除非 Rust 产物;Store 渠道(.msix/.app)若残留
-// updater 配置/前端 import/capability 权限,会被商店静态扫描命中触 Policy 10.2.2 上架硬阻断。
+// 背景:cargo feature 只作用 Rust 编译链,不排除非 Rust 产物;updater 配置/前端 import/
+// capability 权限若意外泄进非 direct 产物,商店静态扫描会命中(上架硬阻断),dev 无 overlay
+// 构建也会因基座 conf 带块而误注册 updater。
 // 落地形态(2026-07-04 施工裁决,详见 Part7 §3.6.5 落地修订):
 //   ① 基座 tauri.conf.json 物理无 plugins.updater(conf 合并只能加不能删,基座必须天生干净);
 //      updater 块只住 tauri.direct-release.conf.json —— 本脚本双向断言(基座净 + direct 有)。
@@ -26,7 +27,7 @@ const NO_DIST = process.argv.includes('--no-dist');
 
 // ── 检查器(纯函数,输入解析后的数据,输出违例字符串数组) ──────────────────────────
 
-/** 基座 conf:不得含 plugins.updater(Store 渠道打包的 conf 由基座直出,必须天生干净)。 */
+/** 基座 conf:不得含 plugins.updater(updater 只住 direct 发布 overlay,基座必须天生干净)。 */
 function checkBaseConf(conf) {
   const v = [];
   if (conf?.plugins?.updater !== undefined) {
@@ -35,7 +36,7 @@ function checkBaseConf(conf) {
   return v;
 }
 
-/** 非 direct 的 overlay(perf / 未来 msstore·steam):同样不得携带 updater 块。 */
+/** 非 direct 的 overlay(perf / acceptance):同样不得携带 updater 块。 */
 function checkOverlayClean(name, conf) {
   const v = [];
   if (conf?.plugins?.updater !== undefined) {

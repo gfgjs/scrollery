@@ -510,7 +510,7 @@ pub fn init_subscriber(
     // 批次C:max_log_dir_bytes(advanced 键,单位 MB)接线——config_manager 已在本段之前
     // 构造好(见 config::boot),故此处直接读、无需重排启动序;仅在启动期这一次
     // 读取生效(RollingFileAppender 的 max_log_files=14 也是启动期定死的同类兜底),
-    // 运行期改配置需重启才影响下次启动的清理上限,故 restart_required 保持真。
+    // 运行期改配置需重启才影响下次启动的清理上限,故本键 hot 保持假(通知重启由此推导)。
     let max_log_dir_bytes: u64 = config
         .get("max_log_dir_bytes")
         .and_then(|v| v.parse::<u64>().ok())
@@ -561,7 +561,7 @@ pub fn init_subscriber(
     // (日志窗口未开时零成本,见 RingBufferLayer 文档)。
     // 批次C:log_ring_buffer_capacity(advanced 键)接线——同上,config_manager 已就位,
     // 启动期读一次;环形缓冲挂在 tracing 全局 subscriber 上构造后不可替换,故运行期改配置
-    // 需重启才生效(restart_required 保持真)。
+    // 需重启才生效(本键 hot 保持假,通知重启由 hot 推导)。
     let log_ring_buffer_capacity: usize = config
         .get("log_ring_buffer_capacity")
         .and_then(|v| v.parse().ok())

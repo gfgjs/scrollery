@@ -12,7 +12,7 @@ use crate::db::models::{DateRange, GalleryFilter, SortSpec, ViewDescriptor, View
 /// 种子库：三目录（root → A → Nested）+ 覆盖全部筛选维度的媒体项 + 一个用户夹 + 一张人脸。
 fn parity_db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/parity-root', 'root');
          INSERT INTO directories (id, root_id, parent_id, rel_path, name, depth) VALUES

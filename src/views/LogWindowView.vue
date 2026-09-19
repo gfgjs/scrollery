@@ -6,6 +6,13 @@ import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useLogWindowStore, RENDER_CAP_MIN, RENDER_CAP_MAX } from '../stores/logWindowStore'
 import { useToastStore } from '../stores/toastStore'
+import {
+  initializeSettings,
+  setSettingsApplyFailedFormatter,
+  setSettingsErrorReporter,
+  setSettingsWriteFailedFormatter,
+  settingsReady,
+} from '../stores/settingsPersistence'
 import { invokeIpc } from '../utils/ipc'
 import { IPC } from '../constants/ipc'
 import { LOG_LEVELS, type LogLevelFilter } from '../types/logEntry'
@@ -21,11 +28,51 @@ const { t } = useI18n()
 const store = useLogWindowStore()
 const toast = useToastStore()
 
+// 中央设置的失败提示:本窗口是独立 Vue app(main.ts 按 label 直接挂根),不走 App.vue。若不在此
+// 接一次口,preset 写盘失败与「已保存但部分项未应用」在本窗口无人提示 —— logWindowStore 的
+// persistPresets 假定「中央服务已提示」,静默吞掉就会让用户以为 preset 已保存。文案复用
+// settings.* 既有键,不新增文案与 UI 框架。
+setSettingsErrorReporter((message) => toast.addToast('error', message, 5000))
+setSettingsWriteFailedFormatter(() => t('settings.saveFailedNotice'))
+setSettingsApplyFailedFormatter((keys) => t('settings.applyFailedNotice', { keys: keys.join(', ') }))
+
+/** 设置快照读取失败:preset 读写不可用。给出可见提示与重试,不静默当作已就绪。 */
+const settingsInitFailed = ref(false)
+const settingsInitRetrying = ref(false)
+
+/**
+ * 确保权威设置已加载。失败保持可见状态(settingsReady 未置位 → 保存入口禁用),
+ * 重试走同一入口(initializeSettings 读取失败会清缓存 Promise,可再次发起)。
+ */
+async function ensureSettingsLoaded(): Promise<void> {
+  if (settingsReady.value) {
+    settingsInitFailed.value = false
+    return
+  }
+  try {
+    await initializeSettings()
+    settingsInitFailed.value = false
+  } catch {
+    settingsInitFailed.value = true
+  }
+}
+
+async function retrySettingsInit(): Promise<void> {
+  settingsInitRetrying.value = true
+  try {
+    await ensureSettingsLoaded()
+  } finally {
+    settingsInitRetrying.value = false
+  }
+}
+
 type Tab = 'live' | 'history' | 'analysis'
 const activeTab = ref<Tab>('live')
 const logDir = ref('')
 
 onMounted(async () => {
+  // 不 await:设置是否就绪由 settingsReady 驱动界面门控,不阻塞日志窗口的其余初始化。
+  void ensureSettingsLoaded()
   try {
     logDir.value = await invokeIpc<string>(IPC.GET_LOG_DIR)
   } catch {
@@ -93,6 +140,8 @@ function onRenderCapChange(e: Event) {
 
 // ── 过滤 preset(方案 §5 P1)────────────────────────────────────────────
 function onSavePreset() {
+  // 未拿到权威设置前禁止保存:占位值不得被当成用户修改写回(preset 区已同条件禁用按钮)。
+  if (!settingsReady.value) return
   let name: string | null = null
   try {
     name = window.prompt(t('logWindow.presetNamePrompt'))
@@ -111,6 +160,7 @@ function onApplyPresetChange(e: Event) {
 }
 
 function onDeletePreset(name: string) {
+  if (!settingsReady.value) return
   store.deletePreset(name)
 }
 
@@ -226,11 +276,23 @@ const contextSelectedIndex = computed(() => store.contextView?.selectedIndex ?? 
             .*
           </button>
         </div>
-        <select class="log-window__input" @change="onApplyPresetChange">
+        <select class="log-window__input" :disabled="!settingsReady" @change="onApplyPresetChange">
           <option value="">{{ t('logWindow.presetSelectPlaceholder') }}</option>
           <option v-for="p in store.presets" :key="p.name" :value="p.name">{{ p.name }}</option>
         </select>
-        <UiButton variant="secondary" @click="onSavePreset">{{ t('logWindow.presetSave') }}</UiButton>
+        <UiButton variant="secondary" :disabled="!settingsReady" @click="onSavePreset">
+          {{ t('logWindow.presetSave') }}
+        </UiButton>
+        <!-- 未就绪/读取失败时的最小提示:标题点明状态(悬停给出原因),重试按钮紧邻被禁用的保存入口,
+             让「preset 现在存不了」这件事可见,而不是静默失败。 -->
+        <template v-if="settingsInitFailed">
+          <span class="log-window__settings-error" :title="t('settings.loadFailedHint')">
+            {{ t('settings.loadFailedTitle') }}
+          </span>
+          <UiButton variant="secondary" :loading="settingsInitRetrying" @click="retrySettingsInit">
+            {{ t('settings.loadFailedRetry') }}
+          </UiButton>
+        </template>
       </div>
 
       <div class="log-window__actions">
@@ -524,6 +586,15 @@ const contextSelectedIndex = computed(() => store.contextView?.selectedIndex ?? 
   color: var(--color-text-primary);
   font-size: var(--font-size-xs);
   min-width: 8em;
+}
+.log-window__input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.log-window__settings-error {
+  font-size: var(--font-size-xs);
+  color: var(--color-error);
+  white-space: nowrap;
 }
 .log-window__input:focus {
   border-color: var(--color-input-border-focus);

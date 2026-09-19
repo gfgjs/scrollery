@@ -7,23 +7,23 @@ import router from './router'
 import i18n from './i18n'
 import { registerBuiltins } from './commands'
 import { uiHarnessScene, isUiHarness } from './harness/runtime'
+import { installSettingsLifecycle } from './composables/useSettingsLifecycle'
 import { installGlobalErrorHandlers } from './utils/logger'
 import { dismissStartupLayer } from './utils/startupLayer'
-import { DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME } from './themes/registry'
+import { useThemeStore } from './stores/themeStore'
 import './assets/styles/index.css'
 
 // 前端日志桥全局兜底(日志能力重构 S3,方案 §4/§9.4):越早挂越好,覆盖 mount 前抛出的错误。
 installGlobalErrorHandlers()
 
-// 兜底:防 FOUC 的首帧着色已由 index.html 内联脚本负责(读 localStorage 快照,两个窗口共享同一
-// index.html、同源 localStorage);此处仅在内联脚本未生效的异常情况下按系统偏好补一份。
-if (!document.documentElement.hasAttribute('data-theme')) {
-  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+// 兜底:防 FOUC 的首帧着色由 index.html 的阻塞脚本负责(按缓存恢复已生成变量 + 解析系统明暗,
+// 两个窗口共享同一 index.html 与同源 localStorage;脚本源码见 src/themes/bootstrapScript.ts)。
+// 此处仅在该脚本未生效的异常情况下补一份明暗属性,让注入的默认主题 CSS 至少选对深浅。
+if (!document.documentElement.hasAttribute('data-color-scheme')) {
   document.documentElement.setAttribute(
-    'data-theme',
-    prefersDark ? DEFAULT_DARK_THEME : DEFAULT_LIGHT_THEME,
+    'data-color-scheme',
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
   )
-  document.documentElement.setAttribute('data-color-scheme', prefersDark ? 'dark' : 'light')
 }
 
 // 独立日志窗口(S4,方案 §5「主体是独立日志窗口」):按 Tauri 窗口 label 分流,跳过主窗口的
@@ -58,12 +58,22 @@ if (isUiHarness && !isTauri) {
 }
 
 if (windowLabel === 'logs') {
+  // 日志窗口不经 App.vue,但它的 preset 列表同样是全局设置(log_filter_presets)。取回权威快照与
+  // 「读取失败要可见可重试」都由 LogWindowView 自己负责(onMounted 调 initializeSettings),故此处
+  // 不再抢跑一次并静默吞掉失败——那会让用户以为 preset 已保存。
+  // 退出 flush 协议必须**每个窗口各装一次**(幂等):后端退出前向全部存活窗口要一次 flush 回执,
+  // 日志窗口持有全局 preset 设置,不装就收不到请求、回执永远少一员,后端只能等超时按未完成处理。
+  // 与主窗口 App.vue 的装配互不影响(各窗口有独立的模块状态)。
+  void installSettingsLifecycle().catch(() => {})
   // 动态 import(而非顶层静态 import):日志窗口(含 @tanstack/vue-virtual 虚拟列表)只在
   // 这一支被走到才需要,静态引入会把它连同主窗口一起塞进同一 entry chunk(main.ts 是两窗口
   // 共享的单一入口),把预算门(scripts/vite-plugin-bundle-budget.mjs)撑爆。
   void import('./views/LogWindowView.vue').then(({ default: LogWindowView }) => {
     const logApp = createApp(LogWindowView)
-    logApp.use(createPinia())
+    // 日志窗口与主窗口同源:主题色板按同一份已确认配置发布(它同样绘制侧栏底色与文字)。
+    const logPinia = createPinia()
+    logApp.use(logPinia)
+    useThemeStore(logPinia)
     logApp.use(i18n)
     logApp.mount('#app')
     dismissStartupLayer()
@@ -71,7 +81,10 @@ if (windowLabel === 'logs') {
 } else {
   const app = createApp(App)
 
-  app.use(createPinia())
+  // 主题运行时在挂载前实例化:水合到达时它已在监听,主题键一旦就位即发布(DOM 与 Canvas 同源)。
+  const pinia = createPinia()
+  app.use(pinia)
+  useThemeStore(pinia)
   app.use(router)
   app.use(i18n)
 

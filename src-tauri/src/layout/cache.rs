@@ -359,30 +359,6 @@ pub fn store_layout_with_lens(
 // 字段，滚出滚回的新鲜度由出口拼装（items_cache::hydrate_rows）自 items 取数缓存天然获得，
 // patch 单点化到 items_cache（见 AppState 组合函数）。
 
-/// 从缓存中检索行切片。
-/// 如果缓存为空或版本不匹配，则返回 `None`。
-pub fn get_rows(
-    cache: &LayoutCache,
-    start_row: usize,
-    end_row: usize,
-    expected_version: Option<u64>,
-) -> Option<Vec<LayoutRow>> {
-    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
-    let data = guard.as_ref()?;
-
-    if let Some(ver) = expected_version {
-        if data.layout_version != ver {
-            return None;
-        }
-    }
-
-    let end = end_row.min(data.rows.len());
-    if start_row >= end {
-        return Some(vec![]);
-    }
-    Some(data.rows[start_row..end].to_vec())
-}
-
 /// 取按布局序的视图全集 id（T14.5 `get_view_ids` 后端）。
 ///
 /// 直接返回缓存内已物化的 `flat_ids` —— 它由 `compute_layout`（经 `query_layout_items`）产出，与
@@ -582,28 +558,6 @@ pub fn get_lens_adjacent_item(
         index: target_idx as usize,
         total_count: data.total_items,
     }
-}
-
-/// Find the Y coordinate of a separator row by its group id (the unique directory id).
-/// Matching by id — not by label substring — so two folders that share a name but live
-/// at different paths each scroll to their own separator instead of always the first.
-/// 通过分组 id（唯一目录 id）查找分隔符行的 Y 坐标。
-/// 按 id 而非标签子串匹配：不同路径下的同名文件夹各自滚动到自己的分隔符，而非总是第一个。
-pub fn get_separator_y_by_group_id(cache: &LayoutCache, group_id: &str) -> Option<f64> {
-    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
-    let data = guard.as_ref()?;
-
-    for row in &data.rows {
-        if let LayoutRow::Separator {
-            y, group_id: gid, ..
-        } = row
-        {
-            if gid.as_deref() == Some(group_id) {
-                return Some(*y);
-            }
-        }
-    }
-    None
 }
 
 /// Find the Y coordinate of the row containing the item with `item_id` (O(1) via the

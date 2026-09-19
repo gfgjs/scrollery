@@ -1,7 +1,7 @@
 // src/utils/zhConvert.ts
 // 简繁转换的「显示层」施加(阅读器方案 R4,§5.10/§5.13)。在替换规则之后、对已渲染的章文档 DOM
-// 就地转换文本节点。关键契约:**只改渲染 DOM、不动后端 canonical 字符流**——故未来 loc1 的字符
-// 偏移锚点不受简繁切换影响(见 types/reader.ts 的 ReaderLocator 契约)。转换走后端 ferrous-opencc
+// 就地转换文本节点。关键契约:**只改渲染 DOM、不动后端 canonical 字符流**——简繁是纯显示层后置变换,
+// 不改变按 canonical 偏移记录的阅读位置。转换走后端 ferrous-opencc
 // (convert_chinese 命令,Vec<String>→Vec<String> 批量),一章一次 IPC(数组边界天然充当 opencc
 // 短语转换的「不跨节点合并」隔离)。
 

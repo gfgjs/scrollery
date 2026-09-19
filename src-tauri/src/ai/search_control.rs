@@ -483,7 +483,7 @@ mod tests {
     /// 结果表的 file_id 有外键指向 media_items,故先播 1..=9 号最小媒体项(测试用到的 id)。
     fn wired_control() -> (SearchControl, rusqlite::Connection) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, parent_id, rel_path, name, depth)

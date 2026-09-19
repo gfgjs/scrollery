@@ -35,11 +35,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { Check } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
-import { invokeIpc } from '../../utils/ipc'
-import { IPC } from '../../constants/ipc'
+import { readSetting, writeSettings } from '../../stores/settingsPersistence'
 import CollapsibleCard from './CollapsibleCard.vue'
 import {
   readerThemesByKind,
@@ -90,21 +89,20 @@ function select(kind: 'light' | 'dark', id: string) {
   const key = kind === 'light' ? 'doc_reader_theme_light' : 'doc_reader_theme_dark'
   if (kind === 'light') lightPick.value = id
   else darkPick.value = id
-  invokeIpc(IPC.SET_APP_CONFIG, { key, value: id }).catch(() => {})
+  // 写盘失败由中央服务统一提示;此处 catch 只为收掉 promise。
+  writeSettings({ [key]: id }).catch(() => {})
 }
 
-onMounted(async () => {
-  const [l, d] = await Promise.all([
-    invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_reader_theme_light' }).catch(
-      () => null,
-    ),
-    invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_reader_theme_dark' }).catch(
-      () => null,
-    ),
-  ])
-  lightPick.value = normalizeReaderThemeId(l, 'light')
-  darkPick.value = normalizeReaderThemeId(d, 'dark')
-})
+// 后端只应用:权威快照变化(启动水合 / 恢复默认 / 外部改文件)→ 同步两槽显示;用户点选走 select 提交。
+function applySlots() {
+  lightPick.value = normalizeReaderThemeId(readSetting('doc_reader_theme_light'), 'light')
+  darkPick.value = normalizeReaderThemeId(readSetting('doc_reader_theme_dark'), 'dark')
+}
+applySlots()
+watch(
+  () => [readSetting('doc_reader_theme_light'), readSetting('doc_reader_theme_dark')],
+  applySlots,
+)
 </script>
 
 <style scoped>

@@ -678,7 +678,8 @@ mod r2_6_query_tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         // root1 → A(顶层) → A/B(子);C(顶层,无子)。
         c.execute_batch(

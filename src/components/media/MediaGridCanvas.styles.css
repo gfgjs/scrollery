@@ -69,12 +69,12 @@
   inset: 0;
   z-index: 7;
   border-radius: inherit;
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
   animation: mgc-hover-fade 220ms ease both;
   pointer-events: none;
 }
 .mgc-hover-card--zoom::after {
-  border: 1px solid var(--material-recipe-float-border-color);
+  border: 1px solid var(--color-border-strong);
 }
 @keyframes mgc-hover-fade {
   from {

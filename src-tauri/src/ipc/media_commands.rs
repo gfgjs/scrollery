@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use tauri::State;
 
-use crate::db::models::{AppStats, DirFile, DirNode, MediaDetail, MediaItem, SelectionDescriptor};
+use crate::db::models::{AppStats, DirFile, DirNode, MediaDetail, SelectionDescriptor};
 use crate::db::queries as q;
 use crate::error::{AppError, Result};
 use crate::scanner::metadata::read_image_dimensions;
@@ -557,48 +557,6 @@ pub(crate) fn current_layout_version(state: &AppState) -> u64 {
     crate::layout::cache::get_summary(&state.layout_cache)
         .map(|s| s.layout_version)
         .unwrap_or(0)
-}
-
-/// 把 `SelectionDescriptor` 解析为实际 id 列表（按视图布局序）。Part5 S4：暴露为 IPC（纯新增）。
-///
-/// - `Explicit{ids}`：上限校验后原样返回。
-/// - `SelectAll{view, excludedIds}`：`view.layoutVersion` 与当前布局不一致 → `ViewStale`；
-///   否则经 `view_to_sql` 取全集 − 排除集。百万级全选在后端 SQL 解析，不经前端整包传 id。
-///
-/// R1-2（T4c）已落地：批量命令（favorite/rating/color/soft_delete/restore）直接收
-/// SelectionDescriptor 在后端解析；本命令保留为通用「描述符 → id 列表」入口（前端仅在
-/// 确需 id 的操作——移动/复制/加收藏夹等——使用物化路径）。
-#[tauri::command]
-pub async fn resolve_selection(
-    selection: SelectionDescriptor,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<i64>> {
-    let version = current_layout_version(&state);
-    read_blocking(&state, move |c| {
-        q::resolve_selection(c, &selection, version)
-    })
-    .await
-}
-
-/// 仅计数 `SelectionDescriptor`（UI「将操作 N 项」）。Part5 S4：暴露为 IPC（纯新增）。
-/// SelectAll 走 `COUNT(*) − (excluded ∩ view)`，不取全 id（精确计数，T18 D3）。
-#[tauri::command]
-pub async fn count_selection(
-    selection: SelectionDescriptor,
-    state: State<'_, Arc<AppState>>,
-) -> Result<u64> {
-    let version = current_layout_version(&state);
-    read_blocking(&state, move |c| q::count_selection(c, &selection, version)).await
-}
-
-/// 获取垃圾桶中的项目（分页）。
-#[tauri::command]
-pub async fn get_trash(
-    offset: i64,
-    limit: i64,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<MediaItem>> {
-    read_blocking(&state, move |c| q::get_trash(c, offset, limit.min(200))).await
 }
 
 /// 获取整体应用统计信息。

@@ -9,10 +9,8 @@
 
 use std::path::PathBuf;
 
-use tracing::info;
-
 use crate::ai::profile::{self, ModelProfile};
-use crate::db::queries::{get_config, set_config};
+use crate::db::queries::set_config;
 use crate::state::AppState;
 
 /// 从应用数据获取模型目录。
@@ -20,21 +18,6 @@ pub(crate) fn models_dir(state: &AppState) -> PathBuf {
     // 从 app_data_dir 真值派生,不得用 log_dir.parent() 反推——log_dir 用户可配置,
     // 改日志目录后反推值漂移会令已下载模型「消失」(2026-07-10 审查 A1)。
     state.app_data_dir.join("models")
-}
-
-/// `ai_backend` 配置退役(T16):行为恒 worker,读到遗留非 worker 值仅提示日志
-/// (保键忽略值,不做 schema 迁移;一个版本周期后随例行清理删键)。
-pub(crate) fn warn_legacy_ai_backend(state: &AppState) {
-    let legacy = state
-        .db_read_pool
-        .get()
-        .ok()
-        .and_then(|conn| get_config(&conn, "ai_backend").ok().flatten());
-    if let Some(v) = legacy {
-        if v != "worker" {
-            info!("配置 ai_backend={v} 已退役:推理恒经 ai-worker 子进程(T16),该值被忽略");
-        }
-    }
 }
 
 /// worker 会话的 provider/gpu_name 回声落库(T16):EP 探测只发生在 worker 侧,host 写回

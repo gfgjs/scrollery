@@ -386,20 +386,82 @@ pub(crate) fn verify_image_tower_contract(
     Ok(())
 }
 
-/// 在一批预处理后的张量上运行 CLIP 图像编码器推理。
+/// 图像批编码分段计时(µs,只累加)。**不分配、不打印**:输出与开关都在调用方
+/// (ai-worker `batch.rs` 的 opt-in 汇总行),本核保持纯推理层,不读环境变量。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageBatchTiming {
+    /// 从会话池取 session 的等待(池内串行时反映上一次占用未释放)。
+    pub pool_wait_us: u64,
+    /// 子批物化:切片 to_owned + 固定 batch 补齐 + Tensor::from_array。
+    pub prep_us: u64,
+    /// session.run 本体(含 DirectML 提交与同步等待)。
+    pub run_us: u64,
+    /// 输出取用:形状断言 + 逐项拷贝到 Vec + 归一化。
+    pub extract_us: u64,
+    /// session.run 调用次数;固定 batch=1 导出时 = 批内项数(逐张推理的直接证据)。
+    pub runs: u32,
+}
+
+/// 可选分段计时器(单一实现路径):`None` 时**零采集**——测量点既不取时钟也不写值;
+/// `Some` 时每个测量点取一次时钟并按选择器累加。带/不带计时共用同一段业务代码,只差
+/// 一个 `Option` 分支,不为计时复制流水线(ai-worker 侧自定义计数结构亦复用本类型)。
+pub struct StageClock<'a, T> {
+    out: Option<&'a mut T>,
+    t0: Option<std::time::Instant>,
+}
+
+impl<'a, T> StageClock<'a, T> {
+    pub fn new(out: Option<&'a mut T>) -> Self {
+        Self { out, t0: None }
+    }
+
+    /// 开始一段测量;关闭时为空操作。
+    pub fn begin(&mut self) {
+        self.t0 = self.out.is_some().then(std::time::Instant::now);
+    }
+
+    /// 结束当前段并按 `pick` 落账 µs;关闭时为空操作。
+    pub fn end(&mut self, pick: fn(&mut T) -> &mut u64) {
+        if let (Some(t0), Some(out)) = (self.t0.take(), self.out.as_deref_mut()) {
+            *pick(out) += t0.elapsed().as_micros() as u64;
+        }
+    }
+
+    /// 计数一次(如 session.run 次数、子批数);关闭时为空操作。
+    pub fn count(&mut self, pick: fn(&mut T) -> &mut u32) {
+        if let Some(out) = self.out.as_deref_mut() {
+            *pick(out) += 1;
+        }
+    }
+}
+
+/// 在一批预处理后的张量上运行 CLIP 图像编码器推理(既有入口:不采集计时)。
 pub fn encode_image_batch(
     session_pool: &crate::engine::SessionPool,
     batch_tensor: Array4<f32>,
     profile: &ModelProfile,
+) -> Result<Vec<Vec<f32>>> {
+    encode_image_batch_timed(session_pool, batch_tensor, profile, None)
+}
+
+/// 同 [`encode_image_batch`];`timing` 为 `Some` 时才采集分段耗时。
+pub fn encode_image_batch_timed(
+    session_pool: &crate::engine::SessionPool,
+    batch_tensor: Array4<f32>,
+    profile: &ModelProfile,
+    timing: Option<&mut ImageBatchTiming>,
 ) -> Result<Vec<Vec<f32>>> {
     let s = profile.image_size as i64;
     let side = profile.image_size as usize;
     let dim = profile.embed_dim;
     let n_total = batch_tensor.shape()[0];
 
+    let mut clock = StageClock::new(timing);
+    clock.begin();
     let mut guard = session_pool
         .get()
         .ok_or_else(|| AiError::Internal("Session pool disconnected".into()))?;
+    clock.end(|t| &mut t.pool_wait_us);
     let input_names = session_input_names(&guard);
     let image_input = resolve_single_input_name(&input_names, &profile.image_input, "image")?;
 
@@ -418,6 +480,7 @@ pub fn encode_image_batch(
     for start in (0..n_total).step_by(chunk) {
         let end = (start + chunk).min(n_total);
         let cur = end - start;
+        clock.begin();
 
         // 物化连续的 [cur,3,S,S] 子批 —— 切片视图非拥有所有权的 Vec，而 `Tensor::from_array` 需要拥有的扁平数据。
         let sub = batch_tensor
@@ -448,12 +511,17 @@ pub fn encode_image_batch(
             let (flat_data, _offset) = sub.into_raw_vec_and_offset();
             Tensor::from_array((shape, flat_data)).map_err(AiError::Ort)?
         };
+        clock.end(|t| &mut t.prep_us);
 
+        clock.begin();
         let outputs = guard
             .run(vec![(image_input.as_str(), tensor)])
             .map_err(AiError::Ort)?;
+        clock.end(|t| &mut t.run_us);
+        clock.count(|t| &mut t.runs);
 
         // Output: "unnorm_image_features" [run_rows, embed_dim]；只取前 cur 个（丢弃填充行输出）。
+        clock.begin();
         let raw = outputs[0]
             .try_extract_tensor::<f32>()
             .map_err(AiError::Ort)?;
@@ -481,6 +549,7 @@ pub fn encode_image_batch(
                 .to_vec();
             results.push(maybe_normalize(embedding, profile));
         }
+        clock.end(|t| &mut t.extract_us);
     }
 
     Ok(results)

@@ -7,6 +7,7 @@ import { formatFileSize } from '../../utils/format'
 import { buildThumbInfoLines, typeBadgeOf } from './mediaGrid.helpers'
 import { truncateToWidth } from './mediaGridCanvas.helpers'
 import type { Palette } from './mediaGridCanvas.palette'
+import type { DemoInfoFormatter } from '../../utils/demoAlias'
 
 /** drawInfoOverlay 每次调用显式接收的上下文(替代原闭包读取 props/palette)。 */
 export interface InfoOverlayCtx {
@@ -14,30 +15,41 @@ export interface InfoOverlayCtx {
   viewportMeta: Map<number, MediaMeta>
   thumbInfoElements: readonly string[]
   showThumbInfo: boolean
+  /** 演示打码的信息浮窗文案替换(宿主注入;关闭时为 null → 走真实文案)。 */
+  demoInfo: DemoInfoFormatter | null
 }
+
+// showInfo 关闭时的空文本块:模块级复用,避免逐帧新建对象。
+const NO_DEMO_TEXT: { lines: string[]; demoSize: string | null } = { lines: [], demoSize: null }
 
 export function createInfoOverlayCache() {
   // 行组装含 toLocaleString 等昂贵调用,不能逐帧逐格现算:按 id 缓存,gen 随数据/设置换代,
   // key 另含 sortDatetime 与格宽(截断随宽变)。
   let infoGen = 0
-  const infoLineCache = new Map<number, { key: string; lines: string[] }>()
+  // 缓存一个 id 的**整块**浮窗文本(信息行 + 演示化的文件大小角标文本):二者同一 gen 口径,
+  // 演示开关翻转即整块失效,不会出现「行换了、大小没换」的混合文案。
+  const infoLineCache = new Map<number, { key: string; lines: string[]; demoSize: string | null }>()
 
-  function infoLinesFor(
+  function infoBundleFor(
     ctx: CanvasRenderingContext2D,
     item: LayoutRowItem,
     maxW: number,
     ctxArgs: InfoOverlayCtx,
-  ): string[] {
+  ): { lines: string[]; demoSize: string | null } {
     const key = `${infoGen}|${item.sortDatetime}|${Math.round(maxW)}`
     const hit = infoLineCache.get(item.id)
-    if (hit && hit.key === key) return hit.lines
-    const raw = buildThumbInfoLines(item, ctxArgs.viewportMeta.get(item.id), ctxArgs.thumbInfoElements)
+    if (hit && hit.key === key) return hit
+    const meta = ctxArgs.viewportMeta.get(item.id)
+    // 演示文案只在缓存未命中路径组装(逐帧逐格热路径零额外分配)。
+    const demo = ctxArgs.demoInfo ? ctxArgs.demoInfo(item, meta) : null
+    const raw = buildThumbInfoLines(item, meta, ctxArgs.thumbInfoElements, demo)
     ctx.font = `10px ${ctxArgs.palette.fontMono}`
     const measure = (s: string) => ctx.measureText(s).width
     const lines = raw.map((l) => truncateToWidth(l, maxW, measure))
     if (infoLineCache.size > 4096) infoLineCache.clear() // 防长会话无界增长
-    infoLineCache.set(item.id, { key, lines })
-    return lines
+    const bundle = { key, lines, demoSize: demo ? demo.fileSize : null }
+    infoLineCache.set(item.id, bundle)
+    return bundle
   }
 
   function drawInfoOverlay(
@@ -52,6 +64,8 @@ export function createInfoOverlayCache() {
   ) {
     const { palette, showThumbInfo: showInfo, thumbInfoElements: els } = ctxArgs
     const sim = item.similarity
+    // 文本块先取(同一 id 逐帧命中缓存):信息行 + 演示化的文件大小角标文本。
+    const bundle = showInfo ? infoBundleFor(ctx, item, w - 12, ctxArgs) : NO_DEMO_TEXT
     // 徽章收集(条件逐字对齐 DOM 模板 v-if):ORIG/THUMB/大小/类型按设置,相似度/LIVE 常显。
     // 类型角标的判定不在此逐字重写,走 helpers.typeBadgeOf 与 DOM 共享单源。
     const badges: Array<{ text: string; px: number; mark?: string }> = []
@@ -61,7 +75,8 @@ export function createInfoOverlayCache() {
         badges.push({ text: 'THUMB', px: 11 })
     }
     if (sim == null && item.fileSize && showInfo && els.includes('size')) {
-      badges.push({ text: formatFileSize(item.fileSize), px: 11 })
+      // 演示打码:文件大小示例化(存在性判定仍用真实 fileSize,不新增原来没有的角标)。
+      badges.push({ text: bundle.demoSize ?? formatFileSize(item.fileSize), px: 11 })
     }
     if (sim != null) badges.push({ text: `${Math.round(sim * 100)}%`, px: 11 })
     if (item.isLivePhoto) badges.push({ text: 'LIVE', px: 11, mark: palette.badgeMarkLive })
@@ -72,7 +87,7 @@ export function createInfoOverlayCache() {
         badges.push({ text: 'DOC', px: 11, mark: palette.badgeMarkDocument })
       else if (kind === 'raw') badges.push({ text: 'RAW', px: 11 })
     }
-    const lines = showInfo ? infoLinesFor(ctx, item, w - 12, ctxArgs) : []
+    const lines = bundle.lines
     if (badges.length === 0 && lines.length === 0) return
 
     // 底部渐变(to top: 0.85 → 70% 处 0.5 → 顶透明;padding-top 24 即渐隐区)

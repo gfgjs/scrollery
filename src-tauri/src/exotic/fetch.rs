@@ -9,12 +9,10 @@
 //! 安全：只接受 HTTPS；下载量精确封顶到 `expected_size`（超出立即中止）；size+sha256 双校验后才
 //! `.part` → 原子 rename——这些策略现由通用引擎统一保证。
 //!
-//! **Part7-T11 渠道物理门控**:`fetch_package`/`fetch_model_blob`(下载-执行面,Store
-//! Policy 10.2.2 禁区)仅 `channel-direct` 编入;`download_registry_index`(签名元数据,
-//! 数据面)全渠道保留——Store 渠道仍可浏览插件目录,获取/安装机制归 Part8 渠道方案。
+//! 三个入口同属直销面:`fetch_package`/`fetch_model_blob` 是下载-执行面,
+//! `download_registry_index` 取签名元数据(验签在 registry.rs,不在此)。
 
-// Path 仅被门控的两个下载入口使用(registry 入口收 &str)。
-#[cfg(feature = "channel-direct")]
+// Path 仅被两个下载入口使用(registry 入口收 &str)。
 use std::path::Path;
 
 use crate::download::{self, DownloadError, TimeoutPolicy};
@@ -79,7 +77,6 @@ const MAX_REGISTRY_FILE: u64 = 4 * 1024 * 1024;
 ///
 /// 包体量小（MB 级），暂不接进度回调（插件商店安装进度 UI 待 Part8）；但已走通用引擎，
 /// **Range 续传/镜像回退能力随引擎天然具备**，后续接入仅需传候选源列表 + 进度回调。
-#[cfg(feature = "channel-direct")]
 pub async fn fetch_package(
     url: &str,
     dest: &Path,
@@ -119,7 +116,6 @@ pub async fn fetch_package(
 ///   (损坏数据上续传只会叠加损坏);
 /// - blob 不进 zip → `InstallLimits` 的 zip-bomb 检查对其天然不适用,自身防线 =
 ///   HTTPS + size 精确封顶 + sha256 + 文件名白名单(registry 数据面校验)。
-#[cfg(feature = "channel-direct")]
 pub async fn fetch_model_blob(
     url: &str,
     dest: &Path,
@@ -176,7 +172,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "channel-direct")]
     fn rejects_non_https() {
         // 非 https 在引擎层即拒（不发请求）；适配器透传为 FetchError::NotHttps。
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -189,7 +184,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "channel-direct")]
     fn model_blob_rejects_non_https() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -207,7 +201,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "channel-direct")]
     fn model_blob_idempotent_skip_when_already_valid() {
         // 已就位且 size+sha 全符 → 不触网直接 Ok(URL 即便非法也不会被访问)。
         let rt = tokio::runtime::Builder::new_current_thread()

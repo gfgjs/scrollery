@@ -62,12 +62,12 @@
             v-for="opt in themeOptions"
             :key="opt.value"
             class="option-card"
-            :class="{ selected: ui.appearance === opt.value }"
+            :class="{ selected: theme.appearance === opt.value }"
             @click="chooseTheme(opt.value)"
           >
             <component :is="opt.icon" :size="22" />
             <span>{{ t(opt.labelKey) }}</span>
-            <Check v-if="ui.appearance === opt.value" :size="15" class="option-check" />
+            <Check v-if="theme.appearance === opt.value" :size="15" class="option-check" />
           </button>
         </div>
       </section>
@@ -138,6 +138,7 @@ import { invokeIpc } from '../../utils/ipc'
 import { logger } from '../../utils/logger'
 import { IPC } from '../../constants/ipc'
 import { useUiStore } from '../../stores/uiStore'
+import { useThemeStore } from '../../stores/themeStore'
 import { useToastStore } from '../../stores/toastStore'
 import { useScanStore } from '../../stores/scanStore'
 import type { AppearanceMode } from '../../types/ui'
@@ -146,6 +147,8 @@ const emit = defineEmits<{ (e: 'done'): void }>()
 
 const { t } = useI18n()
 const ui = useUiStore()
+// 外观模式由主题域持有(见 stores/themeStore);本向导只切偏好,不改主题参数与草稿。
+const theme = useThemeStore()
 const toast = useToastStore()
 const scan = useScanStore()
 
@@ -185,7 +188,7 @@ async function pickFolder() {
 }
 
 function chooseTheme(value: AppearanceMode) {
-  ui.setAppearance(value) // 即时应用 + 持久化 app_config 'appearance'
+  theme.setAppearance(value) // 即时应用 + 持久化 app_config 'appearance'
 }
 
 function chooseLang(lang: string) {

@@ -11,7 +11,7 @@
 //! 限定 ASCII 字母数字(无分隔符/无点)→ join 不可能越出缓存根(Part6 §3.2.1a ②)。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use exotic_protocol::{
@@ -92,6 +92,33 @@ fn log_info(msg: impl Into<String>) {
 }
 fn log_warn(msg: impl Into<String>) {
     exotic_protocol::emit_stderr_log("warn", msg, serde_json::Map::new());
+}
+
+/// EmbedBatch 性能汇总的 opt-in 开关:环境变量 `SCROLLERY_AI_WORKER_PERF` 取 1/true/yes 时
+/// 每请求输出一行 `EMBED_PERF` 分段汇总(每请求一条,不逐项刷日志);未开启时零日志。
+/// 计时本身恒开(Instant::now 级开销,见 [`EmbedTiming`]),只有输出被门控。
+fn perf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SCROLLERY_AI_WORKER_PERF").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    })
+}
+
+/// EmbedBatch 分段计时累加(µs)。decode/preprocess 在解码线程内各自累加(线程并行,求和值
+/// 可超墙钟,仅表单项成本);供料等待/攒批/组批/编码在主线程串行累加,四项之和应≈墙钟。
+#[derive(Default)]
+struct EmbedTiming {
+    /// 主线程阻塞等首个可推理项(`rx.recv`)的累计时间 = 供料跟不上推理的空洞。
+    wait_first_us: u64,
+    /// 非阻塞攒子批(`try_recv` 扫描)的累计时间;解码慢时恒接近 0(拿到多少推多少)。
+    drain_us: u64,
+    /// 组批复制:新建 [n,3,S,S] 张量 + 逐项平坦 memcpy。
+    assemble_us: u64,
+    /// 提交给编码的子批数。
+    groups: u32,
 }
 
 /// 整批失败帧(逐项 Err 之外的系统性失败:批超限/推理错误/维度红线/blob 超限)。
@@ -175,6 +202,16 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
     let mut batch_fail: Option<Frame> = None;
     // cursor 在 scope 外声明:被 spawn 线程借用,须活过整个 'scope。
     let cursor = AtomicUsize::new(0);
+    // 计时(read-only 采样,不改流水线行为):decode/preprocess 由解码线程用原子累加,
+    // 其余段在主线程串行累加;输出仅在 opt-in 时每请求一行([`perf_enabled`])。
+    let perf = perf_enabled();
+    let req_t0 = perf.then(std::time::Instant::now);
+    let mut timing = EmbedTiming::default();
+    let mut enc_timing = clip::ImageBatchTiming::default();
+    // 关闭时零采集:主线程各测量点经 StageClock(None 即空操作),解码线程连时钟都不取。
+    let decode_us = if perf { Some(AtomicU64::new(0)) } else { None };
+    let preprocess_us = if perf { Some(AtomicU64::new(0)) } else { None };
+    let mut clock = clip::StageClock::new(if perf { Some(&mut timing) } else { None });
     std::thread::scope(|s| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<Array4<f32>, WorkerErrorCode>)>(
             threads * 2,
@@ -182,13 +219,26 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
         for _ in 0..threads {
             let tx = tx.clone();
             let cursor = &cursor;
+            let decode_us = &decode_us;
+            let preprocess_us = &preprocess_us;
             s.spawn(move || loop {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 if i >= items.len() {
                     break;
                 }
-                let r = load_cache_image(&sess.ai_cache_dir, &items[i].cache_key)
-                    .map(|img| clip::preprocess_image(&img, &sess.profile));
+                let t_decode = perf.then(std::time::Instant::now);
+                let loaded = load_cache_image(&sess.ai_cache_dir, &items[i].cache_key);
+                if let (Some(t0), Some(acc)) = (t_decode, decode_us.as_ref()) {
+                    acc.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+                let r = loaded.map(|img| {
+                    let t_preprocess = perf.then(std::time::Instant::now);
+                    let t = clip::preprocess_image(&img, &sess.profile);
+                    if let (Some(t0), Some(acc)) = (t_preprocess, preprocess_us.as_ref()) {
+                        acc.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    t
+                });
                 if tx.send((i, r)).is_err() {
                     break; // 推理侧已终止(批级失败提前收摊)
                 }
@@ -200,6 +250,7 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
         while !done {
             // 阻塞等第一个可推理项(解码错误项就地记账,不占子批位)。
             let mut pending: Vec<(usize, Array4<f32>)> = Vec::with_capacity(INFER_SUB_BATCH);
+            clock.begin();
             loop {
                 match rx.recv() {
                     Ok((i, Ok(t))) => {
@@ -213,7 +264,9 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
                     }
                 }
             }
+            clock.end(|t| &mut t.wait_first_us);
             // 非阻塞攒满子批(解码慢时不等,拿到多少推多少——重叠优先于批满)。
+            clock.begin();
             while pending.len() < INFER_SUB_BATCH {
                 match rx.try_recv() {
                     Ok((i, Ok(t))) => pending.push((i, t)),
@@ -221,10 +274,12 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
                     Err(_) => break,
                 }
             }
+            clock.end(|t| &mut t.drain_us);
             if pending.is_empty() {
                 continue; // done 收尾轮无残批
             }
 
+            clock.begin();
             let n = pending.len();
             let mut batch = Array4::<f32>::zeros((n, 3, side, side));
             {
@@ -236,7 +291,10 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
                         .copy_from_slice(t.as_slice().expect("preprocess 输出为标准布局"));
                 }
             }
-            match clip::encode_image_batch(pool, batch, &sess.profile) {
+            clock.end(|t| &mut t.assemble_us);
+            clock.count(|t| &mut t.groups);
+            let enc_out = if perf { Some(&mut enc_timing) } else { None };
+            match clip::encode_image_batch_timed(pool, batch, &sess.profile, enc_out) {
                 Ok(vecs) => {
                     // 维度红线(terminal):模型输出与契约不符是系统性错误,整批 Failure。
                     if vecs.iter().any(|e| e.len() != sess.profile.embed_dim) {
@@ -264,6 +322,39 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
         }
         drop(rx); // 批级失败提前退出时解除解码线程 send 阻塞(正常收尾时为空操作)
     });
+    drop(clock); // 结束对 timing 的可变借用,下方汇总才可读
+    // 分段汇总(每请求一条)。读法:`wait_input_us` 与 `enc_*` 相加≈`wall_us`(供料与
+    // 推理串行);`wall_us - wait_input_us - enc_run_us` 即主线程固定开销(组批复制等)。
+    if perf && !items.is_empty() {
+        let wall_us = req_t0.map(|t0| t0.elapsed().as_micros() as u64).unwrap_or(0);
+        let decode_us = decode_us.as_ref().map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
+        let preprocess_us = preprocess_us
+            .as_ref()
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let n_ok = embeds.iter().filter(|e| e.is_some()).count();
+        log_info(format!(
+            "EMBED_PERF req={request_id} items={} ok={n_ok} err={} fail={} groups={} threads={threads} \
+             wall_us={wall_us} decode_us={} preprocess_us={} wait_input_us={} drain_us={} \
+             assemble_us={} enc_pool_us={} enc_prep_us={} enc_run_us={} enc_extract_us={} \
+             enc_runs={} ms_per_item={:.3}",
+            items.len(),
+            items.len() - n_ok,
+            u8::from(batch_fail.is_some()),
+            timing.groups,
+            decode_us,
+            preprocess_us,
+            timing.wait_first_us,
+            timing.drain_us,
+            timing.assemble_us,
+            enc_timing.pool_wait_us,
+            enc_timing.prep_us,
+            enc_timing.run_us,
+            enc_timing.extract_us,
+            enc_timing.runs,
+            wall_us as f64 / 1000.0 / items.len() as f64,
+        ));
+    }
     if let Some(frame) = batch_fail {
         return frame;
     }

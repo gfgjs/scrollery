@@ -1,17 +1,13 @@
 <template>
-  <!-- T16 收尾:双引擎公共行组件——bucket 与方案 A 曾各持一份逐字节对齐的行模板
-       (分隔符 + 卡片),选区/拖拽/FLIP 的引擎无关性依赖两份标记严格等价,人工对齐有
-       漂移风险;bucket 转默认引擎后抽为单一来源。DOM 结构与原内联模板完全一致
-       (data-item-id 与全部 handlers),两引擎仅 offset-y(段起点 / renderAnchor)与
-       row-will-change 不同。本组件不带样式:行根类由宿主 scoped 样式直接命中(子组件
-       根节点继承父作用域属性),内部类经宿主 :deep() 命中——样式保持单源。 -->
+  <!-- 画廊行体组件(分隔符 + 卡片):选区/拖拽/FLIP 的标记(data-item-id 与全部 handlers)
+       在此单源,避免多份逐字节对齐的模板漂移。本组件不带样式:行根类由宿主 scoped 样式
+       直接命中(子组件根节点继承父作用域属性),内部类经宿主 :deep() 命中——样式保持单源。 -->
   <div
     :class="row.rowType === 'separator' ? 'date-separator' : 'media-grid__row'"
     :style="{
       position: 'absolute',
       top: 0,
       transform: `translate3d(0, ${row.y - offsetY}px, 0)`,
-      willChange: rowWillChange ? 'transform' : undefined,
       left: 0,
       right: 0,
       height: row.height + 'px',
@@ -191,7 +187,7 @@ import type { LayoutRow, LayoutRowItem, LayoutRowSeparator } from '../../types/l
 
 defineProps<{
   row: LayoutRow
-  /** 行 transform 基准:bucket = 所在段起点 seg.start;方案 A = renderAnchor。 */
+  /** 行 transform 基准 = 所在段起点 seg.start。 */
   offsetY: number
   gap: number
   groupBy: string
@@ -212,8 +208,6 @@ defineProps<{
   /** 卡片镜头徽标文本(§6.2/§7.3):宿主经 lensSeparator.resolveLensCardBadge + t 组装;
    *  null = 无徽标(独有/普通画廊);尚未确认卡由模板按 duplicateBucket 换问号图标渲染。 */
   lensCardBadgeText?: (item: LayoutRowItem) => string | null
-  /** 方案 A 行提示合成层(平移模式高频重钉);bucket 行不需要。 */
-  rowWillChange?: boolean
   pendingDeleteLabel: string
   isSelected: (id: number) => boolean
   isPendingDelete: (id: number) => boolean

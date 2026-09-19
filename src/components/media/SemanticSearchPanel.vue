@@ -289,7 +289,7 @@ async function initAndStart() {
   min-height: 56px;
   padding: var(--spacing-sm) clamp(var(--spacing-md), 2vw, var(--spacing-lg));
   border-bottom: 1px solid var(--color-divider);
-  background: var(--material-recipe-chrome-background-color);
+  background: var(--color-bg-secondary);
   flex-shrink: 0;
   pointer-events: auto;
 }

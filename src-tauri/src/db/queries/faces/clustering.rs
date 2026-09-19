@@ -255,7 +255,7 @@ mod f2_f3_cluster_concurrency_tests {
 
     fn mem_fk_on() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');

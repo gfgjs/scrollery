@@ -37,11 +37,9 @@ import type { SelectionCommand } from '../types/selectionCommand'
 
 export interface GallerySelectionOpsDeps {
   compute: (width?: number) => Promise<void>
-  updateVisible: (force?: boolean) => Promise<void>
-  bucketActive: () => boolean
   /** bucket 引擎的「愿望窗口内段全部落地」兑现点(FLIP 的 Last 快照前置)。 */
   whenSettled: () => Promise<void>
-  /** FLIP/fadeOut 的查询根:方案 A 用渲染层 layerRef,bucket 模式用段容器。 */
+  /** FLIP/fadeOut 的查询根:段容器(bucket 渲染分支)。 */
   flipRootEl: () => HTMLElement | null
   patchVisibleRating: (ids: Set<number>, rating: number) => void
   patchVisibleFavorite: (ids: Set<number>, isFavorited: boolean) => void
@@ -78,7 +76,6 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
       viewStore.activeCollection?.kind === 'system'
     ) {
       await deps.compute()
-      deps.updateVisible()
     }
   }
 
@@ -104,7 +101,6 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
     deps.patchVisibleRating(new Set([itemId]), value)
     if (filter.minRating > 0 && value < filter.minRating) {
       await deps.compute()
-      deps.updateVisible()
     }
   }
 
@@ -126,7 +122,6 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
     })
     if (filter.colorLabel > 0 && value !== filter.colorLabel) {
       await deps.compute()
-      deps.updateVisible()
     }
     toast.addToast(
       'success',
@@ -184,9 +179,8 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
   }
 
   // 删除/移除后的平滑重排动画（FLIP + 淡出）已抽到 useGridFlipReflow（自包含 DOM 工具，仅依赖
-  // 一个根元素 getter）。仅用于删除/移除路径，绝不挂到滚动驱动的 updateVisible（避免与虚拟滚动 +
-  // renderAnchor 打架）。B2:根引擎感知——方案 A 用渲染层 layerRef,bucket 模式用段容器
-  // (两分支卡片同为 [data-item-id],FLIP 按 id 匹配跨段照常成立)。
+  // 一个根元素 getter）。仅用于删除/移除路径，绝不挂到滚动驱动的取行。查询根是段容器
+  // (卡片带 [data-item-id],FLIP 按 id 匹配跨段照常成立)。
   const { flipReflow, fadeOutCells } = useGridFlipReflow(() => deps.flipRootEl())
 
   // ── 暂存删除（置灰 + 退出选择时一次重排 + 撤销）─────────────────────────────────
@@ -250,7 +244,6 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
     } else {
       // 已退出选择被重排移除：需重算把恢复的项带回。
       await deps.compute()
-      deps.updateVisible()
     }
   }
 
@@ -261,7 +254,6 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
       stageDeleted(ids)
     } else {
       await deps.compute()
-      deps.updateVisible()
     }
   }
 
@@ -273,10 +265,9 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
     await fadeOutCells(ids)
     await flipReflow(async () => {
       await deps.compute()
-      deps.updateVisible()
       // B2:bucket 模式的行数据在版本换代后异步回填——等愿望窗口内段全部落地,
       // FLIP 的 Last 快照才能读到重排后的真实位置(否则 DOM 为空,动画静默失效)。
-      if (deps.bucketActive()) await deps.whenSettled()
+      await deps.whenSettled()
     })
   }
 

@@ -128,10 +128,10 @@ function scrollToLatest() {
   min-height: var(--control-size-default);
   padding: 0 var(--spacing-md);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--material-recipe-float-border-color);
-  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg-elevated);
   color: var(--color-text-secondary);
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
   cursor: pointer;
   font-size: var(--font-size-xs);
 }

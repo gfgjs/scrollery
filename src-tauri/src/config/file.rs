@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use thiserror::Error;
-use toml_edit::{DocumentMut, Entry, Item, Value};
+use toml_edit::{DocumentMut, Entry, Item};
 
-use super::schema::{section_title, SettingDef, SettingKind, SETTING_DEFS};
+use super::schema::{section_title, SettingDef, SETTING_DEFS};
+use super::value;
 
 /// config.toml 读写过程中的错误。**不含任何原始异常字符串直通 IPC 的设计**(硬约束:IPC
 /// 错误不得泄漏内部字符串)——本类型仍是内部错误,A2 接 IPC 时再映射为稳定 code/variant。
@@ -28,6 +29,12 @@ pub enum ConfigFileError {
     Io(#[from] std::io::Error),
     #[error("读取旧版配置数据库失败:{0}")]
     Database(#[from] rusqlite::Error),
+    /// 调用方给的键不在 schema 内(内部编程错误或跨模块误用,不是用户文件的问题)。
+    #[error("未知配置键:{0}")]
+    UnknownKey(String),
+    /// 值不符合键的类型约束(在进入写盘前的校验层被拦下)。
+    #[error("设置值不合法:{0}")]
+    InvalidValue(String),
 }
 
 impl ConfigFileError {
@@ -47,6 +54,10 @@ impl ConfigFileError {
                 "读取旧版配置数据库失败,本次未迁移配置文件".to_string(),
                 None,
             ),
+            // 两个新变体的 message 都是本模块自己写的中文说明,不含路径与内部异常串,可直接展示。
+            ConfigFileError::UnknownKey(_) | ConfigFileError::InvalidValue(_) => {
+                (self.to_string(), None)
+            }
         }
     }
 }
@@ -119,47 +130,12 @@ pub fn parse_doc(text: &str) -> Result<DocumentMut, ConfigFileError> {
     })
 }
 
-/// 按 `SettingKind` 校验单个 TOML 值节点,合法则返回其规范文本形式(与 `SettingDef.default`
-/// 同一形态,便于上层直接字符串比较/存表),非法返回中文错误说明(调用方转成 `KeyWarning`)。
-fn validate_value(kind: SettingKind, item: &Item) -> Result<String, String> {
-    match kind {
-        SettingKind::Bool => item
-            .as_bool()
-            .map(|b| b.to_string())
-            .ok_or_else(|| "应为布尔值 true 或 false".to_string()),
-        SettingKind::UInt => item
-            .as_integer()
-            .filter(|n| *n >= 0)
-            .map(|n| n.to_string())
-            .ok_or_else(|| "应为非负整数".to_string()),
-        SettingKind::Float => item
-            .as_float()
-            .or_else(|| item.as_integer().map(|n| n as f64))
-            .map(|f| f.to_string())
-            .ok_or_else(|| "应为数字".to_string()),
-        SettingKind::Str | SettingKind::Path => item
-            .as_str()
-            .map(std::string::ToString::to_string)
-            .ok_or_else(|| "应为字符串(用双引号包裹)".to_string()),
-        SettingKind::Enum(options) => {
-            let s = item
-                .as_str()
-                .ok_or_else(|| "应为字符串(用双引号包裹)".to_string())?;
-            if options.contains(&s) {
-                Ok(s.to_string())
-            } else {
-                Err(format!(
-                    "取值 \"{s}\" 不在允许范围内,允许值:{}",
-                    options.join(" / ")
-                ))
-            }
-        }
-    }
-}
-
 /// 加载 config.toml:文件不存在按空文档处理(全部键回退默认,不算警告——正常初始态);
 /// 整文件语法错 → `Err`(调用方按契约保留上一次成功配置,不得让半解析结果流入生效值表);
 /// 单键类型不符 / 文件中出现 schema 之外的未知键 → 记入 `warnings`,该键跳过、其余键照常生效。
+///
+/// 结构类键内部的未知 ID / 表外窗口 label / 多余字段**只忽略该条目**并记一条警告,整键仍生效
+/// (方案 §5.4:一个陌生条目不该让无关设置失效)。值的形态转换与校验全部交 `value` 模块。
 pub fn load(path: &Path) -> Result<LoadedConfig, ConfigFileError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -167,7 +143,16 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ConfigFileError> {
         Err(e) => return Err(ConfigFileError::Io(e)),
     };
     let doc = parse_doc(&text)?;
+    Ok(validate_doc(doc))
+}
 
+/// 校验一份**已解析**的文档,产出生效值表与警告。供三条路径共用:启动与外部重读的 load,以及提交
+/// 写盘后「从最终文档重建生效值」(见 ConfigManager 的 write_patch_locked)——后者使内存快照与磁盘
+/// 内容永不背离(磁盘上由其他写入方或外部编辑留下的键也会一并进入快照,而不是等下一次重读才补上)。
+///
+/// 返回值恒为 Ok:单键级问题只记警告并跳过该键(该键回退 schema 默认值),整文件语法错在 parse_doc
+/// 阶段就已拦下。
+pub fn validate_doc(doc: DocumentMut) -> LoadedConfig {
     let mut values = BTreeMap::new();
     let mut warnings = Vec::new();
 
@@ -175,9 +160,15 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ConfigFileError> {
         // 键在 schema 内、但文件里没写(即注释态或整个缺失)→ 不进 values、不算警告,由
         // `ConfigManager::get` 回退 `def.default`,与「注释态本来就不在 doc 值里」的模板设计一致。
         if let Some(item) = doc.get(def.key) {
-            match validate_value(def.kind, item) {
-                Ok(s) => {
-                    values.insert(def.key.to_string(), s);
+            match value::item_to_canonical(def, item) {
+                Ok(parsed) => {
+                    for note in &parsed.ignored {
+                        warnings.push(KeyWarning {
+                            key: def.key.to_string(),
+                            message: note.clone(),
+                        });
+                    }
+                    values.insert(def.key.to_string(), parsed.text);
                 }
                 Err(message) => warnings.push(KeyWarning {
                     key: def.key.to_string(),
@@ -199,25 +190,24 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ConfigFileError> {
         }
     }
 
-    Ok(LoadedConfig {
+    LoadedConfig {
         values,
         warnings,
         doc,
-    })
+    }
 }
 
-/// 把规范文本值渲染成对应 kind 的 TOML 字面量源码(`Value` 的 `Display` 输出,字符串类会
-/// 自动加引号并按 TOML 规则转义;裸词类原样输出)。解析失败时回退各 kind 的零值/false——
-/// 只会发生在 `SETTING_DEFS.default` 或已通过 `validate_value` 校验过的值上,理论不可达,
-/// 兜底纯粹是不 `unwrap` panic。
-fn render_literal(kind: SettingKind, raw: &str) -> String {
-    let value: Value = match kind {
-        SettingKind::Bool => raw.parse::<bool>().unwrap_or(false).into(),
-        SettingKind::UInt => raw.parse::<i64>().unwrap_or(0).into(),
-        SettingKind::Float => raw.parse::<f64>().unwrap_or(0.0).into(),
-        SettingKind::Str | SettingKind::Path | SettingKind::Enum(_) => raw.into(),
-    };
-    value.to_string()
+/// 把规范文本值渲染成对应 kind 的 TOML 字面量源码。结构类键渲染成**原生 TOML 数组/内联表**
+/// (方案 §4:文件里不得嵌套 JSON 字符串)。渲染失败只可能发生在 schema 自身的默认值写错上
+/// (调用点传入的都是已校验过的规范文本),故回退成注释友好的占位串并把事实记进日志,不 panic。
+fn render_literal(def: &SettingDef, raw: &str) -> String {
+    value::canonical_to_toml_literal(def, raw).unwrap_or_else(|e| {
+        tracing::error!(
+            key = %def.key,
+            "schema 默认值无法渲染为 TOML 字面量,已回退空数组 | default value is not renderable: {e}"
+        );
+        "[]".to_string()
+    })
 }
 
 /// 单键的模板片段:注释说明行 + (`# key = 默认值` 或 `key = 覆盖值`)+ 尾随空行。
@@ -230,18 +220,18 @@ fn render_key_block(def: &SettingDef, override_value: Option<&str>) -> String {
     }
     match override_value {
         Some(v) => {
-            out.push_str(&format!("{} = {}\n", def.key, render_literal(def.kind, v)));
+            out.push_str(&format!("{} = {}\n", def.key, render_literal(def, v)));
         }
         None => {
             out.push_str(&format!(
                 "# {} = {}\n",
                 def.key,
-                render_literal(def.kind, def.default)
+                render_literal(def, def.default)
             ));
         }
     }
-    out.push('\n');
-    out
+   out.push('\n');
+   out
 }
 
 const HEADER: &str = "\
@@ -289,56 +279,6 @@ pub fn render_template(overrides: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// 判断某键是否**连注释态都不在**给定原始文本里(逐行匹配行首「可选空白 + 可选一串 `#` +
-/// 空白 + 键名 + 空白 + `=`」)。用于版本升级后自愈补全新增键(见 `mod.rs::load_or_init`)。
-///
-/// 用**原始文本子串匹配**而非解析后的 `DocumentMut` 树:被注释掉的行根本不会出现在
-/// doc 的值树里,若改用 doc 判断会把"用户特意保持默认(注释态)"的键也误判成缺失,
-/// 每次启动都重复追加。
-fn content_mentions_key(content: &str, key: &str) -> bool {
-    content.lines().any(|line| {
-        let trimmed = line.trim_start().trim_start_matches('#').trim_start();
-        trimmed
-            .strip_prefix(key)
-            .map(|rest| rest.trim_start().starts_with('='))
-            .unwrap_or(false)
-    })
-}
-
-/// 找出 schema 中新增、而旧配置文件里连注释态都没有的键(典型场景:应用升级后 schema
-/// 新增了设置项,但用户的 config.toml 是旧版本写出的),把这些键的模板片段追加到文件末尾。
-/// 无缺失键时返回 `None`(调用方据此判断是否需要重新写盘,避免每次启动都触碰文件 mtime)。
-///
-/// 只追加、不改动既有内容/注释/排版——追加位置在文件末尾,按缺失键所属 section 分组,
-/// 用专门的横幅注释与原有分段区分开,避免与用户可能已手改过的原分段混淆。
-pub fn append_missing_keys(existing_content: &str) -> Option<String> {
-    let missing: Vec<&SettingDef> = SETTING_DEFS
-        .iter()
-        .filter(|d| !content_mentions_key(existing_content, d.key))
-        .collect();
-    if missing.is_empty() {
-        return None;
-    }
-
-    let mut out = existing_content.to_string();
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push('\n');
-    out.push_str(
-        "# ── 新增设置(应用版本升级自动补全,内容与上文其余分段无关)──────────────────\n\n",
-    );
-    let mut last_section = "";
-    for def in &missing {
-        if def.section != last_section {
-            out.push_str(&format!("# ─ {} ─\n", section_title(def.section)));
-            last_section = def.section;
-        }
-        out.push_str(&render_key_block(def, None));
-    }
-    Some(out)
-}
-
 /// 就地修改文档中某键的值(新增或覆盖)。**不经 `Table::insert(&str, Item)`**——该方法会对
 /// 已存在的键调用 `Key::fmt()` 清空其前缀装饰(即行首注释),与"保留既有注释与排版"的硬
 /// 约束冲突;改经 `Entry` API 的 `OccupiedEntry::insert`,只替换值节点、不触碰 key 的装饰。
@@ -347,19 +287,31 @@ pub fn append_missing_keys(existing_content: &str) -> Option<String> {
 /// (不在 schema 内)按 `Str` 处理写成带引号字符串——`ConfigManager::set_and_persist` 只应对
 /// 已知键调用本函数,未知键分支纯粹是防御性兜底,不是本函数鼓励的用法。
 pub fn set_value(doc: &mut DocumentMut, key: &str, raw_value: &str) {
-    let kind = SettingDef::find(key).map_or(SettingKind::Str, |d| d.kind);
-    let value: Value = match kind {
-        SettingKind::Bool => raw_value.parse::<bool>().unwrap_or(false).into(),
-        SettingKind::UInt => raw_value.parse::<i64>().unwrap_or(0).into(),
-        SettingKind::Float => raw_value.parse::<f64>().unwrap_or(0.0).into(),
-        SettingKind::Str | SettingKind::Path | SettingKind::Enum(_) => raw_value.into(),
+    // 键不在 schema 内时按自由文本处理(防御性兜底,不是鼓励用法——上层只对已知键调用本函数)。
+    let Some(def) = SettingDef::find(key) else {
+        match doc.entry(key) {
+            Entry::Occupied(mut occ) => {
+                occ.insert(Item::Value(raw_value.into()));
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(Item::Value(raw_value.into()));
+            }
+        }
+        return;
+    };
+    let Ok(new_item) = value::canonical_to_item(def, raw_value) else {
+        tracing::error!(
+            key = %key,
+            "规范文本无法渲染为 TOML 节点,本次不写入该键 | value is not renderable, skipping key"
+        );
+        return;
     };
     match doc.entry(key) {
         Entry::Occupied(mut occ) => {
-            occ.insert(Item::Value(value));
+            occ.insert(new_item);
         }
         Entry::Vacant(vac) => {
-            vac.insert(Item::Value(value));
+            vac.insert(new_item);
         }
     }
 }
@@ -509,25 +461,5 @@ mod tests {
         assert_eq!(fp, fingerprint("thumb_size = 256\n"));
         let tmp = path.with_extension("toml.tmp");
         assert!(!tmp.exists(), "写盘后不应残留 .tmp 文件");
-    }
-
-    /// append_missing_keys:构造一份"缺了某个 schema 键(连注释都没有)"的旧文件,应被追加;
-    /// 已包含全部键(即使是注释态)的文件应返回 None(不重复追加)。
-    #[test]
-    fn append_missing_keys_adds_absent_and_skips_when_complete() {
-        // 全量模板一定包含所有键 → 视为"完整",不应追加。
-        let full = render_template(&BTreeMap::new());
-        assert!(append_missing_keys(&full).is_none());
-
-        // 去掉某一行(模拟旧版本 schema 还没有这个键)。
-        let without_one: String = full
-            .lines()
-            .filter(|l| !l.contains("thumb_webp_quality"))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let healed = append_missing_keys(&without_one).expect("应检测到缺失键并追加");
-        assert!(healed.contains("thumb_webp_quality"));
-        // 追加是纯粹的"补",原有内容原样保留(仍能找到未被动过的其他键)。
-        assert!(healed.contains("thumb_size"));
     }
 }

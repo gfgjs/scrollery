@@ -6,7 +6,7 @@
 //! EncodeText)→ `exotic::worker::validate_*` 输出校验(「不信任 worker」纪律延续)。
 //!
 //! 路径地位(T16 收束):host 已恒 worker-only——进程内 ort 推理整段删除,本句柄是唯一推理通路;
-//! 遗留 `ai_backend` 配置键已退役(读到非 worker 值仅 warn 忽略,见 `runtime_config::warn_legacy_ai_backend`)。
+//! 遗留 `ai_backend` 配置键已退役(惰性无读)。
 //!
 //! 错误恢复契约(硬止损=重试一次):
 //!   - 进程级异常(超时/断开/协议违例/输出校验失败)→ Supervisor 已 kill(或本端弃用

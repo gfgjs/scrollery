@@ -3,9 +3,8 @@
 //!
 //! 【Part6 §3.9.1a 去环 ③a】本模块的**纯验签逻辑**（`verify_token`/`evaluate_token`/`LicensePayload`）
 //! 自 `src-tauri/src/exotic/license.rs` 迁入本叶 crate——无秘密价值（算法公开、公钥非秘密）。真实
-//! keyring I/O 实现 `KeyringLicenseStore` **留在 src-tauri**（依赖 keyring crate，且只在
-//! `channel-direct` 编入）。`LicenseStatus`/`LicenseError` DTO 仍住更底层的叶 crate
-//! `scrollery-plugin-api`。
+//! keyring I/O 实现 `KeyringLicenseStore` **留在 src-tauri**（依赖 keyring crate，是直销渠道
+//! 唯一实现）。`LicenseStatus`/`LicenseError` DTO 仍住更底层的叶 crate `scrollery-plugin-api`。
 //!
 //! token 编码（§5.2）：`base64url(payload_json_utf8) + "." + base64url(ed25519_signature)`。
 //! 签名覆盖**收到的原始 payload bytes**——Verifier **不**重新序列化后验签（§5.2 核心约定）。

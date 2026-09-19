@@ -295,13 +295,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onGlobalKeydown, tru
   max-height: calc(100vh - 84px);
   overflow: auto;
   padding: var(--spacing-md);
-  border: 1px solid var(--material-recipe-float-border-color);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  background: var(--material-recipe-float-background-color);
+  background: var(--color-bg-elevated);
   color: var(--color-text-primary);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   contain: layout paint style;
   scrollbar-width: thin;
 }

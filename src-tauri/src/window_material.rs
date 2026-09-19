@@ -17,7 +17,7 @@ pub fn apply_from_config(app: &AppHandle) {
     let value = app
         .try_state::<Arc<AppState>>()
         .and_then(|s| s.config.get("window_material"))
-        .unwrap_or_else(|| "mica".to_string()); // ConfigManager::get 对 schema 键自带默认,None 仅理论兜底
+        .unwrap_or_else(|| "none".to_string()); // ConfigManager::get 对 schema 键自带默认,None 仅理论兜底
     apply(app, &value);
 }
 

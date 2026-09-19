@@ -23,25 +23,41 @@ import {
 } from '../../stores/exportStore'
 import { useToastStore } from '../../stores/toastStore'
 import { IpcError, ipcErrorMessage } from '../../utils/ipc'
+import { writeSettings } from '../../stores/settingsPersistence'
+import { readSettingBool } from '../../composables/settingsValues'
 import { formatFileSize } from '../../utils/format'
 
 const { t } = useI18n()
 const store = useExportStore()
 const toast = useToastStore()
 
-// manifest 默认关、记忆选择(方案 A-1 裁决)。
-const MANIFEST_PREF_KEY = 'scrollery-export-include-manifest'
+// manifest 默认关、记忆选择(方案 A-1 裁决)。存设置键 export_include_manifest(设置集中保存,批次B)。
+const MANIFEST_PREF_KEY = 'export_include_manifest'
 
 const targetParent = ref('')
 const naming = ref<ExportNamingScheme>('sequence') // A-2:默认 sequence,保留手排/视图顺序
 const conflict = ref<ExportConflictPolicy>('rename')
-const includeManifest = ref(localStorage.getItem(MANIFEST_PREF_KEY) === 'true')
+// 只在打开对话框/用户改动时取权威值;后端快照变化(启动水合/恢复默认/外部改文件)经 watch 重读。
+const includeManifest = ref(readSettingBool(MANIFEST_PREF_KEY, false))
 const allowInsideLibrary = ref(false)
 const preflight = ref<ExportPreflight | null>(null)
 const starting = ref(false)
 const errorMessage = ref('')
 
-watch(includeManifest, (v) => localStorage.setItem(MANIFEST_PREF_KEY, String(v)))
+// 后端只应用:权威值变化 → 同步显示态;用户改动走 setIncludeManifest 显式提交(不在此 watch 里写,
+// 否则每次快照应用都会回灌一次保存)。
+watch(
+  () => readSettingBool(MANIFEST_PREF_KEY, false),
+  (v) => {
+    includeManifest.value = v
+  },
+)
+
+function setIncludeManifest(v: boolean) {
+  includeManifest.value = v
+  // 写盘失败由中央服务统一提示;此处 catch 只为收掉 promise。
+  writeSettings({ [MANIFEST_PREF_KEY]: String(v) }).catch(() => {})
+}
 
 function buildRequest(): ExportRequest | null {
   if (!store.dialogSelection) return null
@@ -210,7 +226,11 @@ function close() {
       </UiSelect>
     </UiField>
 
-    <UiCheckbox v-model="includeManifest" :label="t('export.includeManifest')" />
+    <UiCheckbox
+      :model-value="includeManifest"
+      :label="t('export.includeManifest')"
+      @update:model-value="setIncludeManifest"
+    />
     <p class="export-hint">{{ t('export.manifestHint') }}</p>
 
     <p v-if="errorMessage" class="export-error">{{ errorMessage }}</p>

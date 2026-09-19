@@ -27,11 +27,19 @@ pub async fn open_log_window(app: tauri::AppHandle, state: State<'_, Arc<AppStat
     }
 
     let ring = state.log_ring.clone();
+    // 先以隐藏态建窗:窗口几何要先按 config.toml 的记录落位,再展示——否则会先闪一下创建默认
+    // 尺寸的位置。恢复逻辑与主窗口共用同一套(缺记录或离屏时回该窗口的创建默认值并居中)。
     let win = WebviewWindowBuilder::new(&app, "logs", WebviewUrl::App("index.html".into()))
         .title("Scrollery — Logs")
         .inner_size(960.0, 640.0)
         .min_inner_size(640.0, 420.0)
+        .visible(false)
         .build()
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
+    crate::config::window::restore_before_show(&app, crate::config::window::LOGS_LABEL);
+    win.show()
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
+    win.set_focus()
         .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
 
     ring.set_subscribed(true);

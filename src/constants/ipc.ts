@@ -24,14 +24,10 @@ export const IPC = {
   GET_LAYOUT_ROWS_BY_Y: 'get_layout_rows_by_y',
   // T16 方案B:按段取行(半开区间 [startY,endY) 精确归属,区别于 by_y 的视口相交语义)
   GET_BUCKET_ROWS: 'get_bucket_rows',
-  GET_SEPARATOR_Y_BY_GROUP_ID: 'get_separator_y_by_group_id',
   GET_ITEM_Y_BY_ID: 'get_item_y_by_id',
   GET_SUBTREE_SCROLL_TARGET: 'get_subtree_scroll_target',
   // 按布局序的视图全集 id（Part5 T4 选区脱离 DOM 的顺序来源；后端 layout_commands.rs:128 已注册）
   GET_VIEW_IDS: 'get_view_ids',
-  // 选择描述符解析/计数（Part5 S4，纯新增）：SelectAll 在后端 SQL 解析全集,不经前端整包传 id
-  RESOLVE_SELECTION: 'resolve_selection',
-  COUNT_SELECTION: 'count_selection',
 
   // ── H-Lab 横向画廊实验(docs/designs/2026-07-02-horizontal-gallery-lab.md)────────
   // 独立缓存/版本,与生产布局命令平行互不可见。
@@ -74,7 +70,6 @@ export const IPC = {
   DELETE_ICC_PROFILE: 'delete_icc_profile',
   SOFT_DELETE_ITEMS: 'soft_delete_items',
   RESTORE_ITEMS: 'restore_items',
-  GET_TRASH: 'get_trash',
   GET_STATS: 'get_stats',
   // ── 格式注册表与 facet（S 线 §6/§7）────────────────────────────────────
   // 已注册格式全集（内置 ∪ exotic Catalog）的 UI 投影；随插件安装变化，故不缓存跨会话。
@@ -102,7 +97,6 @@ export const IPC = {
   STOP_FULL_THUMBNAIL_GENERATION: 'stop_full_thumbnail_generation',
   /** 缩略图生成状态快照(webview 刷新后恢复进度用;进度流走 EVENTS.THUMB_GEN_PROGRESS)。 */
   FULL_THUMB_GEN_STATUS: 'full_thumb_gen_status',
-  // 注:后端另有 cancel_thumbnail_request 命令(Scheme 2 dispatcher 消费),前端按
   // 「在途项保留后端单飞——同项大概率重回视口」的设计(useRequestQueue.cancel)不调用它。
   // 优先测量给定项的真实尺寸（滚动到锚点前抢先算其 y，避免跳动）。
   PRIORITIZE_DIMENSIONS: 'prioritize_dimensions',
@@ -113,7 +107,6 @@ export const IPC = {
 
   // ── 派生流水线（P2/P3/P4，§3.2/§3.3/§3.6：视频封面/关键帧、音频封面、epub 封面） ────
   START_DERIVATION: 'start_derivation',
-  PAUSE_DERIVATION: 'pause_derivation',
   STOP_DERIVATION: 'stop_derivation',
   DERIVATION_STATUS: 'derivation_status',
 
@@ -126,8 +119,6 @@ export const IPC = {
   CANCEL_VIDEO_PLAYBACK: 'cancel_video_playback',
   /** 播放准备进度快照（webview 刷新后恢复进度；无在途 job 回 null）。进度流走 VIDEO_PLAYBACK_PROGRESS_EVENT。 */
   VIDEO_PLAYBACK_PROGRESS_SNAPSHOT: 'video_playback_progress_snapshot',
-  /** FFmpeg 视频扩展组件状态 → 'ready'|'downloading'|'notDownloaded'。 */
-  VIDEO_COMPONENT_STATUS: 'video_component_status',
   /** 触发下载+安装 FFmpeg 视频扩展组件（幂等）。 */
   DOWNLOAD_VIDEO_COMPONENT: 'download_video_component',
   /** 视频可播产物独立池实时占用统计 → { bytes, files, limitMb }（design §5.4，V7 补遗）。 */
@@ -170,7 +161,6 @@ export const IPC = {
   LIST_VERSIONS: 'list_versions',
   GET_CURRENT_VERSION: 'get_current_version',
   GET_DOCUMENT_TEXT: 'get_document_text',
-  GET_VERSION_CONTENT: 'get_version_content',
   SAVE_VERSION: 'save_version',
   SET_CURRENT_VERSION: 'set_current_version',
   DELETE_VERSION: 'delete_version',
@@ -188,13 +178,23 @@ export const IPC = {
   TEST_BACKEND: 'test_backend',
   REMOVE_BACKEND: 'remove_backend',
 
-  // ── 搜索 ────────────────────────────────────────────────────────────
-  SEARCH_MEDIA: 'search_media',
 
   // ── 配置 ────────────────────────────────────────────────────────────
   GET_APP_CONFIG: 'get_app_config',
   SET_APP_CONFIG: 'set_app_config',
-  // 启动时一次性取多项配置（合并 4 次 get_app_config 为 1 次往返）。
+  // ── 中央设置(设置集中保存,2026-09-16)──────────────────────────────────
+  // 全部已注册设置的生效值 + 本进程 revision / generation,供运行时刷新与重置后同步。
+  GET_SETTINGS_SNAPSHOT: 'get_settings_snapshot',
+  // 一次性批量提交具名键值 patch:写盘一次,返回最新快照、变化键、需重启键与应用失败键。
+  // 必须携带 generation:旧代次(重置前)的写入被拒绝,防其他窗口迟到回写。
+  SET_APP_SETTINGS: 'set_app_settings',
+  // 退出前 flush 回报:后端发 SETTINGS_FLUSH_REQUESTED,前端落盘完成后经此回执。
+  // ok=false 时后端保留窗口不退出,由前端给出重试/放弃选择。
+  SETTINGS_FLUSH_DONE: 'settings_flush_done',
+  // 退出前 flush 请求(设置集中保存):后端发 SETTINGS_FLUSH_REQUESTED 事件,载荷 { requestId };
+  // 前端落盘在途/待保存设置后经 IPC.SETTINGS_FLUSH_DONE 回执,后端收齐再退出。
+  SETTINGS_FLUSH_REQUESTED: 'settings-flush-requested',
+  // 启动时一次性取设置快照与内部状态(首启/引导标记),合并为 1 次往返。
   GET_STARTUP_CONFIG: 'get_startup_config',
   // 应用日志目录路径（设置页"打开日志目录"用）。
   GET_LOG_DIR: 'get_log_dir',
@@ -223,8 +223,6 @@ export const IPC = {
   EXPORT_DIAGNOSTICS_PACKAGE: 'export_diagnostics_package',
 
   // ── 文件操作 ──────────────────────────────────────────────────────────
-  MOVE_MEDIA_ITEMS: 'move_media_items',
-  COPY_MEDIA_ITEMS: 'copy_media_items',
   RELOCATE_MEDIA_ITEMS: 'relocate_media_items',
   COPY_MEDIA_ITEMS_DB: 'copy_media_items_db',
   REMOVE_MEDIA_ITEMS_HARD: 'remove_media_items_hard',
@@ -270,8 +268,6 @@ export const IPC = {
   RESTART_AI_ANALYSIS: 'restart_ai_analysis',
   RETRY_FAILED_AI_ITEMS: 'retry_failed_ai_items',
   REBUILD_EMBEDDINGS: 'rebuild_embeddings',
-  LIST_AI_MODELS: 'list_ai_models',
-  IMPORT_AI_MODEL: 'import_ai_model',
   RELOAD_AI_ENGINE: 'reload_ai_engine',
   LIST_MODEL_REGISTRY: 'list_model_registry',
   SET_ACTIVE_MODEL: 'set_active_model',
@@ -407,8 +403,6 @@ export const IPC = {
   GET_EDITING_ENTITLEMENT: 'get_editing_entitlement',
   /** 激活内建图片编辑高级功能；后端固定 plugin id / SKU，前端只提交 token。 */
   ACTIVATE_EDITING_FEATURE: 'activate_editing_feature',
-  /** 撤销内建图片编辑高级功能授权。 */
-  DEACTIVATE_EDITING_FEATURE: 'deactivate_editing_feature',
   /** 获取 orientation 烤入、sRGB、长边受限的 raw 编辑预览 packet。 */
   GET_EDIT_PREVIEW: 'get_edit_preview',
   /** 保存编辑副本:旋转/翻转/裁剪 + 编码落盘 + 单文件入库,直接返回终态(非 job/事件模型)。 */
@@ -418,18 +412,6 @@ export const IPC = {
   START_DEDUP_ANALYSIS: 'start_dedup_analysis',
   STOP_DEDUP_ANALYSIS: 'stop_dedup_analysis',
   DEDUP_STATUS: 'dedup_status',
-  LIST_DUPLICATE_GROUPS: 'list_duplicate_groups',
-  LIST_DUPLICATE_MEMBERS: 'list_duplicate_members',
-  APPLY_DEDUP_SOFT_DELETE: 'apply_dedup_soft_delete',
-  // 文件夹优先复核：统计/候选/范围画廊与单目标文件夹草案。
-  LIST_DUPLICATE_FOLDER_CANDIDATES: 'list_duplicate_folder_candidates',
-  LIST_DUPLICATE_FOLDER_ROOTS: 'list_duplicate_folder_roots',
-  LIST_DUPLICATE_FOLDER_CHILDREN: 'list_duplicate_folder_children',
-  GET_DUPLICATE_FOLDER_SUMMARY: 'get_duplicate_folder_summary',
-  LIST_DUPLICATE_FOLDER_ITEMS: 'list_duplicate_folder_items',
-  LIST_DUPLICATE_GROUP_MEMBERS: 'list_duplicate_group_members',
-  PREVIEW_DEDUP_FOLDER_CLEANUP: 'preview_dedup_folder_cleanup',
-  APPLY_DEDUP_FOLDER_SOFT_DELETE: 'apply_dedup_folder_soft_delete',
 } as const
 
 // ── Tauri 事件 ──────────────────────────────────────────────────────────

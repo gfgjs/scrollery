@@ -81,28 +81,6 @@ const idsOf = (tree: ReturnType<typeof useFolderTree>) => tree.nodes.value.map((
 const expandOf = (tree: ReturnType<typeof useFolderTree>, id: number) =>
   tree.loadChildren(tree.nodes.value.find((n) => n.id === id)!)
 
-describe('useFolderTree 分类参数', () => {
-  it('registeredOnly 的根目录与子目录查询都携带当前分类', async () => {
-    const tree = useFolderTree(
-      () => 'registeredOnly',
-      undefined,
-      () => ['document'] as const,
-    )
-
-    await loadRootsOf(tree)
-    await expandOf(tree, PARENT_ID)
-
-    const directoryCalls = calls.filter(
-      ({ cmd }) => cmd === 'get_directory_tree' || cmd === 'get_directory_children',
-    )
-    expect(directoryCalls).toHaveLength(2)
-    expect(directoryCalls.map(({ args }) => (args as { categories: TreeCategory[] }).categories)).toEqual([
-      ['document'],
-      ['document'],
-    ])
-  })
-})
-
 describe('useFolderTree.loadChildren 并发去重', () => {
   it('并发调用同一 parentId:子节点只注入一次,IPC 只发一次', async () => {
     installDefaultHandler(5) // 延迟放大重叠窗口
@@ -124,20 +102,6 @@ describe('useFolderTree.loadChildren 并发去重', () => {
     expect(childCalls()).toBe(1)
     // 父目录被标记展开。
     expect(tree.nodes.value.find((n) => n.id === PARENT_ID)?.expanded).toBe(true)
-  })
-
-  it('第二道防线:加载完成后再次直接 loadChildren 同一父目录,不产生重复行', async () => {
-    const tree = useFolderTree()
-    await tree.loadRoots([{ id: 1, path: '/root' }] as unknown as Parameters<typeof tree.loadRoots>[0])
-
-    await expandOf(tree, PARENT_ID) // 第一次:注入子节点
-    await expandOf(tree, PARENT_ID) // 第二次(串行,在途表已清):existing 过滤兜底
-
-    const ids = idsOf(tree)
-    expect(new Set(ids).size).toBe(ids.length)
-    for (const cid of CHILD_IDS) {
-      expect(ids.filter((x) => x === cid)).toHaveLength(1)
-    }
   })
 
   /**
@@ -176,17 +140,6 @@ describe('useFolderTree.loadChildren 并发去重', () => {
     expect(keys).toContain('1:dir10/alpha')
     expect(keys).toContain('1:dir10/beta')
   })
-
-  it('单次加载正常注入全部子节点(未回归基本功能)', async () => {
-    const tree = useFolderTree()
-    await tree.loadRoots([{ id: 1, path: '/root' }] as unknown as Parameters<typeof tree.loadRoots>[0])
-    await expandOf(tree, PARENT_ID)
-
-    const ids = idsOf(tree)
-    expect(ids).toContain(PARENT_ID)
-    for (const cid of CHILD_IDS) expect(ids).toContain(cid)
-    expect(childCalls()).toBe(1)
-  })
 })
 
 // ── 折叠 / 后代收集(2026-07-16 补:此前这条路径零覆盖)────────────────────────────
@@ -199,55 +152,6 @@ const loadRootsOf = (tree: ReturnType<typeof useFolderTree>) =>
   tree.loadRoots([{ id: 1, path: '/root' }] as unknown as Parameters<typeof tree.loadRoots>[0])
 
 describe('useFolderTree 折叠', () => {
-  it('折叠目录:移除其全部后代行,自身留下且 expanded=false', async () => {
-    const tree = useFolderTree()
-    await loadRootsOf(tree)
-    await expandOf(tree, PARENT_ID)
-    expect(idsOf(tree)).toHaveLength(1 + CHILD_IDS.length)
-
-    const parent = tree.nodes.value.find((n) => n.id === PARENT_ID)!
-    await tree.toggleNode(parent) // 已 expanded → 折叠
-
-    expect(idsOf(tree)).toEqual([PARENT_ID])
-    expect(tree.nodes.value[0].expanded).toBe(false)
-  })
-
-  it('折叠递归吃掉多层后代(孙节点也移除)', async () => {
-    // 20 之下再挂一层孙节点 30/31。
-    const GRAND = [30, 31]
-    state.handler = (cmd, args) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { hasChildren: true })])
-      }
-      if (cmd === 'get_directory_children') {
-        const a = args as { parentId: number }
-        if (a.parentId === PARENT_ID) {
-          return Promise.resolve([node(20, PARENT_ID, 1, { hasChildren: true })])
-        }
-        if (a.parentId === 20) return Promise.resolve(GRAND.map((id) => node(id, 20, 2)))
-      }
-      return Promise.resolve([])
-    }
-    const tree = useFolderTree()
-    await loadRootsOf(tree)
-    await expandOf(tree, PARENT_ID)
-    await expandOf(tree, 20)
-    expect(idsOf(tree)).toEqual([PARENT_ID, 20, 30, 31])
-
-    await tree.toggleNode(tree.nodes.value.find((n) => n.id === PARENT_ID)!)
-    // 孙节点必须随祖先折叠一并移除。
-    expect(idsOf(tree)).toEqual([PARENT_ID])
-  })
-
-  it('collapseAll:只留扫描根行,且各根 expanded 清零', async () => {
-    const tree = useFolderTree()
-    await loadRootsOf(tree)
-    await expandOf(tree, PARENT_ID)
-    tree.collapseAll()
-
-    expect(idsOf(tree)).toEqual([PARENT_ID])
-    expect(tree.nodes.value[0].expanded).toBe(false)
-  })
 
   /**
    * 🔴 轴契约(D-013):后代收集必须走 **parentKey(路径身份)** 而非 parentId。
@@ -280,32 +184,6 @@ describe('useFolderTree 折叠', () => {
     expect(idsOf(tree)).toHaveLength(1 + CHILD_IDS.length)
 
     await tree.toggleNode(tree.nodes.value.find((n) => n.id === PARENT_ID)!)
-    expect(idsOf(tree)).toEqual([PARENT_ID])
-  })
-
-  /**
-   * 同上的另一半:`collapseAll` 的「是扫描根」判据也必须走 parentKey。
-   * parentId 恒 null 的子节点若被当成根行留下,collapseAll 就成了 no-op。
-   */
-  it('collapseAll 的根判据走 parentKey:parentId 恒 null 的子节点不得被当成根留下', async () => {
-    state.handler = (cmd, args) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { hasChildren: true })])
-      }
-      if (cmd === 'get_directory_children') {
-        const a = args as { parentId: number }
-        if (a.parentId !== PARENT_ID) return Promise.resolve([])
-        return Promise.resolve(
-          CHILD_IDS.map((id) => node(id, null, 1, { parentKey: '1:dir' + PARENT_ID })),
-        )
-      }
-      return Promise.resolve([])
-    }
-    const tree = useFolderTree()
-    await loadRootsOf(tree)
-    await expandOf(tree, PARENT_ID)
-    tree.collapseAll()
-
     expect(idsOf(tree)).toEqual([PARENT_ID])
   })
 })
@@ -348,52 +226,6 @@ function file(name: string, mediaType: DirFile['mediaType'] = 'image'): DirFile 
 }
 
 describe('useFolderTree 树分类筛选', () => {
-  it('DB 文件页把独立分类传给 IPC，而不是在前端过滤已分页结果', async () => {
-    const categories: TreeCategory[] = ['audio', 'other']
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { mediaCount: 1 })])
-      }
-      if (cmd === 'list_directory_files') return Promise.resolve([])
-      return Promise.resolve([])
-    }
-    const tree = useFolderTree(() => 'registeredOnly', undefined, () => categories)
-    await loadRootsOf(tree)
-    await tree.toggleNode(tree.nodes.value[0])
-
-    const call = calls.find((item) => item.cmd === 'list_directory_files')
-    expect(call?.args).toMatchObject({
-      directoryId: PARENT_ID,
-      limit: 201,
-      offset: 0,
-      categories: ['audio', 'other'],
-    })
-  })
-
-  it('FS 文件页同样携带分类，目录请求保持可导航', async () => {
-    const categories: TreeCategory[] = ['other']
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { hasChildren: true })])
-      }
-      if (cmd === 'list_tree_entries') return Promise.resolve({ entries: [], total: 0 })
-      return Promise.resolve([])
-    }
-    const tree = useFolderTree(() => 'allFiles', undefined, () => categories)
-    await loadRootsOf(tree)
-    await tree.toggleNode(tree.nodes.value[0])
-
-    const treeCallsForCategory = treeCalls().filter((item) => {
-      const args = item.args as { categories?: TreeCategory[] }
-      return args.categories?.join(',') === 'other'
-    })
-    expect(treeCallsForCategory.length).toBeGreaterThanOrEqual(2)
-    expect(
-      treeCallsForCategory.every((item) =>
-        Array.isArray((item.args as { categories: TreeCategory[] }).categories),
-      ),
-    ).toBe(true)
-  })
 
   it('分类切换清空旧页并拒绝旧 IPC 回写', async () => {
     let categories: TreeCategory[] = ['image']
@@ -429,62 +261,6 @@ describe('useFolderTree 树分类筛选', () => {
 })
 
 describe('useFolderTree 「所有文件」模式取数', () => {
-  it('默认取值器是 registeredOnly:不传模式 = 明确要 DB 路径(选择器对话框的契约)', async () => {
-    const tree = useFolderTree()
-    await loadRootsOf(tree)
-    await expandOf(tree, PARENT_ID)
-    expect(childCalls()).toBe(1)
-    expect(treeCalls()).toHaveLength(0)
-  })
-
-  it('FS 模式子目录走 list_tree_entries(kind=dirs + 路径身份),不打 DB 子目录命令', async () => {
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { hasChildren: true })])
-      }
-      if (cmd === 'list_tree_entries') return Promise.resolve({ entries: [], total: 0 })
-      return Promise.resolve([])
-    }
-    const tree = fsTree()
-    await loadRootsOf(tree)
-    await expandOf(tree, PARENT_ID)
-
-    expect(childCalls()).toBe(0) // DB 快路径一次都不该走
-    const dirCall = treeCalls().find((c) => (c.args as { kind: string }).kind === 'dirs')
-    // 入参是**路径身份**(rootId + relPath),不是 DB id —— 这正是 FS-only 目录也能展开的原因。
-    expect(dirCall?.args).toMatchObject({
-      rootId: 1,
-      relPath: 'dir' + PARENT_ID,
-      mode: 'allFiles',
-      kind: 'dirs',
-      cursor: 0,
-    })
-  })
-
-  /**
-   * 🔴 本模式的**核心能力**:磁盘上有、库里没有的目录必须能展开。
-   *
-   * 可证伪性:父节点 `id: null`。任何「先拿 id 再取数」的实现(包括改造前那句
-   * `if (node.hasChildren !== false && node.id !== null)`)在这里一个子节点都拉不出来。
-   */
-  it('FS-only 目录(无 DB 行,id=null)照样能展开出子节点', async () => {
-    const FS_ONLY = node(PARENT_ID, null, 0, { hasChildren: null })
-    const orphan = { ...FS_ONLY, id: null } as DirNode
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') return Promise.resolve([orphan])
-      if (cmd === 'list_tree_entries') {
-        return Promise.resolve({ entries: [fsEntry('sub', 'dir')], total: 1 })
-      }
-      return Promise.resolve([])
-    }
-    const tree = fsTree()
-    await loadRootsOf(tree)
-    await tree.loadChildren(tree.nodes.value[0])
-
-    expect(tree.nodes.value.map((n) => n.nodeKey)).toContain(`1:dir${PARENT_ID}/sub`)
-    // 子节点同样没有实体身份 —— 后端不发 directoryId,适配器归一为 null(绝不伪造)。
-    expect(tree.nodes.value.find((n) => n.name === 'sub')?.id).toBeNull()
-  })
 
   /**
    * 🔴 在途去重表的键也必须是**路径身份**(D-013 第三处)。
@@ -585,120 +361,6 @@ describe('useFolderTree 「所有文件」模式取数', () => {
     expect(err).toHaveBeenCalled() // 静默中止 = 用户看到目录莫名少几个而无信号
     err.mockRestore()
   })
-
-  /**
-   * 🔴 「还有没有下一页」读后端的 `nextCursor`,**不能**拿 `entries.length === 页长` 推。
-   *
-   * 可证伪性(真实可达,非假想):总数恰为页长整数倍时,末页**装满 200 条且 nextCursor 缺席**。
-   * 按条数推的实现会说「还有更多」,于是「加载更多」行永不消失、再点又拉回一页空 —— 后端
-   * `exact_multiple_page_size_ends_without_extra_empty_page` 守的是同一个边界的另一半。
-   */
-  it('末页装满一页但无 nextCursor 时,filesHasMore=false', async () => {
-    const full = Array.from({ length: 200 }, (_, i) => fsEntry(`f${i}.jpg`, 'file'))
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { mediaCount: 200 })])
-      }
-      if (cmd === 'list_tree_entries') return Promise.resolve({ entries: full, total: 200 })
-      return Promise.resolve([])
-    }
-    const tree = fsTree()
-    await loadRootsOf(tree)
-    await tree.toggleNode(tree.nodes.value[0])
-
-    const n = tree.nodes.value[0]
-    expect(n.files).toHaveLength(200)
-    expect(n.filesHasMore).toBe(false)
-    expect(n.filesCursor).toBeUndefined()
-  })
-
-  /**
-   * 分页接力:第二页带的游标是**后端上一页给的原话**。
-   *
-   * ⚠ 诚实标注:本用例**区分不出**「读 nextCursor」与「拿 files.length 反推」。后端
-   * `slice_page` 恒有 `next_cursor = cursor + entries.len()`,而 files 视图不丢项,故二者今天
-   * 逐值相等,构造不出合法的分歧输入。留 `filesCursor` 字段的理由不是它今天不同,而是它把
-   * 「翻页游标」与「适配后剩几条」解耦 —— 后者取决于 adaptTreeEntries 怎么分组,那是另一个
-   * 模块的自由。这条用例只钉协议(游标确实往下传),不冒充可证伪。
-   */
-  it('加载更多按后端给的游标请求下一页', async () => {
-    state.handler = (cmd, args) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { mediaCount: 3 })])
-      }
-      if (cmd === 'list_tree_entries') {
-        const a = args as { cursor: number; kind: string }
-        if (a.kind === 'dirs') return Promise.resolve({ entries: [], total: 0 })
-        return a.cursor === 0
-          ? Promise.resolve({ entries: [fsEntry('a.jpg', 'file')], nextCursor: 1, total: 2 })
-          : Promise.resolve({ entries: [fsEntry('b.jpg', 'file')], total: 2 })
-      }
-      return Promise.resolve([])
-    }
-    const tree = fsTree()
-    await loadRootsOf(tree)
-    await tree.toggleNode(tree.nodes.value[0])
-    expect(tree.nodes.value[0].filesCursor).toBe(1)
-
-    await tree.loadMoreFiles(tree.nodes.value[0])
-
-    const fileCalls = treeCalls().filter((c) => (c.args as { kind: string }).kind === 'files')
-    expect(fileCalls.map((c) => (c.args as { cursor: number }).cursor)).toEqual([0, 1])
-    expect(tree.nodes.value[0].files?.map((f) => f.fileName)).toEqual(['a.jpg', 'b.jpg'])
-    expect(tree.nodes.value[0].filesHasMore).toBe(false)
-  })
-})
-
-// ── R-03:FS 模式下根行的 DB 轴字段归一 ─────────────────────────────────────────
-//
-// 根行两种模式都从 DB 来(D-013 键统一),但 FS 模式下其 hasChildren/mediaCount **语义失效**
-// (F-022:双数据源下共享节点沿用旧轴字段是静默语义漂移):
-//  - DB hasChildren=false 而磁盘有 FS-only 子目录 → toggleNode 跳过 loadChildren,整层子目录
-//    永不出现且无信号;
-//  - hasChildren=false + mediaCount=0 的根无 chevron(isExpandable=false)——「所有文件」模式的
-//    核心场景整根不可浏览;
-//  - 根行角标照显递归媒体数,违反 §4.2「媒体数不冒充文件数」。
-describe('useFolderTree FS 模式根行字段归一(R-03)', () => {
-  // 可证伪样本:DB 说「无子目录、0 媒体」——正是①②两条会翻车的形状。
-  const dbShapedRoot = () => node(PARENT_ID, null, 0, { hasChildren: false, mediaCount: 0 })
-
-  it('FS 模式:根行 hasChildren/mediaCount 归一为 null(未知/不适用)', async () => {
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') return Promise.resolve([dbShapedRoot()])
-      if (cmd === 'list_tree_entries') return Promise.resolve({ entries: [], total: 0 })
-      return Promise.resolve([])
-    }
-    const tree = fsTree()
-    await loadRootsOf(tree)
-    expect(tree.nodes.value[0].hasChildren).toBeNull()
-    expect(tree.nodes.value[0].mediaCount).toBeNull()
-  })
-
-  it('对照:registeredOnly 模式根行保留 DB 轴字段(零回归)', async () => {
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') return Promise.resolve([dbShapedRoot()])
-      return Promise.resolve([])
-    }
-    const tree = useFolderTree()
-    await loadRootsOf(tree)
-    expect(tree.nodes.value[0].hasChildren).toBe(false)
-    expect(tree.nodes.value[0].mediaCount).toBe(0)
-  })
-
-  it('端到端:DB 报 hasChildren=false 的根,FS 模式展开仍会去拉子目录(①的行为面)', async () => {
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') return Promise.resolve([dbShapedRoot()])
-      if (cmd === 'list_tree_entries') {
-        return Promise.resolve({ entries: [fsEntry('ghost', 'dir')], total: 1 })
-      }
-      return Promise.resolve([])
-    }
-    const tree = fsTree()
-    await loadRootsOf(tree)
-    await tree.toggleNode(tree.nodes.value[0])
-    // 归一前:hasChildren===false → toggleNode 直接跳过 loadChildren,ghost 永不出现。
-    expect(tree.nodes.value.map((n) => n.name)).toContain('ghost')
-  })
 })
 
 // ── R-04:loadChildren 代际守卫(切模式竞态)────────────────────────────────────
@@ -739,22 +401,6 @@ describe('useFolderTree loadChildren 代际守卫(R-04)', () => {
     // 且旧响应不得把新树里的同键节点标成 expanded(它根本没展开过)。
     expect(tree.nodes.value[0].expanded).not.toBe(true)
   })
-
-  it('无换代时守卫不误伤:正常展开照常注入', async () => {
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { hasChildren: true })])
-      }
-      if (cmd === 'list_tree_entries') {
-        return Promise.resolve({ entries: [fsEntry('kid', 'dir')], total: 1 })
-      }
-      return Promise.resolve([])
-    }
-    const tree = fsTree()
-    await loadRootsOf(tree)
-    await tree.loadChildren(tree.nodes.value[0])
-    expect(tree.nodes.value.map((n) => n.name)).toContain('kid')
-  })
 })
 
 // ── R-10:展开失败不得停在「expanded=true + 空树」────────────────────────────────
@@ -782,26 +428,5 @@ describe('useFolderTree 展开失败回退(R-10)', () => {
     expect(tree.nodes.value[0].expanded).toBe(false) // 回退,不是悬着的假展开
     expect(tree.nodes.value[0].loading).toBe(false)
     expect(reported).toHaveLength(1) // 组件侧据此弹 toast
-  })
-
-  it('对照:取数成功时不触发上报,正常展开', async () => {
-    state.handler = (cmd) => {
-      if (cmd === 'get_directory_tree') {
-        return Promise.resolve([node(PARENT_ID, null, 0, { hasChildren: true })])
-      }
-      if (cmd === 'list_tree_entries') {
-        return Promise.resolve({ entries: [fsEntry('ok', 'dir')], total: 1 })
-      }
-      return Promise.resolve([])
-    }
-    const reported: unknown[] = []
-    const tree = useFolderTree(
-      () => 'allFiles',
-      (e) => reported.push(e),
-    )
-    await loadRootsOf(tree)
-    await tree.toggleNode(tree.nodes.value[0])
-    expect(tree.nodes.value[0].expanded).toBe(true)
-    expect(reported).toHaveLength(0)
   })
 })

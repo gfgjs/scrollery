@@ -63,33 +63,8 @@ export interface ReaderBookPrefs {
 }
 
 /**
- * 复合定位器(仿 Readium Locator,§6.2)。序列化为 `reading_progress.position` /
- * `reader_bookmarks.locator` 的 `loc1:<json>` 值。
- *
- * **偏移的锚定空间 = canonical 文本**:解码 + 分章 + 分段/重排之后、替换规则/简繁转换之前的
- * 章内字符流。替换/简繁是纯显示层变换(不改 canonical、不改偏移);text-context 重锚也在
- * canonical 空间搜索。推论:重排开关/版本切换会变 canonical → 走 `t` 重锚;替换/简繁切换不影响定位。
- */
-export interface ReaderLocator {
-  /** 格式判别:txt/md 主键用 c+o,epub 主键用 cfi。 */
-  k: 'txt' | 'md' | 'epub'
-  /** 章 index(txt/md)。 */
-  c?: number
-  /** 章内字符偏移(txt/md,canonical 空间)。 */
-  o?: number
-  /** epub CFI(epub 主键,foliate 解析)。 */
-  cfi?: string
-  /** 章内 progression 0..1(重锚兜底用)。 */
-  p?: number
-  /** 全书 progression 0..1(页脚百分比 / 跨章兜底)。 */
-  tp?: number
-  /** 上下文三元组(前文 / 锚点原文 / 后文,各约 40 字):布局与文本双无关的最后重锚防线。 */
-  t?: { b: string; h: string; a: string }
-}
-
-/**
  * 一条阅读书签(§6.2,R4),对应 Rust `ReaderBookmark` DTO(camelCase)。`locator` 现用 foliate
- * CFI("cfi:<epubcfi>",与阅读进度同源);loc1 落地后可存 "loc1:<json>",前端形状不变。
+ * CFI("cfi:<epubcfi>",与阅读进度同源)。
  */
 export interface ReaderBookmark {
   id: number

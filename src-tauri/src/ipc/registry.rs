@@ -28,29 +28,21 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::scan_commands::start_scan,
         ipc::scan_commands::stop_scan,
         ipc::scan_commands::clear_database,
-        ipc::scan_commands::clear_settings,
+        // 设置统一入口(2026-09-16 集中保存):快照 / 批量提交 / 完整重置。clear_settings 自
+        // scan_commands 迁至 config_commands,语义由「清空 app_config 表」改为「全默认模板替换
+        // config.toml」——命令名保持不变,前端调用点无需改动。
+        ipc::config_commands::get_settings_snapshot,
+        ipc::config_commands::set_app_settings,
+        ipc::config_commands::clear_settings,
         // 精确内容去重（独立后台分析 + keyset 重复组查询）
         ipc::dedup_commands::start_dedup_analysis,
         ipc::dedup_commands::stop_dedup_analysis,
         ipc::dedup_commands::dedup_status,
-        ipc::dedup_commands::list_duplicate_groups,
-        ipc::dedup_commands::list_duplicate_members,
-        ipc::dedup_commands::list_duplicate_group_members,
-        ipc::dedup_commands::list_duplicate_folder_candidates,
-        ipc::dedup_commands::list_duplicate_folder_roots,
-        ipc::dedup_commands::list_duplicate_folder_children,
-        ipc::dedup_commands::get_duplicate_folder_summary,
-        ipc::dedup_commands::list_duplicate_folder_items,
-        ipc::dedup_commands::preview_dedup_folder_cleanup,
-        ipc::dedup_commands::apply_dedup_folder_soft_delete,
-        ipc::dedup_commands::apply_dedup_soft_delete,
         // layout
         ipc::layout_commands::compute_layout,
         ipc::layout_commands::get_view_ids, // T14.5/T18：按布局序的视图全集 id（Part5 选区前置）
-        ipc::layout_commands::get_layout_rows,
         ipc::layout_commands::get_layout_rows_by_y,
         ipc::layout_commands::get_bucket_rows, // T16 方案B:bucket 段精确取行(B0)
-        ipc::layout_commands::get_separator_y_by_group_id,
         ipc::layout_commands::get_item_y_by_id,
         ipc::layout_commands::get_subtree_scroll_target,
         // H-Lab 横向画廊实验(独立缓存,与生产布局命令平行)
@@ -78,9 +70,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::media_commands::set_playback_position, // V23:播放器播放位置记忆
         ipc::media_commands::soft_delete_items,
         ipc::media_commands::restore_items,
-        ipc::media_commands::resolve_selection, // Part5 S4：选择描述符 → id 列表（按视图布局序）
-        ipc::media_commands::count_selection, // Part5 S4：选择描述符精确计数（SelectAll 走 COUNT(*)）
-        ipc::media_commands::get_trash,
         ipc::media_commands::get_stats,
         ipc::media_commands::list_registered_formats,
         ipc::media_commands::list_library_formats,
@@ -95,7 +84,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::thumbnail_commands::start_incremental_thumbnail_generation,
         ipc::thumbnail_commands::stop_full_thumbnail_generation,
         ipc::thumbnail_commands::full_thumb_gen_status,
-        ipc::thumbnail_commands::cancel_thumbnail_request,
         ipc::thumbnail_commands::regenerate_missing_thumb,
         ipc::thumbnail_commands::clear_all_thumbnails,
         // 数据备份（方案 B §5/§8）
@@ -115,7 +103,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         // 图片简单编辑（方案 C §6）
         ipc::edit_commands::get_editing_entitlement,
         ipc::edit_commands::activate_editing_feature,
-        ipc::edit_commands::deactivate_editing_feature,
         ipc::edit_commands::get_edit_preview,
         ipc::edit_commands::save_edited_image,
         // 查看器渲染色域(B 线,方案 §0①④)
@@ -134,7 +121,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::exotic_commands::stop_exotic_processing,
         ipc::exotic_commands::get_exotic_processing_status,
         ipc::exotic_commands::list_exotic_task_details,
-        ipc::exotic_commands::retry_exotic_task,
         ipc::exotic_commands::retry_exotic_plugin_failures,
         // exotic 激活 / 移除授权命令（Part3 §6.6）
         ipc::exotic_commands::activate_exotic_plugin,
@@ -151,7 +137,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::volume_commands::rename_volume,
         ipc::volume_commands::forget_volume,
         // search
-        ipc::search_commands::search_media,
         // config
         ipc::config_commands::get_app_config,
         ipc::config_commands::get_startup_config,
@@ -159,11 +144,12 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::config_commands::get_thumb_cache_dir,
         ipc::config_commands::get_log_dir,
         ipc::config_commands::get_cache_stats,
-        ipc::config_commands::clear_cache,
         // A2:config.toml 外部编辑支持
         ipc::config_commands::open_config_file,
         ipc::config_commands::get_config_status,
         // 独立日志窗口(日志能力重构 S4,方案 §5/§9.4 S4)
+        // 退出前 flush 回报:后端发起 settings-flush-requested,前端落盘完成后经此回执。
+        ipc::system_commands::settings_flush_done,
         ipc::log_commands::open_log_window,
         ipc::log_commands::list_log_files,
         ipc::log_commands::read_log_file_page,
@@ -193,8 +179,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::ai_commands::stop_ai_analysis,
         ipc::ai_commands::retry_failed_ai_items,
         ipc::ai_commands::rebuild_embeddings,
-        ipc::ai_commands::list_ai_models,
-        ipc::ai_commands::import_ai_model,
         ipc::ai_commands::reload_ai_engine,
         ipc::ai_commands::list_model_registry,
         ipc::ai_commands::set_active_model,
@@ -235,10 +219,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::face_commands::list_likely_face_matches,
         ipc::face_commands::list_face_model_registry,
         ipc::face_commands::download_face_model,
-        ipc::face_commands::set_active_face_model,
         // 派生流水线（视频封面/关键帧、文档缩略图、音频封面/元数据）
         ipc::derive_commands::start_derivation,
-        ipc::derive_commands::pause_derivation,
         ipc::derive_commands::stop_derivation,
         ipc::derive_commands::derivation_status,
         // 视频格式扩展 · 播放链路(V6):resolve/confirm/cancel + 组件下载/状态
@@ -246,7 +228,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::video_commands::confirm_video_playback,
         ipc::video_commands::cancel_video_playback,
         ipc::video_commands::video_playback_progress_snapshot,
-        ipc::video_commands::video_component_status,
         ipc::video_commands::download_video_component,
         ipc::video_commands::video_cache_stats,
         // 文档（P4）：文档缩略图前端渲染回环（§3.4）
@@ -274,7 +255,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::doc_commands::list_versions,
         ipc::doc_commands::get_current_version,
         ipc::doc_commands::get_document_text,
-        ipc::doc_commands::get_version_content,
         ipc::doc_commands::save_version,
         ipc::doc_commands::set_current_version,
         ipc::doc_commands::delete_version,
@@ -307,8 +287,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::system_commands::copy_image_to_clipboard,
         // file ops
         ipc::file_ops_commands::create_physical_folder,
-        ipc::file_ops_commands::move_media_items,
-        ipc::file_ops_commands::copy_media_items,
         ipc::file_ops_commands::relocate_media_items,
         ipc::file_ops_commands::copy_media_items_db,
         ipc::file_ops_commands::remove_media_items_hard,

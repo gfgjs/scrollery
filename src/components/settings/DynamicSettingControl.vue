@@ -123,6 +123,7 @@ import type { Component } from 'vue'
 import { invokeIpc } from '../../utils/ipc'
 import { IPC } from '../../constants/ipc'
 import { useUiStore } from '../../stores/uiStore'
+import { useThemeStore } from '../../stores/themeStore'
 import type { MinimapRenderMode } from '../../stores/uiStore'
 import { useToastStore } from '../../stores/toastStore'
 import { useConfigStore } from '../../stores/configStore'
@@ -142,6 +143,8 @@ import { useTitlebarMode } from '../../composables/useTitlebarMode'
 import { useSelectionBarMode } from '../../composables/useSelectionBarMode'
 import { useToolbarAlign, type BarAlign } from '../../composables/useToolbarAlign'
 import { usePerformanceMonitor } from '../../composables/usePerformanceMonitor'
+import { resetSettings } from '../../stores/settingsPersistence'
+import { logger } from '../../utils/logger'
 
 const props = defineProps<{
   settingKey: string
@@ -149,6 +152,8 @@ const props = defineProps<{
 }>()
 
 const ui = useUiStore()
+// 外观模式归主题域(见 stores/themeStore):本组件只读偏好、写偏好,不碰主题参数与草稿。
+const theme = useThemeStore()
 const toast = useToastStore()
 const config = useConfigStore()
 const media = useMediaStore()
@@ -178,10 +183,6 @@ const toggleBindings: Record<string, { get: () => boolean; set: (v: boolean) => 
     set: (v) => void config.setEnableHoverScale(v),
   },
   hoverAutoplay: { get: () => ui.hoverAutoplay, set: (v) => ui.setHoverAutoplay(v) },
-  bucketScroll: {
-    get: () => ui.bucketSegmentedScroll,
-    set: (v) => ui.setBucketSegmentedScroll(v),
-  },
   showThumbInfo: { get: () => ui.showThumbInfo, set: (v) => ui.setShowThumbInfo(v) },
   showDragHandle: { get: () => ui.showDragHandle, set: (v) => ui.setShowDragHandle(v) },
   autoHideChromeWindowed: {
@@ -197,12 +198,12 @@ const toggleBindings: Record<string, { get: () => boolean; set: (v: boolean) => 
     set: (v) => void config.setEnableVideoKeyframes(v),
   },
   aiHqCache: { get: () => config.aiHqCache, set: (v) => void config.setAiHqCache(v) },
-  // 标题栏合并/分离:经 useTitlebarMode 共享单例读写(非 config store),setter 内含 localStorage 持久。
+  // 标题栏合并/分离:经 useTitlebarMode 共享单例读写(非 config store);setter 提交到中央设置服务。
   titlebarMerged: {
     get: () => titlebarMode.merged.value,
     set: (v) => titlebarMode.setMerged(v),
   },
-  // 选区操作条停靠/浮动:经 useSelectionBarMode 共享单例读写,setter 内含 localStorage 持久。
+  // 选区操作条停靠/浮动:经 useSelectionBarMode 共享单例读写;setter 提交到中央设置服务。
   selectionBarDocked: {
     get: () => selectionBarMode.docked.value,
     set: (v) => selectionBarMode.setDocked(v),
@@ -211,14 +212,10 @@ const toggleBindings: Record<string, { get: () => boolean; set: (v: boolean) => 
 
 const selectBindings: Record<string, { get: () => string; set: (v: string) => void }> = {
   theme: {
-    get: () => ui.appearance,
-    set: (v) => ui.setAppearance(v as typeof ui.appearance),
+    get: () => theme.appearance,
+    set: (v) => theme.setAppearance(v as typeof theme.appearance),
   },
   language: { get: () => ui.language, set: (v) => ui.setLanguage(v) },
-  windowMaterial: {
-    get: () => ui.windowMaterial,
-    set: (v) => ui.setWindowMaterial(v as typeof ui.windowMaterial),
-  },
   closeBehavior: {
     get: () => ui.closeBehavior,
     set: (v) => ui.setCloseBehavior(v as typeof ui.closeBehavior),
@@ -248,7 +245,7 @@ const selectBindings: Record<string, { get: () => string; set: (v: string) => vo
     get: () => config.viewerColorTarget,
     set: (v) => void config.setViewerColorTarget(v),
   },
-  // 两栏水平对齐:经各自单例读写(非 config store),setter 内含 localStorage 持久。三态 center/left/right。
+  // 两栏水平对齐:经各自单例读写(非 config store);setter 提交到中央设置服务。三态 center/left/right。
   toolbarAlign: {
     get: () => toolbarAlign.align.value,
     set: (v) => toolbarAlign.setAlign(v as BarAlign),
@@ -257,7 +254,7 @@ const selectBindings: Record<string, { get: () => string; set: (v: string) => vo
     get: () => selectionBarMode.align.value,
     set: (v) => selectionBarMode.setAlign(v as BarAlign),
   },
-  // 实验性渲染引擎:经 useRenderMode 共享单例读写(非 config store),setter 内含 localStorage 持久。
+  // 实验性渲染引擎:经 useRenderMode 共享单例读写(非 config store);setter 提交到中央设置服务。
   galleryRenderMode: {
     get: () => renderMode.galleryRenderMode.value,
     set: (v) => renderMode.setGalleryRenderMode(v as RenderMode),
@@ -270,38 +267,6 @@ const selectBindings: Record<string, { get: () => string; set: (v: string) => vo
 
 const numberBindings: Record<string, { get: () => number; set: (v: number) => void }> = {
   uiFontSize: { get: () => config.uiFontSize, set: (v) => void config.setUiFontSize(v) },
-  themeTintStrength: {
-    get: () => ui.themeTintStrength,
-    set: (v) => ui.setThemeTintStrength(v),
-  },
-  themeTextStrength: {
-    get: () => ui.themeTextStrength,
-    set: (v) => ui.setThemeTextStrength(v),
-  },
-  glassChromeOpacity: {
-    get: () => ui.glassChromeOpacity,
-    set: (v) => ui.setGlassChromeOpacity(v),
-  },
-  glassStickyOpacity: {
-    get: () => ui.glassStickyOpacity,
-    set: (v) => ui.setGlassStickyOpacity(v),
-  },
-  glassSurfaceOpacity: {
-    get: () => ui.glassSurfaceOpacity,
-    set: (v) => ui.setGlassSurfaceOpacity(v),
-  },
-  glassControlOpacity: {
-    get: () => ui.glassControlOpacity,
-    set: (v) => ui.setGlassControlOpacity(v),
-  },
-  glassContentOpacity: {
-    get: () => ui.glassContentOpacity,
-    set: (v) => ui.setGlassContentOpacity(v),
-  },
-  glassGalleryOpacity: {
-    get: () => ui.glassGalleryOpacity,
-    set: (v) => ui.setGlassGalleryOpacity(v),
-  },
   // 跳过阈值变更须同步失效布局(缩略图形态随之改变)。
   thumbSkipMaxKb: {
     get: () => config.thumbSkipMaxKb,
@@ -375,7 +340,7 @@ const dangerButtons: Record<string, { icon: Component; btnLabelKey: string; onCl
     },
     clearSettings: {
       icon: Paintbrush,
-      btnLabelKey: 'settings.clearSettingsBtn',
+      btnLabelKey: 'settings.resetSettingsBtn',
       onClick: () => void handleClearSettings(),
     },
     clearAllThumbnails: {
@@ -467,16 +432,29 @@ async function handleClearDb() {
 
 async function handleClearSettings() {
   const { confirmed } = await confirm({
-    title: t('settings.clearSettingsBtn'),
-    message: t('sidebar.clearSettingsConfirm'),
+    title: t('settings.resetSettingsConfirmTitle'),
+    message: t('settings.resetSettingsConfirmMessage'),
     danger: true,
+    confirmText: t('settings.resetSettingsBtn'),
   })
   if (!confirmed) return
+  // 重置只刷新设置:资产、阅读进度、任务状态与引导标记都留在各自业务表里,不重放首启向导。
+  // 不再用 window.location.reload 冒充「重启」——那既没重启后端,也会丢掉前端会话态。
   try {
-    await invokeIpc(IPC.CLEAR_SETTINGS)
-    window.location.reload()
+    const change = await resetSettings()
+    // 需重启才生效的项如实告知(热应用项已成默认值并即刻生效)。
+    if (change.restart_required.length > 0) {
+      toast.addToast(
+        'info',
+        t('settings.resetSettingsRestartRequired', { keys: change.restart_required.join('、') }),
+        6000,
+      )
+    } else {
+      toast.addToast('success', t('settings.resetSettingsSuccess'))
+    }
   } catch (e) {
-    toast.addToast('error', t('sidebar.clearSettingsFailed', { error: e }))
+    // 失败提示由中央服务统一发出(含「保留重置前最后确认值」),此处不再重复弹一条。
+    logger.error('reset settings failed', { error: e })
   }
 }
 

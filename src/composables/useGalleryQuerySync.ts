@@ -237,8 +237,7 @@ export function useGalleryQuerySync(): void {
   // ⚠ 本列表是手工枚举,必须与 snapshot()/GalleryFilterSnapshot 字段集保持一致——漏一项无
   // 编译/测试信号,只表现为该筛选 URL 停旧值、刷新静默丢失(R-02:8161b12 漏了 fileFormats,
   // 即 F-021「修枚举点时另一处同形枚举复发」)。有意不收敛为 apiFilterKey:单端日期(from/to)
-  // 也要写 URL,而 apiFilterKey 有意吞掉单端变化。已由 useGalleryQuerySync.spec.ts 的 wiring
-  // 级对拍(逐字段变更 → URL 必变)钉住。
+  // 也要写 URL,而 apiFilterKey 有意吞掉单端变化。
   watch(
     [
       () => route.path,

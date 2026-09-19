@@ -1,7 +1,7 @@
 // src/composables/useHVirtualScroll.ts
 // H-Lab 横向虚拟滚动(x 轴可视窗口;docs/designs/2026-07-02-horizontal-gallery-lab.md §2-3)。
 //
-// 与生产 useVirtualScroll 的关系:同款「rAF 节流 + 取数边界框去重 + fetchId 竞态守卫」模式
+// 与生产 gallery 虚拟滚动的关系:同款「rAF 节流 + 取数边界框去重 + fetchId 竞态守卫」模式
 // (那套已被实战验证),但**独立实现且刻意不移植坐标压缩**(SAFE_MAX 平移模式)——实验库
 // 规模用不到;总宽超过实验上限时经 `overCap` 暴露给宿主横幅告警。某模式毕业转正时,
 // 再做「生产滚动器轴泛化 + 平移模式移植」的统一(届时坐标数学测试参数化跑两轴)。
@@ -49,8 +49,7 @@ interface UseHVirtualScrollOptions {
 //    方向单调由构造保证,反向输入/外源位移自动重基;
 // ③ 定时长:末次输入后 durMs 内必然终止,不与滚动条拖拽等外源滚动持续对抗。
 //
-// 独立于 Vue 生命周期并注入 raf/时钟:四次翻车的命门路径,做成确定性测试接缝,
-// 锁测见 useHVirtualScroll.spec.ts。
+// 独立于 Vue 生命周期并注入 raf/时钟，便于确定性地复现输入时序。
 
 /// 单段动画时长 ms:输入间隔 ≤ 此值时相邻段无缝衔接成连续运动(约两倍于快速
 /// 滚轮的格间隔);再大则慢滚每格拖尾过长,再小则退化向阶跃。

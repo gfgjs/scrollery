@@ -2,7 +2,7 @@
 //!
 //! `query_layout_items`(item_queries)与 `view_to_sql` 共用本模块,是视图定义的单一事实源
 //! (T18 §4);`push_in_predicate`/`push_root_exclusion` 经 `layout` facade 具名重导出供
-//! `queries::search` 跨域复用。
+//! 跨模块复用。
 
 use crate::db::models::{
     DuplicateLensDescriptor, DuplicateLensMode, MediaFilter, ViewDescriptor, ViewScope,
@@ -324,7 +324,7 @@ fn push_order_by(
         // 恒 ASC（方向只作用于组内媒体次键）。改读持久列（原每行调 TREE_SORT_KEY(rel_path) 标量
         // 函数，列参数不可折叠 → 逐行 SQLite→Rust FFI + Vec<u8> 分配）省掉每行 FFI 与分配；键值与
         // 内存 build_dir_rank 的 encode_tree_sort_key 逐位同构（BLOB memcmp = Vec<u8>::cmp），
-        // 刚性等价契约不变（写路径 upsert/move + V19 回填保证列与 rel_path 一致）。
+        // 刚性等价契约不变（写路径 upsert/move 保证列与 rel_path 一致）。
         let dir_order = "r.created_at ASC, r.id ASC, d.tree_sort_key ASC, d.id ASC";
         if sort_within == Some("similarity") && filter.ai_search == Some(true) {
             sql.push_str(&format!(" ORDER BY {dir_order}, ai.similarity {order_dir}"));

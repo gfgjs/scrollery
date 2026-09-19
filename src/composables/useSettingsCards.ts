@@ -4,57 +4,62 @@
 // 为什么用单例而非 provide/inject：CollapsibleCard 既直接用于 SettingsView，也嵌套在
 // ModelLibrary / NetworkStorageSection 等子组件内。单例无需层层 provide 即可让「一键
 // 全部折叠/展开」作用于所有当前已挂载的卡片。
+//
+// 存储（设置集中保存，批次B）：settings_cards_expanded 是「卡片 ID → 布尔」的内联表设置；
+// 各卡默认展开与否由后端 schema 固化，故前端不再按 defaultOpen 自动补种写入（那会与 schema
+// 默认值形成两份真源）。快照未到达前按调用方声明的 defaultOpen 呈现，不落盘。
 
-import { reactive, computed } from 'vue'
+import { computed, reactive } from 'vue'
+import { readSetting, settingsReady, writeSettings } from '../stores/settingsPersistence'
+import { parseSettingJson } from './settingsValues'
 
-/** localStorage 键：保存 `{ [cardId]: open }` 映射 */
-const STORE_KEY = 'settingsCardsExpanded'
+/** 保存展开映射的设置键 */
+const CARD_KEY = 'settings_cards_expanded'
 
-function load(): Record<string, boolean> {
-  try {
-    return JSON.parse(localStorage.getItem(STORE_KEY) || '{}')
-  } catch {
-    return {}
-  }
+/** 读展开映射（规范 JSON 文本 → 表）；缺键或非法文本一律空表（回落各自缺省）。 */
+function readOpenMap(): Record<string, boolean> {
+  return parseSettingJson<Record<string, boolean>>(readSetting(CARD_KEY), {})
 }
 
-// cardId -> open。缺失的键表示「使用默认值（展开）」。
-const openState = reactive<Record<string, boolean>>(load())
 // 当前已挂载（可见）的卡片 id —— 「全部折叠/展开」只作用于这些。
 const mounted = reactive<Set<string>>(new Set())
+// 各卡声明的缺省展开：仅用于权威快照未到达时的呈现，不落盘。
+const declaredDefault = reactive<Record<string, boolean>>({})
 
-function persist() {
-  try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(openState))
-  } catch {
-    /* 忽略配额/序列化错误 */
-  }
+/** 卡片是否展开（快照缺该键时用调用方声明的缺省，默认展开） */
+function isOpen(id: string): boolean {
+  const stored = readOpenMap()[id]
+  if (typeof stored === 'boolean') return stored
+  return declaredDefault[id] ?? true
 }
 
-/** 卡片是否展开（默认展开） */
-function isOpen(id: string): boolean {
-  return openState[id] !== false
+function commit(map: Record<string, boolean>) {
+  // 权威快照未到达前读到的是空表,此刻提交会把其他卡片的展开态一并抹掉;故未就绪不提交。
+  if (!settingsReady.value) return
+  // 写盘失败由中央服务统一提示;此处 catch 只为收掉 promise。
+  writeSettings({ [CARD_KEY]: JSON.stringify(map) }).catch(() => {})
 }
 
 function toggle(id: string) {
-  openState[id] = !isOpen(id)
-  persist()
+  commit({ ...readOpenMap(), [id]: !isOpen(id) })
 }
 
-/** 挂载时登记；若无持久化值且声明默认折叠，则补种 false。 */
+/** 挂载时登记；缺省只记在本地用于首帧呈现。 */
 function register(id: string, defaultOpen = true) {
   mounted.add(id)
-  if (!(id in openState) && defaultOpen === false) openState[id] = false
+  declaredDefault[id] = defaultOpen
 }
 
 function unregister(id: string) {
   mounted.delete(id)
+  delete declaredDefault[id]
 }
 
 /** 一键设置所有已挂载卡片的展开状态。 */
 function setAll(open: boolean) {
-  for (const id of mounted) openState[id] = open
-  persist()
+  const map = readOpenMap()
+  for (const id of mounted) map[id] = open
+  commit(map)
 }
 
 // 全部已展开 / 全部已折叠（仅统计已挂载的卡片，空集合时视为已展开）。

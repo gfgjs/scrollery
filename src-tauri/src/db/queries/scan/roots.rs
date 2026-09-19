@@ -18,37 +18,18 @@ fn map_scan_root(row: &Row<'_>) -> rusqlite::Result<ScanRoot> {
         is_active: row.get::<_, i64>(7)? != 0,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
-        backend_id: row.get(10)?,
-        is_hidden: row.get::<_, i64>(11)? != 0,
+        is_hidden: row.get::<_, i64>(10)? != 0,
     })
 }
 
 // ── 扫描根目录 ───────────────────────────────────────────────────────────────
 
-pub fn insert_scan_root(
-    conn: &Connection,
-    path: &str,
-    alias: Option<&str>,
-    backend_id: Option<i64>,
-) -> Result<i64> {
+pub fn insert_scan_root(conn: &Connection, path: &str, alias: Option<&str>) -> Result<i64> {
     conn.execute(
-        "INSERT INTO scan_roots (path, alias, backend_id) VALUES (?1, ?2, ?3)",
-        params![path, alias, backend_id],
+        "INSERT INTO scan_roots (path, alias) VALUES (?1, ?2)",
+        params![path, alias],
     )?;
     Ok(conn.last_insert_rowid())
-}
-
-/// 设置 / 清除扫描根的存储后端归属（`None`=本地/OS 挂载）。供 Part5 网络盘绑定 UI 调用。
-pub fn set_scan_root_backend(
-    conn: &Connection,
-    root_id: i64,
-    backend_id: Option<i64>,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE scan_roots SET backend_id = ?2, updated_at = strftime('%s','now') WHERE id = ?1",
-        params![root_id, backend_id],
-    )?;
-    Ok(())
 }
 
 /// 设置扫描根的显隐（V21，设置页库级排除）。`hidden=true` 时该根媒体从画廊/时间轴/搜索/统计/
@@ -178,7 +159,7 @@ pub fn list_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
         // id ASC 是必须的稳定 tiebreaker：同秒添加多根时 created_at 相等，顺序否则未定义；
         // 此序须与画廊 folder 目录序的 root 序 (created_at, id) 一致，否则文件树与画廊 root 顺序分歧。
         "SELECT id, path, alias, scan_status, scan_progress, total_files,
-                last_scan_at, is_active, created_at, updated_at, backend_id, is_hidden
+                last_scan_at, is_active, created_at, updated_at, is_hidden
          FROM scan_roots ORDER BY created_at ASC, id ASC",
     )?;
     let rows = stmt.query_map([], map_scan_root)?;
@@ -188,7 +169,7 @@ pub fn list_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
 pub fn get_scan_root(conn: &Connection, id: i64) -> Result<ScanRoot> {
     conn.query_row(
         "SELECT id, path, alias, scan_status, scan_progress, total_files,
-                last_scan_at, is_active, created_at, updated_at, backend_id, is_hidden
+                last_scan_at, is_active, created_at, updated_at, is_hidden
          FROM scan_roots WHERE id = ?1",
         params![id],
         map_scan_root,
@@ -223,46 +204,6 @@ pub fn finish_scan_root(conn: &Connection, id: i64, total: i64) -> Result<()> {
 }
 
 #[cfg(test)]
-mod scan_root_backend_tests {
-    use super::*;
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
-        // backend_id FK→storage_backends；关 FK 免构造后端行（DAO 逻辑测试）。
-        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        c
-    }
-
-    /// insert 默认 backend_id=None（本地）；set_scan_root_backend 绑定/解绑；list/get 正确回读。
-    #[test]
-    fn backend_id_insert_set_and_roundtrip() {
-        let c = mem_db();
-        let id = insert_scan_root(&c, "/photos", Some("图库"), None).unwrap();
-        assert_eq!(
-            get_scan_root(&c, id).unwrap().backend_id,
-            None,
-            "默认应为本地 None"
-        );
-
-        // 绑定到后端 7。
-        set_scan_root_backend(&c, id, Some(7)).unwrap();
-        assert_eq!(get_scan_root(&c, id).unwrap().backend_id, Some(7));
-        // list 同样回读该列。
-        let listed = list_scan_roots(&c).unwrap();
-        assert_eq!(listed[0].backend_id, Some(7));
-
-        // 解绑回本地。
-        set_scan_root_backend(&c, id, None).unwrap();
-        assert_eq!(get_scan_root(&c, id).unwrap().backend_id, None);
-
-        // insert 时直接带 backend_id。
-        let id2 = insert_scan_root(&c, "/net", None, Some(3)).unwrap();
-        assert_eq!(get_scan_root(&c, id2).unwrap().backend_id, Some(3));
-    }
-}
-
-#[cfg(test)]
 mod relink_dao_tests {
     use super::*;
     // 跨域测试 fixture(§2.3):relink 校验需同时用到 roots 与 directories 两域,
@@ -271,7 +212,7 @@ mod relink_dao_tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c
     }
 
@@ -291,7 +232,7 @@ mod relink_dao_tests {
     #[test]
     fn update_scan_root_path_rewrites_only_path() {
         let c = mem_db();
-        let id = insert_scan_root(&c, "D:/photos", Some("图库"), None).unwrap();
+        let id = insert_scan_root(&c, "D:/photos", Some("图库")).unwrap();
         let dir_id = upsert_directory(&c, id, None, "", "photos", 0, None).unwrap();
         seed_item(&c, dir_id, "a.jpg", 111, 222, 0);
 
@@ -318,8 +259,8 @@ mod relink_dao_tests {
     #[test]
     fn sample_root_items_scopes_to_root_and_skips_deleted() {
         let c = mem_db();
-        let root_a = insert_scan_root(&c, "D:/a", None, None).unwrap();
-        let root_b = insert_scan_root(&c, "D:/b", None, None).unwrap();
+        let root_a = insert_scan_root(&c, "D:/a", None).unwrap();
+        let root_b = insert_scan_root(&c, "D:/b", None).unwrap();
         let dir_a = upsert_directory(&c, root_a, None, "", "a", 0, None).unwrap();
         let sub_a = upsert_directory(&c, root_a, Some(dir_a), "sub", "sub", 1, None).unwrap();
         let dir_b = upsert_directory(&c, root_b, None, "", "b", 0, None).unwrap();

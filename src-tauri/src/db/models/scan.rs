@@ -17,8 +17,6 @@ pub struct ScanRoot {
     pub is_active: bool,
     pub created_at: i64,
     pub updated_at: i64,
-    /// 存储后端归属（V7）：`None`=本地 / OS 挂载盘（走 `LocalFs`），`Some`=`storage_backends.id`（网络盘等）。
-    pub backend_id: Option<i64>,
     /// 用户在设置页是否隐藏该根（V21，库级排除）：为真时该根媒体从画廊「全部」/时间轴/搜索/统计/
     /// 侧栏文件树/全选全部排除，取消即恢复。查询侧走条件子查询排除（见 `db::queries::layout`）。
     pub is_hidden: bool,

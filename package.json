@@ -24,8 +24,7 @@
     "build:video-worker": "node scripts/build-video-worker.mjs",
     "build:video-worker:dev": "node scripts/build-video-worker.mjs --dev",
     "verify:channel": "node scripts/verify-channel-bundle.mjs",
-    "check:contrast": "node scripts/check-theme-contrast.mjs",
-    "check:theme-palette": "node scripts/generate-theme-palette.mjs --check",
+    "check:contrast": "vite-node scripts/check-theme-contrast.mjs",
     "capture:themes": "node scripts/capture-theme-matrix.mjs"
   },
   "dependencies": {
@@ -37,7 +36,6 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-os": "^2.3.2",
     "@tauri-apps/plugin-shell": "^2.3.5",
-    "@tauri-apps/plugin-window-state": "^2.4.1",
     "@vscode/markdown-editor": "0.0.2-0",
     "@vscode/observables": "0.1.1-0",
     "cropperjs": "2.1.1",

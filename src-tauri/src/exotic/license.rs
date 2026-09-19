@@ -1,55 +1,49 @@
 // src-tauri/src/exotic/license.rs
-//! 冷门格式插件 · keyring 授权存储 `KeyringLicenseStore`（v3 Part3 §5.2/§5.3）。
+//! 冷门格式插件 · 授权 provider 实现（v3 Part3 §5.2/§5.3）。
 //!
 //! 【Part6 §3.9.1a 去环 ③a】纯验签逻辑（`verify_token`/`evaluate_token`/`LicensePayload`）已迁至
 //! 叶 crate `scrollery-exotic-trust`（无秘密价值）。本文件保留**真实 keyring I/O** 实现
-//! `KeyringLicenseStore`(依赖 keyring crate,是 direct 渠道唯一的 keyring 授权实现),并
+//! `KeyringLicenseStore`(依赖 keyring crate,是直销渠道唯一的 keyring 授权实现),并
 //! `pub use` 再导出迁走的原语，使既有
 //! `crate::exotic::license::{verify_token, LicensePayload, ...}` 引用路径不变。授权 DTO / trait
 //! （`EntitlementProvider`/`LicenseStatus`/`LicenseError`）住更底层的叶 crate `scrollery-plugin-api`。
 //!
+//! 本文件同时提供两个 [`EntitlementProvider`] 实现:keyring 直销 [`KeyringLicenseStore`] 与
+//! fail-closed 回退 [`FreeStubEntitlement`](信任根解析失败时组合根的降级目标)。keyring **crate**
+//! 不属 DRM 专用:storage/proofread 的 API Key 凭据存储复用同一 crate。
+//!
 //! 三份真相中的「授权真相」（§5.1）：token 存系统 keyring（service 固定、account=plugin_id），
 //! DB 不保存 token；日志/遥测/panic/IPC **绝不**输出 token 或 subject_hash（§5.2）。
 
-// Part7-T11 渠道物理门控:KeyringLicenseStore(keyring DRM 实现)仅 direct 渠道编入——
-// msstore/steam 构建物理不含 keyring 授权存取/激活代码(组合根在 mod.rs 按渠道选 stub,
-// 恒 fail-closed;本文件的 trait/DTO/验签原语再导出为全渠道公共契约,不随门)。注意
-// keyring **crate** 本身不门控:storage/proofread 的 API Key 凭据存储属通用能力非 DRM。
-#[cfg(feature = "channel-direct")]
 use std::sync::Arc;
 
-#[cfg(feature = "channel-direct")]
 use crate::exotic::crypto::VerifyingKeyset;
 
 // 授权 DTO / trait 住 plugin-api 叶 crate（§3.9.1a）；此处 `pub use` 再导出使引用路径不变。
-pub use scrollery_plugin_api::{ActivationInfo, EntitlementProvider, LicenseError, LicenseStatus};
+pub use scrollery_plugin_api::{EntitlementProvider, LicenseError, LicenseStatus};
 // 纯验签原语迁至 exotic-trust 叶 crate（§3.9.1a ③a）；`pub use` 再导出保持
 // `crate::exotic::license::{verify_token, evaluate_token, LicensePayload}` 引用路径不变，
 // 并令下方 `KeyringLicenseStore` 内部调用直接可见。
 pub use scrollery_exotic_trust::{evaluate_token, verify_token, LicensePayload};
 
 /// keyring service（与既有 proofread/storage key 同 service，account 区分用途）。
-#[cfg(feature = "channel-direct")]
 use scrollery_plugin_api::KEYRING_SERVICE;
 
 /// keyring account = plugin_id（§5.2）。集中此处，便于审计「token 存放坐标」。
-#[cfg(feature = "channel-direct")]
 fn license_account(plugin_id: &str) -> &str {
     plugin_id
 }
 
 // `LicenseSource` trait 升格为 plugin-api 的 `EntitlementProvider`（上方 `pub use`）;
-// 始终未授权的桩为 `channel_stubs::FreeStubEntitlement`（组合根 fail-closed 回退用）。
+// 始终未授权的桩为本文件的 `FreeStubEntitlement`（组合根 fail-closed 回退用）。
 // `KeyringLicenseStore` 的验签逻辑经 exotic-trust 复用(§8.7):信任根=编译期内置公钥集
 // (默认占位集,发布经 PICASA_EXOTIC_KEYSET_FILE 注入受控签发机公钥)。
 
 /// keyring 实现：token 存系统凭据库；验签用编入 Host 的信任根公钥集。
-#[cfg(feature = "channel-direct")]
 pub struct KeyringLicenseStore {
     keyset: Arc<VerifyingKeyset>,
 }
 
-#[cfg(feature = "channel-direct")]
 impl KeyringLicenseStore {
     pub fn new(keyset: Arc<VerifyingKeyset>) -> Self {
         KeyringLicenseStore { keyset }
@@ -104,7 +98,6 @@ impl KeyringLicenseStore {
     }
 }
 
-#[cfg(feature = "channel-direct")]
 impl EntitlementProvider for KeyringLicenseStore {
     fn evaluate(&self, plugin_id: &str, sku: &str, now: i64) -> LicenseStatus {
         match self.get_token(plugin_id) {
@@ -120,22 +113,74 @@ impl EntitlementProvider for KeyringLicenseStore {
 
     /// 激活（R1-1 收敛：IPC 命令层改走本 trait，不再直构 store）。委托 inherent
     /// [`KeyringLicenseStore::activate`]（先验签后存，失败不覆盖现有有效 token）；
-    /// `LicensePayload`（含 subject_hash，§5.2 禁跨 IPC）止步于本层，向 trait 消费者只投影
-    /// [`ActivationInfo`]。`enc_seed` 派生属 ④ AES 后置项，当前恒 `None`。
+    /// `LicensePayload`（含 subject_hash，§5.2 禁跨 IPC）止步于本层，不向 trait 消费者投影。
     fn activate(
         &self,
         plugin_id: &str,
         sku: &str,
         credential: &str,
         now: i64,
-    ) -> Result<ActivationInfo, LicenseError> {
+    ) -> Result<(), LicenseError> {
         // 显式走 inherent 方法（与本 trait 方法同名，避免歧义误读为递归）。
         let _payload = KeyringLicenseStore::activate(self, plugin_id, sku, credential, now)?;
-        Ok(ActivationInfo { enc_seed: None })
+        Ok(())
     }
 
     /// 撤销 = 移除 keyring token（NoEntry 幂等成功，§6.5）。
     fn deactivate(&self, plugin_id: &str) -> Result<(), LicenseError> {
         self.remove_token(plugin_id)
+    }
+}
+
+/// 未授权回退 / 免费桩：恒 `Unlicensed`。组合根在信任根解析失败时降级到本桩，
+/// 使所有付费插件不可用（核心免费功能完整）。本桩不持密钥与验签逻辑。
+pub struct FreeStubEntitlement;
+
+impl EntitlementProvider for FreeStubEntitlement {
+    fn evaluate(&self, _plugin_id: &str, _sku: &str, _now: i64) -> LicenseStatus {
+        LicenseStatus::Unlicensed
+    }
+
+    fn source_tag(&self) -> &'static str {
+        "free"
+    }
+
+    /// 无验签逻辑、无凭据存储 → 稳定错误码 `activation_unsupported`。亦覆盖组合根 fail-closed
+    /// 回退场景:信任根解析失败降级本桩时,激活同样被拒。
+    fn activate(
+        &self,
+        _plugin_id: &str,
+        _sku: &str,
+        _credential: &str,
+        _now: i64,
+    ) -> Result<(), LicenseError> {
+        Err(LicenseError::ActivationUnsupported)
+    }
+
+    /// 无凭据可撤,幂等成功(设计注:「activate→Err、deactivate→Ok」)。
+    fn deactivate(&self, _plugin_id: &str) -> Result<(), LicenseError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 免费桩(未授权回退)契约锁:恒 Unlicensed、source_tag=free、激活 fail-closed
+    /// (`activation_unsupported`)、撤销幂等。
+    #[test]
+    fn free_stub_is_fail_closed() {
+        let stub = FreeStubEntitlement;
+        assert_eq!(
+            stub.evaluate("any-plugin", "any-sku", 0),
+            LicenseStatus::Unlicensed
+        );
+        assert_eq!(stub.source_tag(), "free");
+        assert_eq!(
+            stub.activate("any-plugin", "any-sku", "any-token", 0),
+            Err(LicenseError::ActivationUnsupported)
+        );
+        assert_eq!(stub.deactivate("any-plugin"), Ok(()));
     }
 }
