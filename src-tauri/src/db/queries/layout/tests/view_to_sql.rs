@@ -9,6 +9,7 @@ use super::super::super::collections::{
     rename_collection, restore_collection,
 };
 use super::super::super::faces::{list_ignored_persons, list_persons};
+use super::super::query_builder::push_in_predicate;
 
 /// 便捷构造：给定 scope + filter，默认排序与 layout_version。
 fn view(scope: ViewScope, filter: GalleryFilter) -> ViewDescriptor {
@@ -71,7 +72,7 @@ fn collection_scope_restricts_to_album_items() {
 fn rename_collection_user_only() {
     // 该测试模块无 DB helper（纯 SQL-string 测试），自建带 migrations 的内存库。
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     let id = create_collection(&c, "旧名", None).unwrap();
     rename_collection(&c, id, "新名").unwrap();
     let name: String = c
@@ -106,7 +107,7 @@ fn soft_delete_and_restore_collection() {
     // 该测试模块无 DB helper；自建带 migrations 的内存库（裸连接默认 foreign_keys=OFF，
     // 故可直接插 album_items 行、item_id 无需真 media_items 即可验证成员保留）。
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
 
     let has = |id: i64| list_collections(&c).unwrap().iter().any(|col| col.id == id);
     let deleted_at = |id: i64| -> Option<i64> {
@@ -119,7 +120,7 @@ fn soft_delete_and_restore_collection() {
     };
 
     let id = create_collection(&c, "度假", None).unwrap();
-    // 给夹加一个成员（直接插 album_items，验证软删除后成员不被级联清除）。run_migrations 后
+    // 给夹加一个成员（直接插 album_items，验证软删除后成员不被级联清除）。initialize_schema 后
     // foreign_keys=ON，故照本仓迁移测试 idiom 关 FK，免为一个 orphan item_id 铺全 directories→
     // media_items 链。
     c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
@@ -167,7 +168,7 @@ fn soft_delete_and_restore_collection() {
 #[test]
 fn list_deleted_collections_partitions_and_orders_by_deleted_at() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
 
     let live_ids = |conn: &Connection| -> Vec<i64> {
         list_collections(conn)
@@ -232,7 +233,7 @@ fn list_deleted_collections_partitions_and_orders_by_deleted_at() {
 #[test]
 fn list_ignored_persons_returns_only_ignored() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     // 三个人物,同一激活模型 'm':普通/隐藏/误检桶。cover_face_id 留空(LEFT JOIN 容许)。
     c.execute(
         "INSERT INTO persons (name, is_named, model_name, face_count, is_hidden, is_ignored) VALUES

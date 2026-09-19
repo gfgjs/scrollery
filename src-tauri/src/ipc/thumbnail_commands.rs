@@ -158,7 +158,7 @@ pub async fn batch_request_thumbnails(
     if let Some(size) = target_size {
         config.size = size;
     }
-    // 归一到有效档位:本路径直调 decode/encode_media_step(绕过 generate_thumbnail 的吸附),
+    // 归一到有效档位:本路径直调 decode/encode_media_step(出口不吸附档位),
     // config.size 可能来自前端 target_size 或库中旧值(如历史默认 480),非档位值会令
     // thumb_path 断言失败/写入无效档位目录。幂等——已是档位则不变。
     config.size = snap_to_tier(config.size);
@@ -244,7 +244,7 @@ pub async fn batch_request_thumbnails(
 
     // ── 冷门格式让路（R3）：needs_gen 中命中未完成 Exotic 的项不进主 generator ──────────
     // 在 needs_gen 过滤点接入 route_thumbnail（与 full 命令共享同一纯函数判定）。
-    // 让路项绝不调 generate_thumbnail/decode_media_step，也绝不写 thumb_status=2。
+    // 让路项绝不进 decode_media_step，也绝不写 thumb_status=2。
     if !needs_gen.is_empty() {
         let snap = state_arc.exotic_catalog.snapshot();
         // 仅当批内确有 catalog 已认领的格式时才走完整路由，常见库零额外成本。
@@ -417,10 +417,6 @@ pub async fn batch_request_thumbnails(
                 for id in needs_gen_clone {
                     if !state_dispatcher.is_database_epoch_current(database_epoch) {
                         break;
-                    }
-                    // 取消请求只消费一次。否则同一 id 滚回视口后的新请求会被旧取消标记永久跳过。
-                    if state_dispatcher.cancelled_thumb_ids.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-                        continue;
                     }
                     // 加载项；对任何无法加载的项也发一个失败结果，使每个请求 id 都恰好产出一个结果。
                     // 静默跳过会让前端在途计数失衡，「处理中 N 项」指示永久卡住（问题9）。
@@ -640,16 +636,6 @@ pub async fn batch_request_thumbnails(
 // start_incremental_thumbnail_generation / stop_full_thumbnail_generation /
 // run_thumbnail_generation 已迁至 `thumbnail_full_gen.rs`（`pub use` 转发见文件顶部，
 // 超长文件拆分方案 tierB-3）。
-
-#[tauri::command]
-pub async fn cancel_thumbnail_request(id: i64, state: State<'_, Arc<AppState>>) -> Result<()> {
-    state
-        .cancelled_thumb_ids
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id);
-    Ok(())
-}
 
 /// 懒自愈（前端 `MediaThumb` 在 `thumb_status=1` 的封面 404 时按格触发）：DB 声称已生成、但
 /// `thumb_path` 文件已被 LRU 缓存驱逐（`enforce_cache_limit` 删文件不改 `thumb_status`，而

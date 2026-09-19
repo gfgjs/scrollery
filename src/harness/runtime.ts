@@ -37,13 +37,6 @@ export const uiHarnessRowHeight: number | null =
     : null
 
 /**
- * `&bucket=1|0` — 覆盖 fixture 的 bucketSegmentedScroll(默认 'false' 保方案 A 视觉基线)。
- * 性能基准要在生产默认引擎(bucket)上跑才有代表性;缺省时维持既有视觉矩阵行为不变。
- */
-export const uiHarnessBucket: boolean | null =
-  isUiHarness && params?.has('bucket') ? params.get('bucket') !== '0' : null
-
-/**
  * `&thumbStatus=0|3` — 覆盖 fixture 条目的初始缩略图状态(默认 3 走原图)。「未生成冷库
  * 首览」基准场景置 0,配合 ipcFixtures 对 BATCH_REQUEST_THUMBNAILS 的模拟生成,走完整的
  * 「请求→生成→回填→sig 变→重载」链路。仅接受 0/3(harness 只面向这两态,其余忽略)。
@@ -69,21 +62,29 @@ export const uiHarnessAvailRatio: number =
     : 0
 
 /**
- * `&theme=<id>` — 6 主题视觉矩阵截图用(S7)。仅承载 URL 里的**原始字符串**,不校验:
- * 合法性判定属注册表(themes/registry),此处引入会让本模块从「读 window 的零依赖入口」
- * 退化为依赖主题层——而本模块正因顶层副作用传染性被 9 个 spec 崩溃教训过(findings 会话续)。
- * 消费方(ipcFixtures)用 getTheme() 解析,非法 id 落回 fixture 默认。
+ * `&appearance=light|dark` — 主题截图矩阵用:指定 harness 呈现哪一档配色。
+ *
+ * 只承载 URL 里的**原始字符串**,不校验取值:本模块是「读 window 的零依赖入口」,引入主题层
+ * 会让它的顶层副作用传染给消费方(9 个 spec 崩溃的既有教训,见 findings 会话续)。合法性判定在
+ * 消费方(ipcFixtures),非法值落回 fixture 默认。
  */
-export const uiHarnessTheme: string | null = isUiHarness ? (params?.get('theme') ?? null) : null
+export const uiHarnessAppearance: 'light' | 'dark' | null =
+  isUiHarness && (params?.get('appearance') === 'light' || params?.get('appearance') === 'dark')
+    ? (params.get('appearance') as 'light' | 'dark')
+    : null
 
 /**
- * `&tint=<pct>` — 主题色浓度矩阵截图用(2026-09-06)。同 uiHarnessTheme:只承载原始字符串,
- * 合法性(20–100 数字)由消费方 ipcFixtures 判定,非法落回 fixture 默认(null→生产默认 60)。
+ * `&seed=custom` — 截图矩阵的「明显自定义配色」档:消费方把两套配色换成一组刻意偏离默认的
+ * 种子(仍走真实 generateTheme 生成),用于人眼核对任意用户配色下的观感。仅认字面量 custom。
  */
-export const uiHarnessTint: string | null = isUiHarness ? (params?.get('tint') ?? null) : null
+export const uiHarnessSeed: 'custom' | null =
+  isUiHarness && params?.get('seed') === 'custom' ? 'custom' : null
 
 /**
- * `&text=<pct>` — 文字浓度矩阵截图用(2026-09-06)。同上:原始字符串进,合法性(40–100
- * 数字)由消费方 ipcFixtures 判定,非法落回 fixture 默认(null→生产默认 75)。
+ * `&render=dom|canvas` — 画廊渲染引擎档:DOM 与 Canvas 两条绘制路径必须都出图(色板同源是
+ * 生成层的契约,但两条路径的绘制实现不同,只有分别截图才能看出差异)。
  */
-export const uiHarnessText: string | null = isUiHarness ? (params?.get('text') ?? null) : null
+export const uiHarnessRenderMode: 'dom' | 'canvas' | null =
+  isUiHarness && (params?.get('render') === 'dom' || params?.get('render') === 'canvas')
+    ? (params.get('render') as 'dom' | 'canvas')
+    : null

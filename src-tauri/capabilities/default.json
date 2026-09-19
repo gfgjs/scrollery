@@ -10,7 +10,6 @@
     "allow-app-commands",
     "shell:default",
     "shell:allow-open",
-    "window-state:default",
     "os:default",
     "core:window:allow-start-dragging",
     "core:window:allow-minimize",

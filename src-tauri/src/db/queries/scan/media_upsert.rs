@@ -374,7 +374,7 @@ mod fast_scan_upsert_recovery_tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); // 免构造 directory 链
         c
     }

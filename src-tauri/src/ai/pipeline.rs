@@ -107,7 +107,6 @@ fn run_pipeline_blocking(
     state: &Arc<AppState>,
     token: &CancellationToken,
 ) -> crate::error::Result<()> {
-    crate::ai::runtime_config::warn_legacy_ai_backend(state);
     crate::ai::worker_pipeline::run_pipeline_worker_blocking(state, token)
 }
 

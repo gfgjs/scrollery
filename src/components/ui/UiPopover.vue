@@ -110,12 +110,12 @@ function requestClose() {
 .ui-popover {
   z-index: calc(var(--z-toast) + 1);
   max-inline-size: var(--popover-max-inline-size);
-  background-color: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background-color: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   color: var(--color-text-primary);
 }
 /* 弹层进出过渡:抽屉推拉——自贴锚点那一侧平移拉出,无缩放,依赖 useFloating 的 transform:false。

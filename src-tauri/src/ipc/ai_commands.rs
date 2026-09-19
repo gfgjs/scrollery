@@ -22,7 +22,7 @@ use crate::state::AppState;
 
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
 // 跨层共享的运行时配置解析(models_dir/active_profile*/active_face_profile*/
-// variant_installed/persist_provider_echo/warn_legacy_ai_backend)已下沉
+// variant_installed/persist_provider_echo)已下沉
 // `ai::runtime_config`(U-P2-a):它们是 ai 核心层与多个 IPC 文件的共享底座,
 // 留在单一命令文件构成层次倒挂。本文件只保留命令私有 helper。
 
@@ -74,6 +74,28 @@ fn variant_fixed_batch(image_file: &str) -> Option<u32> {
         Some(BatchKind::Fixed(k)) if k > 1 => Some(k),
         _ => None,
     }
+}
+
+/// 变体文件未就位 → 稳定 code `AiModelNotLoaded` + 可操作的下载指引。供命令与单测共用。
+fn require_variant_installed(
+    models: &std::path::Path,
+    image_file: &str,
+    text_file: &str,
+) -> Result<()> {
+    if variant_installed(models, image_file, text_file) {
+        return Ok(());
+    }
+    Err(AppError::AiModelNotLoaded(format!(
+        "AI 模型尚未下载，请先在「设置 → AI → 模型库」下载 {} | AI model not downloaded, download it in Settings → AI → Model Library: {}",
+        image_file, image_file
+    )))
+}
+
+/// 激活 CLIP 模型的必需文件是否已就位（复用安装判定）。缺失即拒：流水线不启动、向量不重置、
+/// GPU 分析槽不占用——此前缺失只在 worker 派发线程里退化成一条日志，前端静默无感。
+fn require_active_clip_assets(state: &AppState) -> Result<()> {
+    let profile = active_profile(state);
+    require_variant_installed(&models_dir(state), &profile.image_file, &profile.text_file)
 }
 
 /// get_status 的「资源等待」原因键（P1-1）：本端未运行、仍有剩余，而共享 GPU 分析会话被对端
@@ -341,6 +363,9 @@ pub async fn start_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
     tokio::task::spawn_blocking({
         let s = Arc::clone(&state_arc);
         move || {
+            // 模型文件未就位就该在启动前拒绝（variant_installed 是文件系统 IO，故并进本 blocking
+            // 段）：缺失时前端按稳定 code 弹下载引导，而不是让流水线跑到派发线程再静默失败。
+            require_active_clip_assets(&s)?;
             // ai_status 是全局列，历史失败（例如旧输入名导致的批量 Error）可能没有当前模型向量。
             // 启动前按真实向量覆盖重同步，确保“开始/继续”会补跑缺失项，而不是被 Error 永久跳过。
             let model_id = active_profile(&s).id;
@@ -378,6 +403,14 @@ pub async fn start_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
 #[tauri::command]
 pub async fn restart_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
     let state_arc = Arc::clone(&state);
+
+    // 同 start：模型缺失先拒，且必须在占槽 / cancel / 破坏性 reset **之前**——否则会白清空向量。
+    tokio::task::spawn_blocking({
+        let s = Arc::clone(&state_arc);
+        move || require_active_clip_assets(&s)
+    })
+    .await
+    .map_err(join_err)??;
 
     // F5 mutual exclusion: claim the slot BEFORE the destructive reset below (so a rejection
     // doesn't wipe embeddings). Re-entrant when CLIP already owns it. If the reset then fails,
@@ -463,61 +496,6 @@ pub async fn stop_ai_analysis(state: State<'_, Arc<AppState>>) -> Result<()> {
     .await
     .map_err(join_err)?;
     Ok(())
-}
-
-/// List all AI models in the models directory.
-#[tauri::command]
-pub async fn list_ai_models(state: State<'_, Arc<AppState>>) -> Result<Vec<String>> {
-    let models = models_dir(&state);
-    // R1-3：目录遍历是阻塞 IO，下沉 blocking。
-    tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        if models.exists() && models.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(models) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_file() {
-                            if let Some(ext) = entry.path().extension() {
-                                if ext == "onnx" {
-                                    if let Some(name) = entry.file_name().to_str() {
-                                        files.push(name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        files.sort();
-        Ok(files)
-    })
-    .await
-    .map_err(join_err)?
-}
-
-/// Import an AI model into the models directory.
-#[tauri::command]
-pub async fn import_ai_model(source_path: String, state: State<'_, Arc<AppState>>) -> Result<()> {
-    let models = models_dir(&state);
-    // R1-3：模型文件可达 GB 级，fs::copy 整体下沉 blocking（不能占用 tokio worker 数秒）。
-    tokio::task::spawn_blocking(move || {
-        if !models.exists() {
-            std::fs::create_dir_all(&models)?;
-        }
-
-        let source = std::path::Path::new(&source_path);
-        let file_name = source
-            .file_name()
-            .ok_or_else(|| AppError::PathResolution("无效的文件名 | invalid file name".into()))?;
-        let dest = models.join(file_name);
-
-        // io::Error 经 `?` 归 AppError::Io（泛化 code，不向 UI 泄露底层路径细节）。
-        std::fs::copy(source, &dest)?;
-        Ok(())
-    })
-    .await
-    .map_err(join_err)?
 }
 
 /// Reload the AI engine — T16 后语义:关闭 worker 在载会话,下次分析/搜索按当前
@@ -745,7 +723,15 @@ pub async fn list_model_registry(state: State<'_, Arc<AppState>>) -> Result<serd
 /// 失效常驻缓存。之后用户运行分析以（重新）嵌入新模型下缺失的项 —— 已嵌入项跳过，切回曾用
 /// 模型零成本。
 #[tauri::command]
-pub async fn set_active_model(image_file: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+pub async fn set_active_model(
+    app: tauri::AppHandle,
+    image_file: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<()> {
+    // 代次在**操作开始时**读取:下方含变体校验、GPU 槽释放与向量覆盖重同步等耗时工作,期间若发生
+    // 「恢复默认设置」,本次切换携带的旧代次会被统一入口拒绝——绝不在耗时工作后回读新代次,把切换前
+    // 的意图灌回已重置的配置。
+    let generation = state.config.generation();
     // 由变体文件名反查架构，合成该变体的 profile（id=架构 = 向量主键，不随变体变化）。
     let meta = arch_for_image_file(&image_file).ok_or_else(|| {
         AppError::UnsupportedFormat(format!(
@@ -757,50 +743,77 @@ pub async fn set_active_model(image_file: String, state: State<'_, Arc<AppState>
     })?;
     let arch_id = prof.id.clone();
     let text_file = prof.text_file.clone();
+    let display_name = prof.display_name.clone();
 
     let state_arc = Arc::clone(&state);
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        // 拒绝切换到文件尚未就位的变体（请先下载）。
-        let models = models_dir(&state_arc);
-        if !variant_installed(&models, &image_file, &text_file) {
-            // 「未安装」语义上等同模型未就位 → AiModelNotLoaded（消息直透，保留可操作的中文提示）。
-            return Err(AppError::AiModelNotLoaded(format!(
-                "模型「{}」尚未安装，请先下载其模型文件 | variant not installed: {}",
-                prof.display_name, image_file
-            )));
+    // 阶段 1:拒绝切换到文件尚未就位的变体(请先下载)+ 取消在跑分析 + 释放 GPU 分析槽。
+    // 顺序与改动前一致(校验在前,cancel/释放紧随)。未安装时直接返回、不做收尾——与改动前
+    // 「闭包内提前 return」的行为逐字等价。
+    {
+        let prep_state = Arc::clone(&state_arc);
+        let image_for_prep = image_file.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let models = models_dir(&prep_state);
+            if !variant_installed(&models, &image_for_prep, &text_file) {
+                // 「未安装」语义上等同模型未就位 → AiModelNotLoaded（消息直透，保留可操作的中文提示）。
+                return Err(AppError::AiModelNotLoaded(format!(
+                    "模型「{}」尚未安装，请先下载其模型文件 | variant not installed: {}",
+                    display_name, image_for_prep
+                )));
+            }
+            prep_state.cancel_ai_analysis();
+            // cancel 后释放 GPU 分析槽(2026-07-10 审查 A1,理由见 reload_ai_engine;face 侧对称
+            // 命令 set_active_face_model 一直有此释放,本处补齐对称性)。
+            prep_state.release_gpu_analysis(crate::state::GPU_OWNER_AI);
+            Ok(())
+        })
+        .await
+        .map_err(join_err)??;
+    }
+
+    // 阶段 2:两键一次提交,走统一设置入口(串行门 + 一次批量写盘 + 统一广播),不再逐键直接落盘。
+    // 架构 id = 向量主键;变体文件名仅决定加载哪份图像塔。两者必须一起生效。
+    let patch = std::collections::BTreeMap::from([
+        ("ai_active_model".to_string(), arch_id.clone()),
+        ("ai_active_image_file".to_string(), image_file.clone()),
+    ]);
+    let config_result = crate::config::settings::submit_settings_patch(
+        &app,
+        &state_arc,
+        patch,
+        generation,
+    )
+    .await
+    .map(|_| ());
+
+    // 阶段 3:配置写入成功才重同步向量覆盖(与改动前 `set_and_persist(..)?` 的短路顺序一致:
+    // 配置没写成就不同步)。
+    //
+    // P1-3:整段「改配置 + 同步状态」的结果先收进 switch_result,不就地 `?` 提前返回——配置一旦写入
+    // 就可能已经生效,此时若直接返回,旧模型的在途查询仍持有效票,会把旧向量空间的结果写回结果集。
+    let switch_result = match config_result {
+        Ok(()) => {
+            let sync_state = Arc::clone(&state_arc);
+            let arch_for_sync = arch_id.clone();
+            tokio::task::spawn_blocking(move || {
+                // ai_status 是全局列(非按模型)→ 重新指向新架构的向量覆盖(分批,批间自行取锁,R2-6)。
+                sync_ai_status_for_model(&sync_state.db_writer, &arch_for_sync)
+            })
+            .await
+            .map_err(join_err)?
         }
+        Err(e) => Err(e),
+    };
 
-        state_arc.cancel_ai_analysis();
-        // cancel 后释放 GPU 分析槽(2026-07-10 审查 A1,理由见 reload_ai_engine;face 侧对称
-        // 命令 set_active_face_model 一直有此释放,本处补齐对称性)。
-        state_arc.release_gpu_analysis(crate::state::GPU_OWNER_AI);
-
-        // A2:两键均为 schema 设置类,唯一真源已切到 config.toml——原先的 DB `set_config` 写入
-        // 会被 `get_app_config`/`active_profile_with` 忽略(读侧已改走 ConfigManager),必须
-        // 同步改走 `ConfigManager::set_and_persist`,否则切换模型选择在重启/reload 后失效。
-        // 架构 id = 向量主键；变体文件名仅决定加载哪份图像塔。两者一起持久化。
-        //
-        // P1-3:整段「改配置 + 同步状态」先收进闭包取结果,不就地 `?` 提前返回——配置一旦写入
-        // 就可能已经生效(内存已改;第二次 set_and_persist 或随后的 sync 失败只是后续步骤失败),
-        // 此时若直接返回,旧模型的在途查询仍持有效票,会把旧向量空间的结果写回结果集。
-        let switch_result = (|| -> Result<()> {
-            state_arc
-                .config
-                .set_and_persist("ai_active_model", &arch_id)?;
-            state_arc
-                .config
-                .set_and_persist("ai_active_image_file", &image_file)?;
-            // ai_status 是全局列(非按模型)→ 重新指向新架构的向量覆盖(分批,批间自行取锁,R2-6)。
-            sync_ai_status_for_model(&state_arc.db_writer, &arch_id)
-        })();
-
-        // 共同收尾:只要**尝试过**改模型配置就必须执行,与上面成败无关。吊销在控制面闸门内
-        // 现读 profile:此刻若配置已变,读到的就是新模型——此前登记的请求(按旧模型解析)一律
-        // 作废,此后登记的读到新模型;若配置其实没变(第一步就失败),这次收尾也只是把上一轮
-        // 结果集清掉,无副作用地保守一次。
-        // 擦除失败只记警告:切换本身已生效或已尝试,为「旧结果多留一会儿」报错会误导用户以为
-        // 切换失败(同 restart/rebuild 的姿态);吊销与缓存作废无条件生效。
+    // 共同收尾:只要**尝试过**改模型配置就必须执行,与上面成败无关。吊销在控制面闸门内现读 profile:
+    // 此刻若配置已变,读到的就是新模型——此前登记的请求(按旧模型解析)一律作废,此后登记的读到新模型;
+    // 若配置其实没变(第一步就失败),这次收尾也只是把上一轮结果集清掉,无副作用地保守一次。
+    // 擦除失败只记警告:切换本身已生效或已尝试,为「旧结果多留一会儿」报错会误导用户以为切换失败
+    // (同 restart/rebuild 的姿态);吊销与缓存作废无条件生效。
+    //
+    // 仍在 spawn_blocking 内:擦除要拿 db_writer 的 std 锁(硬约束:IO/DB 不占 UI 线程)。
+    tokio::task::spawn_blocking(move || -> Result<()> {
         if let Err(e) = state_arc.ai_search.model_switched(|| {
             let conn = state_arc.db_writer.lock().unwrap_or_else(|e| e.into_inner());
             crate::ai::search::wipe_search_results(&conn)
@@ -814,18 +827,19 @@ pub async fn set_active_model(image_file: String, state: State<'_, Arc<AppState>
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .close_session();
-
-        // 收尾做完再传播首个错误(配置/同步失败仍要让调用方看见,前端据此报错给用户)。
-        switch_result?;
-
-        info!(
-            "Active AI model switched to {} (variant {}) | 已切换 AI 模型: {}（变体 {}）",
-            arch_id, image_file, arch_id, image_file
-        );
         Ok(())
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+
+    // 收尾做完再传播首个错误(配置/同步失败仍要让调用方看见,前端据此报错给用户)。
+    switch_result?;
+
+    info!(
+        "Active AI model switched to {} (variant {}) | 已切换 AI 模型: {}（变体 {}）",
+        arch_id, image_file, arch_id, image_file
+    );
+    Ok(())
 }
 
 // ── Model download (Layer B) ────────────────────────────────────────────────────
@@ -949,7 +963,7 @@ mod p1_3_teardown_tests {
     /// + 结果表旧行 + 控制面常驻快照。
     fn scene() -> (DbWriter, SearchControl, i64) {
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, parent_id, rel_path, name, depth)
@@ -1080,5 +1094,67 @@ mod p1_3_teardown_tests {
             .unwrap();
         assert_eq!(status, 0, "成功路径须把 ai_status 复位");
         let _: Option<SearchRequestId> = None;
+    }
+}
+
+/// 启动 / 重新开始分析的前置检查表征测试（首次使用未下载模型 → 同步可操作拒绝）。
+///
+/// 锁住三态：文件不齐即反 AiModelNotLoaded（前端按 code 分流成下载引导，不看文案）；
+/// 只齐一半（共享文本塔 / 外置权重 / 词表任一缺）同样拒绝；五项齐 → 放行。
+#[cfg(test)]
+mod model_precheck_tests {
+    use super::*;
+
+    /// 与默认架构对应的图像/文本塔文件名（仅作样例，判定与具体架构无关）。
+    const IMAGE: &str = "vit-b-16.img.fp16.onnx";
+    const TEXT: &str = "vit-b-16.txt.fp16.onnx";
+
+    fn write_asset(dir: &std::path::Path, name: &str) {
+        std::fs::write(dir.join(name), b"x").unwrap();
+    }
+
+    fn all_assets(dir: &std::path::Path) {
+        for name in [
+            IMAGE.to_string(),
+            format!("{IMAGE}.extra_file"),
+            TEXT.to_string(),
+            format!("{TEXT}.extra_file"),
+            "vocab.txt".to_string(),
+        ] {
+            write_asset(dir, &name);
+        }
+    }
+
+    #[test]
+    fn missing_assets_rejected_with_download_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = require_variant_installed(dir.path(), IMAGE, TEXT).unwrap_err();
+
+        let AppError::AiModelNotLoaded(msg) = err else {
+            panic!("未下载须反稳定 code AiModelNotLoaded（前端据此弹下载引导）");
+        };
+        assert!(msg.contains("模型库"), "消息须带可操作的下载指引: {msg}");
+        assert!(msg.contains(IMAGE), "消息须指明缺哪个文件: {msg}");
+    }
+
+    #[test]
+    fn partial_assets_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_asset(dir.path(), IMAGE);
+        write_asset(dir.path(), TEXT);
+
+        assert!(
+            require_variant_installed(dir.path(), IMAGE, TEXT).is_err(),
+            "外置权重 / 词表缺失仍视为未安装"
+        );
+    }
+
+    #[test]
+    fn complete_assets_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        all_assets(dir.path());
+
+        assert!(require_variant_installed(dir.path(), IMAGE, TEXT).is_ok());
     }
 }

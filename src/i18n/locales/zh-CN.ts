@@ -122,16 +122,17 @@ export default {
           '插件在后台 worker 运行，不阻塞界面',
         ],
       },
-      themes: {
-        title: '主题与外观',
-        intro: '三种风格各配浅色与深色主题，适配不同偏好。',
-        points: [
-          '清新、简约、科技三种风格，每种配套浅色与深色主题',
-          '浅色/深色/跟随系统',
-          '界面字号、缩略图行为可调',
-          '沉浸/窗口化模式减少干扰',
-        ],
-      },
+     themes: {
+       title: '主题与外观',
+        intro: '背景、前景与强调色自由配色，浅色与深色各自独立。',
+       points: [
+          '中性、暖纸、冷夜三套内置主题，可调成任意配色',
+          '调好的完整主题可命名保存为「我的主题」，随时重新应用',
+          '浅色、深色、跟随系统，窗口材质与不透明度',
+         '界面字号、缩略图行为可调',
+         '沉浸/窗口化模式减少干扰',
+       ],
+     },
       settingsShortcuts: {
         title: '设置与快捷键',
         intro: '设置页集中所有偏好，支持分区导航与搜索。',
@@ -745,14 +746,11 @@ export default {
     queueStatusCancelled: '已取消',
     toastJobDone: '增强任务 #{id} 已完成({n} 项)',
   },
-  // 内置主题风格名与说明(注册表 nameKey/descriptionKey 指向此处)。
+ // 内置主题风格名与说明(注册表 nameKey/descriptionKey 指向此处)。
   themes: {
-    fresh: '清新 · Fresh',
-    freshDescription: '柔和的绿色调，清爽自然。',
-    minimal: '简约 · Minimal',
-    minimalDescription: '克制的中性色，专注内容。',
-    tech: '科技 · Tech',
-    techDescription: '冷静的蓝色调，清晰利落。',
+    neutral: '中性',
+    warmPaper: '暖纸',
+    coldNight: '冷夜',
   },
   // 阅读专属主题名(R3;注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
   readerThemes: {
@@ -790,45 +788,59 @@ export default {
     galleryGroup: '图库与查看',
     general: '通用',
     theme: '外观主题',
-    themeDesc: '选择外观模式，并为浅色与深色配对选择一种主题风格；跟随系统时自动切换。',
+    themeDesc: '选择外观模式与主题配色；跟随系统时自动切换。',
     themeMode: '外观模式',
-    themeStyle: '主题风格',
-    themeStyleDesc: '一套风格同时应用于浅色与深色。',
     themeSystem: '跟随系统',
     themeLight: '浅色',
     themeDark: '深色',
+    themeBuiltinGroup: '内置主题',
+    themeSavedGroup: '我的主题',
+    themeSavedEmpty: '还没有保存的主题。调好配色后点「保存为主题」即可命名留存。',
+    themeCustom: '自定义',
+    themeBackground: '背景',
+    themeForeground: '前景',
+    themeAccent: '强调色',
+    themeContrast: '层次对比度',
+    themeGallery: '画廊底色',
+    themeGalleryAuto: '跟随界面',
+    themeGalleryAutoHint: '画廊底色跟随界面底面。',
+    themeHexInput: '{label} 的 HEX 值',
+    themeHue: '色相',
+    themeSaturationValue: '饱和度与明度',
+    themePreviewButton: '按钮',
+    themePreviewThisMode: '预览此模式',
+    themePreviewing: '预览中',
+    themeResetMode: '恢复默认',
+    themeApply: '应用',
+    themeSaveAs: '保存为主题',
+    themeSaveAndApply: '保存并应用',
+    themeNameLabel: '主题名称',
+    themeUpdateTarget: '更新目标',
+    themeSaveNewEntry: '另存为新主题',
+    themeUpdateKeepsName: '更新已有主题会保留原名称与配色定位；改名请用「重命名」。',
+    themeRename: '重命名',
+    themeDelete: '删除',
+    themeNameEmpty: '主题名称不能为空。',
+    themeNameDuplicate: '已有同名主题，请换一个名称。',
+    themeNotFound: '目标主题已不存在。',
+    themeSaved: '已保存主题「{name}」。',
+    themeSaveFailed: '保存主题失败，草稿已保留，可重试。',
+    themeDeleted: '已删除主题「{name}」。',
+    themeDeleteFailed: '删除主题失败。',
+    themeContrastWarning: '{modes}配色正文对比不足，可提高层次对比度或恢复默认配色。',
+    themeDraftDroppedExternal: '主题配置已在别处更新，未应用的调整已丢弃。',
+    themeDraftDroppedReset: '设置已重置，未应用的主题调整已丢弃。',
     language: '语言',
     languageDesc: '选择应用的界面语言。',
     windowMaterial: '窗口材质(毛玻璃)',
     windowMaterialDesc:
-      '标题栏、侧栏与状态栏的半透明玻璃效果,仅 Windows 生效。Acrylic 可实时透出窗口背后的内容,但拖动/缩放窗口时可能卡顿。',
-    windowMaterialMica: 'Mica(默认)',
+      '整个窗口共用一层半透明玻璃底,顶栏、侧栏、画廊与底栏连成一片(仅 Windows 生效)。Acrylic 会实时透出窗口背后的内容,拖动/缩放时可能卡顿。',
+    windowMaterialMica: 'Mica',
     windowMaterialAcrylic: 'Acrylic',
-    windowMaterialNone: '不透明',
-    glassChromeOpacity: '窗口栏玻璃不透明度 (%)',
-    glassChromeOpacityDesc:
-      '调整标题栏、工具栏与状态栏的玻璃不透明度缩放。100% 保持当前材质默认观感，数值越小越透明（范围 20–120）。',
-    glassStickyOpacity: '分组/路径遮罩不透明度 (%)',
-    glassStickyOpacityDesc:
-      '调整侧栏分组标题与路径等固定遮罩的不透明度缩放。100% 为默认，数值越小越透明（范围 20–120）。',
-    glassSurfaceOpacity: '卡片表面不透明度 (%)',
-    glassSurfaceOpacityDesc:
-      '调整工具卡片等玻璃表面的不透明度缩放。100% 为默认，数值越小越透明（范围 20–120）。',
-    glassControlOpacity: '控件表面不透明度 (%)',
-    glassControlOpacityDesc:
-      '调整搜索框、下拉框与开关等控件表面的不透明度缩放。100% 为默认，数值越小越透明（范围 20–120）。',
-    glassContentOpacity: '内容底面不透明度 (%)',
-    glassContentOpacityDesc:
-      '调整设置、收藏、人物、插件商店与文档阅读器等文字页面的底面不透明度缩放，保证任意壁纸下文字可读。100% 为基准，数值越大底面越实（120% 起全不透明，范围 20–120）。非毛玻璃模式不生效。',
-    glassGalleryOpacity: '画廊底面不透明度 (%)',
-    glassGalleryOpacityDesc:
-      '调整毛玻璃模式下画廊大底与图片间隙的主题色遮罩。0% 完全透出 Windows 毛玻璃，数值越大越不透明（范围 0–100）。非毛玻璃模式保持原有底色。',
-    themeTintStrength: '主题色浓度 (%)',
-    themeTintStrengthDesc:
-      '调整界面底色的主题色浓度。100% 为满浓度的出厂配色，数值越小底色越接近中性、整体观感越浅（范围 0–100），全部主题即时生效。',
-    themeTextStrength: '文字浓度 (%)',
-    themeTextStrengthDesc:
-      '调整界面文字的颜色浓度。100% 为出厂文字色，数值越小文字越浅、越接近底色，观感越柔和（范围 40–100），全部主题即时生效。',
+    windowMaterialNone: '纯色',
+    windowOpacity: '窗口不透明度',
+    windowMaterialDraftHint:
+      '调整只即时预览界面填充；窗口原生材质与不透明度在点「应用」后生效。',
     reading: '阅读',
     readerThemeHint:
       '设置阅读器的默认主题(日间 / 夜间随应用明暗自动切换)。字号、排版等可在打开书后于阅读器内的设置面板调节。',
@@ -916,9 +928,6 @@ export default {
     showDragHandle: '选中项拖拽手柄',
     showDragHandleDesc:
       '在已选中的缩略图左上角显示拖拽手柄（按住可拖入文件夹）。关闭后仍可用右键菜单移动。',
-    bucketScroll: '分段虚拟滚动',
-    bucketScrollDesc:
-      '画廊默认使用 bucket 分段引擎：段内纯原生滚动、无坐标压缩，配合自研逻辑滚动条，大型图库滚动更顺滑。切换即时生效；关闭则回退到线性平移模式。',
     autoHideChromeWindowed: '窗口化沉浸模式',
     autoHideChromeWindowedDesc: '非全屏时自动隐藏顶栏与底栏，鼠标移至窗口边缘时显示。',
     video: '视频',
@@ -958,6 +967,17 @@ export default {
     clearSettings: '清除设置',
     clearSettingsDesc: '重置所有应用设置为默认值',
     clearSettingsBtn: '清除',
+    // 恢复默认设置(2026-09-16 设置集中保存):语义从「清除」改为「整份恢复默认」——
+    // 覆盖外观、布局、播放/阅读偏好与窗口位置;保留资产、阅读进度、任务状态与引导标记。
+    resetSettings: '恢复默认设置',
+    resetSettingsDesc:
+      '把外观、布局、播放与阅读偏好、窗口位置恢复为默认值。不会删除资产、阅读进度、任务状态，也不会再次触发首次使用引导。',
+    resetSettingsBtn: '恢复默认设置',
+    resetSettingsConfirmTitle: '恢复默认设置',
+    resetSettingsConfirmMessage:
+      '确定把所有应用设置恢复为默认值吗？\n\n配置文件会被替换为默认内容（手写注释也会一并重置）。资产、收藏、阅读进度与任务状态均不受影响。',
+    resetSettingsSuccess: '已恢复默认设置',
+    resetSettingsRestartRequired: '默认值已保存；以下项需重启应用生效：{keys}',
     clearCache: '清空所有缓存',
     clearCacheDesc:
       '不仅清除数据库，同时删除所有的缩略图缓存，这会释放大量磁盘空间，但下次查看时需要重新生成。',
@@ -1031,6 +1051,14 @@ export default {
     configFileParseError: '配置文件解析出错：{message}',
     configFileErrorLine: '（第 {line} 行）',
     configRestartRequiredKeys: '以下配置项需重启应用生效：{keys}',
+    // 中央设置的失败提示(设置集中保存):写盘失败与「已保存但未能应用」两种语义分开,
+    // 不把部分成功报成完全成功。
+    saveFailedNotice: '设置保存失败，已恢复为上一次确认的值。',
+    applyFailedNotice: '设置已保存，但以下项未能应用：{keys}',
+    // 启动设置读取失败:主内容保持不渲染(不让未受保护的界面露出),给出可重试入口。
+    loadFailedTitle: '设置加载失败',
+    loadFailedHint: '未能读取应用设置，界面暂不显示，以免显示未受保护的内容。',
+    loadFailedRetry: '重试',
     openLogWindow: '日志窗口',
     openLogWindowDesc: '打开独立窗口查看实时日志流、过滤与浏览历史',
     openLogWindowBtn: '打开',
@@ -1231,6 +1259,16 @@ export default {
     computing: '正在计算布局…',
     scrollToTop: '回到顶部',
     scrollToBottom: '滚到底部',
+  },
+  demoPrivacy: {
+    // 顶栏一键打码入口(2026-09-16)与别名词:演示时不暴露真实目录名/文件名。
+    enable: '演示打码',
+    disable: '关闭演示打码',
+    aliasFolder: '文件夹',
+    aliasImage: '图片',
+    aliasVideo: '视频',
+    aliasFile: '文件',
+    demoLibrary: '演示图库',
   },
   selection: {
     selected: '已选择 {count} 项',
@@ -1567,6 +1605,11 @@ export default {
     rebuildConfirmMsg:
       '将清空当前模型的全部已分析向量，之后需重新运行分析（可能耗时较长）。确定继续？',
     rebuildConfirm: '清空并重建',
+    // 首次使用未下载模型：分析被拒绝时弹此确认框（确认只导航到模型库，不代下载）。
+    modelMissingTitle: 'AI 模型尚未下载',
+    modelMissingMsg:
+      'AI 分析需要先下载模型文件。请前往「设置 → AI → 模型库」下载当前激活的模型，下载完成后回到此处再次开始。',
+    modelMissingGo: '前往下载',
     emptyPrompt: '在上方搜索框中用自然语言描述图片',
     emptyExamples: '例：「海边日落」「两人自拍」「猫咪玩耍」',
     searching: '语义分析中…',
@@ -1850,6 +1893,10 @@ export default {
     exit: '退出应用',
     // IPC 失败反馈(审查 P1-16):此前先关弹窗后 await,退出/托盘失败零提示。
     actionFailed: '操作失败: {error}',
+    // 退出前 flush 失败(设置集中保存):在途/待保存设置未能落盘,由用户裁决重试或放弃。
+    flushFailed: '部分设置尚未保存成功。可重试,或放弃未保存的修改并退出。',
+    retry: '重试',
+    exitAnyway: '放弃未保存的修改并退出',
   },
   // 新建物理文件夹对话框
   folderCreate: {

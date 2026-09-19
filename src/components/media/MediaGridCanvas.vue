@@ -109,7 +109,7 @@ import {
   SelectionAnimTracker,
   SELECT_ANIM_MS,
 } from './mediaGridCanvas.helpers'
-import { defaultPalette, readPalette, type Palette } from './mediaGridCanvas.palette'
+import { PALETTE_METRICS_FALLBACK, projectPalette, readPaletteMetrics, type Palette } from './mediaGridCanvas.palette'
 import {
   drawSeparator,
   type LensFolderHeaderLines,
@@ -117,6 +117,8 @@ import {
 import { createInfoOverlayCache } from './mediaGridCanvas.infoOverlay'
 import { createCellRenderer } from './mediaGridCanvas.cellRenderer'
 import type { LayoutRow, LayoutRowItem, LayoutRowSeparator, MediaMeta } from '../../types/layout'
+import type { ThemePalette } from '../../themes/types'
+import type { DemoInfoFormatter } from '../../utils/demoAlias'
 import { performanceRecorder } from '../../perf/performanceRecorder'
 import { createCanvasThumbCellMetrics } from '../../perf/canvasThumbCellMetrics'
 
@@ -150,6 +152,12 @@ const props = defineProps<{
   enableHoverScale: boolean
   /** 信息浮窗开关(ui.showThumbInfo 经宿主注入,canvas 不进 store)。 */
   showThumbInfo: boolean
+  /** 演示打码开关(2026-09-16):开启时缩略图位图强模糊、信息浮窗换示例文案、悬停卡完全停用。 */
+  demoPrivacy: boolean
+  /** 信息浮窗演示文案组装(宿主注入;关闭时为 null → 走真实文案)。 */
+  demoInfoText?: DemoInfoFormatter | null
+  /** 路径类分隔行(画廊分组头)的演示别名:返回 null 的行(日期/组头)原样绘制。 */
+  demoSeparatorLabel?: (row: LayoutRowSeparator) => string | null
   /** 选择态拖拽手柄开关(#5,ui.showDragHandle 经宿主注入):关闭时不绘且不可命中。 */
   showDragHandle: boolean
   /** 就地 patch 信号(#15):宿主乐观更新(收藏/评分/色标/缩略图回写)后递增。canvas 据此
@@ -175,13 +183,10 @@ const props = defineProps<{
   /** 文件夹头行文字组(§7.2):宿主经 lensSeparator.getLensFolderStats/formatLensFolderStats
    *  组装(cluster 仅簇首);仅 duplicateFolder 分隔行被调用,其余行返回 null。 */
   lensFolderHeaderLines?: (row: LayoutRowSeparator) => LensFolderHeaderLines | null
-  /** 主题令牌(resolvedThemeId):变化时重读调色板并重绘(运行时切主题即时生效)。 */
-  themeToken: string
-  /** 主题色浓度令牌(themeTintStrength):变化时同 themeToken 重读重绘(底色 wash 随浓度变)。 */
-  tintToken: number
-  /** 文字浓度令牌(themeTextStrength):变化时同 themeToken 重读重绘(canvas 分隔行文字
-   *  吃 --color-text-primary/secondary,数值随文字浓度变)。 */
-  textToken: number
+  /** 当前主题色板(themeStore.currentPalette):DOM 与 Canvas 消费同一份生成结果,
+   *  换代时只重投影调色板并重绘——几何、预取计划、缩略图请求都不动。 */
+  themePalette: ThemePalette
+
   /** Windows 原生玻璃开启时，画布底面透明以透出 DWM Mica/Acrylic；其余平台保持不透明快路径。 */
   glassBackground: boolean
 }>()
@@ -212,19 +217,26 @@ const drawScheduler = new CanvasRafScheduler({
   draw,
 })
 
-// ── 调色板(挂载/换尺寸/换主题时读一次并缓存;canvas 需具体色值,不能用 CSS 变量)──────────
-// palette.ts 的 readPalette 已改为纯函数(签名调整,§3.2),这里保留"挂载/换主题时读一次、
-// 之后每帧引用同一对象引用"的取值时序:模块级 let 只在 applyPalette() 调用点重新赋值。
-let palette: Palette = defaultPalette
+// ── 调色板(挂载/换尺寸/主题换代时投影一次并缓存;canvas 需具体色值,不能用 CSS 变量)──
+// 颜色只从 props.themePalette 投影(与 DOM 同源):这里不读 DOM 取色,也不留第二套默认色;
+// 只有尺寸/字体度量从 DOM 读一次。之后每帧引用同一对象引用。paletteOf() 只兜住「挂载测量前的
+// 理论调用点」——onMounted 已先 applyPalette(),正常首帧即已就绪。
+let palette: Palette | null = null
+function paletteOf(): Palette {
+  palette ??= projectPalette(props.themePalette, PALETTE_METRICS_FALLBACK)
+  return palette
+}
 function applyPalette() {
   const el = wrapRef.value
   if (!el) return
-  palette = readPalette(el)
+  palette = projectPalette(props.themePalette, readPaletteMetrics(el))
 }
 
 // ── 尺寸(视口)与 DPR 适配 ─────────────────────────────────────────────────
 let viewW = 0
 let viewH = 0
+// 画布设备像素比(fitCanvas 每次写入):演示打码的模糊半径按设备像素给定,高 DPR 下观感一致。
+let canvasDpr = 1
 const RESIZE_SETTLE_MS = 120
 let resizeSettleTimer: ReturnType<typeof setTimeout> | null = null
 let resizeSettling = false
@@ -253,6 +265,7 @@ function fitCanvas(): CanvasRenderingContext2D | null {
   const ctx = cv.getContext('2d', { alpha: props.glassBackground })
   if (!ctx) return null
   const dpr = window.devicePixelRatio || 1
+  canvasDpr = dpr
   const w = Math.max(1, Math.round(viewW * dpr))
   const h = Math.max(1, Math.round(viewH * dpr))
   applyCanvasCssSize()
@@ -266,7 +279,7 @@ function fitCanvas(): CanvasRenderingContext2D | null {
   if (props.glassBackground) {
     ctx.clearRect(0, 0, w, h)
   } else {
-    ctx.fillStyle = palette.canvasGap
+    ctx.fillStyle = paletteOf().canvasGap
     ctx.fillRect(0, 0, w, h)
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -353,6 +366,7 @@ const {
   isPendingDelete: props.isPendingDelete,
   isSelected: props.isSelected,
   enableHoverScale: () => props.enableHoverScale,
+  demoPrivacy: () => props.demoPrivacy,
   cacheDir: () => props.cacheDir,
   currentY: () => props.currentY,
   selectionVersion: () => props.selectionVersion,
@@ -367,7 +381,7 @@ const infoOverlay = createInfoOverlayCache()
 
 // drawCell 复合入口(原逻辑域 F 中 drawCell 本体)。
 const drawCell = createCellRenderer({
-  getPalette: () => palette,
+  getPalette: paletteOf,
   selAnim,
   getImage: pipeline.getImage,
   isPendingDelete: props.isPendingDelete,
@@ -375,6 +389,9 @@ const drawCell = createCellRenderer({
   compactCells: () => props.compactCells,
   showThumbInfo: () => props.showThumbInfo,
   thumbInfoElements: () => props.thumbInfoElements,
+  demoPrivacy: () => props.demoPrivacy,
+  devicePixelRatio: () => canvasDpr,
+  demoInfo: () => (props.demoPrivacy ? props.demoInfoText ?? null : null),
   showDragHandle: () => props.showDragHandle,
   isSelectionMode: () => props.isSelectionMode,
   pendingDeleteLabel: () => props.pendingDeleteLabel,
@@ -436,11 +453,12 @@ function draw() {
         ctx,
         row,
         sy,
-        palette,
+        paletteOf(),
         props.groupBy,
         props.separatorCounts?.get(separatorKey),
         props.lensFolderHeaderLines?.(row) ?? null,
         props.lensGroupLabel?.(row) ?? null,
+        props.demoSeparatorLabel?.(row) ?? null,
       )
       continue
     }
@@ -591,17 +609,35 @@ watch(() => props.enableHoverScale, clearHover)
 // 信息浮窗数据/设置换代:缓存整体作废(gen 递增)并重绘——viewportMeta 每批到达换 Map 引用,
 // thumbInfoElements/showThumbInfo 由设置页改动。
 watch(
-  [() => props.viewportMeta, () => props.thumbInfoElements, () => props.showThumbInfo],
+  // 演示文案组装器随语言换代(别名前缀词是译文):换引用即作废缓存里的旧语言文本。
+  [
+    () => props.viewportMeta,
+    () => props.thumbInfoElements,
+    () => props.showThumbInfo,
+    () => props.demoInfoText,
+  ],
   () => {
     infoOverlay.invalidate()
     scheduleDraw()
   },
 )
+// 语言换代无需单独信号:demoInfoText 的新闭包会走过下面的 watch,那里已作废文案缓存并排帧;
+// draw() 本身也会重画分隔头(其别名词同样是译文),一套信号覆盖两处。
 watch(() => props.groupBy, scheduleDraw)
 // 重复镜头进出(§6.2):组内位次角标显隐切换,重绘一次即可(几何不变)。
 watch(() => props.lensActive, scheduleDraw)
 // 手柄开关(#5)由设置页改动:无缓存可作废,重绘即生效。
 watch(() => props.showDragHandle, scheduleDraw)
+// 演示打码开关(2026-09-16):翻转即整块作废信息浮窗文案缓存(防残留真实文件名/路径),并清掉
+// 悬停卡——卡内是真实缩略图与真实文案,打码期间必须立即消失;随后的重绘让位图模糊/还原同帧生效。
+watch(
+  () => props.demoPrivacy,
+  () => {
+    infoOverlay.invalidate()
+    clearHover()
+    scheduleDraw()
+  },
+)
 watch(
   () => props.scrolling,
   (v) => {
@@ -628,9 +664,10 @@ watch(
     scheduleDraw()
   },
 )
-// 运行时切主题/调浓度:重读调色板并重绘(修 MVP「切主题需 toggle 一次刷新」局限)。
+// 主题/配色换代(store 每帧最多发布一次新色板引用):重新投影调色板并重绘。只重绘——
+// 几何与预取计划不变,不触发缩略图重载(与旧 themeToken/tintToken/textToken 同一触发面)。
 watch(
-  () => [props.themeToken, props.tintToken, props.textToken] as const,
+  () => props.themePalette,
   () => {
     applyPalette()
     scheduleDraw()

@@ -1,0 +1,167 @@
+{
+  "APPDATA": [
+    "src-tauri/src/bin/mock_data.rs",
+    "src-tauri/src/bin/sort_profile.rs",
+    "src-tauri/src/bin/worker_e2e.rs"
+  ],
+  "CARGO_MANIFEST_DIR": [
+    "crates/scrollery-exotic-trust/build.rs",
+    "src-tauri/build.rs"
+  ],
+  "CHROME_PATH": [
+    "scripts/bench/canvas-wave-bench.mjs",
+    "scripts/capture-theme-matrix.mjs"
+  ],
+  "CI": [
+    "scripts/build-raw-worker.mjs",
+    "scripts/verify-bundle-content.mjs"
+  ],
+  "CODEX_HOME": [
+    "scripts/install-skills.mjs"
+  ],
+  "DEV": [
+    "src/components/layout/AppToolbar.vue",
+    "src/composables/useBucketVirtualScroll.ts",
+    "src/composables/useGalleryAxisControls.spec.ts",
+    "src/composables/useGalleryAxisControls.ts",
+    "src/composables/usePerformanceMonitor.ts",
+    "src/composables/useRenderMode.ts",
+    "src/composables/useVirtualScroll.spec.ts",
+    "src/composables/useVirtualScroll.ts",
+    "src/harness/runtime.ts",
+    "src/utils/logger.ts"
+  ],
+  "EXOTIC_CAPABILITIES": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_COMPLIANCE_REVIEW_ID": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_FORMATS": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_LICENSE_KEY_ID": [
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_MEDIA_KIND": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_MIN_HOST_VERSION": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_PLUGIN_ID": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_PSD_WORKER_PATH": [
+    "src-tauri/src/exotic/installer.rs",
+    "src-tauri/src/exotic/worker.rs"
+  ],
+  "EXOTIC_RAW_WORKER_PATH": [
+    "src-tauri/src/exotic/installer.rs"
+  ],
+  "EXOTIC_RELEASE_KEY_ID": [
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_SKU": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_TARGET": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_VIDEO_WORKER_PATH": [
+    "src-tauri/src/exotic/installer.rs"
+  ],
+  "EXOTIC_WORKER_CRATE": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_WORKER_NAME": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "EXOTIC_WORKER_PATH": [
+    "scripts/exotic-dev-registry.mjs",
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "OCR_BENCH_IMG": [
+    "crates/scrollery-ai-core/tests/ocr_golden.rs"
+  ],
+  "OCR_MODELS_DIR": [
+    "crates/exotic-workers/ai-worker/src/main.rs",
+    "crates/scrollery-ai-core/tests/ocr_golden.rs"
+  ],
+  "ORT_DYLIB_PATH": [
+    "crates/exotic-workers/ai-worker/src/main.rs",
+    "crates/exotic-workers/enhance-worker/src/main.rs",
+    "crates/scrollery-ai-core/src/engine.rs",
+    "src-tauri/src/ai/engine_boot.rs"
+  ],
+  "OUT_DIR": [
+    "crates/scrollery-exotic-trust/build.rs",
+    "src-tauri/build.rs"
+  ],
+  "PICASA_AI_WORKER_PATH": [
+    "src-tauri/src/ai/worker_client/process.rs"
+  ],
+  "PICASA_ENHANCE_WORKER_PATH": [
+    "src-tauri/src/enhance/service.rs"
+  ],
+  "PICASA_EXOTIC_DEV_FILE_URLS": [
+    "src-tauri/src/download/mod.rs",
+    "src-tauri/src/exotic/installer.rs"
+  ],
+  "PICASA_EXOTIC_DEV_KEYSET": [
+    "src-tauri/src/exotic/mod.rs"
+  ],
+  "PICASA_EXOTIC_KEYSET_FILE": [
+    "crates/scrollery-exotic-trust/build.rs"
+  ],
+  "PICASA_HEIC_SAMPLE": [
+    "src-tauri/src/engine/gpu/wic_engine.rs"
+  ],
+  "PICASA_INTERNAL_REGISTRY_BASE": [
+    "scripts/exotic-internal-registry.mjs"
+  ],
+  "PICASA_REGISTRY_BASE": [
+    "src-tauri/src/ipc/exotic_commands.rs"
+  ],
+  "PICASA_SMOKE_TEST": [
+    "src-tauri/src/lifecycle.rs"
+  ],
+  "PROFILE": [
+    "crates/scrollery-exotic-trust/build.rs"
+  ],
+  "PSD_PROBE_SAMPLES": [
+    "crates/exotic-workers/psd-probe/src/main.rs"
+  ],
+  "RAW_PROBE_SAMPLES": [
+    "crates/exotic-workers/raw-probe/src/main.rs"
+  ],
+  "RUST_LOG": [
+    "scripts/acceptance/isolated-app-smoke.mjs"
+  ],
+  "SCROLLERY_TEST_FFMPEG": [
+    "crates/exotic-workers/video-worker/tests/e2e_ffmpeg.rs"
+  ],
+  "SEVENZIP": [
+    "scripts/acceptance/isolated-app-smoke.mjs",
+    "scripts/verify-bundle-content.mjs"
+  ],
+  "TAURI_DEV_HOST": [
+    "vite.config.ts"
+  ],
+  "TEMP": [
+    "scripts/acceptance/isolated-app-smoke.mjs"
+  ],
+  "VIDEO_DIAG": [
+    "src-tauri/src/video/media_foundation.rs"
+  ]
+}

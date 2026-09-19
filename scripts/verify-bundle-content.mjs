@@ -391,6 +391,7 @@ function main() {
           { name: 'notice.md', source: path.join(ROOT, 'NOTICE.md') },
           { name: 'source.md', source: path.join(ROOT, 'SOURCE.md') },
           { name: 'commercial.md', source: path.join(ROOT, 'COMMERCIAL.md') },
+          { name: 'additional-permission.md', source: path.join(ROOT, 'ADDITIONAL-PERMISSION.md') },
           ...legalTree.map((name) => ({ name, source: path.join(ROOT, 'target', name) })),
         ].map(({ name, source }) => ({ name, size: statSync(source).size }));
         const legalNameMissing = isMsi ? [] : checkLegalEntries(names, legalSources.map(({ name }) => name));

@@ -22,6 +22,7 @@ import {
 } from './mediaGridCanvas.painters'
 import type { Palette } from './mediaGridCanvas.palette'
 import type { InfoOverlayCtx } from './mediaGridCanvas.infoOverlay'
+import type { DemoInfoFormatter } from '../../utils/demoAlias'
 
 export interface CellRendererDeps {
   getPalette: () => Palette
@@ -31,6 +32,12 @@ export interface CellRendererDeps {
   isSelected: (id: number) => boolean
   compactCells: () => boolean
   showThumbInfo: () => boolean
+  /** 演示打码开关(2026-09-16):开启时缩略图位图在 drawImage 阶段强模糊(只改显示,不新增模糊位图)。 */
+  demoPrivacy: () => boolean
+  /** 画布设备像素比:模糊半径按设备像素给定,格尺寸与 DPR 变化时观感一致。 */
+  devicePixelRatio: () => number
+  /** 信息浮窗演示文案组装(关闭时返回 null → 走真实文案)。 */
+  demoInfo: () => DemoInfoFormatter | null
   thumbInfoElements: () => readonly string[]
   showDragHandle: () => boolean
   isSelectionMode: () => boolean
@@ -74,6 +81,7 @@ export function createCellRenderer(deps: CellRendererDeps) {
     viewportMeta: deps.viewportMeta(),
     thumbInfoElements: deps.thumbInfoElements(),
     showThumbInfo: deps.showThumbInfo(),
+    demoInfo: deps.demoInfo(),
   }
   return function drawCell(
     ctx: CanvasRenderingContext2D,
@@ -141,7 +149,41 @@ export function createCellRenderer(deps: CellRendererDeps) {
         // 现行规格位图已在解码期裁到格纵横比,coverRect 退化为全源平贴;stale 位图(规格过期
         // 续画)与 Image 回退(整图)则靠它保住 cover 语义不变形。
         const c = coverRect(sw, sh, w, h)
-        ctx.drawImage(s, c.sx, c.sy, c.sw, c.sh, x, y, w, h)
+        // 演示打码:同一次 drawImage 上加强模糊——请求/解码/缓存全部原样,只改这次显示的像素
+        //(不生成第二套模糊位图)。半径随格尺寸取,并与外层 missing/offline 灰化 filter 复合
+        //(拼接而非覆盖);先按格矩形 clip、再把目标矩形外扩一个半径绘制,模糊边缘落在格内,
+        //不越界污染邻格,也不出现格缘渐隐。
+        //
+        // 两种半径分开口径:blurLogical 是**逻辑坐标**下的扩边量(与 x/y/w/h 同一坐标系),
+        // blurDevice 才是交给 ctx.filter 的值(filter 不随 CTM 缩放,须按 DPR 放大才等观感)。
+        // 拿同一个放大过的值去扩边会让 DPR=2 时裁切幅度翻倍,故两个量必须分开。
+        const blurLogical = deps.demoPrivacy() ? Math.max(6, Math.min(w, h) * 0.1) : 0
+        if (blurLogical > 0) {
+          const blurDevice = blurLogical * deps.devicePixelRatio()
+          const baseFilter = ctx.filter
+          ctx.save()
+          ctx.beginPath()
+          ctx.rect(x, y, w, h)
+          ctx.clip()
+          ctx.filter =
+            baseFilter && baseFilter !== 'none'
+              ? `${baseFilter} blur(${blurDevice}px)`
+              : `blur(${blurDevice}px)`
+          ctx.drawImage(
+            s,
+            c.sx,
+            c.sy,
+            c.sw,
+            c.sh,
+            x - blurLogical,
+            y - blurLogical,
+            w + blurLogical * 2,
+            h + blurLogical * 2,
+          )
+          ctx.restore()
+        } else {
+          ctx.drawImage(s, c.sx, c.sy, c.sw, c.sh, x, y, w, h)
+        }
         loaded = true
       }
     }
@@ -184,6 +226,7 @@ export function createCellRenderer(deps: CellRendererDeps) {
       infoOverlayCtx.viewportMeta = deps.viewportMeta()
       infoOverlayCtx.thumbInfoElements = deps.thumbInfoElements()
       infoOverlayCtx.showThumbInfo = deps.showThumbInfo()
+      infoOverlayCtx.demoInfo = deps.demoInfo()
       deps.drawInfoOverlay(ctx, item, x, y, w, h, loaded, infoOverlayCtx)
       if (item.mediaType === 'video') drawPlayIcon(ctx, x, y, w, h)
       if (item.durationMs) drawDuration(ctx, x, y, w, h, formatDuration(item.durationMs), palette)

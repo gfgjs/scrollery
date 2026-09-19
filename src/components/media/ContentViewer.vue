@@ -173,7 +173,7 @@
         <!-- ── 控制器 ────────────────────────────────────────────────── -->
         <!-- 沉浸模式(P4-c)隐藏本控制条(app shell 由 AppShell 联动隐);退出走浮动按钮 / Esc。
              controlsHidden(2026-07-18):点大图切换底部半透明操作栏显隐(与沉浸互不相干——沉浸连 app
-             shell 一起隐,这里只隐本条),偏好持久化到 localStorage。 -->
+             shell 一起隐,这里只隐本条),偏好存 config.toml(detail_controls_hidden)。 -->
         <div class="detail-controls" v-show="detailControlsVisible">
           <!-- 左侧 -->
           <div class="detail-controls__left">
@@ -271,7 +271,7 @@
 
           <!-- 右侧 -->
           <div class="detail-controls__right">
-            <!-- 人脸蓝框显隐开关（问题5）：仅图像且检测到脸时出现，默认显示，偏好记 localStorage。 -->
+            <!-- 人脸蓝框显隐开关（问题5）：仅图像且检测到脸时出现，默认显示，偏好存 config.toml。 -->
             <UiIconButton
               v-if="detail.mediaType === 'image' && faces.length"
               :label="showFaces ? t('detail.hideFaceBoxes') : t('detail.showFaceBoxes')"
@@ -526,6 +526,8 @@ import { useImageEditor, requestDiscardEdits } from '../../composables/useImageE
 import { useViewerColorSource } from '../../composables/useViewerColorSource'
 import { useEditingEntitlement } from '../../composables/useEditingEntitlement'
 import { useExoticGate } from '../../composables/useExoticGate'
+import { readSettingBool } from '../../composables/settingsValues'
+import { writeSettings } from '../../stores/settingsPersistence'
 import { useOcr } from '../../composables/useOcr'
 import { gateModeFor } from '../../composables/usePluginEntitlement'
 import { usePersonStore } from '../../stores/personStore'
@@ -1040,17 +1042,27 @@ function close() {
 // viewer.clear 使 activeViewer=null → isImmersive 自然归假,无需手动复位。阅读器暂留其局部沉浸,
 // P5 令 DocumentViewer 也 populate viewerStore 后统一(现两者机制并存)。
 const isImmersive = computed(() => viewer.isImmersive)
+/** 底部操作栏显隐设置键(后端 schema 注册,全局查看偏好)。 */
+const CONTROLS_HIDDEN_KEY = 'detail_controls_hidden'
 function toggleImmersive() {
   viewer.setImmersive(!viewer.isImmersive)
 }
 
 // ── 点大图切换底部操作栏显隐(2026-07-18 内容页需求)────────────────────────────
-// 纯查看偏好,持久化到 localStorage(镜像 showFaces,无需 IPC/DB)。与沉浸模式正交:沉浸隐整个 app
+// 全局查看偏好,存中央设置(config.toml 键 detail_controls_hidden)。与沉浸模式正交:沉浸隐整个 app
 // shell,这里只隐本组件底部半透明控制条。
-const controlsHidden = ref(localStorage.getItem('detail_controls_hidden') === 'true')
+const controlsHidden = ref(readSettingBool(CONTROLS_HIDDEN_KEY, false))
+// 后端只应用:权威值变化(启动水合 / 恢复默认 / 外部改文件)→ 同步显示态;用户改动显式提交。
+watch(
+  () => readSettingBool(CONTROLS_HIDDEN_KEY, false),
+  (v) => {
+    controlsHidden.value = v
+  },
+)
 function toggleControls() {
   controlsHidden.value = !controlsHidden.value
-  localStorage.setItem('detail_controls_hidden', String(controlsHidden.value))
+  // 写盘失败由中央服务统一提示;此处 catch 只为收掉 promise。
+  writeSettings({ [CONTROLS_HIDDEN_KEY]: String(controlsHidden.value) }).catch(() => {})
 }
 // 底部操作栏可见性单源:v-show 与视频 chrome 抬升(.has-bottom-controls → --viewer-bottom-inset)
 // 共用同一判据,防两处条件漂移导致视频控制条与缩放工具重叠。

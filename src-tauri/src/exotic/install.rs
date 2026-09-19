@@ -95,10 +95,6 @@ pub enum InstallError {
     CatalogReject(String),
     #[error("安装记录写入失败：{0}")]
     Db(String),
-    /// T13 多渠道预留:Steam/Store 渠道的安装路径(跳 Registry 验签、保 manifest/hash
-    /// 复核)随 Part8 实装;实装前 fail-closed,不预铺无测试保护的弱验签分支。
-    #[error("安装渠道未实装：{0}（Steam/Store 随 Part8 落地）")]
-    ChannelUnsupported(&'static str),
 }
 
 impl InstallError {
@@ -123,7 +119,6 @@ impl InstallError {
             InstallError::Io(_) => "install_io",
             InstallError::CatalogReject(_) => "catalog_reject",
             InstallError::Db(_) => "install_db",
-            InstallError::ChannelUnsupported(_) => "channel_unsupported",
         }
     }
 }
@@ -830,10 +825,6 @@ mod tests {
             (InstallError::Io("e".into()), "install_io"),
             (InstallError::CatalogReject("r".into()), "catalog_reject"),
             (InstallError::Db("e".into()), "install_db"),
-            (
-                InstallError::ChannelUnsupported("steam_depot"),
-                "channel_unsupported",
-            ),
         ];
         for (err, code) in cases {
             assert_eq!(err.code(), *code, "错误码必须稳定：{err:?}");

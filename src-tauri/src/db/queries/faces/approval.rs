@@ -479,7 +479,7 @@ mod x1_conditional_finish_tests {
 
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -626,7 +626,7 @@ mod face_approval_tests {
 
     fn mem() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c
     }

@@ -46,39 +46,6 @@ pub fn list_storage_backends(conn: &Connection) -> Result<Vec<StorageBackendInfo
     rows.map(|r| r.map_err(AppError::from)).collect()
 }
 
-/// 读取某后端的完整配置（含 `cred_ref`）以构建 `StorageBackend`（§3.8）。
-/// 返回 `(kind, host, base_path, username, cred_ref)`。
-// 返回元组已在上方 doc 注明各字段语义，构建 StorageBackend 一次性消费，抽别名收益有限。
-#[allow(clippy::type_complexity)]
-pub fn get_storage_backend_config(
-    conn: &Connection,
-    id: i64,
-) -> Result<
-    Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )>,
-> {
-    conn.query_row(
-        "SELECT kind, host, base_path, username, cred_ref FROM storage_backends WHERE id = ?1",
-        params![id],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(AppError::from)
-}
-
 /// 插入一个存储后端（密码另存 keyring；此处仅 `cred_ref`）。§3.8。
 #[allow(clippy::too_many_arguments)]
 pub fn insert_storage_backend(
@@ -256,10 +223,10 @@ mod volume_dao_tests {
     use crate::db::models::{NewVolume, VolumeKind};
 
     /// 全新内存库（含 V10 卷表）。FK 状态由各测试**显式**设置——FK 是建连接时（connection.rs）开，
-    /// 非 run_migrations 副作用，故不依赖隐式默认。
+    /// 非 initialize_schema 副作用，故不依赖隐式默认。
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c
     }
 
@@ -304,8 +271,8 @@ mod volume_dao_tests {
         let c = mem_db();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
 
-        // 1) 建根（add_scan_root 路径：backend_id=None）。
-        let root_id = insert_scan_root(&c, "C:\\Photos", Some("照片"), None).unwrap();
+        // 1) 建根（add_scan_root 路径）。
+        let root_id = insert_scan_root(&c, "C:\\Photos", Some("照片")).unwrap();
         // 2) 建卷 + 绑定（add_scan_root 内 Piece2 逻辑）。
         let vid = upsert_volume(&c, &new_vol("path:C:")).unwrap();
         set_scan_root_volume(&c, root_id, Some(vid)).unwrap();

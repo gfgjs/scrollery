@@ -2,7 +2,7 @@
 //
 // watcher 注册顺序即 flush 顺序,四个布局相关 watcher(totalItems / layoutDirty / layoutVersion /
 // viewport-meta)必须保持此文件内的声明次序。
-import { watch, onScopeDispose, type Ref } from 'vue'
+import { watch, onScopeDispose } from 'vue'
 import { useTauriListen } from './useTauriListen'
 import { useViewIds } from './useViewIds'
 import { useMediaStore } from '../stores/mediaStore'
@@ -16,20 +16,15 @@ import type { LayoutRow } from '../types/layout'
 export interface GalleryTauriSyncDeps {
   /** 自动重算入口：离屏时登记 deferred，激活后补算当前视图。 */
   requestCompute: () => boolean
-  updateVisible: (force?: boolean) => Promise<void>
   refreshCacheDir: () => Promise<void>
   restoreReflowAnchor: () => Promise<boolean>
   gridRef: () => HTMLElement | null
-  bucketActive: () => boolean
   scrollToLogicalY: (y: number) => Promise<void>
   getViewKey: () => string
   /** browse-only 镜头不需要把布局 flat_ids 物化到前端。 */
   shouldLoadViewIds: () => boolean
   isLensActive: () => boolean
-  /** 方案 A 的可视行(watch 源之一,须传 Ref 本体)。 */
-  visibleRows: Ref<LayoutRow[]>
-  /** bucket 模式的已挂载段行(watch 第三源 + 元数据取 id 用)。 */
-  mountedRows: () => LayoutRow[]
+  /** 当前已挂载段行(视口元数据取 id 用)。 */
   activeRows: () => LayoutRow[]
 }
 
@@ -123,36 +118,33 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
         const restored = await deps.restoreReflowAnchor()
         if (!restored) {
           const saved = scrollCache.get(deps.getViewKey()) || 0
-          if (deps.bucketActive()) await deps.scrollToLogicalY(saved)
-          else el.scrollTop = saved
+          await deps.scrollToLogicalY(saved)
         }
       }
-      deps.updateVisible(true)
+      // 段表重建由引擎的 layoutVersion watch 自驱,无需另发取数请求。
     },
   )
 
   // 当信息浮层开启时，仅为可视项懒加载重型元数据（EXIF/GPS/名称/路径）——
   // 这些字段已从常驻布局缓存剥离（A1），经 get_meta_for_viewport 按需提供。
   watch(
-    // 第三源:bucket 模式的段挂载/卸载(段行深响应,mountedRows() 的依赖变化即触发)。
-    [
-      deps.visibleRows,
-      () => ui.showThumbInfo,
-      () => ui.thumbInfoElements,
-      () => (deps.bucketActive() ? deps.mountedRows() : null),
-    ],
+    // 源即消费面:段挂载/卸载与开关/元素变化都经本 getter 依赖追踪(取 id 的同时建立依赖)。
     () => {
       // 只有勾了真正消费元数据的元素才按视口拉(S7):此前只看总开关,勾 size/status 这类
       // 纯 item 字段的元素也会每屏拉一遍 EXIF/GPS/路径,拉回来无人渲染。元素列表本身也
       // 须入 watch 源,否则中途勾上 camera 要等到行变化才补拉。
-      if (!ui.showThumbInfo || !needsViewportMeta(ui.thumbInfoElements)) return
+      if (!ui.showThumbInfo || !needsViewportMeta(ui.thumbInfoElements)) return ''
       const ids: number[] = []
       for (const row of deps.activeRows()) {
         if (row.rowType === 'normal') {
           for (const it of row.items) ids.push(it.id)
         }
       }
-      if (ids.length > 0) media.ensureMeta(ids)
+      return ids.join(',')
+    },
+    (key) => {
+      if (!key) return
+      media.ensureMeta(key.split(',').map(Number))
     },
     { immediate: true },
   )

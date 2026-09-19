@@ -3,9 +3,14 @@
 // 纯逻辑搬迁,不改变原调用点/参数/时序——见 docs/planning/2026-07-25-超长文件拆分方案/analysis/ContentViewer-vue.md。
 // 红线(风险章节):faceToken 并发丢弃判定须逐字保留,不得简化为取消/AbortController 等替代实现。
 
-import { ref, watch, nextTick, type Ref } from 'vue'
+import { computed, ref, watch, nextTick, type Ref } from 'vue'
 import type { FaceBox } from '../types/person'
 import type { usePersonStore } from '../stores/personStore'
+import { writeSettings } from '../stores/settingsPersistence'
+import { readSettingBool } from './settingsValues'
+
+/** 人脸蓝框显隐(全局查看偏好,后端 schema 注册键 detail_show_faces)。 */
+const SHOW_FACES_KEY = 'detail_show_faces'
 
 export function useContentViewerFaces(options: {
   viewerRef: Ref<HTMLElement | null>
@@ -19,11 +24,11 @@ export function useContentViewerFaces(options: {
   // 图像的**内容矩形**(object-fit:contain 会留黑边),用 getBoundingClientRect 实时测量——它已含
   // 缩放/平移 transform,所以框会自动跟随缩放与拖拽。
   const faces = ref<FaceBox[]>([])
-  // 人脸蓝框显隐开关(问题5)。默认显示;纯前端查看偏好,持久化到 localStorage(无需 IPC)。
-  const showFaces = ref(localStorage.getItem('detail_show_faces') !== 'false')
+  // 人脸蓝框显隐开关(问题5)。默认显示;全局查看偏好,存中央设置(config.toml),重置随快照回默认。
+  const showFaces = computed(() => readSettingBool(SHOW_FACES_KEY, true))
   function toggleFaces() {
-    showFaces.value = !showFaces.value
-    localStorage.setItem('detail_show_faces', String(showFaces.value))
+    // 写盘失败由中央服务统一提示;此处 catch 只为收掉 promise。
+    writeSettings({ [SHOW_FACES_KEY]: String(!showFaces.value) }).catch(() => {})
   }
   // Image content rect in viewer-local coords {x,y,w,h}; null when not measurable.
   // 图像内容矩形(viewer 局部坐标 {x,y,w,h});不可测时为 null。

@@ -2,7 +2,7 @@
 // 旗舰级选择 composable —— 手势采集层 + classicMode.apply 调度 + SelectionState 持有。
 //
 // Part5 T4b：选区脱离 DOM。内部状态由「裸 Set」改为判别联合 SelectionState（explicit{ids} |
-// all{excluded}），离散意图经 classicMode（可插拔策略）解释，顺序/全集取自 useViewIds 的布局序
+// all{excluded}），离散意图经 classicMode 策略解释，顺序/全集取自 useViewIds 的布局序
 // flat_ids 而非可视 DOM。这根治 G1 三症状：Shift 跨视口失效 / Ctrl+A 只选一屏 / 框选漏滚出项。
 // 🔴 开发期不冻结契约：当前固定 classic 模式 + 当前意图集，两层结构令后续演进影响面收敛。
 //
@@ -20,7 +20,9 @@ import {
   type SelectionIntent,
   type SelectionContext,
 } from './selection/types'
-import { getSelectionMode } from './selection/registry'
+// 当前激活的选择模式（classic，桌面照片管理器语义）：手势层只发 SelectionIntent，策略在此装配。
+// 策略层解耦靠 SelectionMode 接口本身 —— 换模式 = 实现该接口并替换下方 apply 调用点。
+import { classicMode } from './selection/classicMode'
 import { applyRangeInvert } from './selection/sweep'
 import { useViewIds } from './useViewIds'
 import { buildCurrentViewDescriptor } from './useViewDescriptor'
@@ -31,8 +33,6 @@ export type BackendSelectionDescriptor = SelectionDescriptor<ViewDescriptorDto>
 
 // 视图布局序全集（range / 全选物化 / 反选 的顺序与全集来源,脱离可视 DOM）。
 const viewIds = useViewIds()
-// 当前激活的选择模式（现固定 classic;未来从 config 读、设置页可切——不冻结）。
-const mode = getSelectionMode()
 
 // ── 单例状态 ──
 // 所有消费者共享同一选区。判别联合:explicit 显式枚举 / all 全选语义(不物化百万 id)。
@@ -103,7 +103,7 @@ function makeCtx(): SelectionContext {
 
 /** 把一个离散意图交当前模式解释为新选区状态,并同步选择模式开关。 */
 function dispatch(intent: SelectionIntent) {
-  state.value = mode.apply(state.value, intent, makeCtx())
+  state.value = classicMode.apply(state.value, intent, makeCtx())
   if (!isEmptySelection(state.value)) isSelectionMode.value = true
   // 置 false 交给上方 watch（空选区 → 退出）,避免两处重复判定。
 }

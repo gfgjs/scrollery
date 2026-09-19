@@ -162,7 +162,8 @@ import {
   type BackupListEntry,
   type BackupPreflight,
 } from '../../stores/backupStore'
-import { useConfigStore } from '../../stores/configStore'
+import { readSetting, writeSettings } from '../../stores/settingsPersistence'
+import { readSettingBool } from '../../composables/settingsValues'
 import { useToastStore } from '../../stores/toastStore'
 import { useConfirm } from '../../composables/useConfirm'
 import { IPC } from '../../constants/ipc'
@@ -171,7 +172,6 @@ import { backupErrorKey, parentDirectoryPath } from '../../utils/backupPresentat
 import { formatFileSize } from '../../utils/format'
 
 const backup = useBackupStore()
-const config = useConfigStore()
 const toast = useToastStore()
 const { confirm } = useConfirm()
 const { locale } = useI18n()
@@ -221,20 +221,28 @@ const latestStatusLabel = computed(() => {
   return bt('backup.latestIdle')
 })
 
+// 备份策略(目录/自动/保留份数)存中央设置;最近成功时间属后台工作时间戳,留 DB 状态键。
 onMounted(async () => {
-  const [dir, enabled, keep, last] = await Promise.all([
-    loadConfig('backup_dir'),
-    loadConfig('backup_auto_enabled'),
-    loadConfig('backup_retention'),
-    loadConfig('backup_last_success_at'),
-  ])
-  destination.value = dir ?? ''
-  autoEnabled.value = enabled === 'true' && !!destination.value
-  retention.value = clampRetention(Number.parseInt(keep ?? '5', 10))
-  const parsedLast = Number.parseInt(last ?? '', 10)
-  lastSuccessEpoch.value = Number.isFinite(parsedLast) ? parsedLast : null
+  applyStrategy()
+  await refreshLastAutoSuccess()
   if (destination.value) await refreshAll()
 })
+
+/** 后端只应用:权威快照变化(启动水合 / 恢复默认 / 外部改文件)→ 同步策略显示,不写回。 */
+function applyStrategy() {
+  destination.value = readSetting('backup_dir') ?? ''
+  autoEnabled.value = readSettingBool('backup_auto_enabled', false) && !!destination.value
+  const keep = Number.parseInt(readSetting('backup_retention') ?? '5', 10)
+  retention.value = clampRetention(keep)
+}
+watch(
+  () => [
+    readSetting('backup_dir'),
+    readSetting('backup_auto_enabled'),
+    readSetting('backup_retention'),
+  ],
+  applyStrategy,
+)
 
 watch(
   () => backup.progress.status,
@@ -245,14 +253,22 @@ watch(
   },
 )
 
-async function loadConfig(key: string): Promise<string | null> {
-  return invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key }).catch(() => null)
-}
-
 async function refreshLastAutoSuccess() {
-  const value = await loadConfig('backup_last_success_at')
+  // 后台工作时间戳(状态键,留 DB):经内部状态 GET 读取,不走设置服务。
+  const value = await invokeIpc<string | null>(IPC.GET_APP_CONFIG, {
+    key: 'backup_last_success_at',
+  }).catch(() => null)
   const parsed = Number.parseInt(value ?? '', 10)
   lastSuccessEpoch.value = Number.isFinite(parsed) ? parsed : null
+}
+
+/** 提交设置:写盘失败由中央服务统一提示,此处 catch 只为不让 rejection 漏成 unhandled。 */
+async function persist(patch: Record<string, string>) {
+  try {
+    await writeSettings(patch)
+  } catch {
+    /* 中央服务已提示 */
+  }
 }
 
 function clampRetention(value: number): number {
@@ -269,7 +285,7 @@ async function chooseDestination() {
   if (!selected || typeof selected !== 'string') return
 
   destination.value = selected
-  await config.saveConfig('backup_dir', selected)
+  await persist({ backup_dir: selected })
   await refreshAll()
 
   // 改选既有目录时保留用户当前自动策略；只在首次设置目的地时给出 B-1 显式建议。
@@ -285,19 +301,19 @@ async function chooseDestination() {
     cancelText: bt('backup.manualOnly'),
   })
   retention.value = 5
-  await config.saveConfig('backup_retention', '5')
+  await persist({ backup_retention: '5' })
   await setAutoEnabled(confirmed)
 }
 
 async function setAutoEnabled(enabled: boolean) {
   if (enabled && !canEnableAuto.value) return
   autoEnabled.value = enabled
-  await config.saveConfig('backup_auto_enabled', String(enabled))
+  await persist({ backup_auto_enabled: String(enabled) })
 }
 
 async function saveRetention() {
   retention.value = clampRetention(retention.value)
-  await config.saveConfig('backup_retention', String(retention.value))
+  await persist({ backup_retention: String(retention.value) })
 }
 
 async function refreshAll() {

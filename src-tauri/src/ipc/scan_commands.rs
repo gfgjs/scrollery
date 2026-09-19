@@ -79,8 +79,7 @@ pub async fn add_scan_root(
                 .db_writer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            // backend_id=None：本地/OS 挂载盘（网络盘绑定经 Part5 设置 UI 走 set_scan_root_backend）。
-            let id = q::insert_scan_root(&conn, &norm, alias.as_deref(), None)?;
+            let id = q::insert_scan_root(&conn, &norm, alias.as_deref())?;
             {
                 let volume_id = q::upsert_volume(&conn, &new_vol)?;
                 q::set_scan_root_volume(&conn, id, Some(volume_id))?;
@@ -958,20 +957,6 @@ pub async fn clear_database(state: State<'_, Arc<AppState>>, app: AppHandle) -> 
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
 
     info!("clear_database: all media data wiped | 清除数据库：所有媒体数据已擦除");
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn clear_settings(state: State<'_, Arc<AppState>>) -> Result<()> {
-    info!("User action: Clearing settings | 用户操作：正在清除设置");
-    // R1-3：写走 write_blocking。
-    super::blocking::write_blocking(&state, |conn| {
-        // 仅删除用户设置，保留如 schema_version 等系统键值，避免重启时重复执行数据库迁移导致崩溃
-        conn.execute("DELETE FROM app_config WHERE key != 'schema_version'", [])?;
-        Ok(())
-    })
-    .await?;
-    info!("clear_settings: settings wiped | 清除设置：设置项已擦除");
     Ok(())
 }
 

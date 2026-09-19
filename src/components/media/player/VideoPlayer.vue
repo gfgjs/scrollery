@@ -95,7 +95,7 @@ const {
   exitPipIfActive,
 } = useVideoPlayback(videoEl)
 
-const { prefs } = usePlayerPrefs()
+const { prefs, setPrefs } = usePlayerPrefs()
 const fullscreen = useVideoFullscreen()
 
 // ── GE 批接线:进度记忆 / 字幕 / 截帧 / seekbar sprite 预览 ───────────────────
@@ -114,8 +114,7 @@ const ocr = useOcr()
 // 时序门控(采纳 opus 深审):useVideoPlayback 的 attach() 在同一 videoEl watch 批次里先跑,
 // 会把镜像 ref(volume/muted/rate)同步成元素的**默认值**(1/false/1)。若下面的回写 watch
 // 无门控,这个默认值会在 applyPrefs() 真正施加已存偏好之前抢先写回 prefs.value,
-// 把 localStorage 里的已存偏好用默认值错写覆盖。门控:首次 applyPrefs() 完成前,
-// 回写 watch 一律早退,不落 localStorage。
+// 用默认值错写覆盖已存偏好。门控:首次 applyPrefs() 完成前,回写 watch 一律早退。
 let prefsApplied = false
 function applyPrefs(): void {
   const el = videoEl.value
@@ -128,18 +127,31 @@ function applyPrefs(): void {
   prefsApplied = true
 }
 watch(videoEl, (el) => el && applyPrefs(), { immediate: true })
-// 用户交互改动镜像态 → 回写偏好(施加 prefs 自身触发的事件写回为同值,无环)。
+// 后端只应用:设置快照变化(启动水合 / 恢复默认 / 外部改文件)→ 施加到元素,不发保存请求。
+watch(
+  prefs,
+  () => {
+    if (prefsApplied) applyPrefs()
+  },
+  { deep: true },
+)
+// 用户交互改动镜像态 → 显式提交(与权威值同值时早退,applyPrefs 自身触发的事件不产生写盘)。
+// 音量/倍速是连续操作,提交走中央防抖合并;静音/循环是离散开关,即时提交。
 watch(volume, (v) => {
-  if (prefsApplied) prefs.value.volume = v
+  if (!prefsApplied || v === prefs.value.volume) return
+  setPrefs({ volume: v }, { debounce: true })
 })
 watch(muted, (v) => {
-  if (prefsApplied) prefs.value.muted = v
+  if (!prefsApplied || v === prefs.value.muted) return
+  setPrefs({ muted: v })
 })
 watch(rate, (v) => {
-  if (prefsApplied) prefs.value.rate = v
+  if (!prefsApplied || v === prefs.value.rate) return
+  setPrefs({ rate: v }, { debounce: true })
 })
 watch(loop, (v) => {
-  if (prefsApplied) prefs.value.loop = v
+  if (!prefsApplied || v === prefs.value.loop) return
+  setPrefs({ loop: v })
 })
 
 // ── 播放失败 → 诊断面板 ─────────────────────────────────────────────────────

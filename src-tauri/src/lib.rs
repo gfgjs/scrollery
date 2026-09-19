@@ -6,26 +6,6 @@
 //! `docs/planning/2026-07-25-超长文件拆分方案/analysis/lib-rs.md` §3.1(共 9 条),
 //! 各 boot 函数的文档注释里也复述了与自己相关的那几条——**调整调用顺序前必读**。
 
-// ── 渠道 feature 互斥守卫(Part7-T10 / Part7 §3.6.1)─────────────────────────────────
-// Cargo feature 是叠加语义:`--features channel-msstore` 不会关掉 default 里的
-// channel-direct,两渠道并存 → 必须编译期直接报错,而非编出渠道语义混乱的二进制。
-// ① 多开互斥(两两组合)
-#[cfg(any(
-    all(feature = "channel-direct", feature = "channel-msstore"),
-    all(feature = "channel-direct", feature = "channel-steam"),
-    all(feature = "channel-msstore", feature = "channel-steam"),
-))]
-compile_error!("channel-direct / channel-msstore / channel-steam 互斥,只能开一个;非 direct 构建须加 --no-default-features");
-
-// ② 零 channel 守卫:--no-default-features 后若忘带任一 channel,三 feature 全关、
-//    Provider 工厂(Part7-T12)将无分支可选 → 显式报错,而非编出无授权渠道的残废二进制。
-#[cfg(not(any(
-    feature = "channel-direct",
-    feature = "channel-msstore",
-    feature = "channel-steam",
-)))]
-compile_error!("必须恰好开启一个 channel:channel-direct / channel-msstore / channel-steam(--no-default-features 后须显式 --features 带上目标 channel)");
-
 pub mod ai;
 pub mod audio;
 pub mod backup;
@@ -83,7 +63,6 @@ pub const BUILD_VARIANT: &str = if cfg!(feature = "perf") {
 use std::sync::Arc;
 
 use tauri::Manager;
-use tauri_plugin_window_state::StateFlags;
 use tracing::info;
 
 use crate::state::AppState;
@@ -109,33 +88,12 @@ impl StartupFailure {
     }
 }
 
-/// T13 渠道占位(Part6 §8.4):Steam 构建的启动自检桩——Part8 接入 steamworks 后实装
-/// `SteamAPI_RestartAppIfNecessary`(非 Steam 拉起时经 Steam 重启并退出);现仅日志,
-/// 保 channel-steam 组合可编译(Part7-T10 三渠道互斥守卫在本文件顶部)。
-#[cfg(feature = "channel-steam")]
-fn steam_restart_if_necessary_stub() {
-    tracing::info!("channel-steam 构建:SteamAPI_RestartAppIfNecessary 占位(Part8 实装)");
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(feature = "channel-steam")]
-    steam_restart_if_necessary_stub();
     let builder = tauri::Builder::default()
         // ── 插件 ───────────────────────────────────────────────────────
-        .plugin(
-            tauri_plugin_window_state::Builder::default()
-                // Only persist geometry — never persist VISIBLE state.
-                // The main window starts with visible:false so setup() can first
-                // remove the platform title bar (where needed), then show the
-                // restored full-size window with the static startup layer.
-                //
-                // 只持久化窗口几何信息，绝不持久化 VISIBLE 状态。
-                // 主窗口以 visible:false 创建，setup() 先完成平台标题栏修正，
-                // 再显示带静态启动层的恢复后完整窗口。
-                .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
-                .build(),
-        )
+        // 窗口几何不再由独立插件持久化:位置/尺寸/scale/最大化统一走 config.toml 的 window_geometry
+        // 键(见 config::window 与 setup 里的装载点),因此这里只留对话与平台探测插件。
         .plugin(tauri_plugin_dialog::init())
         // os:前端平台探测(自绘标题栏 mac/windows 分叉,顶栏重构 L0)。仅暴露 os:default
         // 只读查询面(platform/arch/type 等),无写能力。
@@ -145,22 +103,21 @@ pub fn run() {
         // 已装 exotic worker exe)的能力,构成「webview 沦陷 → 改写 worker 二进制 → 本地执行」
         // 升级链。删权限 + 摘插件 + 去依赖,零功能损失。
         .plugin(tauri_plugin_shell::init());
-    // T7/T9(Part7 §3.5):updater 仅 direct 渠道编入+注册(msstore/steam 物理排除——
-    // Store 政策禁「下载-执行」自更新;dep 经 channel-direct feature 绑定)。更新检查走
+    // T7/T9(Part7 §3.5):updater 属直销(direct)发布面(dep 为普通依赖,渠道 feature 已退役),
+    // 日后接入第三方渠道时再按渠道重新定门控。更新检查走
     // Rust 侧 API(app.updater()),**不开放 webview ACL 权限/不引前端包**——现无更新 UI
     // 消费者,IPC 面越小越好;Part8 做更新 UI 时再定「Rust 驱动+事件通知」或「JS 驱动
     // +capability」。签名公钥/endpoints 见 tauri.direct-release.conf.json(dev 密钥,
     // 首发前轮换或转正,.gitignore .release-keys 注有决策链)。
-    // T11/§3.6.5①(Part7):updater 配置块从基座 conf 迁入 direct 发布 overlay——tauri 的
-    // conf 合并只能加/改不能删,Store 渠道打包进安装包的 conf 必须**基座天生干净**。因此
-    // direct 渠道内再按「编译进 context 的最终配置是否携带 plugins.updater」决定注册:
-    // 插件 init 对缺配置是硬失败(Config.pubkey 必填),dev/无 overlay 构建不带块 → 不注册,
-    // tauri dev 与普通 build 不受影响;正式 direct 发布走 tauri:build:direct-release。
+    // T11/§3.6.5①(Part7):updater 配置块住 direct 发布 overlay,基座 conf 保持天生干净
+    // (tauri 的 conf 合并只能加/改不能删)。因此按「编译进 context 的最终配置是否携带
+    // plugins.updater」决定注册:插件 init 对缺配置是硬失败(Config.pubkey 必填),
+    // dev/无 overlay 构建不带块 → 不注册,tauri dev 与普通 build 不受影响;
+    // 正式 direct 发布走 tauri:build:direct-release。
     let tauri_context = tauri::generate_context!();
     // 启动计时锚(2026-07-13 排查热启动变慢):RunEvent::Ready 读它算 Rust boot→Ready 总耗时,
     // 用于一刀切分「后端 setup 耗时」与「前端 Vite/WebView2/Vue 挂载耗时」。
     let _ = lifecycle::BOOT_INSTANT.set(std::time::Instant::now());
-    #[cfg(feature = "channel-direct")]
     let builder = if tauri_context.config().plugins.0.contains_key("updater") {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     } else {
@@ -205,14 +162,14 @@ pub fn run() {
             let db_boot = db::boot::init(&app_data_dir)
                 .unwrap_or_else(|f| fatal_startup_error(app.handle(), f.context, &f.detail));
 
-            // 配置文件初始化 + 启动期键读取。**必须在 DB 迁移之后**(§3.1 不变量 2)。
-            let cfg = config::boot::init(&app_data_dir, &db_boot.writer);
+            // 配置文件初始化 + 启动期键读取(自 P24 起不再读 DB,与 DB 初始化的先后不再构成不变量)。
+            let cfg = config::boot::init(&app_data_dir);
 
             // 保存首帧材质值；窗口仍保持隐藏，待 AppState manage 完成后同步应用并显示。
             let startup_material = cfg
                 .manager
                 .get("window_material")
-                .unwrap_or_else(|| "mica".to_string());
+                .unwrap_or_else(|| "none".to_string());
 
             let cache_dir = cfg
                 .custom_cache_dir
@@ -360,6 +317,17 @@ pub fn run() {
             app.manage(app_state.clone());
             info!("AppState initialised | 应用状态 (AppState) 初始化完成");
 
+            // ── 窗口几何持久化(设计 §6)──────────────────────────────────────────
+            // 位置/正常尺寸/scale factor/最大化统一进 config.toml 的 window_geometry 键,取代已退役的
+            // tauri-plugin-window-state(它的独立状态文件既不参与恢复默认设置,又是第二个持久化出口)。
+            // 配置读写缝由配置核心提供(唯一写盘入口);采集总闸暂关,等恢复与展示走完再打开。
+            // 提交恒走配置核心的统一编排入口(config::settings::submit_window_geometry:async 串行门
+            // + 写锁内按 label 合并 + 统一广播),因此窗口几何没有第二个写盘路径,也不绕过核心的串行门。
+            config::window::install(app.handle().clone(), app_state.clone());
+            // 先按记录恢复边界(缺记录/离屏则回默认值居中),再进下面的展示流程 —— 与旧插件
+            // 在 setup 前恢复的可见结果一致,但不再有第二个文件。
+            config::window::restore_before_show(app.handle(), config::window::MAIN_LABEL);
+
             // 主窗口必须在 AppState 就绪后才显示，否则 WebView 可能在 setup 完成前发起
             // IPC，导致 startupConfigPromise 失败、html[data-glass] 未写入。材质先同步挂载，
             // 再显示同一个完整尺寸的静态启动层，避免透明窗口闪过；show 后再异步重挂一次，
@@ -370,6 +338,8 @@ pub fn run() {
                 let _ = main_win.set_focus();
                 crate::window_material::apply(app.handle(), &startup_material);
             }
+            // 到这里启动期程序化落位已结束,打开采集总闸:此后的 move/resize 才算用户调整。
+            config::window::activate_capture();
 
             // ── 自动备份调度器（方案 B §7）────────────────────────────────────────
             // 启动后 idle ~2min 首检、此后每小时复检。dormant until 用户开启 backup_auto_enabled（B-1）。

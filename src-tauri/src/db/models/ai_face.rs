@@ -160,7 +160,7 @@ pub struct FaceStatusSummary {
 }
 
 /// 一个人物簇作为人物墙卡片（F6）：身份 + 一张用于裁剪人脸的封面缩略图。`cover_thumb_path`/
-/// `cover_thumb_status` 沿用 `SearchResult` 的约定（status=3 → path 为原图绝对路径；否则为分档
+/// `cover_thumb_status` 沿用搜索结果行的既有约定（status=3 → path 为原图绝对路径；否则为分档
 /// 缓存相对路径）；前端从该缩略图裁出 `cover_bbox`（归一化 [x,y,w,h]）作头像。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

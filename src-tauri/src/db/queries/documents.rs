@@ -344,7 +344,7 @@ mod reader_bookmarks_tests {
 
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); // 免构造 media_items,直接插书签
         c
     }
@@ -440,7 +440,7 @@ mod document_meta_tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         // document_meta.item_id FK→media_items；关 FK 免构造 media 行（DAO 逻辑测试）。
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c

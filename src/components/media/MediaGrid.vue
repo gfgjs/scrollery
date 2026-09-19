@@ -1,5 +1,5 @@
 <template>
-  <div class="media-grid-layout">
+  <div class="media-grid-layout" :class="{ 'media-grid-layout--gallery-auto': galleryAuto }">
     <div ref="mediaGridWrapperRef" class="media-grid-wrapper" :style="sidebarViewportLockStyle">
       <!-- 语义子视图返回栏：处于「某人物」或「某收藏夹」的照片视图时出现，点击或 ESC 回其总览页。 -->
       <button v-if="backBar" class="view-back-bar" @click="exitToOverview">
@@ -19,7 +19,9 @@
         :class="{
           'is-scrolling': isScrolling,
           'is-compact': compactCells,
-          'media-grid--bucket': bucketActive,
+          // 原生滚动条隐藏:映射态物理 spacer 无法表达逻辑比例,滚动条 UI 由 MediaScrollbar
+          // 呈现逻辑百分比(有内容即适用,不再随引擎开关翻转)。
+          'media-grid--bucket': media.totalRows > 0,
         }"
         @scroll.passive="onGridScroll"
         @wheel.passive="onGridWheel"
@@ -83,18 +85,17 @@
         <!-- T16 方案B(B1.5):bucket 分段渲染。容器总高 = 真实逻辑高、零坐标平移;
              等高算术分段(useBucketVirtualScroll),仅渲染愿望窗口内的 1-3 个段——可见性
              是纯算术,无 IntersectionObserver、无全量占位 div、无内联函数 ref(B1 真机
-             根因 C/D 由此结构性消除)。段行未到时以骨架条纹占位(--loading)。与下方
-             方案 A 分支经 bucketActive 互斥,方案 A 零改动保留、开关即回退。卡片标记与
-             方案 A 保持一致(data-item-id 与全部 handlers),使选区/拖拽/可视 patch
-             消费面两边等价;B2 再抽公共行组件去重。 -->
+             根因 C/D 由此结构性消除)。段行未到时以骨架条纹占位(--loading)。
+             卡片标记(data-item-id 与全部 handlers)是选区/拖拽/可视 patch 的公共消费面;
+             行体抽在 MediaGridRow(T16 收尾)。 -->
         <!-- Canvas 渲染模式(§9 T4 最简原型):与下方 DOM 分支互斥,canvasMode 时接管。
-             底层引擎(bucket/方案 A)不变,canvas 消费 activeRows 同源数据。
+             底层引擎(bucket)不变,canvas 消费 activeRows 同源数据。
              §8.1 browse-only:is-selection-mode 在镜头态强制 false(Canvas 不画 checkbox/拖拽手柄)。 -->
         <MediaGridCanvas
           v-if="canvasMode"
-          :rows="canvasRows"
+          :rows="activeRowsRef"
           :current-y="currentLogicalY"
-          :spacer-height="canvasSpacerHeight"
+          :spacer-height="bucketSpacerHeight"
           :cache-dir="cacheDir"
           :compact-cells="compactCells"
           :is-selected="selection.isSelected"
@@ -117,10 +118,11 @@
           :lens-group-label="lensGroupLabel"
           :lens-card-badge-text="lensCardBadgeText"
           :lens-folder-header-lines="lensFolderHeaderLines"
-          :theme-token="ui.resolvedThemeId"
-          :tint-token="ui.themeTintStrength"
-          :text-token="ui.themeTextStrength"
-          :glass-background="galleryUsesGlass"
+          :demo-privacy="demoPrivacyEnabled"
+          :demo-info-text="demoInfoText"
+          :demo-separator-label="demoSeparatorLabel"
+          :theme-palette="theme.currentPalette"
+          :glass-background="galleryTransparent"
           @cell-click="handleCardClick"
           @cell-contextmenu="(item, e) => onContextMenu(e, item.id)"
           @cell-pointerdown="onCardPointerDown"
@@ -133,7 +135,7 @@
         />
 
         <div
-          v-else-if="media.totalRows > 0 && bucketActive"
+          v-else-if="media.totalRows > 0"
           ref="bucketContentRef"
           class="media-grid__content media-grid__content--bucket"
           :style="{ height: bucketSpacerHeight + 'px', position: 'relative' }"
@@ -188,64 +190,13 @@
           </div>
         </div>
 
-        <!-- 虚拟滚动包装器 (绝对定位) -->
-        <div
-          v-else-if="media.totalRows > 0"
-          class="media-grid__content"
-          :style="{ height: spacerHeight + 'px', position: 'relative' }"
-        >
-          <!-- 渲染层：平移模式（>SAFE_MAX）下其 transform 把可视窗口钉到视口；普通模式下为静态偏移。 -->
-          <div
-            ref="layerRef"
-            class="media-grid__layer"
-            :style="{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
-              willChange: 'transform',
-            }"
-          >
-            <!-- 行体 = 双引擎公共组件 MediaGridRow(T16 收尾抽取,DOM 与原内联模板
-                 逐字节等价);offset-y = renderAnchor,行加 will-change(平移模式
-                 高频重钉合成层)。§8.1 browse-only:selection-mode 在镜头态强制 false。 -->
-            <MediaGridRow
-              v-for="row in visibleRows"
-              :key="rowKey(row)"
-              :row="row"
-              :offset-y="renderAnchor"
-              :row-will-change="!compactCells"
-              :gap="GAP"
-              :group-by="ui.groupBy"
-              :separator-counts="separatorCounts"
-              :lens-active="lensActive"
-              :lens-group-label="lensGroupLabel"
-              :lens-cluster-label="lensClusterLabel"
-              :compact-cells="compactCells"
-              :selection-mode="selection.isSelectionMode.value && !lensActive"
-              :cache-dir="cacheDir"
-              :pending-delete-label="t('selection.pendingDelete')"
-              :is-selected="selection.isSelected"
-              :is-pending-delete="isPendingDelete"
-              :on-card-click="handleCardClick"
-              :on-card-pointer-down="onCardPointerDown"
-              :on-card-context-menu="onContextMenu"
-              :on-request-thumb="onRequestThumb"
-              :on-cancel-thumb="onCancelThumb"
-              :on-regenerate-thumb="onRegenerateThumb"
-              :on-favorite="handleFavorite"
-              :on-rate="handleRate"
-              :on-select="selection.toggleSelect"
-            />
-          </div>
-        </div>
       </div>
 
       <!-- T16 B3.2:bucket 引擎自研逻辑滚动条(原生条已隐藏,见 .media-grid--bucket)。
            拇指渲染纯逻辑百分比,与画廊逐帧同步;映射态停稳偿债只动物理 scrollTop,
            对本条零感知——原生拇指「急速滚动往回跳」由此根治。 -->
       <MediaScrollbar
-        v-if="bucketActive && media.totalRows > 0"
+        v-if="media.totalRows > 0"
         :total-height="media.totalHeight"
         :current-y="currentLogicalY"
         :active="isScrolling"
@@ -307,6 +258,7 @@
             :total-height="media.totalHeight"
             :current-y="currentLogicalY"
             :min-thumb="config.scrollThumbMinHeight"
+            :theme-palette="theme.currentPalette"
             @jump="scrollToY"
             @scrubbing="axisScrubbing = $event"
           />
@@ -473,6 +425,7 @@ import { preloadViewerComponent } from '../../router/viewerRouteLoader'
 import { useMediaStore } from '../../stores/mediaStore'
 import { useConfigStore } from '../../stores/configStore'
 import { useUiStore } from '../../stores/uiStore'
+import { useThemeStore } from '../../stores/themeStore'
 import { useViewStore } from '../../stores/viewStore'
 import { useDuplicateLensStore } from '../../stores/duplicateLensStore'
 import { useViewportDimPriority } from '../../composables/useViewportDimPriority'
@@ -527,6 +480,8 @@ import { useViewIds } from '../../composables/useViewIds'
 import { useHistoryStore } from '../../stores/historyStore'
 import { useMediaDragToFolder } from '../../composables/useMediaDragToFolder'
 import type { LayoutRow, LayoutRowItem, LayoutRowSeparator, LayoutSeparatorInfo } from '../../types/layout'
+import { demoInfoTextOf, demoSeparatorLabelOf, type DemoInfoFormatter } from '../../utils/demoAlias'
+import { useDemoPrivacy } from '../../composables/useDemoPrivacy'
 import {
   formatLensClusterLabel,
   formatLensFolderStats,
@@ -542,6 +497,7 @@ import { scrollCache, galleryScrollKey } from '../../utils/scrollCache'
 import { isContentViewerRoute, openMediaRoute } from '../../utils/mediaRoute'
 import { isGalleryRoute } from '../../utils/galleryQuery'
 import { isWindows } from '../../utils/platform'
+import { GALLERY_AUTO } from '../../themes/types'
 
 // KeepAlive include 按组件名匹配(App.vue 只保活本组件);显式命名不依赖 SFC 文件名推断。
 defineOptions({ name: 'MediaGrid' })
@@ -555,12 +511,34 @@ function rowKey(row: LayoutRow): string {
 }
 
 const ui = useUiStore()
+const theme = useThemeStore()
 const config = useConfigStore()
 const viewStore = useViewStore()
 const media = useMediaStore()
 const duplicateLens = useDuplicateLensStore()
 const queue = useRequestQueue()
-const { t } = useI18n()
+const { t, locale } = useI18n()
+
+// 演示打码(2026-09-16):开关本身在共享单例(useDemoPrivacy),这里上报「当前引擎是否支持」并把
+// 开关透传给 canvas。支持态按**渲染偏好 + 引擎能力**判定,与「现在有没有结果」解耦——
+// 筛选到空 / 空图库时按钮不能消失,否则用户关不掉仍在打码的文件树。
+const { demoPrivacyEnabled, setDemoPrivacySupported } = useDemoPrivacy()
+
+// 信息浮窗演示文案的组装器:别名前后缀词是译文,语言换代必须让 canvas 侧的文案缓存失效。
+// **每次重算都返回新闭包**(不是直接 return 模块函数引用):Vue 的 computed 只在值引用变化时才
+// 换 prop,原样返回同一引用等于永不换代,缓存里的旧语言别名就洗不掉。它的 watch 已作废文案
+// 缓存并排重绘,而 draw() 也会重画分隔头——语言换代一处信号即可覆盖两者,不再另发 token。
+const demoInfoText = computed<DemoInfoFormatter>(() => {
+  void locale.value
+  return (item, meta) => demoInfoTextOf(item, meta)
+})
+
+// 分隔行的演示别名:判定收在 demoSeparatorLabelOf(纯函数,可测),**关闭时恒为 null**,canvas 才
+// 会原样画真实标签;开启时只换路径类行(folder 分组与镜头文件夹头)——日期标签与重复组头都是
+// 日期/结构化数字文本,本就不含敏感名称。
+function demoSeparatorLabel(row: LayoutRowSeparator): string | null {
+  return demoSeparatorLabelOf(row, ui.groupBy, demoPrivacyEnabled.value)
+}
 const router = useRouter()
 const route = useRoute()
 const contentViewerRoute = computed(() => isContentViewerRoute(route.path))
@@ -761,8 +739,7 @@ function getViewKey() {
   )
 }
 
-const layerRef = ref<HTMLElement | null>(null)
-// bucket 分支的内容容器(B2):FLIP/fadeOut 在 bucket 模式以它为根查询 [data-item-id]。
+// 段容器(FLIP/fadeOut 的查询根):以它为根查询 [data-item-id]。
 const bucketContentRef = ref<HTMLElement | null>(null)
 
 // KeepAlive 在屏标志:驱动布局源的取数闸门(详见 useGalleryVirtualEngine 的 onScreen 注)。
@@ -779,48 +756,60 @@ const {
   clearGateTimer,
 } = useGalleryScrollGate({ rowHeight: () => ui.gridRowHeight })
 
-// 双引擎交汇层(方案 A ↔ bucket 分段 + Canvas 派生读数面)。🔴 见该文件头注的三条红线。
+// 虚拟滚动交汇层(bucket 分段引擎 + Canvas 派生读数面)。🔴 见该文件头注的红线。
 const {
   containerWidth,
-  layoutSource,
-  bucketActive,
   bucketScroll,
-  visibleRows,
-  updateVisible,
-  onScroll,
-  spacerHeight,
-  renderAnchor,
-  logicalToPhysical,
   bucketSegments,
   bucketAnchorDelta,
   bucketSpacerHeight,
   currentLogicalY,
   activeRows,
+  activeRowsRef,
   canvasCapable,
   canvasActive,
-  canvasRows,
   canvasPatchTick,
   bumpCanvasPatchTick,
-  canvasSpacerHeight,
   canvasSelectionVersion,
   compute,
+  requestCompute,
   onResize,
   cancelPendingResize,
-  scrollToY,
+  flushIfDeferred,
 } = useGalleryVirtualEngine({
   gridRef: () => gridRef.value,
-  layerRef: () => layerRef.value,
   // route-return 锁窗、`/view` 覆盖层存续与 KeepAlive 失活均不允许布局 IPC；结束后只按最终
   // 宽度回放一次，避免旧防抖或查看器 chrome 的中间几何提交。
   onScreen: () => gridOnScreen && !contentViewerRoute.value && !ui.routeReturnSidebarTransitioning,
 })
 
+/** 程序化滚动到逻辑 y(时间轴 / minimap 的统一入口)。 */
+function scrollToY(y: number, smooth = true): void {
+  void bucketScroll.scrollToLogicalY(y, { smooth })
+}
+
 // canvas 是原型:偏好为 canvas 时若 canvasCapable 不满足(iOS/超大库)仍自动回退 DOM。
 // 判据单点在 useGalleryVirtualEngine(两引擎的取行窗也按它自驱,§4.3 S3),此处只别名消费。
 const canvasMode = canvasActive
-// 画廊底面与 html[data-glass] 同源：只在 Windows 原生 Mica/Acrylic 已就绪时透出背板。
-// 非玻璃模式保留 Canvas 的不透明合成快路径，避免把性能开销带给默认浏览体验。
-const galleryUsesGlass = computed(() => isWindows && ui.windowMaterial !== 'none')
+// 打码能力只存在于 Canvas 渲染路径。支持态 = 渲染偏好为 canvas **且**引擎有能力(canvasCapable),
+// 有意不含 canvasActive 里的 media.totalRows > 0:那条表示「当前有结果」,算进来会让筛选到空/
+// 空图库时按钮消失——而此时文件树仍在打码,用户没有关掉它的入口。
+// immediate 让首帧即定;unmount 撤回,免得画廊不在场还留着「支持」误导顶栏。
+const demoPrivacySupported = computed(
+  () => galleryRenderMode.value === 'canvas' && canvasCapable.value,
+)
+watch(demoPrivacySupported, (v) => setDemoPrivacySupported(v), { immediate: true })
+onBeforeUnmount(() => setDemoPrivacySupported(false))
+// 画廊底面与 html[data-glass] 同源:gallery=auto 时沿用共享玻璃底(清透明,一条底面贯穿窗口),
+// gallery 指定颜色是明确覆盖——即使材质开启也保持不透明实色(DOM 走 .media-grid-layout 自身
+// 的 --color-bg-canvas,Canvas 由 galleryTransparent 决定是否清透明)。非玻璃模式保留 Canvas 的
+// 不透明合成快路径,避免把性能开销带给默认浏览体验。
+const galleryAuto = computed(
+  () => theme.currentDefinition[theme.effectiveMode].gallery === GALLERY_AUTO,
+)
+const galleryTransparent = computed(
+  () => isWindows && theme.currentMaterial !== 'none' && galleryAuto.value,
+)
 // 全局性能面板只持有稳定 getter；失活时注销，避免在查看器路由误跑画廊基准。
 // (与 onActivated/onDeactivated 同属 KeepAlive 胶水,故留根组件。)
 let unregisterGalleryBenchmark: (() => void) | null = null
@@ -835,7 +824,6 @@ function activatePerformanceBenchmark() {
       timelineMode: canShowScrubber.value ? timelineRenderMode.value : 'hidden',
       groupBy: ui.groupBy,
       totalItems: media.layoutSummary?.totalItems ?? media.totalItems,
-      bucketScroll: bucketActive.value,
     }),
   })
 }
@@ -857,9 +845,7 @@ const { captureReflowAnchor, restoreReflowAnchor } = useReflowAnchor({
   activeRows,
   currentLogicalY: () => currentLogicalY.value,
   getViewKey,
-  bucketActive: () => bucketActive.value,
   scrollToLogicalY: (y) => bucketScroll.scrollToLogicalY(y),
-  logicalToPhysical,
 })
 
 // 镜头排列切换的焦点恢复(§8.1):切换 groups/folders 或开关独有项时按聚焦卡片 item ID 恢复滚动位
@@ -867,9 +853,7 @@ const { captureReflowAnchor, restoreReflowAnchor } = useReflowAnchor({
 // restoreReflowOrLensFocus 注),机制通用,P3 folders 排列切换直接生效。
 const { restoreLensFocus } = useLensFocusRestore({
   gridRef: () => gridRef.value,
-  bucketActive: () => bucketActive.value,
   scrollToLogicalY: (y) => bucketScroll.scrollToLogicalY(y),
-  logicalToPhysical,
   getViewKey,
 })
 
@@ -903,10 +887,8 @@ const {
   onMoveCopyConfirm,
 } = useGallerySelectionOps({
   compute,
-  updateVisible,
-  bucketActive: () => bucketActive.value,
   whenSettled: () => bucketScroll.whenSettled(),
-  flipRootEl: () => (bucketActive.value ? bucketContentRef.value : layerRef.value),
+  flipRootEl: () => bucketContentRef.value,
   patchVisibleRating,
   patchVisibleFavorite,
   patchVisibleColorLabel,
@@ -942,7 +924,6 @@ const { backBar, exitToOverview, onKeyDown } = useGalleryKeyboard({
   selectionDescriptor,
   patchVisibleSelected,
   compute,
-  updateVisible,
   // §8.1 browse-only:镜头态旁路 document 级选择语义(Ctrl+A/ESC 清选区),谓词由宿主注入。
   lensActive: () => lensActive.value,
 })
@@ -962,33 +943,31 @@ function onScrollbarJump(y: number) {
 }
 
 // minimap 轴跳转:与 onScrollbarJump 同一拖拽链关闸(共用时间戳,释放路径在
-// sampleScrollGate 的 scrollbarDragUntil 判定,与引擎无关);经 scrollToY 双引擎通吃,
-// 即时落点(smooth=false——拖拽/滚轮要跟手,VSCode minimap 点击也是瞬移语义)。
+// sampleScrollGate 的 scrollbarDragUntil 判定);即时落点(smooth=false——拖拽/滚轮要跟手,
+// VSCode minimap 点击也是瞬移语义)。
 function onMinimapJump(y: number) {
   noteAxisJump()
   scrollToY(y, false)
 }
 
-// B3.1 输入源分类转发(仅 bucket 引擎消费):wheel/滚动键/触屏盖 1:1 印记,与滚动条
-// 拖动区分;wheel 另担映射态物理钉边后的边缘续滚。全部不阻断,对原生滚动零干预。
+// B3.1 输入源分类转发:wheel/滚动键/触屏盖 1:1 印记,与滚动条拖动区分;wheel 另担映射态
+// 物理钉边后的边缘续滚。全部不阻断,对原生滚动零干预。
 function onGridWheel(e: WheelEvent) {
   if (contentViewerRoute.value) return
-  if (bucketActive.value) bucketScroll.onWheel(e)
+  bucketScroll.onWheel(e)
 }
 function onGridKeydown(e: KeyboardEvent) {
   if (contentViewerRoute.value) return
-  if (bucketActive.value) bucketScroll.onKeydown(e)
+  bucketScroll.onKeydown(e)
 }
 function onGridTouchmove() {
   if (contentViewerRoute.value) return
-  if (bucketActive.value) bucketScroll.onTouchmove()
+  bucketScroll.onTouchmove()
 }
 
 function onGridScroll() {
   if (contentViewerRoute.value) return
-  let internalHop = false
-  if (bucketActive.value) internalHop = bucketScroll.onScroll()
-  else onScroll()
+  const internalHop = bucketScroll.onScroll()
   if (!isScrolling.value) {
     isScrolling.value = true
   }
@@ -1027,7 +1006,7 @@ function onGridScroll() {
       // bucket 缓存逻辑 y(B3 映射态下物理 scrollTop 不自足);方案 A 仍缓存物理。
       scrollCache.set(
         getViewKey(),
-        bucketActive.value ? currentLogicalY.value : gridRef.value.scrollTop,
+        currentLogicalY.value,
       )
     }
   }, 150)
@@ -1091,11 +1070,10 @@ async function settleRouteReturnLayout(): Promise<void> {
   if (!gridOnScreen || ui.routeReturnSidebarTransitioning) return
   const finalWidth = measureContainerWidth()
   const widthChanged = applyContainerWidth(finalWidth, false)
-  const recomputed = await layoutSource.flushIfDeferred()
+  const recomputed = await flushIfDeferred()
   if (ui.routeReturnSidebarTransitioning) return
-  if (recomputed) {
-    updateVisible()
-  } else if (widthChanged) {
+  // deferred 补算与宽度重排二选一;段表重建由引擎 layoutVersion watch 自驱,无需另刷可视窗。
+  if (!recomputed && widthChanged) {
     onResize(finalWidth)
   }
 }
@@ -1198,11 +1176,9 @@ function onGalleryReactivate(): void {
   focusGridIfUnowned()
   const saved = scrollCache.get(getViewKey()) || 0
   if (gridRef.value && saved > 0) {
-    // bucket 缓存的是逻辑 y(映射态物理不自足),经 scrollToLogicalY 还原;方案 A 直写物理。
-    if (bucketActive.value) void bucketScroll.scrollToLogicalY(saved)
-    else gridRef.value.scrollTop = saved
+    // 缓存的是逻辑 y(映射态物理不自足),经 scrollToLogicalY 还原。
+    void bucketScroll.scrollToLogicalY(saved)
   }
-  updateVisible()
   // route-return 锁窗内不回放 deferred:等最终宽度落定后由唯一同步点决定是回放还是尺寸重排。
   if (!ui.routeReturnSidebarTransitioning) void settleRouteReturnLayout()
 }
@@ -1290,7 +1266,7 @@ onMounted(async () => {
   if (gridOnScreen && !contentViewerRoute.value && !ui.routeReturnSidebarTransitioning) {
     await compute()
   } else {
-    layoutSource.requestCompute()
+    requestCompute()
   }
 
   // 初始/重挂载时主动拉一次布局序全集（layoutVersion watcher 仅在变化时触发,挂载不触发）。
@@ -1302,19 +1278,14 @@ onMounted(async () => {
   // 重建——从 /collections·/persons·/doc·/audio 等异组件路由返回)走 onMounted 却因版本未变
   // 不触发该 watcher → 落回 scrollTop=0 丢位。覆盖层时代此路径被「Teleport 保活网格永不卸载」
   // 掩盖;P4 看图台路由化后开图即卸载网格,本恢复是「返回网格保位不重排」的支柱(计划 P4-5)。
-  // 时序:await nextTick 等 spacerHeight 落到 DOM 后再设 scrollTop,否则大值被容器裁到当前可
-  // 视高(T16 教训:物理 scrollTop 须在总高就绪后设)。恢复须先于 updateVisible,使首帧可视窗口
-  // 就在恢复位算,避免 0→saved 的双渲染闪跳。saved=0(首次访问无缓存)时跳过,新网格本就在顶。
+  // 时序:await nextTick 等段容器总高落到 DOM 后再设 scrollTop,否则大值被容器裁到当前可
+  // 视高(T16 教训:物理 scrollTop 须在总高就绪后设)。恢复位即引擎愿望窗口的重建位,首帧可视
+  // 窗口就在该位算,无 0→saved 双渲染闪跳。saved=0(首次访问无缓存)时跳过,新网格本就在顶。
   await nextTick()
   if (gridRef.value) {
     const saved = scrollCache.get(getViewKey()) || 0
-    if (saved > 0) {
-      if (bucketActive.value) await bucketScroll.scrollToLogicalY(saved)
-      else gridRef.value.scrollTop = saved
-    }
+    if (saved > 0) await bucketScroll.scrollToLogicalY(saved)
   }
-
-  updateVisible()
 })
 
 // ── 缩略图请求处理 ──────────────────────────────────────────────
@@ -1326,7 +1297,7 @@ function onCancelThumb(id: number) {
 async function onRequestThumb(id: number) {
   try {
     const result = await queue.request(id)
-    // 查找并修补 visibleRows 中的项目
+    // 查找并修补当前可视行中的项目
     for (const row of activeRows()) {
       if (row.rowType !== 'normal') continue
       const item = row.items.find((it) => it.id === id)
@@ -1368,17 +1339,13 @@ async function onRegenerateThumb(id: number) {
 }
 
 // 可视窗口优先取尺寸已抽到 useViewportDimPriority（自包含 feature：注入 visibleRows/isScrolling
-// 与 recompute/refresh，内部自持去重集 + 防抖调度，resetKey 变化即清去重集）。
+// 与 recompute，内部自持去重集 + 防抖调度，resetKey 变化即清去重集）。
 useViewportDimPriority({
-  // B2:行源引擎感知——bucket 模式喂已挂载段的行(与 activeRows() 同源;computed 亦是
-  // Ref,内部 watch 随段挂载/换代自然触发)。refresh 在 bucket 模式为 no-op(方案 A 门控),
-  // 重算后的段回填由 layoutVersion watch 自驱。
-  visibleRows: computed(() =>
-    bucketActive.value ? bucketScroll.mountedRows() : visibleRows.value,
-  ),
+  // 行源 = 已挂载段的行(与 activeRowsRef 同源;computed 亦是 Ref,内部 watch 随段挂载/换代
+  // 自然触发)。补全尺寸后的段回填由 layoutVersion watch 自驱。
+  visibleRows: activeRowsRef,
   isScrolling,
   recompute: compute,
-  refresh: updateVisible,
   // 重排/优先级去重集的 resetKey 含镜头模式与「显示独有项」开关(§8.3):镜头⇄普通/排列
   // 切换/开关切换都是集合切换,旧的「已请求尺寸」去重集必须作废,否则新布局首帧拿不到视口尺寸。
   resetKey: () => [
@@ -1489,7 +1456,7 @@ function lensFolderHeaderLines(row: LayoutRowSeparator): { cluster: string | nul
 
 function onFolderStatsChanged() {
   // 重取画廊以显示新入库项(若适用于当前视图)
-  layoutSource.requestCompute()
+  requestCompute()
   media.loadStats()
 }
 
@@ -1502,28 +1469,22 @@ onBeforeUnmount(() => {
 
 // Tauri 事件(增强/卷插拔)+ 布局脏标/版本/视口元数据联动。
 useGalleryTauriSync({
-  requestCompute: layoutSource.requestCompute,
-  updateVisible,
+  requestCompute,
   refreshCacheDir,
   // §8.1:镜头排列切换的焦点恢复链在 reflow 锚点之后(见 restoreReflowOrLensFocus 注)。
   restoreReflowAnchor: restoreReflowOrLensFocus,
   gridRef: () => gridRef.value,
-  bucketActive: () => bucketActive.value,
   scrollToLogicalY: (y) => bucketScroll.scrollToLogicalY(y),
   getViewKey,
   shouldLoadViewIds: () => !lensActive.value,
   isLensActive: () => lensActive.value,
-  visibleRows,
-  mountedRows: () => bucketScroll.mountedRows(),
   activeRows,
 })
 
 // 侧栏点击文件夹 → 画廊滚动定位(含「计算布局中点击」排队)。
 useGalleryScrollToDir({
   gridRef: () => gridRef.value,
-  bucketActive: () => bucketActive.value,
   scrollToLogicalY: (y, o) => bucketScroll.scrollToLogicalY(y, o),
-  logicalToPhysical,
   getViewKey,
   beginProgrammaticScroll,
   endProgrammaticScroll,

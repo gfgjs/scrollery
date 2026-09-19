@@ -37,6 +37,18 @@ fn launch_derivation_pipeline(
     );
 }
 
+/// 由后端在「一批设置变更」后按最终参数重启派生流水线,与用户点「开始」同语义:取消当前运行并按
+/// 最新配置重新开始(续传待处理/被中断项,**不**重置任何已完成行,故不是「全量重做」)。
+///
+/// 存在的意义:缩略图档位/编码质量与视频封面/关键帧开关等键改变后,存量待处理项必须按新参数重跑
+/// ——此前由前端在改动这些设置后调用 `start_derivation` 达成,设置写入收口到批量入口后改由后端
+/// 按批统一安排(同一批只重启一次),故此入口保持与那次调用完全相同的语义。
+pub(crate) fn restart_derivation_after_config_change(app: &AppHandle, state: &Arc<AppState>) {
+    state.cancel_derivation();
+    info!("Restarting derivation after settings change | 设置变更后重启派生流水线");
+    launch_derivation_pipeline(app.clone(), state, None, None);
+}
+
 /// 把可选 kind 字符串列表解析为类型化 kind(空列表 ⇒ 无过滤)。
 fn parse_kind_filter(kinds: Option<Vec<String>>) -> Result<Option<Vec<DerivationKind>>> {
     match kinds {
@@ -112,22 +124,6 @@ pub async fn start_derivation(
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
-    Ok(())
-}
-
-/// 暂停运行中的流水线：取消但保留 active 标志，以便之后续传（含下次启动自动续传）。
-/// 在途任务下次运行时恢复为待处理。
-#[tauri::command]
-pub async fn pause_derivation(state: State<'_, Arc<AppState>>) -> Result<()> {
-    info!("Pausing derivation pipeline (keeps resume flag) | 暂停派生流水线（保留续传标志）");
-    state.cancel_derivation();
-    let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let conn = s.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = set_config(&conn, "derivation_active", "1");
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
     Ok(())
 }
 

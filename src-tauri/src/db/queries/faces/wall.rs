@@ -131,7 +131,7 @@ mod hidden_root_person_wall_tests {
     /// 两根各一图;p1 两脸(跨两根,封面钉 root2 的图 2),p2 单脸(仅 root2)。
     fn two_roots_persons() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES

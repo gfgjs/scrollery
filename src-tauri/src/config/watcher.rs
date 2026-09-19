@@ -11,7 +11,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use super::file::{fingerprint, load, ConfigFileError, LoadedConfig};
+use super::file::fingerprint;
 
 #[derive(Debug, Error)]
 pub enum WatcherError {
@@ -35,40 +35,6 @@ pub fn is_self_write(current: Option<u64>, last_own: Option<u64>) -> bool {
         (Some(cur), Some(last)) => cur == last,
         _ => false,
     }
-}
-
-/// A2:比较 watcher 重载前后的「生效值表」,算出真正变了的键(`keys`)与其中需要重启才生效的
-/// 子集(`restart_required`,对称于 `SettingDef.hot`)。纯函数,单测不必起真 watcher(A2 任务
-/// 清单 §8 要求)。
-///
-/// 传入的两个表都是**原始 values 表**(只含文件里出现的实值,缺省键不在表内,与
-/// `ConfigManager::raw_values_snapshot`/`file::LoadedConfig.values` 同型)——本函数内部按
-/// `SETTING_DEFS` 解析各键的「实际生效值」(表里有则取表值,否则取 schema 默认值)再比较,
-/// 与 `ConfigManager::get` 的解析口径一致,避免「表面上值没变、但一个从注释态一个从实值态
-/// 恰好撞出同一默认值」这类误判。
-pub fn diff_changed_keys(
-    old_values: &std::collections::BTreeMap<String, String>,
-    new_values: &std::collections::BTreeMap<String, String>,
-) -> (Vec<String>, Vec<String>) {
-    let mut keys = Vec::new();
-    let mut restart_required = Vec::new();
-    for def in super::schema::SETTING_DEFS {
-        let old = old_values
-            .get(def.key)
-            .map(String::as_str)
-            .unwrap_or(def.default);
-        let new = new_values
-            .get(def.key)
-            .map(String::as_str)
-            .unwrap_or(def.default);
-        if old != new {
-            keys.push(def.key.to_string());
-            if !def.hot {
-                restart_required.push(def.key.to_string());
-            }
-        }
-    }
-    (keys, restart_required)
 }
 
 /// 启动 config.toml 的文件监听,返回的 `RecommendedWatcher` 须由调用方持有(drop 即停止监听)。
@@ -95,7 +61,7 @@ pub fn spawn_config_watcher<F>(
     callback: F,
 ) -> Result<RecommendedWatcher, WatcherError>
 where
-    F: Fn(Result<LoadedConfig, ConfigFileError>) + Send + 'static,
+    F: Fn() + Send + 'static,
 {
     let parent = path
         .parent()
@@ -134,9 +100,13 @@ where
                 }
             }
 
+            // 本周期的**唯一**目的是判断「要不要通知调用方去重读」:读一次磁盘内容算指纹,与本进程
+            // 最近一次自写比对即可,不做解析、不携带内容出去。真正的内容解析、校验与生效都发生在提交
+            // 门内(见 `settings::reload_from_disk`)——把这份内容带进门的做法会让「防抖窗口里读到的
+            // 旧文件」有机会覆盖更新的状态,重置后旧值复活正是由此而来。
             let path_for_read = path.clone();
             let last_fp = Arc::clone(&last_own_fingerprint);
-            let outcome = tokio::task::spawn_blocking(move || {
+            let self_write = tokio::task::spawn_blocking(move || {
                 let content = std::fs::read_to_string(&path_for_read).ok();
                 let current_fp = content.as_deref().map(fingerprint);
                 let last = *last_fp
@@ -149,15 +119,15 @@ where
                     *last_fp
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                    None
+                    true
                 } else {
-                    Some(load(&path_for_read))
+                    false
                 }
             })
             .await;
 
-            if let Ok(Some(result)) = outcome {
-                callback(result);
+            if let Ok(false) = self_write {
+                callback();
             }
         }
     });
@@ -184,7 +154,7 @@ pub fn spawn_config_file_watcher(
     config_path: PathBuf,
     config: Arc<super::ConfigManager>,
 ) -> Option<notify::RecommendedWatcher> {
-    use tauri::{Emitter, Manager};
+    use tauri::Manager;
 
     // watcher 内部聚合任务须 spawn 进 tokio runtime,但本函数在 setup hook 主线程被调,
     // 无 ambient runtime 上下文(直接 tokio::spawn 会 panic)。经 block_on 短暂进入 tauri
@@ -194,67 +164,23 @@ pub fn spawn_config_file_watcher(
     let app_for_cb = app.clone();
     let config_for_cb = config.clone();
 
-    let result = spawn_config_watcher(config_path, fingerprint_lock, runtime, move |load_result| {
+    let result = spawn_config_watcher(config_path, fingerprint_lock, runtime, move || {
         let app = app_for_cb.clone();
         let config = config_for_cb.clone();
         tauri::async_runtime::spawn(async move {
-            match load_result {
-                Ok(loaded) => {
-                    for w in &loaded.warnings {
+            // state 尚未装配时(setup 期极早的外部编辑)无处应用运行时影响,直接原地重读内存值;
+            // 装配完成后统一走编排入口(门内重读磁盘 → 应用影响 → 广播快照)。
+            match app.try_state::<Arc<crate::state::AppState>>() {
+                Some(state) => {
+                    crate::config::settings::reload_from_disk(&app, state.inner()).await;
+                }
+                None => {
+                    if let Err(e) = config.reload_from_disk() {
                         tracing::warn!(
-                            key = %w.key,
-                            message = %w.message,
-                            "config.toml 外部编辑键警告(已跳过,沿用默认值) | external-edit key warning, skipped"
+                            "config.toml 外部编辑加载失败(启动早期) | external edit load failed early: {}",
+                            e.message
                         );
                     }
-
-                    let old_values = config.raw_values_snapshot();
-                    let (keys, restart_required) = diff_changed_keys(&old_values, &loaded.values);
-                    config.replace_values(loaded.values);
-                    config.clear_load_error();
-
-                    if keys.is_empty() {
-                        // 无实际生效值变化(如仅改了注释/排版,或写回与默认值相同的值)→
-                        // 不广播,避免前端空刷新。
-                        return;
-                    }
-
-                    let restart_set: std::collections::HashSet<&str> =
-                        restart_required.iter().map(String::as_str).collect();
-                    if let Some(state) = app.try_state::<Arc<crate::state::AppState>>() {
-                        for key in &keys {
-                            if restart_set.contains(key.as_str()) {
-                                continue; // 仅存值(已在 replace_values 生效),下次重启才应用副作用。
-                            }
-                            let value = config.get(key).unwrap_or_default();
-                            if let Err(e) = crate::ipc::config_commands::apply_setting_effects(
-                                &app, &state, key, &value,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "config.toml 外部编辑应用键 {} 的热应用副作用失败(值已生效,副作用可能需手动触发) | applying hot-effect for key {} failed: {}",
-                                    key, key, e
-                                );
-                            }
-                        }
-                    }
-
-                    let _ = app.emit(
-                        "config-file-changed",
-                        serde_json::json!({ "keys": keys, "restart_required": restart_required }),
-                    );
-                }
-                Err(e) => {
-                    let (message, line) = e.to_status_message();
-                    tracing::warn!(
-                        "config.toml 外部编辑加载失败,已保留上一次成功配置(不应用不崩) | external edit load failed, kept last-good config: {message}"
-                    );
-                    config.record_load_error(e);
-                    let _ = app.emit(
-                        "config-file-error",
-                        serde_json::json!({ "message": message, "line": line }),
-                    );
                 }
             }
         });
@@ -297,47 +223,4 @@ mod tests {
         assert!(!is_self_write(None, Some(42)));
     }
 
-    // ── diff_changed_keys ────────────────────────────────────────────────────
-
-    #[test]
-    fn diff_reports_no_change_for_identical_tables() {
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("thumb_size".to_string(), "256".to_string());
-        let (keys, restart) = diff_changed_keys(&m, &m.clone());
-        assert!(keys.is_empty());
-        assert!(restart.is_empty());
-    }
-
-    /// hot 键(如 thumb_size)变化 → 进 `keys`,不进 `restart_required`。
-    #[test]
-    fn diff_hot_key_change_is_not_restart_required() {
-        let old = std::collections::BTreeMap::new(); // 空表 = 全部走默认值
-        let mut new = std::collections::BTreeMap::new();
-        new.insert("thumb_size".to_string(), "256".to_string()); // 默认 512 → 覆盖 256,hot=true
-        let (keys, restart) = diff_changed_keys(&old, &new);
-        assert!(keys.contains(&"thumb_size".to_string()));
-        assert!(!restart.contains(&"thumb_size".to_string()));
-    }
-
-    /// 非 hot 键(如 log_dir,restart_required=true)变化 → 同时进 `keys` 与 `restart_required`。
-    #[test]
-    fn diff_cold_key_change_is_restart_required() {
-        let old = std::collections::BTreeMap::new();
-        let mut new = std::collections::BTreeMap::new();
-        new.insert("log_dir".to_string(), "D:/logs".to_string());
-        let (keys, restart) = diff_changed_keys(&old, &new);
-        assert!(keys.contains(&"log_dir".to_string()));
-        assert!(restart.contains(&"log_dir".to_string()));
-    }
-
-    /// 「注释态回默认值」与「显式写回同默认值」在 diff 视角下等价于无变化——按解析后的生效值
-    /// 比较,不按「键是否出现在表里」比较。
-    #[test]
-    fn diff_treats_explicit_default_same_as_commented_default() {
-        let old = std::collections::BTreeMap::new(); // thumb_size 缺省 → 默认 512
-        let mut new = std::collections::BTreeMap::new();
-        new.insert("thumb_size".to_string(), "512".to_string()); // 显式写回默认值
-        let (keys, _restart) = diff_changed_keys(&old, &new);
-        assert!(!keys.contains(&"thumb_size".to_string()));
-    }
 }

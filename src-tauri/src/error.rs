@@ -16,6 +16,11 @@ pub enum AppError {
     #[error("Connection pool error: {0}")]
     Pool(#[from] r2d2::Error),
 
+    /// 数据库结构与本程序不兼容:旧格式、缺少格式标识,或来自更新的程序。须重置数据库,或改用
+    /// 当前格式的备份恢复 —— 不自动清理任何用户数据与源资产。
+    #[error("数据库结构与本程序不兼容,需重置数据库或改用当前格式备份 | database schema is incompatible with this build; reset the database or restore a current-format backup")]
+    SchemaIncompatible,
+
     #[error("EXIF parse error: {0}")]
     Exif(#[from] exif::Error),
 
@@ -141,7 +146,7 @@ pub enum AppError {
 
     /// 数据恢复(方案 B §6/§9)失败。与 [`AppError::Backup`] 同姿态:`code` 是稳定小写分流标识,
     /// 原样透到 IPC `code` 字段。稳定码集:`restore_format_unsupported`(包格式版本过新)/
-    /// `restore_schema_too_new`(schema 新于本二进制)/ `restore_corrupt`(quick_check/sha256 不符/
+    /// `restore_schema_incompatible`(备份库结构非当前格式,过旧与过新一律不接受)/ `restore_corrupt`(quick_check/sha256 不符/
     /// 损坏)/ `restore_path_invalid`(zip-slip/盘符/符号链接逃逸)/ `restore_size_limit`(条目数/
     /// 解压尺寸超限,zip bomb)/ `restore_document_missing`(rebase 后版本文件缺失)/
     /// `restore_rollback_failed`(预恢复回滚包失败)/ `restore_io`。message **不携带绝对路径 / SQL /
@@ -432,6 +437,8 @@ impl Serialize for AppError {
         let (code, msg) = match self {
             AppError::Io(_) => ("Io", "文件读写异常 | IO error"),
             AppError::Db(_) => ("Db", "数据库访问异常 | Database error"),
+            // 结构不兼容的稳定码:单一来源即此处(其它模块不复制该字面量)。
+            AppError::SchemaIncompatible => ("db_schema_incompatible", "数据库结构与本程序不兼容,需重置数据库或改用当前格式备份 | database schema is incompatible with this build; reset the database or restore a current-format backup"),
             AppError::Pool(_) => ("Pool", "数据库连接池异常 | Connection pool error"),
             AppError::Exif(_) => ("Exif", "照片元数据解析异常 | EXIF parse error"),
             AppError::Xmp(_) => ("Xmp", "XMP 数据解析异常 | XMP parse error"),
@@ -484,7 +491,7 @@ impl Serialize for AppError {
             AppError::Relink { code, message } => (*code, message.as_str()),
             // 同上：备份的稳定码（backup_dir_not_writable / backup_document_inconsistent / ...）供前端分流。
             AppError::Backup { code, message } => (*code, message.as_str()),
-            // 同上：恢复的稳定码（restore_schema_too_new / restore_corrupt / restore_path_invalid / ...）供前端分流。
+            // 同上：恢复的稳定码（restore_schema_incompatible / restore_corrupt / restore_path_invalid / ...）供前端分流。
             AppError::Restore { code, message } => (*code, message.as_str()),
             // 同上：导出的稳定码（export_target_invalid / export_target_inside_library / file_job_busy / ...）供前端分流。
             AppError::Export { code, message } => (*code, message.as_str()),
@@ -684,7 +691,7 @@ mod tests {
     fn restore_error_surfaces_stable_code() {
         for code in [
             "restore_format_unsupported",
-            "restore_schema_too_new",
+            "restore_schema_incompatible",
             "restore_corrupt",
             "restore_path_invalid",
             "restore_size_limit",
@@ -698,6 +705,18 @@ mod tests {
             let v = serde_json::to_value(&err).expect("serialize AppError::Restore");
             assert_eq!(v["code"], code, "restore code 须为稳定码");
         }
+    }
+
+    /// 锁住结构不兼容的稳定码契约:序列化后 code 原样透出,提示含重置指引。
+    #[test]
+    fn schema_incompatible_surfaces_stable_code() {
+        let err = AppError::SchemaIncompatible;
+        let v = serde_json::to_value(&err).expect("serialize AppError::SchemaIncompatible");
+        assert_eq!(v["code"], "db_schema_incompatible");
+        assert!(
+            v["message"].as_str().unwrap_or_default().contains("重置"),
+            "提示须含重置指引"
+        );
     }
 
     /// 锁住 OCR 错误契约（T7,同 Player/Backup 姿态）:九个稳定码全遍历，序列化后 IPC

@@ -62,13 +62,6 @@
   --z-overlay: 200;
   --z-toast: 300;
 
-  /* ── Shared media marks ─────────────────────────────────────
-     徽章文字统一压 scrim;类别色只作为小面积点色/图标色,不随主题重复漂移。 */
-  --color-badge-scrim: rgba(0, 0, 0, 0.6);
-  --color-badge-mark-live: #ffaaaa;
-  --color-badge-mark-audio: #5dd39e;
-  --color-badge-mark-document: #ffd166;
-  --color-rating-amber: #fbbf24;
 
   /* ── Focus Ring ────────────────────────────────────────────── */
   --focus-ring-width: 2px;
@@ -133,7 +126,22 @@
   --media-overlay-bg: rgb(0 0 0 / 0.66);
   --media-overlay-text: #fff;
 
+  /* ── Elevation Shadows ───────────────────────────────────────
+     阴影是纯黑 alpha 的层次语言(不含用户配色),但与明暗强相关:暗底要更重才成形。
+     原六套主题 CSS 各自声明这四档,主题层删除后收归此处一份,按 data-color-scheme 取档。 */
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05), 0 1px 1px rgb(0 0 0 / 0.025);
+  --shadow-md: 0 4px 12px -2px rgb(0 0 0 / 0.07), 0 2px 5px -1px rgb(0 0 0 / 0.035);
+  --shadow-lg: 0 10px 28px -4px rgb(0 0 0 / 0.1), 0 4px 10px -2px rgb(0 0 0 / 0.045);
+  --shadow-xl: 0 20px 40px -6px rgb(0 0 0 / 0.14), 0 8px 16px -3px rgb(0 0 0 / 0.06);
   /* ── Opacity ───────────────────────────────────────────────── */
   --opacity-disabled: 0.4;
   --opacity-hover: 0.08;
+}
+
+/* 暗色档阴影:同一四档加厚(数值沿用原深色主题的声明)。 */
+html[data-color-scheme='dark'] {
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.24);
+  --shadow-md: 0 4px 14px -2px rgb(0 0 0 / 0.48), 0 2px 6px -1px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 12px 32px -4px rgb(0 0 0 / 0.58), 0 4px 12px -2px rgb(0 0 0 / 0.38);
+  --shadow-xl: 0 20px 48px -6px rgb(0 0 0 / 0.7), 0 8px 20px -3px rgb(0 0 0 / 0.48);
 }

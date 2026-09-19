@@ -29,8 +29,7 @@ export function thumbhashToDataURL(hash: number[] | Uint8Array): string {
 
 // ── ThumbHash 解码(官方实现的忠实移植) ──────────────────────────────────
 // 算法与常量逐行对齐 evanw/thumbhash(MIT)及后端编码所用的 thumbhash crate
-// (同算法的官方 Rust 移植);正确性由 thumbhash.spec.ts 以 Rust 编码器+解码器
-// 产出的跨语言金标(thumbhash.golden.ts)逐通道对拍锁定。
+// (同算法的官方 Rust 移植);Rust 编码器+解码器产出的跨语言金标保留在 thumbhash.golden.ts。
 
 /** 解码结果:w×h 的 RGBA 像素(非预乘 alpha)。 */
 export interface ThumbHashImage {

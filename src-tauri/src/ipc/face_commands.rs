@@ -27,7 +27,7 @@ use crate::db::queries::{
     create_person_from_faces, get_config, get_faces_for_item, list_ignored_persons,
     list_likely_matches, list_persons, merge_persons, reassign_face_to_person,
     reject_face_candidate, rename_person, reset_error_face_items, reset_face_data, set_config,
-    set_person_hidden, set_person_ignored, sync_face_status_for_model, unassign_face,
+    set_person_hidden, set_person_ignored, unassign_face,
 };
 use crate::error::{AppError, Result};
 use crate::ipc::ai_commands::ANALYSIS_BUSY_WAITING_KEY;
@@ -593,67 +593,6 @@ pub async fn list_face_model_registry(
             })
             .collect();
         Ok(infos)
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-}
-
-/// 切换激活人脸模型轨(Part4-T6 / §3.5.2,此前推迟的 gated 命令)。门(按序):①profile 须存在;
-/// ②`verified` 对拍门——未对拍轨(SCRFD/ArcFace:`detect_scrfd` 从未与 InsightFace 对拍)
-/// 拒绝激活,防静默算错;③两个 onnx 均已安装。之后仿 CLIP `set_active_ai_model`:取消运行中
-/// 的人脸流水线、落库 `face_model_active`、把全局 `face_status` 重新指向新轨覆盖、丢弃引擎
-/// 使下次启动加载新轨 session(不 eager 重载:人脸流水线由用户显式启动,且避免 CLIP 模型缺失
-/// 时连累本命令)。旧轨 faces/persons 保留(名册隔离)——切回零成本。
-#[tauri::command]
-pub async fn set_active_face_model(
-    model_id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    let state_arc = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let prof = find_face_profile(&model_id)
-            .ok_or_else(|| AppError::System(format!("未知人脸模型 {model_id}")))?;
-        if !prof.verified {
-            return Err(AppError::System(format!(
-                "「{}」尚未通过对拍验证(输出可能静默算错),暂不可激活",
-                prof.display_name
-            )));
-        }
-        let models = models_dir(&state_arc);
-        if !face_variant_installed(&models, &prof) {
-            return Err(AppError::System(format!(
-                "「{}」尚未安装,请先下载或导入其模型文件",
-                prof.display_name
-            )));
-        }
-        if active_face_model_id(&state_arc) == prof.id {
-            return Ok(()); // 幂等:已是激活轨。
-        }
-
-        // 停当前轨流水线并释放共享 GPU 槽(同 pause;新轨由用户显式再启动)。
-        state_arc.cancel_face_analysis();
-        state_arc.release_gpu_analysis(GPU_OWNER_FACE);
-
-        // A2:schema 设置类键,唯一真源已切到 config.toml——原 DB 写会被 `active_face_model_id_with`
-        // (读侧已改走 ConfigManager)忽略,必须同步改走 `set_and_persist`。
-        state_arc
-            .config
-            .set_and_persist("face_model_active", &prof.id)?;
-        // face_status 是全局列(非按模型)→ 指向新轨的 faces 覆盖(分批,批间自行取锁)。
-        sync_face_status_for_model(&state_arc.db_writer, &prof.id)?;
-
-        // 关闭 worker 在载会话:下次(启动分析/搜索)按新轨 SessionInit 重建。
-        state_arc
-            .ai_worker
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .close_session();
-
-        info!(
-            "Active face model switched to {} | 已切换人脸模型:{}",
-            prof.id, prof.id
-        );
-        Ok(())
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?

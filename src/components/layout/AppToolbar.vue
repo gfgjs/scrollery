@@ -90,6 +90,17 @@
     >
       <FlaskConical :size="18" />
     </UiIconButton>
+    <!-- Canvas 支持时可开启打码；已开启时保留关闭入口，避免切换引擎或卸载画廊后
+         文件树仍在打码却无法关闭。DOM 画廊本身没有打码实现。 -->
+    <UiIconButton
+      v-if="demoPrivacySupported || demoPrivacyEnabled"
+      :label="demoPrivacyEnabled ? $t('demoPrivacy.disable') : $t('demoPrivacy.enable')"
+      :active="demoPrivacyEnabled"
+      @click="toggleDemoPrivacy"
+    >
+      <EyeOff v-if="demoPrivacyEnabled" :size="18" />
+      <ScanEye v-else :size="18" />
+    </UiIconButton>
     <!-- 撤销/重做/全屏已迁标题栏 ContextualToolbar(顶栏重构 P3);键盘 Ctrl+Z/Y(本组件 keydown)
          与 F11(AppShell)保持不变。 -->
 
@@ -236,10 +247,13 @@ import {
   ListFilter,
   PanelLeftClose,
   PanelLeftOpen,
+  ScanEye,
+  EyeOff,
 } from '@lucide/vue'
 import UiIconButton from '../ui/UiIconButton.vue'
 import UiPopover from '../ui/UiPopover.vue'
 import { useToolbarOverflow } from '../../composables/useToolbarOverflow'
+import { useDemoPrivacy } from '../../composables/useDemoPrivacy'
 import { useToolbarAlign } from '../../composables/useToolbarAlign'
 import GalleryViewControls from './GalleryViewControls.vue'
 import { chipCountOf, chipStateOf, chipWidthKey } from './filterChips.descriptors'
@@ -266,6 +280,8 @@ const media = useMediaStore()
 const ai = useAiStore()
 // 搜索单源门面（S2-a）：草稿 / 已提交查询 / 提交路由集中于此，AppToolbar 只保留输入 UI 与防抖。
 const search = useSearchStore()
+// 演示打码开关(2026-09-16):状态与「当前引擎是否支持」都在共享单例里,本组件只读+切换。
+const { demoPrivacyEnabled, demoPrivacySupported, toggleDemoPrivacy } = useDemoPrivacy()
 // 顶栏中部 chips 簇水平对齐(居中默认/靠左/靠右)——仅挪中部折叠区,标题恒左、搜索恒右不动。
 // 收窄窗口时 justify 留白先被吃掉,再由 useToolbarOverflow 折叠(「先减留白再折叠」天然成立)。
 const { align: toolbarAlign } = useToolbarAlign()
@@ -795,14 +811,14 @@ function toggleSearchMode() {
   top: calc(100% + var(--spacing-sm));
   left: 0;
   right: 0;
-  background-color: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background-color: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
   padding: var(--spacing-xs);
   z-index: 100;
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .dropdown-item {

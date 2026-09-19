@@ -19,9 +19,9 @@
   width: var(--control-size-compact);
   height: var(--control-size-compact);
   border-radius: var(--radius-sm);
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
-  box-shadow: var(--material-recipe-float-box-shadow);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
+  box-shadow: var(--shadow-lg);
   color: var(--color-text-secondary);
   cursor: pointer;
   opacity: 0.35;

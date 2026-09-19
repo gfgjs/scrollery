@@ -43,9 +43,5 @@ export function createLatestWriteQueue<K, V>(
         }
       })()
     },
-    /** 该 key 是否有在途写(测试/诊断用)。 */
-    isPending(key: K): boolean {
-      return pending.has(key)
-    },
   }
 }

@@ -16,7 +16,6 @@
             <button
               type="button"
               class="toast__close"
-
               @click="toastStore.removeToast(toast.id)"
             >
               <X :size="14" />
@@ -73,10 +72,13 @@ async function onAction(toastId: string, action: ToastAction) {
   flex-direction: column;
   align-items: center;
   gap: var(--spacing-sm);
+  width: max-content;
+  max-width: min(460px, calc(100vw - 32px));
   z-index: 99999;
   pointer-events: none;
 }
 .toast {
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: var(--spacing-sm);
@@ -84,26 +86,33 @@ async function onAction(toastId: string, action: ToastAction) {
   border-radius: var(--radius-xl);
   font-size: var(--font-size-sm);
   font-weight: 500;
+  line-height: 1.5;
+  color: var(--color-text-primary);
   pointer-events: auto;
   cursor: default;
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  max-width: 460px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: var(--shadow-lg);
+  max-width: 100%;
   user-select: text;
 }
 .toast__row {
   display: flex;
   align-items: center;
   gap: var(--spacing-sm);
+  min-width: 0;
+}
+.toast__icon {
+  display: block;
+  flex-shrink: 0;
 }
 .toast__actions {
   display: flex;
   flex-wrap: wrap;
   gap: var(--spacing-xs);
-  padding-left: 24px; /* 与消息对齐，让过图标 */
+  padding-inline-start: calc(16px + var(--spacing-sm)); /* 跟随图标宽度与间距，保持和正文对齐。 */
 }
 .toast__chip {
   min-height: var(--control-size-compact);
@@ -126,41 +135,36 @@ async function onAction(toastId: string, action: ToastAction) {
   color: var(--color-accent-text);
 }
 .toast__msg {
-  flex-grow: 1;
-  word-break: break-all;
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .toast__close {
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: var(--control-size-compact);
   height: var(--control-size-compact);
   padding: 0; /* 压掉 UA button 默认内边距(全局 reset 未清 padding) */
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
-  color: inherit;
+  color: var(--color-text-secondary);
   cursor: pointer;
-  opacity: 0.7;
-  transition: opacity var(--transition-normal);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
   flex-shrink: 0;
-  margin-left: 8px;
+}
+.toast__close > svg {
+  display: block;
+  flex-shrink: 0;
 }
 .toast__close:hover {
   background: var(--color-bg-hover);
-  opacity: 1;
+  color: var(--color-text-primary);
 }
-/* Toast 统一使用浮层材质；状态只负责边线与图标，避免高饱和色块夺走内容焦点。 */
-.toast--success {
-  border-inline-start: 3px solid var(--color-success);
-}
-.toast--error {
-  border-inline-start: 3px solid var(--color-error);
-}
-.toast--warning {
-  border-inline-start: 3px solid var(--color-warning);
-}
-.toast--info {
-  border-inline-start: 3px solid var(--color-info);
-}
+/* Toast 统一使用浮层材质，通过图标颜色区分状态。 */
 .toast--success .toast__icon { color: var(--color-success); }
 .toast--error .toast__icon { color: var(--color-error); }
 .toast--warning .toast__icon { color: var(--color-warning); }

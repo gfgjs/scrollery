@@ -165,22 +165,6 @@ pub async fn get_document_text(item_id: i64, state: State<'_, Arc<AppState>>) ->
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// 读取某版本的文本内容（§5.3）。
-#[tauri::command]
-pub async fn get_version_content(
-    version_id: i64,
-    state: State<'_, Arc<AppState>>,
-) -> Result<String> {
-    // span 埋点(W1,D-312 info 档:load_document 类,读文件+解码,真实 IO 工作)。
-    let _span = crate::logging::SpanTimer::info("ipc:get_version_content");
-    let state = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        read_ref_text(&state, 0, Some(version_id))
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-}
-
 /// 单事务写一个 appdata 版本(方案 B §3.1,原为「插行→写文件→回填」两步非原子):
 /// 插行(拿 id)→ 派生 `{id}.{ext}` 路径 → 写原子文件 → 回填路径 → commit。
 ///
@@ -1175,7 +1159,7 @@ mod tests {
 
     fn seeded_doc_thumb_db() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -1463,7 +1447,7 @@ mod tests {
     fn write_version_tx_commits_row_and_file() {
         use rusqlite::Connection;
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); // 免构造 media_items(仅测版本写事务)
 
         let dir = std::env::temp_dir().join(format!("scrollery_wvt_ok_{}", std::process::id()));
@@ -1496,7 +1480,7 @@ mod tests {
     fn write_version_tx_rollback_leaves_no_row_on_file_failure() {
         use rusqlite::Connection;
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
 
         let missing = std::env::temp_dir()

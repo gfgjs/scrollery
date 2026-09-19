@@ -2,9 +2,6 @@
 
 use super::*;
 
-// 跨域测试定向 import(§5 规则 2):搜索侧格式筛选对拍走 search owner。
-use super::super::super::search::search_media;
-
 /// fixture 的**区分度**是刻意设计的，逐条对应一种「基础谓词漏了会怎样」：
 /// - `gif` 只以 `is_deleted=1` 存在 → 漏 `is_deleted=0` 则回收站里的格式污染全局 facet；
 /// - `mov` 只以 Live-Photo 伴随视频存在 → 漏 `companion_of IS NULL` 则伴随视频的格式冒出来；
@@ -16,7 +13,7 @@ use super::super::super::search::search_media;
 /// 否则测试对「漏掉基础谓词」零区分度，跟生产库一样什么都测不出。
 fn seeded() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -66,24 +63,6 @@ fn facet_is_distinct_and_sorted() {
 #[test]
 fn empty_library_yields_empty_facet() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     assert!(list_library_formats(&c).unwrap().is_empty());
-}
-
-/// 搜索侧同吃格式筛选：漏了会让「画廊按 PNG 筛过、搜同一个词却把 JPG 也搜出来」。
-/// 走真库而非只对拍 SQL 字符串 —— 参数错位不报错、只静默筛错，只有真跑才抓得住。
-#[test]
-fn search_media_applies_file_formats() {
-    let c = seeded();
-    let f = |formats: Option<Vec<String>>| MediaFilter {
-        file_formats: formats,
-        search_scope: Some("filename".into()),
-        ..Default::default()
-    };
-    // 不筛格式:a.jpg 与 b.png 都不含 "b"…… 用能命中两者的词。
-    let all = search_media(&c, ".", &f(None), 10).unwrap();
-    assert_eq!(all.len(), 2, "jpg + png 两条活行");
-    let only_png = search_media(&c, ".", &f(Some(vec!["png".into()])), 10).unwrap();
-    assert_eq!(only_png.len(), 1);
-    assert_eq!(only_png[0].file_name, "b.png");
 }

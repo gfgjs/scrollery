@@ -1,0 +1,1572 @@
+{
+  "kind": "ai-worker EmbedBatch 阶段基准",
+  "driver": "tools/bench_ai_worker_stages.py",
+  "generated_at_utc": "2026-09-17T03:07:41Z",
+  "wall_seconds_total": 9.2,
+  "environment": {
+    "worker_exe": "C:\\workspace\\scrollery\\target\\debug\\ai-worker.exe",
+    "worker_exe_bytes": 14813184,
+    "worker_exe_sha256": "6425ffa42b8d5aec25bedb694c7650a6d7dbd90aa945e6ab4c50a81c5ec9217e",
+    "worker_exe_mtime_utc": "2026-09-17T03:06:45Z",
+    "cargo_profile_note": "同上:dev + [profile.dev.package.scrollery-ai-core] opt-level=2;确认轮",
+    "models_dir": "C:\\Users\\gf\\AppData\\Roaming\\com.scrollery.app\\models",
+    "image_model": "vit-b-16.img.fp16.onnx",
+    "text_model": "vit-b-16.txt.fp16.onnx",
+    "image_model_bytes": 3770126,
+    "image_provider_requested": "directml",
+    "ai_cache_dir": "C:\\Users\\gf\\AppData\\Roaming\\com.scrollery.app\\cache\\ai_thumbs",
+    "db_path": "C:\\Users\\gf\\AppData\\Roaming\\com.scrollery.app\\scrollery.db",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti, 12288 MiB, 610.74"
+  },
+  "sample": {
+    "requested": 1024,
+    "db_completed_with_vector": 62056,
+    "used": 1024,
+    "cache_missing": 0,
+    "first_item_id": 63686,
+    "last_item_id": 132992
+  },
+  "session_init": {
+    "wall_ms": 1276.9,
+    "ready_session": {
+      "embed_dim": 512,
+      "face_embed_dim": null,
+      "caps": [
+        "embedding"
+      ],
+      "provider": "directml",
+      "gpu_name": "DirectML GPU"
+    },
+    "progress": [
+      {
+        "stage": "ort_runtime_init:begin",
+        "elapsed_ms": 0
+      },
+      {
+        "stage": "ort_runtime_init:ok",
+        "elapsed_ms": 5
+      },
+      {
+        "stage": "validate:begin",
+        "elapsed_ms": 5
+      },
+      {
+        "stage": "provider_detect:begin",
+        "elapsed_ms": 76
+      },
+      {
+        "stage": "clip_image_load:begin(DirectML (GPU),pool=1)",
+        "elapsed_ms": 76
+      },
+      {
+        "stage": "clip_image_load:slot_ok(1/1)",
+        "elapsed_ms": 757
+      },
+      {
+        "stage": "clip_text_load:begin(CPU,pool=2)",
+        "elapsed_ms": 757
+      },
+      {
+        "stage": "clip_text_load:slot_ok(1/2)",
+        "elapsed_ms": 868
+      },
+      {
+        "stage": "clip_text_load:slot_ok(2/2)",
+        "elapsed_ms": 1258
+      },
+      {
+        "stage": "contract_check:begin",
+        "elapsed_ms": 1258
+      }
+    ]
+  },
+  "passes": [
+    {
+      "batch": 64,
+      "measured": false,
+      "requests": 16,
+      "items": 1024,
+      "wall_us_total": 3953566,
+      "ok_total": 1024,
+      "err_total": 0,
+      "items_per_s_aggregate": 259.01,
+      "items_per_s_per_request_mean_ref_only": 259.17,
+      "wall_us_per_request_mean": 247097,
+      "wall_us_per_item_mean": 3860,
+      "worker_stage_sums": {
+        "wall_us": 3926086,
+        "decode_us": 10723962,
+        "preprocess_us": 11099788,
+        "wait_input_us": 254459,
+        "drain_us": 148,
+        "assemble_us": 189337,
+        "enc_pool_us": 159,
+        "enc_prep_us": 90353,
+        "enc_run_us": 3277210,
+        "enc_extract_us": 2009,
+        "enc_runs": 1024,
+        "groups": 116
+      },
+      "worker_stage_us_per_item": {
+        "wall_us": 3834.1,
+        "decode_us": 10472.6,
+        "preprocess_us": 10839.6,
+        "wait_input_us": 248.5,
+        "drain_us": 0.1,
+        "assemble_us": 184.9,
+        "enc_pool_us": 0.2,
+        "enc_prep_us": 88.2,
+        "enc_run_us": 3200.4,
+        "enc_extract_us": 2.0,
+        "enc_runs": 1.0,
+        "groups": 0.1
+      },
+      "label": "warmup",
+      "requests_detail": [
+        {
+          "rid": 2,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 268826,
+          "items_per_s": 238.07
+        },
+        {
+          "rid": 3,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 238963,
+          "items_per_s": 267.82
+        },
+        {
+          "rid": 4,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 241312,
+          "items_per_s": 265.22
+        },
+        {
+          "rid": 5,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 243978,
+          "items_per_s": 262.32
+        },
+        {
+          "rid": 6,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 246837,
+          "items_per_s": 259.28
+        },
+        {
+          "rid": 7,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 245593,
+          "items_per_s": 260.59
+        },
+        {
+          "rid": 8,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 242514,
+          "items_per_s": 263.9
+        },
+        {
+          "rid": 9,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 245953,
+          "items_per_s": 260.21
+        },
+        {
+          "rid": 10,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 249772,
+          "items_per_s": 256.23
+        },
+        {
+          "rid": 11,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 244652,
+          "items_per_s": 261.6
+        },
+        {
+          "rid": 12,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 252224,
+          "items_per_s": 253.74
+        },
+        {
+          "rid": 13,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 246988,
+          "items_per_s": 259.12
+        },
+        {
+          "rid": 14,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 246377,
+          "items_per_s": 259.76
+        },
+        {
+          "rid": 15,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 244936,
+          "items_per_s": 261.29
+        },
+        {
+          "rid": 16,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 249395,
+          "items_per_s": 256.62
+        },
+        {
+          "rid": 17,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 245246,
+          "items_per_s": 260.96
+        }
+      ]
+    },
+    {
+      "batch": 64,
+      "measured": true,
+      "requests": 16,
+      "items": 1024,
+      "wall_us_total": 3968697,
+      "ok_total": 1024,
+      "err_total": 0,
+      "items_per_s_aggregate": 258.02,
+      "items_per_s_per_request_mean_ref_only": 258.13,
+      "wall_us_per_request_mean": 248043,
+      "wall_us_per_item_mean": 3875,
+      "worker_stage_sums": {
+        "wall_us": 3940698,
+        "decode_us": 10828648,
+        "preprocess_us": 11361117,
+        "wait_input_us": 257963,
+        "drain_us": 153,
+        "assemble_us": 192451,
+        "enc_pool_us": 167,
+        "enc_prep_us": 94700,
+        "enc_run_us": 3279343,
+        "enc_extract_us": 2204,
+        "enc_runs": 1024,
+        "groups": 100
+      },
+      "worker_stage_us_per_item": {
+        "wall_us": 3848.3,
+        "decode_us": 10574.9,
+        "preprocess_us": 11094.8,
+        "wait_input_us": 251.9,
+        "drain_us": 0.1,
+        "assemble_us": 187.9,
+        "enc_pool_us": 0.2,
+        "enc_prep_us": 92.5,
+        "enc_run_us": 3202.5,
+        "enc_extract_us": 2.2,
+        "enc_runs": 1.0,
+        "groups": 0.1
+      },
+      "label": "measured",
+      "requests_detail": [
+        {
+          "rid": 18,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 245404,
+          "items_per_s": 260.79
+        },
+        {
+          "rid": 19,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 243489,
+          "items_per_s": 262.85
+        },
+        {
+          "rid": 20,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 246360,
+          "items_per_s": 259.78
+        },
+        {
+          "rid": 21,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 241787,
+          "items_per_s": 264.7
+        },
+        {
+          "rid": 22,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 259686,
+          "items_per_s": 246.45
+        },
+        {
+          "rid": 23,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 244213,
+          "items_per_s": 262.07
+        },
+        {
+          "rid": 24,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 244676,
+          "items_per_s": 261.57
+        },
+        {
+          "rid": 25,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 246988,
+          "items_per_s": 259.12
+        },
+        {
+          "rid": 26,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 246850,
+          "items_per_s": 259.27
+        },
+        {
+          "rid": 27,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 254975,
+          "items_per_s": 251.01
+        },
+        {
+          "rid": 28,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 254270,
+          "items_per_s": 251.7
+        },
+        {
+          "rid": 29,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 244256,
+          "items_per_s": 262.02
+        },
+        {
+          "rid": 30,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 249377,
+          "items_per_s": 256.64
+        },
+        {
+          "rid": 31,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 248994,
+          "items_per_s": 257.03
+        },
+        {
+          "rid": 32,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 241370,
+          "items_per_s": 265.15
+        },
+        {
+          "rid": 33,
+          "items": 64,
+          "ok": 64,
+          "err": 0,
+          "wall_us": 256002,
+          "items_per_s": 250.0
+        }
+      ]
+    }
+  ],
+  "throughput_by_batch": [
+    {
+      "batch": 64,
+      "label": "warmup",
+      "items": 1024,
+      "sum_wall_s": 3.954,
+      "items_per_s_aggregate": 259.01
+    },
+    {
+      "batch": 64,
+      "label": "measured",
+      "items": 1024,
+      "sum_wall_s": 3.969,
+      "items_per_s_aggregate": 258.02
+    }
+  ],
+  "worker_perf_lines": [
+    {
+      "req": 2,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 19,
+      "threads": 20,
+      "wall_us": 267568,
+      "decode_us": 646862,
+      "preprocess_us": 665536,
+      "wait_input_us": 27465,
+      "drain_us": 5,
+      "assemble_us": 11200,
+      "enc_pool_us": 10,
+      "enc_prep_us": 4975,
+      "enc_run_us": 219696,
+      "enc_extract_us": 103,
+      "enc_runs": 64,
+      "ms_per_item": 4.181
+    },
+    {
+      "req": 3,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 237015,
+      "decode_us": 548790,
+      "preprocess_us": 656261,
+      "wait_input_us": 10550,
+      "drain_us": 8,
+      "assemble_us": 13041,
+      "enc_pool_us": 5,
+      "enc_prep_us": 4745,
+      "enc_run_us": 200791,
+      "enc_extract_us": 109,
+      "enc_runs": 64,
+      "ms_per_item": 3.703
+    },
+    {
+      "req": 4,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 239322,
+      "decode_us": 685633,
+      "preprocess_us": 736132,
+      "wait_input_us": 13519,
+      "drain_us": 7,
+      "assemble_us": 11177,
+      "enc_pool_us": 9,
+      "enc_prep_us": 5676,
+      "enc_run_us": 201325,
+      "enc_extract_us": 130,
+      "enc_runs": 64,
+      "ms_per_item": 3.739
+    },
+    {
+      "req": 5,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 242734,
+      "decode_us": 637873,
+      "preprocess_us": 700540,
+      "wait_input_us": 14654,
+      "drain_us": 4,
+      "assemble_us": 9708,
+      "enc_pool_us": 7,
+      "enc_prep_us": 6148,
+      "enc_run_us": 206230,
+      "enc_extract_us": 137,
+      "enc_runs": 64,
+      "ms_per_item": 3.793
+    },
+    {
+      "req": 6,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 245445,
+      "decode_us": 630412,
+      "preprocess_us": 685063,
+      "wait_input_us": 14667,
+      "drain_us": 8,
+      "assemble_us": 14556,
+      "enc_pool_us": 13,
+      "enc_prep_us": 6272,
+      "enc_run_us": 203987,
+      "enc_extract_us": 139,
+      "enc_runs": 64,
+      "ms_per_item": 3.835
+    },
+    {
+      "req": 7,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 244047,
+      "decode_us": 809218,
+      "preprocess_us": 640691,
+      "wait_input_us": 16475,
+      "drain_us": 27,
+      "assemble_us": 12928,
+      "enc_pool_us": 8,
+      "enc_prep_us": 4606,
+      "enc_run_us": 201312,
+      "enc_extract_us": 110,
+      "enc_runs": 64,
+      "ms_per_item": 3.813
+    },
+    {
+      "req": 8,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 240645,
+      "decode_us": 669052,
+      "preprocess_us": 715937,
+      "wait_input_us": 12742,
+      "drain_us": 7,
+      "assemble_us": 11587,
+      "enc_pool_us": 11,
+      "enc_prep_us": 5537,
+      "enc_run_us": 204633,
+      "enc_extract_us": 115,
+      "enc_runs": 64,
+      "ms_per_item": 3.76
+    },
+    {
+      "req": 9,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 244260,
+      "decode_us": 839541,
+      "preprocess_us": 671422,
+      "wait_input_us": 16527,
+      "drain_us": 21,
+      "assemble_us": 11632,
+      "enc_pool_us": 9,
+      "enc_prep_us": 5882,
+      "enc_run_us": 202980,
+      "enc_extract_us": 136,
+      "enc_runs": 64,
+      "ms_per_item": 3.817
+    },
+    {
+      "req": 10,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 248114,
+      "decode_us": 673330,
+      "preprocess_us": 728225,
+      "wait_input_us": 16310,
+      "drain_us": 8,
+      "assemble_us": 13228,
+      "enc_pool_us": 15,
+      "enc_prep_us": 5623,
+      "enc_run_us": 205165,
+      "enc_extract_us": 115,
+      "enc_runs": 64,
+      "ms_per_item": 3.877
+    },
+    {
+      "req": 11,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 243305,
+      "decode_us": 762608,
+      "preprocess_us": 761039,
+      "wait_input_us": 15523,
+      "drain_us": 8,
+      "assemble_us": 10609,
+      "enc_pool_us": 10,
+      "enc_prep_us": 6624,
+      "enc_run_us": 204219,
+      "enc_extract_us": 131,
+      "enc_runs": 64,
+      "ms_per_item": 3.802
+    },
+    {
+      "req": 12,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 250195,
+      "decode_us": 669631,
+      "preprocess_us": 664619,
+      "wait_input_us": 17420,
+      "drain_us": 6,
+      "assemble_us": 12093,
+      "enc_pool_us": 11,
+      "enc_prep_us": 5804,
+      "enc_run_us": 206426,
+      "enc_extract_us": 129,
+      "enc_runs": 64,
+      "ms_per_item": 3.909
+    },
+    {
+      "req": 13,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 244364,
+      "decode_us": 570431,
+      "preprocess_us": 678160,
+      "wait_input_us": 16481,
+      "drain_us": 8,
+      "assemble_us": 11044,
+      "enc_pool_us": 7,
+      "enc_prep_us": 5201,
+      "enc_run_us": 203942,
+      "enc_extract_us": 105,
+      "enc_runs": 64,
+      "ms_per_item": 3.818
+    },
+    {
+      "req": 14,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 245082,
+      "decode_us": 639215,
+      "preprocess_us": 674847,
+      "wait_input_us": 16461,
+      "drain_us": 7,
+      "assemble_us": 11049,
+      "enc_pool_us": 10,
+      "enc_prep_us": 5774,
+      "enc_run_us": 203882,
+      "enc_extract_us": 134,
+      "enc_runs": 64,
+      "ms_per_item": 3.829
+    },
+    {
+      "req": 15,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 242980,
+      "decode_us": 612975,
+      "preprocess_us": 682040,
+      "wait_input_us": 15821,
+      "drain_us": 11,
+      "assemble_us": 10480,
+      "enc_pool_us": 10,
+      "enc_prep_us": 5130,
+      "enc_run_us": 203590,
+      "enc_extract_us": 118,
+      "enc_runs": 64,
+      "ms_per_item": 3.797
+    },
+    {
+      "req": 16,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 248409,
+      "decode_us": 600876,
+      "preprocess_us": 690336,
+      "wait_input_us": 14648,
+      "drain_us": 7,
+      "assemble_us": 13262,
+      "enc_pool_us": 16,
+      "enc_prep_us": 6245,
+      "enc_run_us": 205727,
+      "enc_extract_us": 168,
+      "enc_runs": 64,
+      "ms_per_item": 3.881
+    },
+    {
+      "req": 17,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 8,
+      "threads": 20,
+      "wall_us": 242601,
+      "decode_us": 727515,
+      "preprocess_us": 748940,
+      "wait_input_us": 15196,
+      "drain_us": 6,
+      "assemble_us": 11743,
+      "enc_pool_us": 8,
+      "enc_prep_us": 6111,
+      "enc_run_us": 203305,
+      "enc_extract_us": 130,
+      "enc_runs": 64,
+      "ms_per_item": 3.791
+    },
+    {
+      "req": 18,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 243871,
+      "decode_us": 595708,
+      "preprocess_us": 684015,
+      "wait_input_us": 15779,
+      "drain_us": 9,
+      "assemble_us": 12104,
+      "enc_pool_us": 12,
+      "enc_prep_us": 5268,
+      "enc_run_us": 203506,
+      "enc_extract_us": 128,
+      "enc_runs": 64,
+      "ms_per_item": 3.81
+    },
+    {
+      "req": 19,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 241718,
+      "decode_us": 577691,
+      "preprocess_us": 710665,
+      "wait_input_us": 11253,
+      "drain_us": 5,
+      "assemble_us": 11987,
+      "enc_pool_us": 8,
+      "enc_prep_us": 5315,
+      "enc_run_us": 206216,
+      "enc_extract_us": 133,
+      "enc_runs": 64,
+      "ms_per_item": 3.777
+    },
+    {
+      "req": 20,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 244374,
+      "decode_us": 693661,
+      "preprocess_us": 771175,
+      "wait_input_us": 15369,
+      "drain_us": 5,
+      "assemble_us": 11656,
+      "enc_pool_us": 11,
+      "enc_prep_us": 5502,
+      "enc_run_us": 204250,
+      "enc_extract_us": 143,
+      "enc_runs": 64,
+      "ms_per_item": 3.818
+    },
+    {
+      "req": 21,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 240653,
+      "decode_us": 621289,
+      "preprocess_us": 736591,
+      "wait_input_us": 10587,
+      "drain_us": 9,
+      "assemble_us": 12657,
+      "enc_pool_us": 8,
+      "enc_prep_us": 5711,
+      "enc_run_us": 204015,
+      "enc_extract_us": 122,
+      "enc_runs": 64,
+      "ms_per_item": 3.76
+    },
+    {
+      "req": 22,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 258359,
+      "decode_us": 615489,
+      "preprocess_us": 710589,
+      "wait_input_us": 14987,
+      "drain_us": 23,
+      "assemble_us": 14793,
+      "enc_pool_us": 13,
+      "enc_prep_us": 8365,
+      "enc_run_us": 211891,
+      "enc_extract_us": 237,
+      "enc_runs": 64,
+      "ms_per_item": 4.037
+    },
+    {
+      "req": 23,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 241807,
+      "decode_us": 863415,
+      "preprocess_us": 679915,
+      "wait_input_us": 12822,
+      "drain_us": 5,
+      "assemble_us": 11135,
+      "enc_pool_us": 7,
+      "enc_prep_us": 5665,
+      "enc_run_us": 204741,
+      "enc_extract_us": 127,
+      "enc_runs": 64,
+      "ms_per_item": 3.778
+    },
+    {
+      "req": 24,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 242727,
+      "decode_us": 641553,
+      "preprocess_us": 727710,
+      "wait_input_us": 14232,
+      "drain_us": 6,
+      "assemble_us": 12183,
+      "enc_pool_us": 8,
+      "enc_prep_us": 5414,
+      "enc_run_us": 203003,
+      "enc_extract_us": 141,
+      "enc_runs": 64,
+      "ms_per_item": 3.793
+    },
+    {
+      "req": 25,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 7,
+      "threads": 20,
+      "wall_us": 245382,
+      "decode_us": 812915,
+      "preprocess_us": 692799,
+      "wait_input_us": 16790,
+      "drain_us": 7,
+      "assemble_us": 11180,
+      "enc_pool_us": 9,
+      "enc_prep_us": 5706,
+      "enc_run_us": 204258,
+      "enc_extract_us": 117,
+      "enc_runs": 64,
+      "ms_per_item": 3.834
+    },
+    {
+      "req": 26,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 245671,
+      "decode_us": 714332,
+      "preprocess_us": 707841,
+      "wait_input_us": 21765,
+      "drain_us": 11,
+      "assemble_us": 11026,
+      "enc_pool_us": 10,
+      "enc_prep_us": 4974,
+      "enc_run_us": 199366,
+      "enc_extract_us": 117,
+      "enc_runs": 64,
+      "ms_per_item": 3.839
+    },
+    {
+      "req": 27,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 252555,
+      "decode_us": 794280,
+      "preprocess_us": 779880,
+      "wait_input_us": 18961,
+      "drain_us": 11,
+      "assemble_us": 12917,
+      "enc_pool_us": 11,
+      "enc_prep_us": 6891,
+      "enc_run_us": 204966,
+      "enc_extract_us": 127,
+      "enc_runs": 64,
+      "ms_per_item": 3.946
+    },
+    {
+      "req": 28,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 252687,
+      "decode_us": 666124,
+      "preprocess_us": 689430,
+      "wait_input_us": 18812,
+      "drain_us": 9,
+      "assemble_us": 12777,
+      "enc_pool_us": 19,
+      "enc_prep_us": 5776,
+      "enc_run_us": 207651,
+      "enc_extract_us": 138,
+      "enc_runs": 64,
+      "ms_per_item": 3.948
+    },
+    {
+      "req": 29,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 242965,
+      "decode_us": 560131,
+      "preprocess_us": 701355,
+      "wait_input_us": 14751,
+      "drain_us": 16,
+      "assemble_us": 11650,
+      "enc_pool_us": 10,
+      "enc_prep_us": 6346,
+      "enc_run_us": 206850,
+      "enc_extract_us": 135,
+      "enc_runs": 64,
+      "ms_per_item": 3.796
+    },
+    {
+      "req": 30,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 247707,
+      "decode_us": 711985,
+      "preprocess_us": 665425,
+      "wait_input_us": 17135,
+      "drain_us": 6,
+      "assemble_us": 12233,
+      "enc_pool_us": 6,
+      "enc_prep_us": 5823,
+      "enc_run_us": 204268,
+      "enc_extract_us": 114,
+      "enc_runs": 64,
+      "ms_per_item": 3.87
+    },
+    {
+      "req": 31,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 247067,
+      "decode_us": 616042,
+      "preprocess_us": 685008,
+      "wait_input_us": 17100,
+      "drain_us": 13,
+      "assemble_us": 11345,
+      "enc_pool_us": 11,
+      "enc_prep_us": 5831,
+      "enc_run_us": 204756,
+      "enc_extract_us": 132,
+      "enc_runs": 64,
+      "ms_per_item": 3.86
+    },
+    {
+      "req": 32,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 238663,
+      "decode_us": 583372,
+      "preprocess_us": 657463,
+      "wait_input_us": 16148,
+      "drain_us": 9,
+      "assemble_us": 9798,
+      "enc_pool_us": 14,
+      "enc_prep_us": 5725,
+      "enc_run_us": 203308,
+      "enc_extract_us": 130,
+      "enc_runs": 64,
+      "ms_per_item": 3.729
+    },
+    {
+      "req": 33,
+      "items": 64,
+      "ok": 64,
+      "err": 0,
+      "fail": 0,
+      "groups": 6,
+      "threads": 20,
+      "wall_us": 254492,
+      "decode_us": 760661,
+      "preprocess_us": 761256,
+      "wait_input_us": 21472,
+      "drain_us": 9,
+      "assemble_us": 13010,
+      "enc_pool_us": 10,
+      "enc_prep_us": 6388,
+      "enc_run_us": 206298,
+      "enc_extract_us": 163,
+      "enc_runs": 64,
+      "ms_per_item": 3.976
+    }
+  ],
+  "consistency_across_batches": [],
+  "db_vector_spot_check": {
+    "model_name": "cn-clip-vit-b16",
+    "checked": 32,
+    "max_abs_diff": 0.0,
+    "min_cosine": 0.9999999999999998,
+    "items": [
+      {
+        "item_id": 63686,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 65614,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 67815,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 69772,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 72352,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 74340,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 76416,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999998
+      },
+      {
+        "item_id": 78337,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 80260,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 82185,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 84385,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 86306,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 88227,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 90976,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 92897,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 94817,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 96740,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 98670,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 100590,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 102515,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 104555,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 106537,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 108538,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 110657,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 112621,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 115203,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0
+      },
+      {
+        "item_id": 119775,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 122206,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 124146,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 126378,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 0.9999999999999999
+      },
+      {
+        "item_id": 128670,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      },
+      {
+        "item_id": 130595,
+        "dim_db": 512,
+        "dim_worker": 512,
+        "max_abs_diff": 0.0,
+        "cosine": 1.0000000000000002
+      }
+    ]
+  },
+  "gpu_samples": [
+    {
+      "t": 1789614452.381,
+      "gpu_util_pct": 10.0,
+      "mem_used_mib": 1262.0,
+      "power_w": 39.03
+    },
+    {
+      "t": 1789614453.413,
+      "gpu_util_pct": 9.0,
+      "mem_used_mib": 1533.0,
+      "power_w": 67.84
+    },
+    {
+      "t": 1789614454.415,
+      "gpu_util_pct": 83.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 141.12
+    },
+    {
+      "t": 1789614455.425,
+      "gpu_util_pct": 80.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 196.75
+    },
+    {
+      "t": 1789614456.434,
+      "gpu_util_pct": 82.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 196.65
+    },
+    {
+      "t": 1789614457.447,
+      "gpu_util_pct": 85.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 195.67
+    },
+    {
+      "t": 1789614458.46,
+      "gpu_util_pct": 85.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 197.71
+    },
+    {
+      "t": 1789614459.462,
+      "gpu_util_pct": 85.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 197.27
+    },
+    {
+      "t": 1789614460.47,
+      "gpu_util_pct": 86.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 196.06
+    },
+    {
+      "t": 1789614461.478,
+      "gpu_util_pct": 83.0,
+      "mem_used_mib": 1542.0,
+      "power_w": 197.01
+    }
+  ],
+  "worker_log_tail": [
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=19 json=5278B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=19 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=241718 decode_us=577691 preprocess_us=710665 wait_input_us=11253 drain_us=5 assemble_us=11987 enc_pool_us=8 enc_prep_us=5315 enc_run_us=206216 enc_extract_us=133 enc_runs=64 ms_per_item=3.777",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=20 json=5278B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=20 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=244374 decode_us=693661 preprocess_us=771175 wait_input_us=15369 drain_us=5 assemble_us=11656 enc_pool_us=11 enc_prep_us=5502 enc_run_us=204250 enc_extract_us=143 enc_runs=64 ms_per_item=3.818",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=21 json=5278B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=21 items=64 ok=64 err=0 fail=0 groups=7 threads=20 wall_us=240653 decode_us=621289 preprocess_us=736591 wait_input_us=10587 drain_us=9 assemble_us=12657 enc_pool_us=8 enc_prep_us=5711 enc_run_us=204015 enc_extract_us=122 enc_runs=64 ms_per_item=3.760",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=22 json=5278B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=22 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=258359 decode_us=615489 preprocess_us=710589 wait_input_us=14987 drain_us=23 assemble_us=14793 enc_pool_us=13 enc_prep_us=8365 enc_run_us=211891 enc_extract_us=237 enc_runs=64 ms_per_item=4.037",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=23 json=5278B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=23 items=64 ok=64 err=0 fail=0 groups=7 threads=20 wall_us=241807 decode_us=863415 preprocess_us=679915 wait_input_us=12822 drain_us=5 assemble_us=11135 enc_pool_us=7 enc_prep_us=5665 enc_run_us=204741 enc_extract_us=127 enc_runs=64 ms_per_item=3.778",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=24 json=5278B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=24 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=242727 decode_us=641553 preprocess_us=727710 wait_input_us=14232 drain_us=6 assemble_us=12183 enc_pool_us=8 enc_prep_us=5414 enc_run_us=203003 enc_extract_us=141 enc_runs=64 ms_per_item=3.793",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=25 json=5278B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=25 items=64 ok=64 err=0 fail=0 groups=7 threads=20 wall_us=245382 decode_us=812915 preprocess_us=692799 wait_input_us=16790 drain_us=7 assemble_us=11180 enc_pool_us=9 enc_prep_us=5706 enc_run_us=204258 enc_extract_us=117 enc_runs=64 ms_per_item=3.834",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=26 json=5287B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=26 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=245671 decode_us=714332 preprocess_us=707841 wait_input_us=21765 drain_us=11 assemble_us=11026 enc_pool_us=10 enc_prep_us=4974 enc_run_us=199366 enc_extract_us=117 enc_runs=64 ms_per_item=3.839",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=27 json=5342B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=27 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=252555 decode_us=794280 preprocess_us=779880 wait_input_us=18961 drain_us=11 assemble_us=12917 enc_pool_us=11 enc_prep_us=6891 enc_run_us=204966 enc_extract_us=127 enc_runs=64 ms_per_item=3.946",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=28 json=5342B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=28 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=252687 decode_us=666124 preprocess_us=689430 wait_input_us=18812 drain_us=9 assemble_us=12777 enc_pool_us=19 enc_prep_us=5776 enc_run_us=207651 enc_extract_us=138 enc_runs=64 ms_per_item=3.948",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=29 json=5342B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=29 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=242965 decode_us=560131 preprocess_us=701355 wait_input_us=14751 drain_us=16 assemble_us=11650 enc_pool_us=10 enc_prep_us=6346 enc_run_us=206850 enc_extract_us=135 enc_runs=64 ms_per_item=3.796",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=30 json=5342B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=30 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=247707 decode_us=711985 preprocess_us=665425 wait_input_us=17135 drain_us=6 assemble_us=12233 enc_pool_us=6 enc_prep_us=5823 enc_run_us=204268 enc_extract_us=114 enc_runs=64 ms_per_item=3.870",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=31 json=5342B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=31 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=247067 decode_us=616042 preprocess_us=685008 wait_input_us=17100 drain_us=13 assemble_us=11345 enc_pool_us=11 enc_prep_us=5831 enc_run_us=204756 enc_extract_us=132 enc_runs=64 ms_per_item=3.860",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=32 json=5342B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=32 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=238663 decode_us=583372 preprocess_us=657463 wait_input_us=16148 drain_us=9 assemble_us=9798 enc_pool_us=14 enc_prep_us=5725 enc_run_us=203308 enc_extract_us=130 enc_runs=64 ms_per_item=3.729",
+      "fields": {}
+    },
+    {
+      "lvl": "debug",
+      "msg": "收到 Request req_id=33 json=5342B blob=0B",
+      "fields": {}
+    },
+    {
+      "lvl": "info",
+      "msg": "EMBED_PERF req=33 items=64 ok=64 err=0 fail=0 groups=6 threads=20 wall_us=254492 decode_us=760661 preprocess_us=761256 wait_input_us=21472 drain_us=9 assemble_us=13010 enc_pool_us=10 enc_prep_us=6388 enc_run_us=206298 enc_extract_us=163 enc_runs=64 ms_per_item=3.976",
+      "fields": {}
+    }
+  ],
+  "notes": [
+    "热缓存基线:ai_thumbs 已完整存在,不含 host 缺缓存现场派生(禁止与本机冷缓存端到端数直接 A/B)",
+    "worker 分段来自 batch.rs 的 opt-in EMBED_PERF 行(wall_us/decode_us/preprocess_us/wait_input_us/assemble_us/enc_*);decode/preprocess 为线程内求和,可超墙钟",
+    "驱动不启动 app、不写应用 DB;DB 以 mode=ro 打开",
+    "构建为 debug(opt0 本地 crate),与当前运行中的 dev 主程序一致;发布构建数值会更低"
+  ]
+}

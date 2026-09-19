@@ -285,7 +285,7 @@ mod mark_missing_tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         // 两个 scan_root + 各一目录（root1→dir10，root2→dir20）。
         c.execute_batch(

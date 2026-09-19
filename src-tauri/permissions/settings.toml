@@ -1,0 +1,18 @@
+# 设置统一入口的显式权限声明(2026-09-16 设置集中保存)。
+#
+# 为什么单独声明一条:这几个命令是本轮新增/语义变更的用户设置读写入口(见
+# src/ipc/config_commands.rs 的模块文档)。build.rs 依 registry.rs 生成的 allow-app-commands
+# 已覆盖它们在**本地窗口**下的调用,但那条是「全部 app 命令」的粗粒度兜底;把设置入口单独列出,
+# 使「谁能读写用户设置」在 ACL 层可见、可收窄(例如日后日志窗口若要禁写设置,只需不给它本条)。
+#
+# 说明:capability 的权限是并集,故本文件当前与 allow-app-commands 并存不冲突,只是把意图写明。
+
+[[permission]]
+identifier = "allow-settings-commands"
+description = "用户设置的统一入口:读取全量快照、批量提交、恢复默认设置,以及退出前的落盘回执。"
+commands.allow = [
+  "get_settings_snapshot",
+  "set_app_settings",
+  "clear_settings",
+  "settings_flush_done",
+]

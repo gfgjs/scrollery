@@ -95,6 +95,15 @@ opt-level = 2
 [profile.dev.package.ndarray]
 opt-level = 2
 
+# ── dev 本地推理核单独提速(2026-09-17 AI 分析吞吐线)─────────────────────────────────────────
+# dev 默认 opt-0 下,scrollery-ai-core 的 CLIP 预处理(CatmullRom 缩放 + 归一化循环)与
+# 输出搬运是 worker 供料侧的实测热点:2026-09-17 基线显示 preprocess 线程累计约 121-146ms/项
+# (20 解码线程),供料跟不上推理时主线程约 40-61% 的墙钟空等 wait_input。
+# 仅覆盖该 crate:worker 整包与其它本地 crate 保持 opt-0,换增量编译速度不退化;
+# 不改模型/算法/协议,数值结果按基线对拍逐位一致(max_abs_diff=0)。
+[profile.dev.package.scrollery-ai-core]
+opt-level = 2
+
 [profile.release]
 lto       = "thin"
 opt-level = 3

@@ -1,9 +1,10 @@
 <template>
   <!--
-    ⚠️ TWO-ROOT FRAGMENT — a sticky header + a collapsible body, with NO wrapping
-    element. This is load-bearing, do not "tidy" it into a single <div>.
-    ⚠️ 两根片段——一个粘性标题 + 一个可折叠主体，外层无包裹元素。这是承重设计，
-    请勿「整理」成单个 <div>。
+    ⚠️ MULTI-ROOT FRAGMENT — a sticky header + a collapsible body (+ a zero-height
+    flow marker, see below), with NO wrapping element. This is load-bearing, do not
+    "tidy" it into a single <div>.
+    ⚠️ 多根片段——一个粘性标题 + 一个可折叠主体（外加一个零高文档流标记，见下），
+    外层无包裹元素。这是承重设计，请勿「整理」成单个 <div>。
 
     Because component boundaries are transparent in the DOM, every section's
     header ends up a *direct child* of `.sidebar__scroll-area`. That is what lets
@@ -16,6 +17,12 @@
     （top + bottom 双向）的原因。若把 标题+主体 包进 <div>，会把每个标题的 sticky
     限制在该包裹元素内，导致标题只能在各自区块内粘住，破坏跨区块堆叠。
   -->
+  <!--
+    零高文档流标记:只用来报告标题的文档流位置(吸顶判据见 useSidebarSections)。
+    它是标题的兄弟节点,不是包裹元素,所以不影响上面那条 sticky 堆叠约束;
+    自身不参与粘性、不占高度,不改变任何布局与滚动数学。
+  -->
+  <div ref="flowRef" class="acc-flow-marker" aria-hidden="true"></div>
   <!-- 折叠开关是内部 <button>,而非整头 div——
        #actions 插槽里是真按钮,button 嵌 button 属非法 HTML(浏览器解析会拆散嵌套)。
        toggle flex:1 覆盖 actions 之外全部空白,原「点头部任意空白折叠」体感不变
@@ -75,7 +82,18 @@ const sections = useSidebarSections()
 const expanded = computed(() => sections.isExpanded(props.id))
 
 // 仅在挂载期间登记，使条件区块（通过 v-if 挂载）恰好在可见时参与粘性偏移——不留空档。
-onMounted(() => sections.register(props.id, props.order))
+onMounted(() => {
+  sections.register(props.id, props.order)
+  // 标记 + 标题 + 主体交给控制器做吸顶判定（玻璃模式据此决定是否补局部衬底；
+  // 主体高度变化——折叠动画、树异步展开——会挪动下方标题，由控制器复判）。
+  if (flowRef.value && headerRef.value && bodyRef.value) {
+    sections.registerSticky(props.id, {
+      marker: flowRef.value,
+      header: headerRef.value,
+      body: bodyRef.value,
+    })
+  }
+})
 onUnmounted(() => sections.unregister(props.id))
 
 const index = computed(() => {
@@ -110,6 +128,7 @@ function onAfterEnter(el: Element) {
 
 const headerRef = ref<HTMLElement | null>(null)
 const bodyRef = ref<HTMLElement | null>(null)
+const flowRef = ref<HTMLElement | null>(null)
 
 // 主体在滚动内容坐标系中的几何量 + 上下粘性堆叠 inset,供揭示判定/揭示滚动共用一套数字。
 // 主体非 sticky,rect 反映真实文档流位置(标题的 rect 是钉住后的视觉位置,不可用)。
@@ -203,6 +222,11 @@ function onLeave(el: Element) {
 
 /* ── Sticky header ─────────────────────────────────────────────────────────
    双向粘性：滚出顶部时粘顶、滚出底部时粘底，按 index 堆叠互不遮挡。 */
+/* 吸顶判据的位置基准:非 sticky,恒在文档流原位。零高块盒 ⇒ 不改变布局,也不会被
+   sticky 挪动;绝不可改成 display:none/contents——那样就没有 rect,判据失去基准。 */
+.acc-flow-marker {
+  height: 0;
+}
 .acc-header {
   position: sticky;
   z-index: 10;

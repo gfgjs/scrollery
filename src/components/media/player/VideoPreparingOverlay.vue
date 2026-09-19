@@ -197,12 +197,12 @@ function onCancelledRetryClick(): void {
   max-width: 360px;
   padding: var(--spacing-lg) var(--spacing-xl);
   border-radius: var(--radius-xl);
-  border: 1px solid var(--material-recipe-float-border-color);
-  background: var(--material-recipe-float-background-color);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg-elevated);
   text-align: center;
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .vpo-title {

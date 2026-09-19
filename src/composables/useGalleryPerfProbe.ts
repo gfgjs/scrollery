@@ -3,7 +3,7 @@ import { summarizeFrames } from './galleryPerfProbe.helpers'
 
 /**
  * 画廊性能探针(dev 门控)。仅当 localStorage['scrollery.debug.perfProbe'] 为真时激活;
- * 关闭时**立即 return、不注册任何 watch/监听** —— 生产零开销(镜像 useVirtualScroll 的
+ * 关闭时**立即 return、不注册任何 watch/监听** —— 生产零开销(镜像引擎的
  * scrollery.debug.safeMax dev-flag 惯例)。
  *
  * 采三项基线(对应 docs/designs/2026-07-09-画廊极密网格渲染方案.md §1.1 三根因):

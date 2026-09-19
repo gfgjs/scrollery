@@ -75,29 +75,6 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
-      # Part7-T11/§3.6.5⑤ 第四面:渠道依赖树断言(cargo tree 只解析不编译,秒级)。
-      # Store 渠道树不得含 updater;direct 树必须仍含(反向守卫防误删)。
-      # 组合「编译」验证在本地施工时实证,T16 商业流水线建成后随矩阵常态化。
-      # 🔴 herestring 而非管道(2026-07-04 首跑实证):GitHub 的 shell:bash 注入 pipefail,
-      #    「echo 大文本 | grep -q」在 grep 命中早退时上游收 SIGPIPE(141)→ 管道整体非零——
-      #    正向断言(期望命中)被误判失败;反向的 forbidden 扫描则可能真命中被静默放行。
-      #    竞态取决于管道缓冲/调度,本地无 pipefail 或缓冲更大即跑不出。herestring 是重定向,
-      #    无管道无竞态;$( ) 捕获亦保 set -e 对上游失败仍生效。
-      - name: 渠道依赖树断言(updater 物理排除)
-        run: |
-          for ch in channel-msstore channel-steam; do
-            tree=$(cargo tree -p scrollery -e normal --no-default-features --features "custom-protocol,lite,$ch" --locked)
-            if grep -q "tauri-plugin-updater" <<< "$tree"; then
-              echo "::error::tauri-plugin-updater 泄入 $ch 依赖树(Part7 §3.6.2 红线)"; exit 1
-            fi
-          done
-          tree=$(cargo tree -p scrollery -e normal --locked)
-          if ! grep -q "tauri-plugin-updater" <<< "$tree"; then
-            echo "诊断:direct 树共 $(grep -c "" <<< "$tree") 行,未见 tauri-plugin-updater"
-            echo "::error::direct 依赖树意外丢失 tauri-plugin-updater(updater 能力被误删?)"; exit 1
-          fi
-          echo "✓ 渠道依赖树断言过:store 渠道零 updater;direct 树含 updater"
-
       # G3 发行前置:NOTICE 归属清单新鲜度门——lockfile 变更未重生成 NOTICE.md 即红。
       # 脚本零依赖(node 内置模块,windows runner 自带 node);cargo tree 只解析不编译,秒级。
       - name: NOTICE 归属清单新鲜度(generate-notice --check)
@@ -177,13 +154,11 @@ jobs:
         run: node scripts/check-exotic-protocol-sync.mjs
 
       # 主题对比度门(2026-07-10 审查 B17 后半):a44436b 扩到 21 组的 WCAG 硬门槛此前只有
-      # 手跑路径,主题 CSS 回归可静默入库(「门禁落地须接门控」纪律)。纯静态读 CSS,秒级。
+      # 手跑路径,主题 CSS 回归可静默入库(「门禁落地须接门控」纪律)。
+      # 2026-09-16 主题配色重构后色板的唯一真源是 src/themes/generate.ts,脚本直接 import 它
+      # (零算法复制),故必须经 vite-node 跑 TS——纯 node 解析不了 TS 导入。
       - name: 主题对比度门禁(check-theme-contrast)
-        run: node scripts/check-theme-contrast.mjs
-
-      # B1:主题中性层/accent/status 由静态锚点生成,防止六份 CSS 手改后派生角色漂移。
-      - name: 主题色板锚点门禁(check-theme-palette)
-        run: node scripts/generate-theme-palette.mjs --check
+        run: npm run check:contrast
 
       # R2-3:存量 33 lint 错清零后开硬门(含 R1-7 的 vue/no-bare-strings-in-template i18n 防回潮规则)。
       - name: ESLint
@@ -195,13 +170,13 @@ jobs:
       - name: vitest 单元测试
         run: npm test
 
-      # Part7-T11/§3.6.5⑤ 前三面:conf/capability/dist 渠道合规扫描。
+      # Part7 §3.6.5⑤:conf/capability/dist 发布合规扫描(updater 块只许住 direct 发布 overlay)。
       # 🔴 必须扫 minify 后生产 bundle(原型实证:未 minify 的 if(false) 死块函数名残留会误报);
       # 脚本启动先跑内置 selftest(正反样本),防扫描器退化成只会 PASS 的空壳。
       - name: vite build(生产 bundle)
         run: npm run build
 
-      - name: 渠道合规扫描(verify-channel-bundle)
+      - name: 发布合规扫描(verify-channel-bundle)
         run: node scripts/verify-channel-bundle.mjs
 
   # ── Part7-T1 开机冒烟(§3.1.6)——只在 release tag / 手动 dispatch 上跑 ──────────────

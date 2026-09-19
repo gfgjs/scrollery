@@ -693,10 +693,12 @@ import {
 } from '@lucide/vue'
 import { IPC } from '../constants/ipc'
 import { invokeIpc } from '../utils/ipc'
+import { readSetting, writeSettings } from '../stores/settingsPersistence'
+import { readSettingEnum } from '../composables/settingsValues'
 import { useToastStore } from '../stores/toastStore'
 import { useUiStore } from '../stores/uiStore'
-import { getTheme } from '../themes/registry'
-import { normalizeReaderThemeId, READER_THEME_FOLLOW } from '../themes/readerThemes'
+import { useThemeStore } from '../stores/themeStore'
+import { READER_THEME_FOLLOW } from '../themes/readerThemes'
 import { usePager, type PagerMode } from '../composables/usePager'
 import { useToolbarOverflow } from '../composables/useToolbarOverflow'
 import UiPopover from '../components/ui/UiPopover.vue'
@@ -750,20 +752,31 @@ const error = ref('')
 const initialPos = ref<string | null>(null)
 const pageInfo = ref<{ page: number; pages: number } | null>(null)
 const readerRef = ref<ReaderApi | null>(null)
-const pagerMode = ref<PagerMode>('scroll')
+// 三项阅读模式偏好(存中央设置):初值取权威快照,缺键回落各自默认;下方 watch 随快照变化应用。
+const PAGER_MODE_KEY = 'doc_pager_mode'
+const READER_FLOW_KEY = 'doc_reader_flow'
+const STYLE_MODE_KEY = 'doc_epub_style_mode'
+/** 取值候选集(schema 已限定枚举;此处仅用于快照未到/异常文本时的回落判定)。 */
+const PAGER_MODES = ['scroll', 'wheel-snap', 'keyboard'] as const
+const READER_FLOWS = ['paginated', 'scrolled'] as const
+const STYLE_MODES = ['book', 'reader'] as const
+const pagerMode = ref<PagerMode>(readSettingEnum(PAGER_MODE_KEY, PAGER_MODES, 'scroll'))
 // foliate 阅读流（txt/epub）：翻页 / 滚动。运行时切换不 remount（不进 readerKey），由 BookReader watch 施加。
-const readerFlow = ref<'paginated' | 'scrolled'>('paginated')
+const readerFlow = ref<'paginated' | 'scrolled'>(
+  readSettingEnum(READER_FLOW_KEY, READER_FLOWS, 'paginated'),
+)
 // 护栏态(2026-07-17):BookReader 检出超限单片强制 scrolled → 本层提示一次 + 禁用流切换。换文档复位。
 const flowForced = ref(false)
 // epub 排版模式：'book' 自带（书样式胜出，默认，零回归）/ 'reader' 智能（阅读器排版覆盖）。仅 epub 有意义。
-const styleMode = ref<'book' | 'reader'>('book')
+const styleMode = ref<'book' | 'reader'>(readSettingEnum(STYLE_MODE_KEY, STYLE_MODES, 'book'))
 // 阅读主题（R3）：日/夜两槽全局选择（reader theme id 或 FOLLOW，默认 FOLLOW=跟随应用零回归）。
 const readerThemeLight = ref(READER_THEME_FOLLOW)
 const readerThemeDark = ref(READER_THEME_FOLLOW)
-// app 当前是否暗色：决定阅读主题选择器编辑/展示哪一槽（注册表 kind 权威，异常回落 light）。
+// app 当前是否暗色:决定阅读主题选择器编辑/展示哪一槽(主题 store 的有效模式权威)。
 const ui = useUiStore()
+const theme = useThemeStore()
 const viewer = useViewerStore()
-const appIsDark = computed(() => getTheme(ui.resolvedThemeId)?.kind === 'dark')
+const appIsDark = computed(() => theme.isDark)
 // 自动翻页（R4）：开关（每会话瞬态，换书重置）+ 间隔秒（全局持久化，设置面板调）。
 const autoScroll = ref(false)
 const readerAutoScrollSec = ref(5)
@@ -1167,16 +1180,15 @@ async function openExternal() {
   if (detail.value) await shellOpen(detail.value.absPath).catch(() => {})
 }
 
+// 三项阅读模式偏好存中央设置(config.toml);写盘失败由中央服务统一提示,此处 catch 只为收掉 promise。
 function savePagerMode() {
-  invokeIpc(IPC.SET_APP_CONFIG, { key: 'doc_pager_mode', value: pagerMode.value }).catch(() => {})
+  writeSettings({ [PAGER_MODE_KEY]: pagerMode.value }).catch(() => {})
 }
 function saveReaderFlow() {
-  invokeIpc(IPC.SET_APP_CONFIG, { key: 'doc_reader_flow', value: readerFlow.value }).catch(() => {})
+  writeSettings({ [READER_FLOW_KEY]: readerFlow.value }).catch(() => {})
 }
 function saveStyleMode() {
-  invokeIpc(IPC.SET_APP_CONFIG, { key: 'doc_epub_style_mode', value: styleMode.value }).catch(
-    () => {},
-  )
+  writeSettings({ [STYLE_MODE_KEY]: styleMode.value }).catch(() => {})
 }
 
 // 沉浸态代理 + Esc 分层退出（composable；window keydown 监听器仍由本文件 onMounted/onBeforeUnmount
@@ -1199,40 +1211,29 @@ useDocActiveViewerSync({
   viewer,
 })
 
-// 初始化翻页模式 / 阅读流 / 排版模式 / 自动翻页速率 / 阅读主题日夜槽（持久化），并随路由 id 变化
-// 重载文档。排版全参数（10 项）的启动引导已随 useReaderTypography 内建，不在此重复。
-invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_pager_mode' })
-  .then((v) => {
-    if (v === 'scroll' || v === 'wheel-snap' || v === 'keyboard') pagerMode.value = v
-  })
-  .catch(() => {})
-invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_reader_flow' })
-  .then((v) => {
-    if (v === 'paginated' || v === 'scrolled') readerFlow.value = v
-  })
-  .catch(() => {})
-invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_epub_style_mode' })
-  .then((v) => {
-    if (v === 'book' || v === 'reader') styleMode.value = v
-  })
-  .catch(() => {})
-invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_reader_autoscroll_sec' })
-  .then((v) => {
-    const n = Number(v)
-    if (Number.isFinite(n) && n >= 2 && n <= 30) readerAutoScrollSec.value = Math.round(n)
-  })
-  .catch(() => {})
-// 阅读主题日/夜槽（R3）：归一化挡跨槽误存/已卸载主题（回落 FOLLOW），不产生无色变量。
-invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_reader_theme_light' })
-  .then((v) => {
-    readerThemeLight.value = normalizeReaderThemeId(v, 'light')
-  })
-  .catch(() => {})
-invokeIpc<string | null>(IPC.GET_APP_CONFIG, { key: 'doc_reader_theme_dark' })
-  .then((v) => {
-    readerThemeDark.value = normalizeReaderThemeId(v, 'dark')
-  })
-  .catch(() => {})
+// 翻页模式 / 阅读流 / 排版模式随权威快照应用(启动水合、恢复默认、外部改文件):只应用,不写回。
+// 自动翻页速率与阅读主题日夜槽的水合已随 useReaderTypography 内建(同一份设置来源),不在此重复。
+// 勾选/下拉的用户改动经 saveXxx 显式提交,故本组 watch 不会与写盘互激。
+watch(
+  () => readSetting(PAGER_MODE_KEY),
+  () => {
+    pagerMode.value = readSettingEnum(PAGER_MODE_KEY, PAGER_MODES, 'scroll')
+  },
+)
+watch(
+  () => readSetting(READER_FLOW_KEY),
+  () => {
+    readerFlow.value = readSettingEnum(READER_FLOW_KEY, READER_FLOWS, 'paginated')
+  },
+)
+watch(
+  () => readSetting(STYLE_MODE_KEY),
+  () => {
+    styleMode.value = readSettingEnum(STYLE_MODE_KEY, STYLE_MODES, 'book')
+  },
+)
+
+// 随路由 id 变化重载文档。排版全参数（14 项）的启动引导已随 useReaderTypography 内建，不在此重复。
 
 watch(id, load, { immediate: true })
 

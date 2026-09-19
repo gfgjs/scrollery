@@ -19,7 +19,6 @@ export interface GalleryKeyboardDeps {
   selectionDescriptor: () => BackendSelectionDescriptor
   patchVisibleSelected: (apply: (item: LayoutRowItem) => void) => void
   compute: (width?: number) => Promise<void>
-  updateVisible: (force?: boolean) => Promise<void>
   /** §8.1 browse-only 谓词:重复镜头激活时旁路 document 级选择语义（宿主从 duplicateLensStore 注入）。 */
   lensActive: () => boolean
 }
@@ -100,7 +99,6 @@ export function useGalleryKeyboard(deps: GalleryKeyboardDeps) {
               // 「≥N 星」筛选激活且批量评分跌破阈值 → 这些项应离开视图，重算。
               if (filter.minRating > 0 && rating < filter.minRating) {
                 await deps.compute()
-                deps.updateVisible()
               }
             })
             .catch((err) => {

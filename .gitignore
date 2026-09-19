@@ -87,9 +87,11 @@ src-tauri/binaries/
 # 有意不入库:一次 18 张 ~9MB 的**可再生**证据,脚本才是耐久资产;入库等于用仓库体积换一份
 # 立刻过期的快照(且它不是基线——本仓有意不做 pixel-diff 门,理由见脚本顶部注释)。
 .screenshots/
-# worklog-kit 生成物不入库(C-3)
-.worklog/generated/
 
 # 仅本机的调研/临时工作区(会话产物,可随时删除)。
 # 双重防线:此处不入库(故 git archive 也取不到),scripts/publish-oss.ps1 的排除表另有一份。
 .research-tmp/
+
+# AI 分析吞吐优化基准的 opt0 基线可执行文件(15MB,本机构建产物、可再生,不入库)。
+# 归档目录整体随 docs 改名入库,唯独此 exe 仅留本机,避免用仓库体积换一次性证据。
+/.docs-废弃-归档-禁止读取/planning/2026-09-17-AI分析吞吐优化/artifacts/ai-worker-opt0-baseline.exe

@@ -102,17 +102,17 @@ useFocusTrap(overlayEl, () => props.open)
    此处仅补齐全局尚未覆盖的 header/title/关闭键/body/footer——它们此前在各对话框 scoped 里重复。 */
 .dialog-overlay {
   background: var(--color-bg-overlay);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .dialog-content {
-  background-color: var(--material-recipe-float-background-color);
-  border-color: var(--material-recipe-float-border-color);
+  background-color: var(--color-bg-elevated);
+  border-color: var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   animation: ui-dialog-slide var(--duration-normal) var(--ease-out);
 }
 
@@ -134,7 +134,7 @@ useFocusTrap(overlayEl, () => props.open)
 
 .dialog-header {
   padding: var(--spacing-md) var(--spacing-lg);
-  border-bottom: 1px solid var(--material-recipe-float-border-color);
+  border-bottom: 1px solid var(--color-border-strong);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -182,7 +182,7 @@ useFocusTrap(overlayEl, () => props.open)
 
 .dialog-footer {
   padding: var(--spacing-md) var(--spacing-lg);
-  border-top: 1px solid var(--material-recipe-float-border-color);
+  border-top: 1px solid var(--color-border-strong);
   background: transparent;
   display: flex;
   justify-content: flex-end;
@@ -191,11 +191,11 @@ useFocusTrap(overlayEl, () => props.open)
 
 /* 显式 float 标记保留给既有消费方；基座默认已采用同一材质，避免新旧调用方出现两套表面。 */
 .dialog-content--float {
-  background-color: var(--material-recipe-float-background-color);
-  border-color: var(--material-recipe-float-border-color);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  background-color: var(--color-bg-elevated);
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 .dialog-content--float .dialog-footer {
   background: transparent;

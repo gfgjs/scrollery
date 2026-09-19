@@ -806,7 +806,7 @@ mod tests {
 
     /// 建库 + 插入 root/dir/media(psd) + 播种 thumbnail 任务。返回 (item_id, cache_key)。
     fn setup_db(conn: &Connection) -> (i64, i64) {
-        crate::db::migration::run_migrations(conn).unwrap();
+        crate::db::schema::initialize_schema(conn).unwrap();
         conn.execute(
             "INSERT INTO scan_roots (path, alias) VALUES (?1, 'r')",
             rusqlite::params![std::env::temp_dir().to_string_lossy().to_string()],
@@ -1150,7 +1150,7 @@ mod tests {
         std::fs::write(root.join("synthetic.psd"), make_rgb_psd(300, 200)).unwrap();
 
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
         conn.execute(
             "INSERT INTO scan_roots (path, alias) VALUES (?1, 'r')",
             rusqlite::params![root.to_string_lossy().to_string()],

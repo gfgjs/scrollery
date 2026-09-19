@@ -3,8 +3,8 @@
 //!
 //! 本叶 crate 只持**抽象与 DTO**：`EntitlementProvider`（授权真相数据源 trait）+ `LicenseStatus`
 //! （授权态）+ `LicenseError`（验签/授权错误）。**无任何密钥材料、无门控逻辑**——抽象本身不构成
-//! 授权能力，实现恒住宿主 `src-tauri/src/exotic/`：直销 keyring 实现（`KeyringLicenseStore`）、
-//! 未授权回退桩（`FreeStubEntitlement`）、渠道骨架桩（msstore/steam）。
+//! 授权能力，实现恒住宿主 `src-tauri/src/exotic/`：直销 keyring 实现（`KeyringLicenseStore`）
+//! 与未授权回退桩（`FreeStubEntitlement`）。
 //!
 //! 单向依赖图（无环，§3.9.1a 实证）:`plugin-api`（叶）← `exotic-trust` / `src-tauri`。
 
@@ -82,28 +82,6 @@ impl LicenseError {
     }
 }
 
-/// 激活成功结果（Part0 §9.1 / Part6 §3.8 的 `ActivationInfo`）。
-///
-/// 刻意**不**携带 `LicensePayload`——其 `subject_hash` 按 §5.2 不得跨 IPC 下发；投影在 trait
-/// 边界完成，消费者（IPC 命令层）拿到的即是可安全外传的最小集。
-///
-/// `enc_seed`：direct 渠道后续用于派生 worker 权重解密密钥（④ AES，当前后置未实现，恒 `None`）；
-/// ms_store / steam 渠道按设计恒 `None`（worker 内置、无 AES 解密，Part8 §3.4）。
-#[derive(Clone, PartialEq, Eq)]
-pub struct ActivationInfo {
-    pub enc_seed: Option<String>,
-}
-
-/// `enc_seed` 是密钥派生材料——`Debug` 只暴露存在性，防日志 / panic 输出泄露
-/// （对齐 exotic-trust `LicensePayload` 的脱敏惯例）。
-impl std::fmt::Debug for ActivationInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ActivationInfo")
-            .field("enc_seed", &self.enc_seed.as_ref().map(|_| "<redacted>"))
-            .finish()
-    }
-}
-
 /// 授权真相数据源抽象（Part6 §3.8：由原 `LicenseSource` 升格而来）。
 ///
 /// 宿主（含 `ExoticHost`）经 `Arc<dyn EntitlementProvider>` 持有：读路径走 `evaluate`、写路径走
@@ -117,25 +95,26 @@ pub trait EntitlementProvider: Send + Sync {
     /// 评估 `(plugin_id, sku)` 在 `now`（unix 秒）的授权态。
     fn evaluate(&self, plugin_id: &str, sku: &str, now: i64) -> LicenseStatus;
 
-    /// 渠道 / 来源标识（当前 `"direct"`（keyring 直销）/ `"free"`（开源桩）;后续多渠道扩
-    /// `"ms_store"` / `"steam"`）。供前端 gate 展示与诊断;**不**参与授权判定本身。
+    /// 渠道 / 来源标识（`"direct"`（keyring 直销）/ `"free"`（未授权回退桩））。供前端 gate
+    /// 展示与诊断;**不**参与授权判定本身。
     fn source_tag(&self) -> &'static str;
 
-    /// 激活：验证 `credential`（direct = Ed25519 token；store / steam = 平台收据）并持久化授权。
+    /// 激活：验证 `credential`（direct = Ed25519 token）并持久化授权。
     ///
     /// **调用方契约（§5.2 / §6.6）**：`plugin_id` / `sku` **必须**取自可信 Catalog，绝不取自前端
     /// 输入或 credential 自身；实现方失败时**不得**覆盖既有有效授权。错误经 `code()` 跨边界，
-    /// 绝不含 token / 密钥材料。
+    /// 绝不含 token / 密钥材料。授权凭据止步于实现层：`LicensePayload`（含 `subject_hash`）
+    /// 不向消费者投影（§5.2）。
     ///
     /// 默认实现 fail-closed（`ActivationUnsupported`）——只读 provider（测试桩 / 免费桩）不覆写
-    /// 即天然安全；真实渠道（direct / ms_store / steam）必须覆写。
+    /// 即天然安全；真实渠道（direct）必须覆写。
     fn activate(
         &self,
         _plugin_id: &str,
         _sku: &str,
         _credential: &str,
         _now: i64,
-    ) -> Result<ActivationInfo, LicenseError> {
+    ) -> Result<(), LicenseError> {
         Err(LicenseError::ActivationUnsupported)
     }
 
@@ -175,20 +154,6 @@ mod tests {
         for (err, code) in cases {
             assert_eq!(err.code(), *code, "错误码必须稳定：{err:?}");
         }
-    }
-
-    /// enc_seed 是密钥派生材料，Debug 输出必须脱敏（防日志 / panic 泄露）。
-    #[test]
-    fn activation_info_debug_redacts_enc_seed() {
-        let info = ActivationInfo {
-            enc_seed: Some("top-secret-seed".into()),
-        };
-        let dbg = format!("{info:?}");
-        assert!(
-            !dbg.contains("top-secret-seed"),
-            "Debug 不得输出 enc_seed 明文"
-        );
-        assert!(dbg.contains("redacted"), "Debug 应标示脱敏占位");
     }
 
     /// trait 默认实现 fail-closed：只读 provider 不覆写 activate 也绝不放行授权写入。

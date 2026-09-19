@@ -8,7 +8,7 @@
 //! 真实入口（R3）：`thumbnail_commands.rs` 只有 `batch_request_thumbnails` 与
 //! `start_full_thumbnail_generation` 两个命令，各自「查缓存 → needs_gen → 生成」。Router 接在
 //! **这两处的 needs_gen 过滤点**：命中未完成 `Exotic` 即不入 needs_gen——既不调
-//! `generate_thumbnail`/`decode_media_step`/`process_deferred_cpu`，也不写 `thumb_status=2`。
+//! `decode_media_step`/`process_deferred_cpu`，也不写 `thumb_status=2`。
 
 use crate::exotic::{Capability, ExoticTaskStatus, FormatResolution};
 

@@ -14,8 +14,8 @@ use crate::db::queries::{
 use crate::dedup::hash::DEDUP_HASH_VERSION;
 use crate::error::{AppError, Result};
 use crate::layout::cache::{
-    dedup_summary, get_rows, get_summary, get_view_ids as cache_view_ids, store_layout_with_lens,
-    LayoutCache, LayoutSummary,
+    dedup_summary, get_rows_by_y, get_summary, get_view_ids as cache_view_ids,
+    store_layout_with_lens, LayoutCache, LayoutSummary,
 };
 use crate::layout::geometry::{median_measured_aspect, HydratedRow, LayoutParams, LayoutRow};
 use crate::layout::grid_pack::compute_grid_layout;
@@ -958,25 +958,6 @@ fn ensure_layout_unchanged(layout_cache: &LayoutCache, expected: Option<u64>) ->
     Ok(())
 }
 
-/// 从内存缓存中获取布局行的切片。
-#[tauri::command]
-pub async fn get_layout_rows(
-    start_row: usize,
-    end_row: usize,
-    layout_version: Option<u64>,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<HydratedRow>> {
-    // Scrolling = active interaction → throttle background decode (布局被视频派生阻塞).
-    // 滚动 = 主动交互 → 节流后台解码。
-    state.note_interaction();
-    // S3 出口拼装：瘦行几何 + items 取数缓存载荷 → 线上行（两把锁先后独立取放，不重叠）。
-    // 镜头投影先短读锁取 Arc（普通画廊 = None），与 items 读锁不重叠。
-    let rows = get_rows(&state.layout_cache, start_row, end_row, layout_version)
-        .ok_or(AppError::LayoutNotReady)?;
-    let lens = crate::layout::cache::get_lens_projection(&state.layout_cache);
-    hydrate_visible(state.inner(), rows, lens, layout_version).await
-}
-
 /// 从内存缓存中获取与 [top_y, bottom_y] 相交的布局行的切片。
 #[tauri::command]
 pub async fn get_layout_rows_by_y(
@@ -988,9 +969,8 @@ pub async fn get_layout_rows_by_y(
     // Scrolling = active interaction → throttle background decode (布局被视频派生阻塞).
     // 滚动 = 主动交互 → 节流后台解码。
     state.note_interaction();
-    let rows =
-        crate::layout::cache::get_rows_by_y(&state.layout_cache, top_y, bottom_y, layout_version)
-            .ok_or(AppError::LayoutNotReady)?;
+    let rows = get_rows_by_y(&state.layout_cache, top_y, bottom_y, layout_version)
+        .ok_or(AppError::LayoutNotReady)?;
     let lens = crate::layout::cache::get_lens_projection(&state.layout_cache);
     hydrate_visible(state.inner(), rows, lens, layout_version).await
 }
@@ -1012,18 +992,6 @@ pub async fn get_bucket_rows(
             .ok_or(AppError::LayoutNotReady)?;
     let lens = crate::layout::cache::get_lens_projection(&state.layout_cache);
     hydrate_visible(state.inner(), rows, lens, layout_version).await
-}
-
-/// 通过分组 id（唯一目录 id）查找分隔符行的 Y 坐标。
-#[tauri::command]
-pub async fn get_separator_y_by_group_id(
-    group_id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Option<f64>> {
-    Ok(crate::layout::cache::get_separator_y_by_group_id(
-        &state.layout_cache,
-        &group_id,
-    ))
 }
 
 /// 查找包含给定项 id 的行的 Y 坐标（用于行高重排后把视口重新锚定到之前浏览的项 — 问题1）。

@@ -350,7 +350,6 @@ describe('按批 slot 判定', () => {
 describe('targetSize 阶梯(THUMB_SIZE_TIERS 首个 ≥ rowHeight,超界回退末档)', () => {
   it.each([
     [200, 256],
-    [64, 64],
     [512, 512],
     [1200, 1024],
   ])('gridRowHeight=%i → targetSize=%i', async (rowHeight, expected) => {

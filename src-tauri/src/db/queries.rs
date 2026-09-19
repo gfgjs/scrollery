@@ -17,7 +17,6 @@ mod media;
 mod metadata;
 mod move_journal;
 mod scan;
-mod search;
 mod storage;
 mod thumbnail;
 
@@ -35,6 +34,5 @@ pub use media::*;
 pub use metadata::*;
 pub use move_journal::*;
 pub use scan::*;
-pub use search::*;
 pub use storage::*;
 pub use thumbnail::*;

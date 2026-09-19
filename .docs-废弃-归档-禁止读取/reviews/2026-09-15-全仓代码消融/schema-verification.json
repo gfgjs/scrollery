@@ -1,0 +1,16 @@
+{
+  "source": "src-tauri/src/db/schema.rs CURRENT_SCHEMA",
+  "baseline": "V1-V33 applied to empty database, captured schema-before.json",
+  "allowed_changes": [
+    "scan_roots.backend_id column and its storage_backends FK removed",
+    "exotic_plugins.entitlement_source column removed",
+    "settings seeds removed; schema marker 34; four system albums retained"
+  ],
+  "table_count": 33,
+  "explicit_index_count": 37,
+  "index_definition_check": "All 37 token sequences match including UNIQUE, columns/order, expressions and WHERE predicates; whitespace only ignored",
+  "index_differences": [],
+  "runtime_evidence": "final main crate lib: 1293 passed / 0 failed / 9 ignored; includes 5 current-schema tests and backup tests",
+  "source_commit": "31cab793934ec8fa1b634414fee00a0229d07bd7",
+  "column_and_foreign_key_check": "Actual source DDL compared to baseline metadata for all 33 tables: equal after the two declared column removals and scan_roots.backend_id FK removal; cid/FK numeric positions normalized after deletion."
+}

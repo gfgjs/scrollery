@@ -26,7 +26,6 @@ pub mod proofread_commands;
 pub mod registry;
 pub mod reveal;
 pub mod scan_commands;
-pub mod search_commands;
 pub mod storage_commands;
 pub mod system_commands;
 pub mod thumbnail_commands;

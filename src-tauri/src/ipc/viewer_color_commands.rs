@@ -169,14 +169,43 @@ pub async fn list_icc_profiles(state: State<'_, Arc<AppState>>) -> Result<Vec<Ic
 
 /// 删除自定义 ICC profile(连带派生子树;若为当前选中则复位 config 至 srgb)。
 #[tauri::command]
-pub async fn delete_icc_profile(profile_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
+pub async fn delete_icc_profile(
+    app: tauri::AppHandle,
+    profile_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<()> {
     if is_mobile!() {
         return Err(unsupported_platform());
     }
+    // 代次在**操作开始时**读取:删除文件是耗时工作,期间若发生「恢复默认设置」,本操作携带的旧代次
+    // 会被统一入口拒绝,不会把「删除前看到的选择」回灌进已重置的配置(耗时操作后回读新代次再灌旧
+    // 意图是明确禁止的)。
+    let generation = state.config.generation();
     let state_arc = state.inner().clone();
-    tokio::task::spawn_blocking(move || delete_icc_blocking(&state_arc, &profile_id))
+    let deleted = tokio::task::spawn_blocking({
+        let state_arc = Arc::clone(&state_arc);
+        let profile_id = profile_id.clone();
+        move || delete_icc_blocking(&state_arc, &profile_id)
+    })
         .await
-        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
+
+    // 删除的恰是当前选中的 profile:复位为「不派生」——viewer_color_target 回 srgb、
+    // viewer_color_custom_id 回默认空串(等价于原先的 reset_key)。经统一入口提交,故与其他设置写入
+    // 串行、只写一次盘,并带操作开始时的代次。失败仅告警:文件已删,resolve_profile 会返
+    // icc_not_found,前端自然回退直显原图(与改动前同姿态)。
+    if deleted.needs_config_reset {
+        let patch = std::collections::BTreeMap::from([
+            ("viewer_color_target".to_string(), "srgb".to_string()),
+            ("viewer_color_custom_id".to_string(), String::new()),
+        ]);
+        if let Err(e) =
+            crate::config::settings::submit_settings_patch(&app, &state_arc, patch, generation).await
+        {
+            tracing::warn!("删除当前 ICC 后复位渲染色域配置失败(文件已删): {e}");
+        }
+    }
+    Ok(())
 }
 
 // ── 阻塞实现(spawn_blocking 内)────────────────────────────────────────────────
@@ -340,7 +369,16 @@ fn delete_profile_files(app_data_dir: &Path, cache_dir: &Path, profile_id: &str)
     Ok(())
 }
 
-fn delete_icc_blocking(state: &AppState, profile_id: &str) -> Result<()> {
+/// 删除结果:是否需要把渲染色域配置复位(删的正是当前选中的 profile)。
+///
+/// 为什么把「是否需要复位」回传给调用方而不是就地写配置:配置写入必须经过统一设置入口(串行门 +
+/// 一次批量写盘 + 广播),而本函数运行在 `spawn_blocking` 的同步上下文里、无法 await 那道门。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeleteOutcome {
+    needs_config_reset: bool,
+}
+
+fn delete_icc_blocking(state: &AppState, profile_id: &str) -> Result<DeleteOutcome> {
     let cache_dir = state
         .thumb_config
         .read()
@@ -349,17 +387,10 @@ fn delete_icc_blocking(state: &AppState, profile_id: &str) -> Result<()> {
         .clone();
     delete_profile_files(&state.app_data_dir, &cache_dir, profile_id)?;
 
-    // 若删的恰是当前选中 profile,后端复位 target=srgb、清 custom_id(best-effort:写失败仅告警,
-    // 此时文件已删 → resolve_profile 会返 icc_not_found → 前端自然回退直显原图)。
-    if state.config.get("viewer_color_custom_id").as_deref() == Some(profile_id) {
-        if let Err(e) = state.config.set_and_persist("viewer_color_target", "srgb") {
-            tracing::warn!("删除当前 ICC 后复位 viewer_color_target 失败: {e}");
-        }
-        if let Err(e) = state.config.reset_key("viewer_color_custom_id") {
-            tracing::warn!("删除当前 ICC 后清 viewer_color_custom_id 失败: {e}");
-        }
-    }
-    Ok(())
+    // 只判断是否需要复位,复位本身由调用方经统一入口提交(见 DeleteOutcome 文档)。
+    Ok(DeleteOutcome {
+        needs_config_reset: state.config.get("viewer_color_custom_id").as_deref() == Some(profile_id),
+    })
 }
 
 #[cfg(test)]

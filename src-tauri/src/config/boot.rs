@@ -3,13 +3,9 @@
 //!
 //! 自 `lib.rs::run()` 的 setup 段 h 迁出(D-450 纯结构移动,行为不变)。
 //!
-//! 顺序不变量(拆分方案 §3.1 第 2 条):必须在 DB 迁移完成**之后**调用——
-//! `load_or_init` 内的 `migrate_if_needed` 要读 `app_config` 表做一次性迁移。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use crate::db::DbWriter;
 
 /// [`init`] 的产出:配置门面 + 启动期定死的一批设置值。
 pub struct ConfigBoot {
@@ -32,18 +28,13 @@ pub struct ConfigBoot {
 
 /// 配置文件初始化 + 读取持久化配置(setup 段 h)。
 ///
-/// config.toml 是 59 个设置类键的唯一真源(A1 schema);必须在 DB 迁移完成后
-/// (`load_or_init` 内的 `migrate_if_needed` 要读 `app_config` 表做一次性迁移)、
-/// 日志/缓存目录解析之前初始化——那些段起改为从这里读,不再查 DB。
-///
 /// 语法错时的契约(硬约束):**绝不覆盖/重写用户的坏文件**,回退全部键为 schema
 /// 默认值(`ConfigManager::degraded`),错误记入 `last_error` 供 `get_config_status`
 /// IPC 展示,应用照常启动——不得因用户手改配置文件写错就拒绝启动。
-pub fn init(app_data_dir: &Path, db_writer: &DbWriter) -> ConfigBoot {
+pub fn init(app_data_dir: &Path) -> ConfigBoot {
     let config_path = app_data_dir.join("config.toml");
     let config_manager = {
-        let conn = db_writer.lock().unwrap_or_else(|e| e.into_inner());
-        match crate::config::ConfigManager::load_or_init(config_path.clone(), &conn) {
+        match crate::config::ConfigManager::load_or_init(config_path.clone()) {
             Ok((manager, warnings)) => {
                 for w in &warnings {
                     tracing::warn!(

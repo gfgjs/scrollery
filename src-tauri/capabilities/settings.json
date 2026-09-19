@@ -1,0 +1,7 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema/acl/capability.json",
+  "identifier": "settings",
+  "description": "设置统一入口的能力声明(get_settings_snapshot/set_app_settings/clear_settings/settings_flush_done,定义见 src-tauri/permissions/settings.toml)。独立成文件以避免与 default.json 的窗口插件权限改动相互覆盖;主窗口与独立日志窗口都读写同一份设置,故两者都覆盖。",
+  "windows": ["main", "logs"],
+  "permissions": ["allow-settings-commands"]
+}

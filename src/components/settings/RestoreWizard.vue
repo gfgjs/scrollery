@@ -58,9 +58,6 @@
         </div>
       </dl>
 
-      <p v-if="summary.needsMigration" class="restore-note">
-        {{ bt('backup.restoreMigratedNote') }}
-      </p>
       <p v-if="summary.externalDocumentVersions > 0" class="restore-warning">
         {{
           bt('backup.restoreExternalWarning', {
@@ -259,8 +256,7 @@ function closeWizard() {
   font-size: var(--font-size-sm);
 }
 .restore-warning,
-.restore-danger,
-.restore-note {
+.restore-danger {
   margin: 0;
   padding: 10px 12px;
   border-radius: var(--radius-md);
@@ -274,10 +270,6 @@ function closeWizard() {
 .restore-danger {
   color: var(--color-error);
   background: color-mix(in srgb, var(--color-error) 10%, transparent);
-}
-.restore-note {
-  color: var(--color-text-secondary);
-  background: var(--color-bg-elevated);
 }
 .restore-summary {
   display: grid;

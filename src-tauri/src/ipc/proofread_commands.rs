@@ -58,23 +58,24 @@ pub async fn get_proofread_config(state: State<'_, Arc<AppState>>) -> Result<Pro
 
 /// 持久化校对端点配置（base_url / model）（§5.4）。
 ///
-/// A2:两键均为 schema 设置类,唯一真源已切到 config.toml——原 DB 写会被读侧
-/// (`get_proofread_config`/`proofread_chunk`,已改走 ConfigManager)忽略,必须同步改走
-/// `set_and_persist`。文件 IO 是阻塞操作,下沉 spawn_blocking(硬约束)。
+/// 两键均为设置类,唯一真源是 config.toml。提交走**统一设置入口**(一次批量写盘 + 串行门 +
+/// 统一广播),不再逐键直接落盘——同一份改动应只写一次文件,且与其他设置写入串行。
 #[tauri::command]
 pub async fn set_proofread_config(
+    app: tauri::AppHandle,
     base_url: String,
     model: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        s.config.set_and_persist("proofread_base_url", &base_url)?;
-        s.config.set_and_persist("proofread_model", &model)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+    // 本操作不涉及耗时工作,代次在提交前读取即可(仍随请求回传,重置后的迟到写入会被拒)。
+    let generation = state.config.generation();
+    let patch = std::collections::BTreeMap::from([
+        ("proofread_base_url".to_string(), base_url),
+        ("proofread_model".to_string(), model),
+    ]);
+    crate::config::settings::submit_settings_patch(&app, state.inner(), patch, generation)
+        .await
+        .map(|_| ())
 }
 
 /// 把 API key 存入系统凭据库（绝不入 DB）（§5.4）。

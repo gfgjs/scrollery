@@ -22,7 +22,7 @@ use crate::layout::lens::assemble_lens_groups;
 /// 隐藏根。组摘要用可读 ASCII 字节（'gA'=X'6741'…），字节序 0x41<0x42<… 可手算。
 fn lens_db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES
              (1, '/lens-a', 'A'), (2, '/lens-b', 'B'), (3, '/lens-h', 'H');

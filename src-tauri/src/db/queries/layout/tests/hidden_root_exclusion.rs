@@ -6,12 +6,11 @@ use super::*;
 use crate::db::models::{GalleryFilter, SortSpec, ViewDescriptor, ViewScope};
 use crate::db::queries::media::get_app_stats;
 use crate::db::queries::scan::{hidden_root_ids, set_scan_root_hidden};
-use crate::db::queries::search::search_media;
 
 /// 两根:root1(可见,dir10:a.jpg/b.png) + root2(待隐,dir20:c.gif/d.webp)。全为 image、活行。
 fn two_roots() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r1'), (20, 2, '', 'r2');
@@ -87,23 +86,6 @@ fn facet_excludes_hidden_root_formats() {
     );
     set_scan_root_hidden(&c, 2, true).unwrap();
     assert_eq!(list_library_formats(&c).unwrap(), vec!["jpg", "png"]);
-}
-
-/// 搜索结果排除隐藏根内的文件。
-#[test]
-fn search_excludes_hidden_root() {
-    let c = two_roots();
-    let f = MediaFilter {
-        search_scope: Some("filename".into()),
-        ..Default::default()
-    };
-    assert_eq!(search_media(&c, ".", &f, 10).unwrap().len(), 4);
-    set_scan_root_hidden(&c, 2, true).unwrap();
-    let got = search_media(&c, ".", &f, 10).unwrap();
-    assert_eq!(got.len(), 2, "隐藏 root2 后搜索只剩 root1 两项");
-    assert!(got
-        .iter()
-        .all(|r| r.file_name == "a.jpg" || r.file_name == "b.png"));
 }
 
 /// 全选(view_to_sql)与画廊可见集一致:隐藏根 id 非空 → SQL 含排除谓词;空集 → 不含。

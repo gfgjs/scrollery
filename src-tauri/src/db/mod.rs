@@ -1,6 +1,5 @@
 pub mod boot;
 pub mod connection;
-pub mod migration;
 pub mod models;
 pub mod queries;
 pub mod schema;

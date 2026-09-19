@@ -139,10 +139,10 @@
           <!-- 各卡行序与行体均由注册表驱动(设计 §8):行=SettingRow 外壳,特例行就地内嵌。 -->
           <CollapsibleCard id="general" :title="$t('settings.appearanceGroup')">
             <template v-for="key in generalKeys('appearance')" :key="key">
-              <!-- 特例:主题行无右侧控件,其控件为下方 ThemePicker;钉住区仍用 compact select -->
+              <!-- 特例:主题行无右侧控件,其控件为下方 ThemeSettings(配色卡与主题库);钉住区仍用 compact select -->
               <template v-if="key === 'theme'">
                 <SettingRow setting-key="theme" no-control />
-                <ThemePicker />
+                <ThemeSettings />
               </template>
               <SettingRow v-else :setting-key="key" />
             </template>
@@ -549,6 +549,7 @@ import { useMediaStore } from '../stores/mediaStore'
 import { useConfirm } from '../composables/useConfirm'
 import { useAiStore } from '../stores/aiStore'
 import { useConfigStore } from '../stores/configStore'
+import { useThemeStore } from '../stores/themeStore'
 import { useDerivationStore } from '../stores/derivationStore'
 import { useConfigFile } from '../composables/useConfigFile'
 import { useI18n } from 'vue-i18n'
@@ -563,7 +564,7 @@ import { formatFileSize } from '../utils/format'
 import { setThumbCacheDir } from '../utils/thumbCacheDir'
 import SettingRow from '../components/settings/SettingRow.vue'
 import DynamicSettingControl from '../components/settings/DynamicSettingControl.vue'
-import ThemePicker from '../components/settings/ThemePicker.vue'
+import ThemeSettings from '../components/settings/ThemeSettings.vue'
 import ReaderSettingsSection from '../components/settings/ReaderSettingsSection.vue'
 import NetworkStorageSection from '../components/settings/NetworkStorageSection.vue'
 import KnownVolumesSection from '../components/settings/KnownVolumesSection.vue'
@@ -586,6 +587,8 @@ const media = useMediaStore()
 const { confirm } = useConfirm()
 const ai = useAiStore()
 const config = useConfigStore()
+// 主题草稿随设置页退出丢弃:取消／Esc／退出设置都丢弃草稿,无需额外确认(方案 §2)。
+const theme = useThemeStore()
 const derive = useDerivationStore()
 // 外置配置文件(config.toml,批次B):App.vue 已挂过一次全局监听,这里再次调用只是复用同一份
 // 共享状态(status/lastError 跨调用同源,见 useConfigFile.ts 头注),不会重复注册监听。
@@ -628,15 +631,6 @@ const generalSettingGroups: Record<GeneralViewGroup, readonly SettingKey[]> = {
   common: ['language', 'closeBehavior'],
   appearance: [
     'theme',
-    'themeTintStrength',
-    'themeTextStrength',
-    'windowMaterial',
-    'glassChromeOpacity',
-    'glassStickyOpacity',
-    'glassSurfaceOpacity',
-    'glassControlOpacity',
-    'glassContentOpacity',
-    'glassGalleryOpacity',
     'uiFontSize',
     'titlebarMerged',
     'toolbarAlign',
@@ -651,7 +645,6 @@ const generalSettingGroups: Record<GeneralViewGroup, readonly SettingKey[]> = {
     'axisViewportOpacity',
     'hoverScale',
     'hoverAutoplay',
-    'bucketScroll',
     'viewerColorTarget',
     'viewerIccManager',
   ],
@@ -927,6 +920,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener('keydown', onKeyDown)
+  // 路由离开(含浏览器后退)同样丢弃主题草稿:只切设置分类不触发本钩子,不会误取消。
+  theme.cancelEdit()
 })
 
 function onKeyDown(e: KeyboardEvent) {
@@ -1023,6 +1018,8 @@ async function handleThumbInfoToggle(e: MouseEvent, val: string) {
 }
 
 function closeSettings() {
+  // 退出设置即丢弃主题草稿(取消／Esc／返回同语义,无需额外确认;方案 §2)。
+  theme.cancelEdit()
   if (window.history.state?.back) router.back()
   else void router.replace('/')
 }

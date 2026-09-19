@@ -61,58 +61,6 @@ fn staging_dir(staging_root: &Path, plugin_id: &str) -> PathBuf {
     staging_root.join(format!("{plugin_id}.staging"))
 }
 
-/// 安装来源渠道(T13,Part6 §8.4/Part0 §9.5):落安装真相 `entitlement_source` 列。
-/// DirectRegistry=现行「验签 Registry → HTTPS 下载 → 装」;Steam/Store 渠道 Part8 实装
-/// (届时跳 Registry 验签、保留 zip 内 manifest/hash 复核;RegistryExpect 仅 direct 渠道存在)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallSource {
-    DirectRegistry,
-    SteamDepot,
-    StoreBundled,
-}
-
-impl InstallSource {
-    /// DB `exotic_plugins.entitlement_source` 列的稳定字符串(改名=破坏性契约变更)。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            InstallSource::DirectRegistry => "direct",
-            InstallSource::SteamDepot => "steam_depot",
-            InstallSource::StoreBundled => "store_bundled",
-        }
-    }
-}
-
-/// 多渠道交付源(T13/§3.8/§3.11 预留):Part8 实装 Store/Steam 真实交付(拉包/就地发现)
-/// 时在此扩方法;现阶段只承载渠道判别——不预设无消费者的方法(同 T15 裁决④哲学)。
-pub trait PluginDeliverySource: Send + Sync {
-    /// 该交付源的安装来源(经 install_staged_zip 落 `entitlement_source` 列)。
-    fn channel(&self) -> InstallSource;
-}
-
-/// 直销交付(现行唯一实装渠道,exotic_commands 安装命令消费)。
-pub struct DirectRegistryDelivery;
-impl PluginDeliverySource for DirectRegistryDelivery {
-    fn channel(&self) -> InstallSource {
-        InstallSource::DirectRegistry
-    }
-}
-
-/// Steam Depot 交付 stub(§8.4 凑齐三变体;Part8 实装)。
-pub struct SteamDepotDelivery;
-impl PluginDeliverySource for SteamDepotDelivery {
-    fn channel(&self) -> InstallSource {
-        InstallSource::SteamDepot
-    }
-}
-
-/// MS Store MSIX 内置交付 stub(Part8 实装)。
-pub struct StoreBundledDelivery;
-impl PluginDeliverySource for StoreBundledDelivery {
-    fn channel(&self) -> InstallSource {
-        InstallSource::StoreBundled
-    }
-}
-
 /// 从已落地 staging 的 zip 安全安装（§6.4）。返回安装真相记录。
 ///
 /// `expect` 来自**已验签 Registry** 条目（plugin_id/version/target/package_sequence），绝不来自前端。
@@ -120,15 +68,9 @@ pub fn install_staged_zip(
     ctx: &InstallContext<'_>,
     zip_path: &Path,
     expect: &RegistryExpect<'_>,
-    source: InstallSource,
     now: i64,
     writer: &std::sync::Mutex<Connection>,
 ) -> Result<InstalledPluginRecord, InstallError> {
-    // T13 渠道分流:Steam/Store 安装路径随 Part8 实装;此前 fail-closed(先于一切副作用),
-    // 防无测试保护的弱验签分支先行存在。
-    if source != InstallSource::DirectRegistry {
-        return Err(InstallError::ChannelUnsupported(source.as_str()));
-    }
     let plugin_id = expect.plugin_id;
     let extract = staging_dir(ctx.staging_root, plugin_id);
     let _ = std::fs::remove_dir_all(&extract); // 清上次残留
@@ -169,7 +111,6 @@ pub fn install_staged_zip(
         install_state: install_state::INSTALLED.to_string(),
         installed_at: now,
         updated_at: now,
-        entitlement_source: source.as_str().to_string(),
     };
     // 仅此一步需写 DB——短暂持锁，**不**在前面的解压/hash/rename 期间占用 db_writer（安全评审 medium，
     // 防止扫描入库等所有 DB 写路径被长时间饿死）。
@@ -482,9 +423,6 @@ pub fn record_from_installed(
         install_state: install_state::INSTALLED.to_string(),
         installed_at: now,
         updated_at: now,
-        // 回滚重建现只发生在 direct 渠道(其余渠道 fail-closed);Part8 Steam 落地时
-        // 改为保留 DB 原值,防修复覆盖来源。
-        entitlement_source: InstallSource::DirectRegistry.as_str().to_string(),
     })
 }
 
@@ -580,7 +518,7 @@ mod tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c
     }
 
@@ -704,42 +642,6 @@ mod tests {
         );
     }
 
-    /// T13:非 direct 渠道 fail-closed——Steam/Store 安装路径 Part8 才实装,当前必须整体
-    /// 拒绝(channel_unsupported)且零副作用;另锁「渠道→列值」映射与交付源 trait 同口径。
-    #[test]
-    fn non_direct_channel_fails_closed() {
-        let sk = signing_key(9);
-        let ks = release_keyset(&sk);
-        let catalog = CatalogStore::from_builtin().unwrap();
-        let snap = catalog.snapshot();
-        let (install_root, staging_root) = dirs("channel");
-        let writer = std::sync::Mutex::new(mem_db());
-        let ctx = InstallContext {
-            install_root: &install_root,
-            staging_root: &staging_root,
-            keyset: &ks,
-            catalog: &snap,
-            host_version: "0.1.0",
-        };
-        let z = build_zip("channel", &sk, "1.0.0", 3, "psd", b"W");
-        for src in [InstallSource::SteamDepot, InstallSource::StoreBundled] {
-            let r = install_staged_zip(&ctx, &z, &expect_v("1.0.0", 3), src, NOW, &writer);
-            assert!(
-                matches!(r, Err(InstallError::ChannelUnsupported(_))),
-                "got {r:?}"
-            );
-        }
-        assert!(!install_root.join(PID).exists(), "拒绝后不得有安装目录");
-        assert!(q::get_exotic_plugin(&writer.lock().unwrap(), PID)
-            .unwrap()
-            .is_none());
-        // 渠道→entitlement_source 列值映射(交付源 trait 同口径)。
-        assert_eq!(DirectRegistryDelivery.channel().as_str(), "direct");
-        assert_eq!(SteamDepotDelivery.channel().as_str(), "steam_depot");
-        assert_eq!(StoreBundledDelivery.channel().as_str(), "store_bundled");
-        let _ = std::fs::remove_file(&z);
-    }
-
     #[test]
     fn install_then_upgrade_then_uninstall() {
         let sk = signing_key(1);
@@ -758,15 +660,7 @@ mod tests {
 
         // 首装 v1.0.0 seq=3。
         let z1 = build_zip("v1", &sk, "1.0.0", 3, "psd", b"WORKER-V1");
-        let rec = install_staged_zip(
-            &ctx,
-            &z1,
-            &expect_v("1.0.0", 3),
-            InstallSource::DirectRegistry,
-            NOW,
-            &writer,
-        )
-        .unwrap();
+        let rec = install_staged_zip(&ctx, &z1, &expect_v("1.0.0", 3), NOW, &writer).unwrap();
         assert_eq!(rec.version, "1.0.0");
         assert_eq!(rec.install_state, "installed");
         let current = install_root.join(PID);
@@ -788,15 +682,7 @@ mod tests {
 
         // 升级 v1.1.0 seq=4：内容替换、backup 已丢弃。
         let z2 = build_zip("v2", &sk, "1.1.0", 4, "psd", b"WORKER-V2-LONGER");
-        let rec2 = install_staged_zip(
-            &ctx,
-            &z2,
-            &expect_v("1.1.0", 4),
-            InstallSource::DirectRegistry,
-            NOW + 10,
-            &writer,
-        )
-        .unwrap();
+        let rec2 = install_staged_zip(&ctx, &z2, &expect_v("1.1.0", 4), NOW + 10, &writer).unwrap();
         assert_eq!(rec2.version, "1.1.0");
         assert_eq!(
             std::fs::read(current.join("bin/psd-worker.exe")).unwrap(),
@@ -840,15 +726,7 @@ mod tests {
             host_version: "0.1.0",
         };
         let z = build_zip("wp", &sk, "2.0.0", 7, "psd", b"WORKER-BIN");
-        install_staged_zip(
-            &ctx,
-            &z,
-            &expect_v("2.0.0", 7),
-            InstallSource::DirectRegistry,
-            NOW,
-            &writer,
-        )
-        .unwrap();
+        install_staged_zip(&ctx, &z, &expect_v("2.0.0", 7), NOW, &writer).unwrap();
 
         // worker 定位：取 kind=worker 文件的绝对路径，存在。
         let wp = installed_worker_path(&install_root, PID).unwrap();
@@ -896,14 +774,7 @@ mod tests {
             host_version: "0.1.0",
         };
         let z = build_zip("creject", &sk, "1.0.0", 3, "jpg", b"W");
-        let r = install_staged_zip(
-            &ctx,
-            &z,
-            &expect_v("1.0.0", 3),
-            InstallSource::DirectRegistry,
-            NOW,
-            &writer,
-        );
+        let r = install_staged_zip(&ctx, &z, &expect_v("1.0.0", 3), NOW, &writer);
         assert!(
             matches!(r, Err(InstallError::CatalogReject(_))),
             "got {r:?}"
@@ -935,15 +806,7 @@ mod tests {
             host_version: "0.1.0",
         };
         let z = build_zip("tamper", &sk, "1.0.0", 3, "psd", b"GOOD-WORKER");
-        install_staged_zip(
-            &ctx,
-            &z,
-            &expect_v("1.0.0", 3),
-            InstallSource::DirectRegistry,
-            NOW,
-            &writer,
-        )
-        .unwrap();
+        install_staged_zip(&ctx, &z, &expect_v("1.0.0", 3), NOW, &writer).unwrap();
         // 篡改已装文件。
         let worker = install_root.join(PID).join("bin/psd-worker.exe");
         std::fs::write(&worker, b"TAMPERED").unwrap();

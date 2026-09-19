@@ -129,12 +129,9 @@ use std::time::Duration;
 use crate::exotic::catalog::Capability;
 use crate::exotic::coordinator::{WakeReason, PSD_PLUGIN_ID};
 use crate::exotic::crypto::VerifyingKeyset;
+use crate::exotic::install::RegistryExpect;
 use crate::exotic::install::{plugin_install_dir, rollback_to_backup};
 use crate::exotic::installer;
-// install 命令体专用(Part7-T11:随 install_exotic_plugin 门 channel-direct)。
-#[cfg(feature = "channel-direct")]
-use crate::exotic::install::RegistryExpect;
-#[cfg(feature = "channel-direct")]
 use crate::exotic::installer::InstallContext;
 use crate::exotic::registry::RegistryCache;
 
@@ -300,22 +297,6 @@ pub async fn list_exotic_task_details(
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// 重试单项（item + capability）：error → pending 并唤醒。
-#[tauri::command]
-pub async fn retry_exotic_task(
-    item_id: i64,
-    capability: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    super::blocking::write_blocking(&state, move |c| {
-        crate::db::queries::reset_exotic_task_for_retry(c, item_id, &capability)
-    })
-    .await?;
-    // 用户点重试：绕过 auto 门控（区别于自动重试时钟的 RetryDue，P2）。
-    state.wake_exotic(WakeReason::UserRequested);
-    Ok(())
-}
-
 /// 重试某插件全部失败任务（error → pending）并唤醒。
 #[tauri::command]
 pub async fn retry_exotic_plugin_failures(
@@ -405,8 +386,6 @@ pub async fn deactivate_exotic_plugin(
 // 命令参数**只**接受 plugin_id（已验证字符集），绝不接受 URL/路径/hash/可执行路径（§6.6）。
 // 安装目录/下载坐标均由已验签 Registry 与 AppState 派生路径决定。替换/删除目录前先 quiesce。
 
-// install 专用(Part7-T11 随之门控):宿主版本随包给 InstallContext 做兼容性判定。
-#[cfg(feature = "channel-direct")]
 const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn builtin_keyset() -> Result<VerifyingKeyset> {
@@ -571,25 +550,7 @@ pub async fn list_exotic_registry(
         .collect())
 }
 
-/// 安装插件——**非 direct 渠道桩**(Part7-T11/§3.6.2 物理排除):Store 政策禁「下载-执行」,
-/// msstore/steam 构建的下载-安装路径(fetch_package/fetch_model_blob 与下方 direct 命令体)
-/// 编译期不存在;保留同名命令返回稳定错误码,前端 IPC 面不随渠道漂移。卸载/修复/回滚等
-/// 本地生命周期操作不涉下载,全渠道保留;渠道内插件获取(Store IAP/MSIX 内置)归 Part8 D5-D8。
-#[cfg(not(feature = "channel-direct"))]
-#[tauri::command]
-#[allow(unused_variables)]
-pub async fn install_exotic_plugin(
-    plugin_id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    Err(AppError::Exotic {
-        code: "channel_unsupported",
-        message: "本渠道不支持应用内下载安装插件".into(),
-    })
-}
-
 /// 安装插件（§6.4）：从已验签 Registry 选条目 →（下载 zip 到 staging，**待 P6.2**）→ 安全安装。
-#[cfg(feature = "channel-direct")]
 #[tauri::command]
 pub async fn install_exotic_plugin(
     plugin_id: String,
@@ -697,15 +658,7 @@ pub async fn install_exotic_plugin(
                 package_sequence: entry.package_sequence,
             };
             // install_staged_zip 仅在 upsert 时短锁 db_writer（不在解包/hash/rename 期间持锁）。
-            // T13:本命令 = 直销 Registry 渠道(经交付源取渠道判别,落 entitlement_source 列)。
-            installer::install_staged_zip(
-                &ctx,
-                &zip_c,
-                &expect,
-                installer::PluginDeliverySource::channel(&installer::DirectRegistryDelivery),
-                now,
-                &state_arc.db_writer,
-            )
+            installer::install_staged_zip(&ctx, &zip_c, &expect, now, &state_arc.db_writer)
         })
         .await
     };

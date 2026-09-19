@@ -6,16 +6,9 @@
 @import '@fontsource-variable/inter/opsz.css';
 
 @import './variables.css';
-/* 内置主题：每份文件提供完整语义 token 集。 */
-@import './themes/fresh-light.css';
-@import './themes/fresh-dark.css';
-@import './themes/minimal-light.css';
-@import './themes/minimal-dark.css';
-@import './themes/tech-light.css';
-@import './themes/tech-dark.css';
-/* 宿主材质适配层必须位于主题之后、任何 token 消费者之前。 */
-@import './material.css';
-/* 窗口玻璃模式覆写层:消费 material 层角色 token(--material-chrome),故须在 material.css 之后;
+/* 主题颜色不再由静态 CSS 提供:默认色板由 vite-plugin-theme-default-css 注入(与运行时同一份
+   generateTheme 结果),运行时色板由 apply.ts 写入 html 内联变量。此处只留非颜色基础层。 */
+/* 窗口玻璃模式覆写层:消费主题生成的 --color-* 与唯一窗口不透明度 --window-opacity,
    置于 reset.css 之前以保导入顺序契约(两者相对 order 由契约测试断言)。 */
 @import './glass.css';
 @import './reset.css';
@@ -229,8 +222,8 @@
   inset: 0;
   background: var(--color-bg-overlay);
   z-index: 100;
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 /* ── Empty state ─────────────────────────────────────────────────────────── */
@@ -347,6 +340,14 @@
   opacity: var(--opacity-disabled);
 }
 
+/* 原生部件明暗:原六套主题 CSS 里的 color-scheme 声明随文件删除,按主题应用写出的同一属性
+(apply.ts 的 data-color-scheme)补回 —— 原生滚动条、日期控件等按此跟随明暗。 */
+html[data-color-scheme='dark'] {
+  color-scheme: dark;
+}
+html[data-color-scheme='light'] {
+  color-scheme: light;
+}
 /* ── Native & Custom Select ──────────────────────────────────── */
 
 select {
@@ -505,10 +506,10 @@ select option:disabled {
 /* ── Settings Card ───────────────────────────────────────────── */
 
 .settings-card {
-  background-color: var(--material-recipe-surface-background-color);
-  border: 1px solid var(--material-recipe-surface-border-color);
+  background-color: var(--color-bg-surface);
+  border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-lg);
-  box-shadow: var(--material-recipe-surface-box-shadow);
+  box-shadow: none;
   overflow: hidden;
 }
 .settings-card__header {
@@ -584,8 +585,8 @@ select option:disabled {
   inset: 0;
   z-index: 9999;
   background: var(--color-bg-overlay);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -593,12 +594,12 @@ select option:disabled {
 }
 
 .dialog-content {
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   width: 100%;
   max-width: 420px;
   display: flex;

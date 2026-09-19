@@ -44,7 +44,8 @@
     </template>
 
     <template #sidebar>
-      <AppSidebar />
+      <!-- 设置快照到达前不挂载侧栏:文件夹树与库统计都是用户资产信息(演示打码未就位时不得先露出)。 -->
+      <AppSidebar v-if="settingsReady" />
     </template>
 
     <!-- 分离模式(!titlebarMerged):Gallery 工具栏独立成标题栏下方第二条 bar(S3 分层)。
@@ -63,17 +64,32 @@
     <!-- 默认插槽：媒体内容或语义搜索面板 -->
     <!-- 语义搜索面板显示在主库血统视图(smart-album + folder 筛选)。S2-c 前这些视图全停在 '/',故此前判据是
          route.path === '/';拆分为多路径后平移到 isPrimaryGalleryRoute 以保持同一集合(不含 collection/person 详情)。 -->
-    <SemanticSearchPanel v-show="isPrimaryGalleryRoute(route.path)" />
-    <!-- 图/视频查看器保留 `/view/:id` 的 URL/历史/深链语义，但不再替换 MediaGrid 的 DOM。
-         该路由期间同一画廊实例继续作为底层帧，ContentViewer 由下方绝对覆盖层呈现；关闭时
-         立即撤掉覆盖层，不经历 KeepAlive 激活、首帧或 route Transition 等待。 -->
-    <RouterView v-slot="{ Component }">
-      <KeepAlive :include="['GalleryRouteLayer']">
-        <component :is="contentViewerRoute ? GalleryRouteLayer : Component" />
-      </KeepAlive>
-    </RouterView>
-    <div v-if="contentViewerRoute" class="content-viewer-route-overlay">
-      <ContentViewerOverlay />
+    <!-- 启动设置就绪门控(设置集中保存 §5.1 + 演示打码回归):中央快照到达前不渲染任何会展示用户
+         资产的内容——演示打码等「默认安全」值在快照就位前只是占位,此时渲染画廊会先露一帧真实内容;
+         读取失败同样不放行,只给可重试的错误面板。门内只有资产内容:窗口外壳(标题栏/侧栏/底栏)与
+         全局关闭确认、通知层都留在门外,故启动失败时用户仍能正常关窗。 -->
+    <template v-if="settingsReady">
+      <SemanticSearchPanel v-show="isPrimaryGalleryRoute(route.path)" />
+      <!-- 图/视频查看器保留 `/view/:id` 的 URL/历史/深链语义，但不再替换 MediaGrid 的 DOM。
+           该路由期间同一画廊实例继续作为底层帧，ContentViewer 由下方绝对覆盖层呈现；关闭时
+           立即撤掉覆盖层，不经历 KeepAlive 激活、首帧或 route Transition 等待。 -->
+      <RouterView v-slot="{ Component }">
+        <KeepAlive :include="['GalleryRouteLayer']">
+          <component :is="contentViewerRoute ? GalleryRouteLayer : Component" />
+        </KeepAlive>
+      </RouterView>
+      <div v-if="contentViewerRoute" class="content-viewer-route-overlay">
+        <ContentViewerOverlay />
+      </div>
+    </template>
+    <div v-else class="settings-gate">
+      <div v-if="startupError" class="settings-gate__panel" role="alert">
+        <h2 class="settings-gate__title">{{ t('settings.loadFailedTitle') }}</h2>
+        <p class="settings-gate__hint">{{ t('settings.loadFailedHint') }}</p>
+        <button class="btn btn-primary" @click="retryStartupSettings">
+          {{ t('settings.loadFailedRetry') }}
+        </button>
+      </div>
     </div>
 
     <template #statusbar>
@@ -118,13 +134,24 @@ import { logger } from './utils/logger'
 import { dismissStartupLayer } from './utils/startupLayer'
 import { IPC } from './constants/ipc'
 import {
-  applyUiFontSize,
   applyTimelineScrollWidth,
   applyTimelineAxisWidth,
   applyAxisViewportOpacity,
 } from './utils/uiScale'
 import { useDerivationAutoStart } from './composables/useDerivationAutoStart'
 import { useConfigFile } from './composables/useConfigFile'
+import { useToastStore } from './stores/toastStore'
+import { useI18n } from 'vue-i18n'
+import { installSettingsLifecycle } from './composables/useSettingsLifecycle'
+import {
+  initializeSettings,
+  readSetting,
+  setSettingsApplyFailedFormatter,
+  setSettingsErrorReporter,
+  setSettingsWriteFailedFormatter,
+  settingsReady,
+} from './stores/settingsPersistence'
+import type { StartupPayload } from './types/config'
 import { useTitlebarMode } from './composables/useTitlebarMode'
 import {
   chromeAutoHidden,
@@ -298,7 +325,64 @@ useDerivationAutoStart()
 // 不会重复注册监听（见 useConfigFile.ts 头注）。
 useConfigFile()
 
+// 退出前 flush 协议的前端一侧(设置集中保存 §5.4):后端在退出/关窗前经事件请求一次落盘,
+// 前端 flush 完再回执。装配点必须在**首次 await 之前**(见 onMounted 顶注),否则启动 IPC
+// 卡住时退出收不到请求、后端只能等超时。
+//
+// 中央设置的失败提示也在此接一次口:写盘失败与「已保存但部分项未应用」经 toast 统一可见,
+// 消费方各处 `void writeSettings(...)` 不必自己弹错,也不会静默显示成已保存。
+const toast = useToastStore()
+const { t } = useI18n()
+setSettingsErrorReporter((message) => toast.addToast('error', message, 5000))
+setSettingsWriteFailedFormatter(() => t('settings.saveFailedNotice'))
+setSettingsApplyFailedFormatter((keys) => t('settings.applyFailedNotice', { keys: keys.join(', ') }))
+
 let frontendHeartbeatTimer: number | undefined
+
+/** 启动设置读取失败(主内容不渲染,给可重试入口;见模板的 ready 门控)。 */
+const startupError = ref(false)
+
+/**
+ * 应用启动批里的**全局项与内部状态**。设置值本身已由中央服务应用(uiStore 的 watch),此处只处理
+ * 不属设置快照的启动期项:语言、界面尺度(CSS 变量)与首启/引导标记。
+ *
+ * 首启/引导标记只在此处消费——快照刷新(resetSettings/外部编辑)不经过它,故重置设置不会重放
+ * 首次使用引导。
+ */
+function applyStartupPayload(payload: StartupPayload) {
+  const language = readSetting('language') ?? ui.language
+  ui.applyLanguage(language)
+
+  // 界面尺度:单一事实源(P1-18),与设置页 setter 共用同一应用函数。
+  const timelineScrollWidth = readSetting('timeline_scroll_width')
+  if (timelineScrollWidth != null) applyTimelineScrollWidth(Number(timelineScrollWidth))
+  const timelineAxisWidth = readSetting('timeline_axis_width')
+  if (timelineAxisWidth != null) applyTimelineAxisWidth(Number(timelineAxisWidth))
+  const axisViewportOpacity = readSetting('axis_viewport_opacity')
+  if (axisViewportOpacity != null) applyAxisViewportOpacity(Number(axisViewportOpacity))
+
+  // 滚动条/视窗最小高、字号与悬停缩放的 DOM 副作用统一由 configStore 收敛(见
+  // applyDomAffectingValues):启动这里显式推一次(首帧值可能恰好等于默认值,靠 watch 差分不会触发),
+  // 之后的改动由它的快照 watch 跟进。
+  config.applyDomAffectingValues()
+
+  // 首启检测(T17,§3.8):仅当 first_launch 被显式写为 'false'(用户完成/跳过过引导)才抑制;
+  // 其余情形(缺省 null/空串/意外值)都视为「未走过引导」→ 显示向导。
+  if (payload.state.firstLaunch !== 'false') showOnboarding.value = true
+  ui.hydrateGuideSeen(payload.state.guideSeen)
+}
+
+/** 设置就绪门控:读取失败时可重试一次(不改用占位默认值放行)。 */
+async function retryStartupSettings() {
+  startupError.value = false
+  try {
+    const payload = await initializeSettings()
+    applyStartupPayload(payload)
+  } catch (e) {
+    startupError.value = true
+    logger.error('Failed to load startup settings on retry', { error: e })
+  }
+}
 
 function sendFrontendHeartbeat(): void {
   // 心跳失败意味着后端已不可达或页面正在销毁；不能在这里反复刷用户可见错误。
@@ -308,6 +392,8 @@ function sendFrontendHeartbeat(): void {
 onMounted(async () => {
   // 关闭监听和心跳必须在首次 await 前装配。启动配置 IPC 卡住或失败时，任务栏关闭仍应可用。
   void listenAppEvent('window-close-requested', () => ui.requestAppClose())
+  // 退出前 flush 协议同样必须在首次 await 前装配:启动 IPC 卡住时,退出仍应能请求落盘。
+  void installSettingsLifecycle().catch(() => {})
   sendFrontendHeartbeat()
   frontendHeartbeatTimer = window.setInterval(sendFrontendHeartbeat, 1000)
   // 窗口重新可见/聚焦时立即补发心跳：Chromium 对隐藏页计时器节流(隐藏约 5 分钟后约 1 次/分)，
@@ -319,62 +405,22 @@ onMounted(async () => {
 
   // 仅初始化主题 — 数据加载在 AppSidebar.vue 的 onMounted 中处理
 
-  // R2-4:复用 uiStore 在 setup 期发出的唯一一次 get_startup_config(14 键批量)。
-  // uiStore 自己的 9 键由 store 内 .then 应用;此处只消费全局项与 first_launch,
-  // 整个启动阶段的配置 IPC 由 11 次归 1 次。
+  // 启动初始化:设置快照与内部状态经 uiStore 的唯一一次 get_startup_config 取回(全应用共享
+  // 同一 Promise)。设置值本身已由中央服务应用;此处只消费全局项(语言/字号/时间轴尺度)与
+  // 内部状态(首启/引导标记)——这两个标记只在启动生效,快照刷新时不重放,故重置设置不会
+  // 重放首启向导。
   try {
-    const cfg = await ui.startupConfigPromise
-
-    if (cfg.language) {
-      ui.applyLanguage(cfg.language)
+    const payload = await ui.startupConfigPromise
+    if (payload) {
+      applyStartupPayload(payload)
     } else {
-      ui.applyLanguage(ui.language)
+      // 读取失败:启动层已经解除,但**设置就绪门控**仍为假 → 主内容不渲染(见模板),用户看到
+      // 的是可重试的初始化错误提示,而不是未受保护的界面。
+      startupError.value = true
+      logger.error('Failed to load startup settings')
     }
-
-    if (cfg.timelineScrollWidth) {
-      // 单一事实源(P1-18):与 configStore.setTimelineScrollWidth 共用同一应用函数。
-      applyTimelineScrollWidth(Number(cfg.timelineScrollWidth))
-    }
-
-    if (cfg.timelineAxisWidth) {
-      // 时间轴轴宽:持久值启动即应用(未设时 CSS 变量回落默认 44px)。
-      applyTimelineAxisWidth(Number(cfg.timelineAxisWidth))
-    }
-
-    if (cfg.axisViewportOpacity) {
-      // 轴视窗不透明度缩放:持久值启动即应用(未设时 CSS 变量回落默认 1=100%)。
-      applyAxisViewportOpacity(Number(cfg.axisViewportOpacity))
-    }
-
-    if (cfg.scrollThumbMinHeight) {
-      // 滚动条/视窗最小高:纯 JS 数值,预水合 configStore(供 MediaGrid prop),避免 loadConfig
-      // 懒加载前组件用默认高;打开设置页后 loadConfig 会以同值幂等覆盖。
-      config.scrollThumbMinHeight = Number(cfg.scrollThumbMinHeight)
-    }
-
-    if (cfg.uiFontSize) {
-      // 单一事实源(P1-18):与 configStore.setUiFontSize 共用,消除启动/实时的 1px 漂移。
-      applyUiFontSize(parseInt(cfg.uiFontSize, 10))
-    }
-
-    // Canvas 不经过 `.media-card:hover` CSS，必须把同一份启动配置回填到 configStore；
-    // 否则 Canvas 首次挂载仍会读默认 true，设置页加载 config 前关闭值不会生效。
-    config.enableHoverScale = cfg.enableThumbHoverScale !== 'false'
-    if (!config.enableHoverScale) {
-      document.documentElement.classList.add('disable-hover-scale')
-    } else {
-      document.documentElement.classList.remove('disable-hover-scale')
-    }
-
-    // 首启检测(T17, §3.8;R2-4 并入启动批):仅当 first_launch 被显式写为 'false'(用户完成/
-    // 跳过过引导)才抑制;其余一切情形(缺省 null / 空串 / 意外值)都视为「未走过引导」→ 显示向导。
-    // 完成/跳过时向导自身写 'false'(见 OnboardingWizard)。
-    if (cfg.firstLaunch !== 'false') showOnboarding.value = true
-    ui.hydrateGuideSeen(cfg.guideSeen)
-  } catch (e) {
-    logger.error('Failed to load startup config', { error: e })
   } finally {
-    // 关键启动配置完成后才开放底层 UI；启动层本身已在 index.html 首帧绘制。
+    // 关键启动配置流程到此结束;实际放开主内容由 settingsReady 决定(见模板 v-if)。
     dismissStartupLayer()
   }
 
@@ -404,6 +450,36 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.settings-gate {
+  display: grid;
+  place-items: center;
+  height: 100vh;
+  background-color: var(--color-bg-primary);
+  color: var(--color-text-primary);
+}
+
+.settings-gate__panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-sm);
+  max-width: 420px;
+  padding: var(--spacing-lg);
+  text-align: center;
+}
+
+.settings-gate__title {
+  margin: 0;
+  font-size: var(--font-size-lg);
+}
+
+.settings-gate__hint {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
 .titlebar-viewer-title {
   min-width: 0;
   max-width: min(36vw, 420px);
@@ -437,7 +513,7 @@ onBeforeUnmount(() => {
   transform: translateY(-100%);
   transition: transform var(--duration-normal) var(--ease-out);
   /* 收起时自身在视口外,无需 pointer-events 处理;滑入后正常可交互 */
-  box-shadow: var(--material-recipe-float-box-shadow);
+  box-shadow: var(--shadow-lg);
 }
 .titlebar-host--immersive.titlebar-host--revealed {
   transform: translateY(0);

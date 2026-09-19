@@ -101,7 +101,8 @@ mod tests {
           "license_tier": "paid",
           "sku": "psd-engine-2026",
           "platforms": ["x86_64-pc-windows-msvc"],
-          "min_host_version": "0.1.0"
+          "min_host_version": "0.1.0",
+          "worker_id": "psd-worker"
         },
         {
           "plugin_id": "exotic-doc-cad",
@@ -112,7 +113,8 @@ mod tests {
           "license_tier": "paid",
           "sku": "cad-engine-2026",
           "platforms": ["x86_64-pc-windows-msvc"],
-          "min_host_version": "0.1.0"
+          "min_host_version": "0.1.0",
+          "worker_id": "cad-worker"
         }
       ]
     }"#;

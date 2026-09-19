@@ -249,21 +249,6 @@ pub async fn cancel_video_playback(
     Ok(())
 }
 
-/// FFmpeg 视频扩展组件当前状态:`"ready" | "downloading" | "notDownloaded"`(§3.3)。
-#[tauri::command]
-pub async fn video_component_status(state: State<'_, Arc<AppState>>) -> Result<&'static str> {
-    let app_data = state.app_data_dir.clone();
-    let status =
-        tokio::task::spawn_blocking(move || crate::exotic::tools::ffmpeg_tool_status(&app_data))
-            .await
-            .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
-    Ok(match status {
-        crate::exotic::tools::ToolStatus::Ready { .. } => "ready",
-        crate::exotic::tools::ToolStatus::Downloading => "downloading",
-        crate::exotic::tools::ToolStatus::NotDownloaded => "notDownloaded",
-    })
-}
-
 /// 触发下载 + 安装 FFmpeg 视频扩展组件(§3.1/§3.3):走既有 tools.rs 下载引擎(len+sha256 校验、
 /// `*.tmp` 同卷 rename、逐文件 sha256 复核)。幂等:已就绪直接返回。
 #[tauri::command]

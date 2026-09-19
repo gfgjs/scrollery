@@ -129,16 +129,17 @@ export default {
           'Plugins run in a background worker and never block the UI',
         ],
       },
-      themes: {
-        title: 'Themes & Appearance',
-        intro: 'Three styles each pair a light and dark theme for different preferences.',
-        points: [
-          'Fresh, Minimal, and Tech styles, each with light and dark themes',
-          'Light / Dark / Follow system',
-          'Interface font size and thumbnail behavior are adjustable',
-          'Immersive/windowed modes reduce distraction',
-        ],
-      },
+     themes: {
+       title: 'Themes & Appearance',
+        intro: 'Pick background, foreground and accent freely; light and dark are saved separately.',
+       points: [
+          'Neutral, Warm Paper and Cold Night built-in themes, or tune any color yourself',
+          'Name a full theme and save it under My themes to reapply later',
+          'Light / Dark / Follow system, plus window material and opacity',
+         'Interface font size and thumbnail behavior are adjustable',
+         'Immersive/windowed modes reduce distraction',
+       ],
+     },
       settingsShortcuts: {
         title: 'Settings & Shortcuts',
         intro: 'The Settings page centralizes all preferences, with section navigation and search.',
@@ -769,12 +770,9 @@ export default {
   },
   // 内置主题风格名与说明(注册表 nameKey/descriptionKey 指向此处)。
   themes: {
-    fresh: 'Fresh · 清新',
-    freshDescription: 'A soft green palette that feels calm and natural.',
-    minimal: 'Minimal · 简约',
-    minimalDescription: 'Restrained neutrals that keep attention on your content.',
-    tech: 'Tech · 科技',
-    techDescription: 'Cool blue tones with a crisp, focused feel.',
+    neutral: 'Neutral',
+    warmPaper: 'Warm Paper',
+    coldNight: 'Cold Night',
   },
   // 阅读专属主题名(R3;注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
   readerThemes: {
@@ -813,45 +811,62 @@ export default {
     general: 'General',
     theme: 'Theme',
     themeDesc:
-      'Choose the appearance mode and one style paired across light and dark; System switches between them automatically.',
+      'Choose the appearance mode and theme colors; System switches between light and dark automatically.',
     themeMode: 'Appearance mode',
-    themeStyle: 'Theme style',
-    themeStyleDesc: 'One style is applied to both light and dark themes.',
     themeSystem: 'System',
     themeLight: 'Light',
     themeDark: 'Dark',
+    themeBuiltinGroup: 'Built-in themes',
+    themeSavedGroup: 'My themes',
+    themeSavedEmpty: 'No saved themes yet. Tune the colors, then use Save as theme to name one.',
+    themeCustom: 'Custom',
+    themeBackground: 'Background',
+    themeForeground: 'Foreground',
+    themeAccent: 'Accent',
+    themeContrast: 'Contrast',
+    themeGallery: 'Gallery background',
+    themeGalleryAuto: 'Follow interface',
+    themeGalleryAutoHint: 'The gallery uses the interface background.',
+    themeHexInput: '{label} HEX value',
+    themeHue: 'Hue',
+    themeSaturationValue: 'Saturation and brightness',
+    themePreviewButton: 'Button',
+    themePreviewThisMode: 'Preview this mode',
+    themePreviewing: 'Previewing',
+    themeResetMode: 'Reset',
+    themeApply: 'Apply',
+    themeSaveAs: 'Save as theme',
+    themeSaveAndApply: 'Save and apply',
+    themeNameLabel: 'Theme name',
+    themeUpdateTarget: 'Update target',
+    themeSaveNewEntry: 'Save as a new theme',
+    themeUpdateKeepsName:
+      'Updating an existing theme keeps its name and identity; use Rename to change the name.',
+    themeRename: 'Rename',
+    themeDelete: 'Delete',
+    themeNameEmpty: 'Theme name cannot be empty.',
+    themeNameDuplicate: 'A theme with this name already exists. Choose another name.',
+    themeNotFound: 'The target theme no longer exists.',
+    themeSaved: 'Saved theme "{name}".',
+    themeSaveFailed: 'Saving the theme failed. Your draft is kept; you can retry.',
+    themeDeleted: 'Deleted theme "{name}".',
+    themeDeleteFailed: 'Deleting the theme failed.',
+    themeContrastWarning:
+      '{modes} colors fall below the body text contrast target. Raise the contrast slider or reset to the default palette.',
+    themeDraftDroppedExternal:
+      'Theme settings changed elsewhere; unapplied adjustments were discarded.',
+    themeDraftDroppedReset: 'Settings were reset; unapplied theme adjustments were discarded.',
     language: 'Language',
     languageDesc: 'Choose the interface language for the application.',
     windowMaterial: 'Window material (glass)',
     windowMaterialDesc:
-      'Translucent glass effect on the title bar, sidebar and status bar; Windows only. Acrylic reveals what is behind the window in real time, but dragging or resizing may stutter.',
-    windowMaterialMica: 'Mica (default)',
+      'The whole window shares one translucent glass base, so the title bar, sidebar, gallery and status bar read as one surface (Windows only). Acrylic reveals what is behind the window in real time; dragging or resizing may stutter.',
+    windowMaterialMica: 'Mica',
     windowMaterialAcrylic: 'Acrylic',
-    windowMaterialNone: 'Opaque',
-    glassChromeOpacity: 'Window chrome glass opacity (%)',
-    glassChromeOpacityDesc:
-      'Adjust the glass opacity scale for the title bar, toolbar, and status bar. 100% keeps the current material defaults; lower values are more transparent (20–120).',
-    glassStickyOpacity: 'Group/path mask opacity (%)',
-    glassStickyOpacityDesc:
-      'Adjust the opacity scale for fixed sidebar group and path masks. 100% is the default; lower values are more transparent (20–120).',
-    glassSurfaceOpacity: 'Card surface opacity (%)',
-    glassSurfaceOpacityDesc:
-      'Adjust the opacity scale for glass surfaces such as tool cards. 100% is the default; lower values are more transparent (20–120).',
-    glassControlOpacity: 'Control surface opacity (%)',
-    glassControlOpacityDesc:
-      'Adjust the opacity scale for controls such as search, selects, and toggles. 100% is the default; lower values are more transparent (20–120).',
-    glassContentOpacity: 'Content base opacity (%)',
-    glassContentOpacityDesc:
-      'Adjust the base opacity scale for text-heavy pages such as Settings, Collections, Persons, Plugin Store, and the Document Viewer, keeping text readable over any wallpaper. 100% is the baseline; higher values make the base more solid (fully opaque from 120%, range 20–120). No effect outside glass mode.',
-    glassGalleryOpacity: 'Gallery base opacity (%)',
-    glassGalleryOpacityDesc:
-      'Adjust the theme-colored overlay behind the gallery and between thumbnails in glass mode. 0% fully reveals the Windows backdrop; higher values are more opaque (0–100). Opaque mode keeps its existing base color.',
-    themeTintStrength: 'Theme tint strength (%)',
-    themeTintStrengthDesc:
-      'Adjust the theme-tint strength of UI base colors. 100% is the full-strength factory palette; lower values wash base colors toward neutral for a lighter look (0–100). Applies instantly to every theme.',
-    themeTextStrength: 'Text strength (%)',
-    themeTextStrengthDesc:
-      'Adjust the color strength of UI text. 100% is the factory text color; lower values soften text toward the background (40–100). Applies instantly to every theme.',
+    windowMaterialNone: 'Solid',
+    windowOpacity: 'Window opacity',
+    windowMaterialDraftHint:
+      'Changes preview the interface fill only; the native window material and opacity apply when you click Apply.',
     reading: 'Reading',
     readerThemeHint:
       'Set the reader default theme (day / night auto-switch with the app appearance). Font size, typography, etc. can be adjusted from the settings panel inside the reader once a book is open.',
@@ -948,9 +963,6 @@ export default {
     showDragHandle: 'Drag handle on selected items',
     showDragHandleDesc:
       'Show a drag handle at the top-left of selected thumbnails (hold to drag into a folder). With it off, moving via the context menu still works.',
-    bucketScroll: 'Segmented virtual scrolling',
-    bucketScrollDesc:
-      'The gallery uses the bucket segmented engine by default: native in-segment scrolling with no coordinate compression, paired with the logical scrollbar — smoother on large libraries. Takes effect immediately; turn off to fall back to linear translation.',
     autoHideChromeWindowed: 'Windowed Immersive Mode',
     autoHideChromeWindowedDesc:
       'Automatically hide the title bar and status bar when not fullscreen; move the pointer to the window edge to reveal them.',
@@ -992,6 +1004,18 @@ export default {
     clearSettings: 'Clear Settings',
     clearSettingsDesc: 'Reset all application settings to default values.',
     clearSettingsBtn: 'Clear',
+    // 恢复默认设置(2026-09-16 设置集中保存):语义从「清除」改为「整份恢复默认」——
+    // 覆盖外观、布局、播放/阅读偏好与窗口位置;保留资产、阅读进度、任务状态与引导标记。
+    resetSettings: 'Restore Default Settings',
+    resetSettingsDesc:
+      'Restore appearance, layout, playback and reading preferences, and window position to defaults. Assets, reading progress, task state, and the first-launch guide are untouched.',
+    resetSettingsBtn: 'Restore Defaults',
+    resetSettingsConfirmTitle: 'Restore Default Settings',
+    resetSettingsConfirmMessage:
+      'Restore all application settings to their default values?\n\nThe config file will be replaced with default content (handwritten comments are reset too). Assets, favorites, reading progress, and task state are unaffected.',
+    resetSettingsSuccess: 'Default settings restored',
+    resetSettingsRestartRequired:
+      'Defaults saved; these items take effect after restarting the app: {keys}',
     clearCache: 'Clear All Caches',
     clearCacheDesc:
       'Clear the database AND delete all thumbnail caches. This frees up a lot of disk space but thumbnails must be regenerated next time.',
@@ -1071,6 +1095,15 @@ export default {
     configFileErrorLine: '(line {line})',
     configRestartRequiredKeys:
       'The following settings require an app restart to take effect: {keys}',
+    // 中央设置的失败提示(设置集中保存):写盘失败与「已保存但未能应用」两种语义分开,
+    // 不把部分成功报成完全成功。
+    saveFailedNotice: 'Saving settings failed. Restored to the last confirmed values.',
+    applyFailedNotice: 'Settings were saved, but these could not be applied: {keys}',
+    // 启动设置读取失败:主内容保持不渲染(不让未受保护的界面露出),给出可重试入口。
+    loadFailedTitle: 'Failed to load settings',
+    loadFailedHint:
+      'App settings could not be read. The interface stays hidden so unprotected content is not shown.',
+    loadFailedRetry: 'Retry',
     openLogWindow: 'Log Window',
     openLogWindowDesc: 'Open a standalone window for the live log stream, filters, and history',
     openLogWindowBtn: 'Open',
@@ -1277,6 +1310,16 @@ export default {
     computing: 'Computing layout…',
     scrollToTop: 'Scroll to Top',
     scrollToBottom: 'Scroll to Bottom',
+  },
+  demoPrivacy: {
+    // Top-bar one-click masking entry and alias words: real folder/file names are hidden while demoing.
+    enable: 'Demo privacy mode',
+    disable: 'Exit demo privacy mode',
+    aliasFolder: 'Folder',
+    aliasImage: 'Image',
+    aliasVideo: 'Video',
+    aliasFile: 'File',
+    demoLibrary: 'Demo Library',
   },
   selection: {
     selected: '{count} selected',
@@ -1623,6 +1666,11 @@ export default {
     rebuildConfirmMsg:
       'This will clear all analyzed vectors for the current model; you will need to run the analysis again (may take a while). Continue?',
     rebuildConfirm: 'Clear & Rebuild',
+    // First run without downloaded models: shown when analysis is rejected (confirm only navigates).
+    modelMissingTitle: 'AI model not downloaded yet',
+    modelMissingMsg:
+      'AI analysis needs the model files first. Go to "Settings → AI → Model Library" to download the active model, then come back here and start again.',
+    modelMissingGo: 'Go to download',
     emptyPrompt: 'Describe the image in natural language in the search box above',
     emptyExamples: 'e.g. "sunset at the beach", "selfie of two people", "cat playing"',
     searching: 'Analyzing…',
@@ -1913,6 +1961,10 @@ export default {
     exit: 'Exit App',
     // IPC 失败反馈(审查 P1-16):此前先关弹窗后 await,退出/托盘失败零提示。
     actionFailed: 'Action failed: {error}',
+    // 退出前 flush 失败(设置集中保存):在途/待保存设置未能落盘,由用户裁决重试或放弃。
+    flushFailed: 'Some settings could not be saved. Retry, or discard the unsaved changes and exit.',
+    retry: 'Retry',
+    exitAnyway: 'Discard unsaved changes and exit',
   },
   // 新建物理文件夹对话框
   folderCreate: {

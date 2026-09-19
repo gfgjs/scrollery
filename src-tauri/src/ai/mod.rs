@@ -15,6 +15,5 @@ pub mod remote_registry;
 pub mod runtime_config;
 pub mod search;
 pub mod search_control;
-pub mod vector_store;
 pub mod worker_client;
 pub mod worker_pipeline;

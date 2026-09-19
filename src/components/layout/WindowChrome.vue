@@ -134,10 +134,10 @@ onBeforeUnmount(() => {
   align-items: stretch;
   height: var(--titlebar-height);
   min-height: var(--titlebar-height);
-  background-color: var(--material-recipe-chrome-background-color);
+  background-color: var(--color-bg-secondary);
   /* chrome 材质叠层:仅「宣」等有纸纹的主题非 none;与 sidebar/toolbar 同款 */
-  background-image: var(--material-recipe-chrome-background-image);
-  border-bottom: 1px solid var(--material-recipe-chrome-border-color);
+  background-image: none;
+  border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
   user-select: none;
   color: var(--color-text-primary);
@@ -162,8 +162,8 @@ onBeforeUnmount(() => {
   /* Phase G G3: 三键置顶且不透明——极窄窗内容若仍溢出, 藏其后而不盖住三键(非裁剪, 不影响下拉弹层) */
   position: relative;
   z-index: 2;
-  background-color: var(--material-recipe-chrome-background-color);
-  background-image: var(--material-recipe-chrome-background-image);
+  background-color: var(--color-bg-secondary);
+  background-image: none;
   flex-shrink: 0;
 }
 

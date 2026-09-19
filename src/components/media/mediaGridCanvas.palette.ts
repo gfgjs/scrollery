@@ -1,44 +1,36 @@
-// Canvas 网格调色板(挂载/换尺寸/换主题/换浓度时读一次并缓存;canvas 需具体色值,不能用 CSS 变量)。
-// 纯数据 + 一个 DOM 读取函数,从 MediaGridCanvas.vue 下沉(方案 2.2 ①)。
-import { resolveTokenColor } from '../../utils/cssColor'
+// Canvas 网格调色板:把主题生成的色板投影成网格绘制所需的字段(方案 §6)。
+//
+// Canvas 需要具体色值(fillStyle 吃不下 var()/color-mix()),故颜色**只**来自 store 发布的
+// ThemePalette——DOM 与 Canvas 同一份生成结果,这里不保留第二套默认色、也不逐帧 getComputedStyle。
+// 只有非颜色的尺寸/字体度量仍从 DOM 读一次(它们来自 variables.css,与主题无关)。
+import type { ThemePalette } from '../../themes/types'
 import type { docBadgeKind } from './mediaGrid.helpers'
 
-/**
- * 媒体徽标/评分的共享色板源。
- *
- * 这些值同时由 variables.css 提供给 DOM 与 Canvas;这里仅作 computed style
- * 读取失败时的同源 fallback,不要在六套主题里各自覆写。
- */
-export const CANONICAL_BADGE_COLORS = {
-  scrim: 'rgba(0, 0, 0, 0.6)',
-  markLive: '#ffaaaa',
-  markAudio: '#5dd39e',
-  markDocument: '#ffd166',
-  ratingAmber: '#fbbf24',
-} as const
-
+/** 网格绘制消费的调色板:字段按绘制用途命名,值全部来自传入的 ThemePalette。 */
 export interface Palette {
   accent: string
+  /** 分隔行辅助文字(计数/副标题)。取画廊底派生的辅助文字:显式 gallery 可与窗口底色反极性，
+   *  用窗口 textSecondary 会在「暗界面 + 浅色画廊」上读不清。 */
   sepText: string
-  /** 无 ThumbHash 格子的格面底色。亮色主题刻意比 gallery canvas 更暗，
+  /** 无缩略图格子的格面底色。亮色主题刻意比 gallery canvas 更暗，
    *  暗色主题则稍亮，降低“整片底色 ↔ 彩色缩略图”反复切换的明度闪烁。 */
   canvasPlaceholder: string
-  /** 格缝/整幅清屏色 = --color-bg-canvas-gap,与画廊底色统一；格面占位色另保留区分度。 */
+  /** 格缝/整幅清屏色 = canvasGap,与画廊底色统一；格面占位色另保留区分度。 */
   canvasGap: string
-  /** 格内 1px 内描边 = --color-thumb-outline:白底图贴亮底/暗图贴暗底时勾出图与底的边界。
-   *  用户诉求是"加阴影"——canvas 每帧逐格 shadowBlur 走中间面模糊,数百格 60fps 不可承受;
-   *  1px 零模糊描边等效达成分隔且近零成本,DOM 侧 .media-thumb::before 同 token 同源。 */
+  /** 格内 1px 内描边:白底图贴亮底/暗图贴暗底时勾出图与底的边界。
+   *  用户诉求是“加阴影”——canvas 每帧逐格 shadowBlur 走中间面模糊,数百格 60fps 不可承受;
+   *  1px 零模糊描边等效达成分隔且近零成本,DOM 侧 .media-thumb::before 同变量同源。 */
   thumbOutline: string
   /** 选中态目标圆角 = --radius-lg(px 数值;DOM .media-thumb--selected 的 border-radius)。 */
   radiusLg: number
-  /** 分隔行文字色 = --color-text-primary。 */
+  /** 分隔行标题文字。同上取画廊底派生的正文,不拿窗口 textPrimary。 */
   textPrimary: string
-  /** 文本文档卡纸面/仿文本行(--color-doc-paper(-line),S5 收敛的可主题化 token)。 */
+  /** 文本文档卡纸面/仿文本行(--color-doc-paper(-line),从实际画廊底色派生)。 */
   docPaper: string
   docPaperLine: string
   /** 文本卡扩展名徽章按格式配色(--color-badge-doc-*)。 */
   badgeDoc: Record<ReturnType<typeof docBadgeKind>, string>
-  /** B1 canonical 徽标源;B4 用于 scrim + 类别点/短边,不让类别色承载整块文字背景。 */
+  /** 图片上方徽标/评分的专用遮罩与类别点色:品牌语义色,不随主题漂移。 */
   badgeScrim: string
   badgeMarkLive: string
   badgeMarkAudio: string
@@ -52,62 +44,64 @@ export interface Palette {
   fontMono: string
 }
 
-export const defaultPalette: Palette = {
-  accent: '#4a9',
-  sepText: '#888',
-  canvasPlaceholder: '#cfd4d7',
-  canvasGap: '#c0c6ca',
-  thumbOutline: 'rgba(0, 0, 0, 0.07)',
+/** 非颜色的度量值:与主题无关,仍按现有机制从 DOM 读一次。 */
+export interface PaletteMetrics {
+  radiusLg: number
+  radiusXs: number
+  radiusSm: number
+  fontMono: string
+}
+
+/** 度量回退:仅用于挂载测量前的理论调用点;颜色一律来自传入色板,此处不设任何颜色默认值。 */
+export const PALETTE_METRICS_FALLBACK: PaletteMetrics = {
   radiusLg: 10,
-  textPrimary: '#eee',
-  docPaper: '#f5f2ea',
-  docPaperLine: '#d8d2c4',
-  badgeDoc: { generic: '#6c757d', md: '#4a5568', word: '#2b579a', excel: '#217346', ppt: '#d24726' },
-  badgeScrim: CANONICAL_BADGE_COLORS.scrim,
-  badgeMarkLive: CANONICAL_BADGE_COLORS.markLive,
-  badgeMarkAudio: CANONICAL_BADGE_COLORS.markAudio,
-  badgeMarkDocument: CANONICAL_BADGE_COLORS.markDocument,
-  ratingAmber: CANONICAL_BADGE_COLORS.ratingAmber,
   radiusXs: 4,
   radiusSm: 6,
-  fontMono: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+  fontMono: 'monospace',
+}
+
+/** 读一次尺寸/字体度量(挂载与换尺寸时调用;不含任何颜色读取)。 */
+export function readPaletteMetrics(el: HTMLElement): PaletteMetrics {
+  const s = getComputedStyle(el)
+  const num = (name: string, fallback: number) => parseFloat(s.getPropertyValue(name)) || fallback
+  return {
+    radiusLg: num('--radius-lg', PALETTE_METRICS_FALLBACK.radiusLg),
+    radiusXs: num('--radius-xs', PALETTE_METRICS_FALLBACK.radiusXs),
+    radiusSm: num('--radius-sm', PALETTE_METRICS_FALLBACK.radiusSm),
+    fontMono: s.getPropertyValue('--font-mono').trim() || PALETTE_METRICS_FALLBACK.fontMono,
+  }
 }
 
 /**
- * 从 el 的 computed style 读一份新调色板对象(不再原地重写模块级 let,拆分后改为纯函数,
- * 调用点自行重新赋值——见 MediaGridCanvas.vue §3.2:取值时序不变,仍是"挂载/换尺寸/换主题
- * 时读一次,之后每帧引用同一对象引用"）。
+ * 色板 + 度量 → 网格调色板(纯投影,无算法、无默认值)。
+ *
+ * 调用点:挂载 / 换尺寸 / 主题换代。之后每帧引用同一对象引用,不再触碰 DOM。
  */
-export function readPalette(el: HTMLElement): Palette {
-  const s = getComputedStyle(el)
-  const g = (name: string, fallback: string) => s.getPropertyValue(name).trim() || fallback
-  // 含 var() 的 color-mix 浓度表达式(2026-09-06 起:底色 wash 五件 + 文字 ramp 两件)须解成
-  // 具体色(fillStyle 吃不下 var());其余 token 仍是纯色,直接读原值。
-  const gc = (name: string, fallback: string) => resolveTokenColor(el, name, fallback)
+export function projectPalette(theme: ThemePalette, metrics: PaletteMetrics): Palette {
   return {
-    accent: g('--color-accent', '#4a9'),
-    sepText: gc('--color-text-secondary', '#888'),
-    canvasPlaceholder: gc('--color-bg-canvas-placeholder', '#cfd4d7'),
-    canvasGap: gc('--color-bg-canvas-gap', '#c0c6ca'),
-    thumbOutline: g('--color-thumb-outline', 'rgba(0, 0, 0, 0.07)'),
-    radiusLg: parseFloat(g('--radius-lg', '10px')) || 10,
-    textPrimary: gc('--color-text-primary', '#eee'),
-    docPaper: gc('--color-doc-paper', '#f5f2ea'),
-    docPaperLine: gc('--color-doc-paper-line', '#d8d2c4'),
+    accent: theme.accent,
+    sepText: theme.canvasTextSecondary,
+    canvasPlaceholder: theme.canvasPlaceholder,
+    canvasGap: theme.canvasGap,
+    thumbOutline: theme.thumbOutline,
+    radiusLg: metrics.radiusLg,
+    textPrimary: theme.canvasText,
+    docPaper: theme.docPaper,
+    docPaperLine: theme.docPaperLine,
     badgeDoc: {
-      generic: g('--color-badge-doc-generic', '#6c757d'),
-      md: g('--color-badge-doc-md', '#4a5568'),
-      word: g('--color-badge-doc-word', '#2b579a'),
-      excel: g('--color-badge-doc-excel', '#217346'),
-      ppt: g('--color-badge-doc-ppt', '#d24726'),
+      generic: theme.badgeDocGeneric,
+      md: theme.badgeDocMd,
+      word: theme.badgeDocWord,
+      excel: theme.badgeDocExcel,
+      ppt: theme.badgeDocPpt,
     },
-    badgeScrim: g('--color-badge-scrim', CANONICAL_BADGE_COLORS.scrim),
-    badgeMarkLive: g('--color-badge-mark-live', CANONICAL_BADGE_COLORS.markLive),
-    badgeMarkAudio: g('--color-badge-mark-audio', CANONICAL_BADGE_COLORS.markAudio),
-    badgeMarkDocument: g('--color-badge-mark-document', CANONICAL_BADGE_COLORS.markDocument),
-    ratingAmber: g('--color-rating-amber', CANONICAL_BADGE_COLORS.ratingAmber),
-    radiusXs: parseFloat(g('--radius-xs', '4px')) || 4,
-    radiusSm: parseFloat(g('--radius-sm', '6px')) || 6,
-    fontMono: g('--font-mono', 'ui-monospace, SFMono-Regular, Consolas, monospace'),
+    badgeScrim: theme.badgeScrim,
+    badgeMarkLive: theme.badgeMarkLive,
+    badgeMarkAudio: theme.badgeMarkAudio,
+    badgeMarkDocument: theme.badgeMarkDocument,
+    ratingAmber: theme.ratingAmber,
+    radiusXs: metrics.radiusXs,
+    radiusSm: metrics.radiusSm,
+    fontMono: metrics.fontMono,
   }
 }

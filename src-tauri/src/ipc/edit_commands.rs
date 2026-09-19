@@ -100,20 +100,6 @@ pub async fn activate_editing_feature(
     Ok(())
 }
 
-/// 撤销内建编辑 feature 授权；供设置页/回归测试复用，操作幂等。
-#[tauri::command]
-pub async fn deactivate_editing_feature(state: State<'_, Arc<AppState>>) -> Result<()> {
-    let provider = state.entitlement_provider();
-    tokio::task::spawn_blocking(move || provider.deactivate(EDITING_PLUGIN_ID))
-        .await
-        .map_err(|_| AppError::System("图片编辑撤销授权任务异常终止".into()))?
-        .map_err(|e| AppError::Exotic {
-            code: e.code(),
-            message: format!("图片编辑撤销授权失败：{}", e.code()),
-        })?;
-    Ok(())
-}
-
 fn unix_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -7,8 +7,8 @@
 #    §3.7.3——本工作流仅用 github.token,无任何签名凭据)。
 #
 # 免费版形态(2026-07-04 T17 施工裁决):
-#   - 构建 = 默认 `tauri build`:release profile + default features(custom-protocol+lite feature
-#     +channel-direct)。注:根 Cargo.toml **有** `[profile.lite]`(opt-z+LTO+strip)但本工作流**不调用**
+#   - 构建 = 默认 `tauri build`:release profile + default features(custom-protocol + lite)。
+#     注:根 Cargo.toml **有** `[profile.lite]`(opt-z+LTO+strip)但本工作流**不调用**
 #     它(走 release profile);是否让免费版走体积优化 profile 是开放决策(见 todo H3),非本工作流缺陷。
 #   - 基座 conf 无 updater 配置块 → 运行时不注册 updater、不产 .sig 更新包(§3.6.5①
 #     条件注册;与 §3.7.1「免费版不含 updater 更新包」一致)。
@@ -90,9 +90,9 @@ jobs:
       - name: tauri build(免费版,含 MSI + NSIS 安装包)
         run: npx tauri build
 
-      # 渠道合规扫描针对**最终产物**:扫的就是上面 beforeBuildCommand 产出的、装进安装包的 dist
+      # 发布合规扫描针对**最终产物**:扫的就是上面 beforeBuildCommand 产出的、装进安装包的 dist
       # (原顺序里扫的是独立 npm run build 的 dist,与发布产物不是同一份)。
-      - name: 渠道合规扫描(verify-channel-bundle)
+      - name: 发布合规扫描(verify-channel-bundle)
         run: node scripts/verify-channel-bundle.mjs
 
       # 发布 SHA 上复跑测试门控(oss-gate 在 sync-staging 验过,此处对 tag SHA 再取证)。

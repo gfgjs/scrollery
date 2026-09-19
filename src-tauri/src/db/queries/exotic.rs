@@ -326,7 +326,7 @@ pub fn get_exotic_plugin(
     let row = conn
         .query_row(
             "SELECT plugin_id, version, manifest_hash, package_sequence, install_state,
-                    installed_at, updated_at, entitlement_source
+                    installed_at, updated_at
              FROM exotic_plugins WHERE plugin_id=?1",
             params![plugin_id],
             |row| {
@@ -338,7 +338,6 @@ pub fn get_exotic_plugin(
                     install_state: row.get(4)?,
                     installed_at: row.get(5)?,
                     updated_at: row.get(6)?,
-                    entitlement_source: row.get(7)?,
                 })
             },
         )
@@ -355,15 +354,14 @@ pub fn upsert_exotic_plugin(
     conn.execute(
         "INSERT INTO exotic_plugins
             (plugin_id, version, manifest_hash, package_sequence, install_state, installed_at,
-             updated_at, entitlement_source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(plugin_id) DO UPDATE SET
             version=excluded.version,
             manifest_hash=excluded.manifest_hash,
             package_sequence=excluded.package_sequence,
             install_state=excluded.install_state,
-            updated_at=excluded.updated_at,
-            entitlement_source=excluded.entitlement_source",
+            updated_at=excluded.updated_at",
         params![
             rec.plugin_id,
             rec.version,
@@ -372,7 +370,6 @@ pub fn upsert_exotic_plugin(
             rec.install_state,
             rec.installed_at,
             rec.updated_at,
-            rec.entitlement_source,
         ],
     )?;
     Ok(())
@@ -517,21 +514,6 @@ pub fn list_exotic_task_details(
     Ok(rows)
 }
 
-/// 单任务重置为 pending（用户「重试此项」命令）：清输出/指纹/错误/租约/退避。返回行数。
-pub fn reset_exotic_task_for_retry(
-    conn: &Connection,
-    item_id: i64,
-    capability: &str,
-) -> Result<usize> {
-    Ok(conn.execute(
-        "UPDATE exotic_tasks
-         SET status=0, attempts=0, next_retry_at=NULL, claimed_at=NULL, lease_owner=NULL,
-             last_error_code=NULL, last_error_message=NULL, updated_at=strftime('%s','now')
-         WHERE item_id=?1 AND capability=?2 AND status IN (3,4)",
-        params![item_id, capability],
-    )?)
-}
-
 /// 某插件全部 error 任务（status 3/4）重置为 pending（用户「重试插件失败」命令）。返回行数。
 pub fn reset_exotic_plugin_failures(conn: &Connection, plugin_id: &str) -> Result<usize> {
     Ok(conn.execute(
@@ -625,7 +607,7 @@ mod exotic_dao_tests {
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         // 关 FK 以便用最小 media_items 夹具覆盖任务 DAO，而不构造完整目录树。
         c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         c
@@ -868,7 +850,6 @@ mod exotic_dao_tests {
             install_state: crate::exotic::install_state::INSTALLED.into(),
             installed_at: 100,
             updated_at: 100,
-            entitlement_source: "direct".into(),
         };
         upsert_exotic_plugin(&c, &rec).unwrap();
         let got = get_exotic_plugin(&c, PID).unwrap().unwrap();

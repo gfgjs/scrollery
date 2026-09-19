@@ -2058,7 +2058,6 @@ async function stageChain(ctx) {
           backupId: r.backupId,
           stagingDir: r.stagingDir,
           schemaVersion: r.schemaVersion,
-          needsMigration: r.needsMigration,
           counts: r.counts,
         };
       });

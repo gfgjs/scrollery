@@ -25,6 +25,8 @@ export interface CanvasHoverCardDeps {
   scrolling: () => boolean
   isSelectionMode: () => boolean
   enableHoverScale: () => boolean
+  /** 演示打码开关(2026-09-16):开启时悬停卡完全不可用(它渲染的是真实缩略图与真实文案)。 */
+  demoPrivacy: () => boolean
   isPendingDelete: (id: number) => boolean
   isSelected: (id: number) => boolean
   cacheDir: () => string
@@ -111,6 +113,8 @@ export function useCanvasHoverCard(deps: CanvasHoverCardDeps) {
       }
     }
     if (token !== hoverPrepToken) return
+    // 预解码等待期开关被打开:不落卡(打码期间不得出现真实内容)。
+    if (deps.demoPrivacy()) return
     const cell = { x: hit.item.x, y: hit.rowY - deps.currentY(), w: hit.item.w, h: hit.item.h }
     // 选择模式和“悬停放大”关闭时都保持原位原尺寸(对齐 DOM 的 transform:none);
     // 常规态 1.06 对齐 DOM hover;小格放大镜倍率封顶 1.2(真机反馈 1.5 仍突兀,防深入邻格)。
@@ -135,6 +139,12 @@ export function useCanvasHoverCard(deps: CanvasHoverCardDeps) {
    */
   function handleHoverTracking(e: PointerEvent, fromCard: boolean) {
     if (deps.scrolling() || isThumbLoadDeferred()) {
+      clearHover()
+      return
+    }
+    // 演示打码:打码期间不弹新卡(卡内是真实缩略图与真实信息文案)。已存在的卡不在这一支清,
+    // 由宿主在开关翻转时统一 clearHover——但打码态下每次指针移动都会走到这里,清掉更稳。
+    if (deps.demoPrivacy()) {
       clearHover()
       return
     }

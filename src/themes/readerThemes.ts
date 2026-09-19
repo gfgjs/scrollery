@@ -1,15 +1,16 @@
 // 阅读专属主题调色板（阅读器方案 R3「主题日夜配对 + 羊皮纸纹理」）。
 //
-// 与 app chrome 主题（registry.ts 的 BUILTIN_THEMES：墨/素/宣…）**分属两个命名空间**：
+// 与 app chrome 主题(themes/presets.ts 的 BUILTIN_PRESETS:中性/暖纸/冷夜,由 generateTheme 生成
+// 完整色板)**分属两个命名空间**：
 // 后者是整个应用外壳的语义色层（30+ 变量），前者只是阅读区正文/背景的一对色 —— 因为好的**阅读**
 // 底色（纸白 / 羊皮纸 / 护眼 / 夜间）与好的**界面**底色标准不同。二者解耦：用户可在深色界面里读纸白，
 // 或在浅色界面里读夜间（不常见但不禁止）。
 //
 // 「日夜配对」= 持久化 light-槽 与 dark-槽两个选择（各默认 FOLLOW），随 app 明暗自动切换应用哪一槽，
-// 与 app 自身 theme_light/theme_dark 的模型同构。FOLLOW = 跟随应用主题色（保持 R2 起的既有行为，
+// 与 app 自身 theme_light_palette/theme_dark_palette 的槽位模型同构。FOLLOW = 跟随应用主题色(保持 R2 起的既有行为，
 // 也是零回归默认）。
 //
-// 纯数据 + 查表，无 DOM / 无副作用，node 环境可单测；对比度门禁见 reader-theme-contract.spec.ts。
+// 纯数据 + 查表，无 DOM / 无副作用。
 
 /** 「跟随应用主题」哨兵值：不属任何调色板条目，resolveReaderColors 遇之回落 app 颜色。 */
 export const READER_THEME_FOLLOW = 'follow'
@@ -30,7 +31,7 @@ export interface ReaderTheme {
   texture?: boolean
 }
 
-// 精选阅读调色板。颜色须过 WCAG AA 正文对比度门禁（≥4.5，见 reader-theme-contract.spec.ts）。
+// 精选阅读调色板。正文与背景的设计对比度要求为 ≥4.5。
 // light：纸白（中性偏暖白）/ 羊皮纸（暖黄 + 纹理）/ 护眼（低饱和青绿）。
 // dark：夜间（中性深灰）/ 石墨（近黑冷调）。
 export const READER_THEMES: readonly ReaderTheme[] = [

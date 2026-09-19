@@ -127,11 +127,11 @@ pub fn fetch_export_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migration::run_migrations;
+    use crate::db::schema::initialize_schema;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        initialize_schema(&conn).unwrap();
         conn
     }
 

@@ -1,0 +1,83 @@
+[
+  {
+    "run": "r1-cold",
+    "cold": 164,
+    "drawP50": 2.9,
+    "drawP95": 3.4,
+    "bmpP50": 0,
+    "jank": 0.0014,
+    "fps": 119.9
+  },
+  {
+    "run": "r2-cold",
+    "cold": 992,
+    "drawP50": 3,
+    "drawP95": 4.7,
+    "bmpP50": 74,
+    "jank": 0.2177,
+    "fps": 98.2
+  },
+  {
+    "run": "r3-cold",
+    "cold": 3825,
+    "drawP50": 2.3,
+    "drawP95": 4,
+    "bmpP50": 54,
+    "jank": 0.1028,
+    "fps": 108.8
+  },
+  {
+    "run": "r4-cold",
+    "cold": 114827,
+    "drawP50": 2.6,
+    "drawP95": 3.3,
+    "bmpP50": 55.5,
+    "jank": 0.017,
+    "fps": 118.1
+  },
+  {
+    "run": "r5-burst",
+    "cold": 205411,
+    "drawP50": 2.8,
+    "drawP95": 4.88,
+    "bmpP50": 53.2,
+    "jank": 0.0928,
+    "fps": 109.6
+  },
+  {
+    "run": "s1-selectanim",
+    "cold": 43676,
+    "drawP50": 4.2,
+    "drawP95": 7.68,
+    "bmpP50": 94.7,
+    "jank": 0.6047,
+    "fps": 70.9
+  },
+  {
+    "run": "s2-selectanim",
+    "cold": 884,
+    "drawP50": 4,
+    "drawP95": 6.8,
+    "bmpP50": 77.7,
+    "jank": 0.4366,
+    "fps": 83.1
+  },
+  {
+    "run": "w1-warm",
+    "cold": 164,
+    "drawP50": 3,
+    "drawP95": 3.4,
+    "bmpP50": 65.45,
+    "jank": 0.0155,
+    "fps": 118.2
+  },
+  {
+    "run": "w2-warm",
+    "cold": 1378,
+    "drawP50": 2.6,
+    "drawP95": 3.1,
+    "bmpP50": 21.3,
+    "jank": 0.0028,
+    "fps": 119.6
+  }
+]

@@ -346,7 +346,7 @@ mod snapshot_tests {
 
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -902,7 +902,7 @@ mod reset_derivations_tests {
     /// 建全量 schema + 5 个 item + 各类 (kind, status) 派生行,覆盖复位边界。
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -964,7 +964,7 @@ mod poison_guard_tests {
     /// 建单个 item + 一行 status=1 的派生任务,用于逐轮驱动 `reset_processing_derivations`。
     fn one_processing_task() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -1116,7 +1116,7 @@ mod kind_filter_tests {
     /// 三 kind 混布:视频 1/2 各有 cover+keyframes 行(状态混合),音频 3 有 audio_cover 行。
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -1186,7 +1186,7 @@ mod video_playable_tests {
 
     fn one_video() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -1387,7 +1387,7 @@ mod hidden_root_derivation_tests {
     /// 两根:root1(视频 1)+root2(视频 2 + pdf 文档 3),全 status=0 待处理。
     fn two_roots_pending() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES
@@ -1447,7 +1447,7 @@ mod doc_thumb_guard_tests {
     /// 5 个 item 覆盖白名单内外:pdf/svg(接受)、epub(后端渲染,拒)、txt/mp4(非文档缩略图,拒)。
     fn seeded() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        crate::db::migration::run_migrations(&c).unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');

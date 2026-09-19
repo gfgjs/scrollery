@@ -303,7 +303,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-  background-color: var(--material-recipe-canvas-background-color);
+  background-color: var(--color-bg-primary);
   color: var(--color-text-primary);
 }
 
@@ -331,13 +331,13 @@ onBeforeUnmount(() => {
   /* 静息态刻意低调(用户裁:看图台上此钮不得喧宾夺主):无边框无投影、底色减淡、
      整体半透明,hover/键盘聚焦才显形——同 immersive-exit 的「悬停显现」语义,
      但保持 token 化随主题(非 S5 恒深色豁免面)。34px 触达目标不缩,只降视觉重量。 */
-  background: var(--material-recipe-float-background-color);
+  background: var(--color-bg-elevated);
   color: var(--color-text-secondary);
   opacity: 0.55;
-  border: 1px solid var(--material-recipe-float-border-color);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  border: 1px solid var(--color-border-strong);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   /* left 与侧栏 margin-left 同用 --transition-normal → 侧栏滑动时浮动钮同步跟随、不抢跑;
      hover 变色仍走 fast。 */
   transition:
@@ -350,7 +350,7 @@ onBeforeUnmount(() => {
 .viewer-sidebar-toggle:focus-visible {
   opacity: 1;
   color: var(--color-text-primary);
-  background: var(--material-recipe-float-background-color);
+  background: var(--color-bg-elevated);
 }
 
 .app-sidebar {
@@ -360,10 +360,10 @@ onBeforeUnmount(() => {
   height: 100%;
   min-width: 180px;
   max-width: 400px;
-  background-color: var(--material-recipe-chrome-background-color);
+  background-color: var(--color-bg-secondary);
   /* chrome 材质叠层:仅「宣」等有纸纹的主题非 none;画布区永不消费此 token */
-  background-image: var(--material-recipe-chrome-background-image);
-  border-right: 1px solid var(--material-recipe-chrome-border-color);
+  background-image: none;
+  border-right: 1px solid var(--color-border);
   overflow: hidden;
   flex-shrink: 0;
   /* 收起动画:只过渡 margin-left(内容恒宽不重排);拖拽调宽改的是 width、无过渡故实时跟手。
@@ -405,9 +405,9 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   padding: 0 var(--spacing-md);
-  background-color: var(--material-recipe-chrome-background-color);
-  background-image: var(--material-recipe-chrome-background-image);
-  border-bottom: 1px solid var(--material-recipe-chrome-border-color);
+  background-color: var(--color-bg-secondary);
+  background-image: none;
+  border-bottom: 1px solid var(--color-border);
   gap: var(--toolbar-gap);
   flex-shrink: 0;
 }
@@ -426,9 +426,9 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   padding: 0 var(--spacing-md);
-  background-color: var(--material-recipe-chrome-background-color);
-  background-image: var(--material-recipe-chrome-background-image);
-  border-top: 1px solid var(--material-recipe-chrome-border-color);
+  background-color: var(--color-bg-secondary);
+  background-image: none;
+  border-top: 1px solid var(--color-border);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
   flex-shrink: 0;

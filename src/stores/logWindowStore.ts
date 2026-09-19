@@ -4,10 +4,12 @@
 // 内实例化——主窗口从不 use 本 store,不产生额外订阅/内存开销。
 
 import { defineStore } from 'pinia'
-import { ref, shallowRef, computed } from 'vue'
+import { ref, shallowRef, computed, watch } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { IPC, EVENTS } from '../constants/ipc'
 import { useTauriListen } from '../composables/useTauriListen'
+import { readSetting, writeSettings } from './settingsPersistence'
+import { parseSettingJson } from '../composables/settingsValues'
 import { LOG_LEVELS, type LogEntry, type LogLevelFilter } from '../types/logEntry'
 
 /** 环形缓冲上限的默认值/可调区间(方案 §5 MVP「默认 10k 行,设置可调 5k-20k」)。
@@ -182,7 +184,7 @@ export const useLogWindowStore = defineStore('logWindow', () => {
   const filteredHistory = computed(() => historyEntries.value.filter(matchesFilter))
 
   // ── 过滤 preset(方案 §5 P1「过滤条件 preset(Docker 范式)」)────────────────
-  // 存 localStorage(非后端):这是纯 UI 偏好,窗口关了也该留着,且不值得为它加一条 IPC/DB 往返。
+  // 存中央设置键 log_filter_presets(原生表数组):全局用户偏好,与其它设置同库同理。
   interface LogFilterPreset {
     name: string
     levels: LogLevelFilter[]
@@ -190,28 +192,26 @@ export const useLogWindowStore = defineStore('logWindow', () => {
     text: string
     textMode: 'substring' | 'regex'
   }
-  const PRESETS_STORAGE_KEY = 'scrollery.logWindow.presets.v1'
+  const PRESETS_KEY = 'log_filter_presets'
 
-  function loadPresetsFromStorage(): LogFilterPreset[] {
-    try {
-      const raw = localStorage.getItem(PRESETS_STORAGE_KEY)
-      if (!raw) return []
-      const parsed: unknown = JSON.parse(raw)
-      return Array.isArray(parsed) ? (parsed as LogFilterPreset[]) : []
-    } catch {
-      // localStorage 不可用(隐私模式/无 DOM 的测试环境等)——preset 功能静默降级为仅本次会话有效。
-      return []
-    }
+  /** 读 preset 列表:缺键/非法文本/非数组一律空表。 */
+  function readPresets(): LogFilterPreset[] {
+    const parsed = parseSettingJson<unknown>(readSetting(PRESETS_KEY), [])
+    return Array.isArray(parsed) ? (parsed as LogFilterPreset[]) : []
   }
 
-  const presets = ref<LogFilterPreset[]>(loadPresetsFromStorage())
+  const presets = ref<LogFilterPreset[]>(readPresets())
+  // 后端只应用:权威快照变化(启动水合 / 恢复默认 / 外部改文件)→ 重读列表,不写回。
+  watch(
+    () => readSetting(PRESETS_KEY),
+    () => {
+      presets.value = readPresets()
+    },
+  )
 
+  /** 提交 preset 列表:写盘失败由中央服务统一提示,此处 catch 只为收掉 promise。 */
   function persistPresets() {
-    try {
-      localStorage.setItem(PRESETS_STORAGE_KEY, JSON.stringify(presets.value))
-    } catch {
-      // 同上,静默降级。
-    }
+    writeSettings({ [PRESETS_KEY]: JSON.stringify(presets.value) }).catch(() => {})
   }
 
   function saveCurrentAsPreset(name: string) {

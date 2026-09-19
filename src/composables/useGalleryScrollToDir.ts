@@ -9,9 +9,7 @@ import { useUiStore } from '../stores/uiStore'
 
 export interface GalleryScrollToDirDeps {
   gridRef: () => HTMLElement | null
-  bucketActive: () => boolean
   scrollToLogicalY: (y: number, o?: { smooth?: boolean }) => Promise<void>
-  logicalToPhysical: (y: number) => number
   getViewKey: () => string
   beginProgrammaticScroll: () => void
   endProgrammaticScroll: () => void
@@ -34,20 +32,13 @@ export function useGalleryScrollToDir(deps: GalleryScrollToDirDeps) {
         IPC.GET_SUBTREE_SCROLL_TARGET,
         { dirId },
       )
-      const el = deps.gridRef()
-      if (target && el) {
-        // `y` 是逻辑坐标；scrollCache 存物理 scrollTop → 需映射。
+      if (target && deps.gridRef()) {
+        // `y` 是逻辑坐标;scrollCache 在 bucket 引擎下同样存逻辑 y(物理位在映射态不自足)。
         // 落到后代 → 高亮/展开该子文件夹，而非空父文件夹。
         if (ui.groupBy === 'folder' && target.dirId !== dirId) ui.scrolledDirectoryId = target.dirId
         const targetY = Math.max(0, target.y)
-        if (deps.bucketActive()) {
-          void deps.scrollToLogicalY(targetY, { smooth: true })
-          scrollCache.set(deps.getViewKey(), targetY)
-        } else {
-          const physY = deps.logicalToPhysical(targetY)
-          el.scrollTo({ top: physY, behavior: 'smooth' })
-          scrollCache.set(deps.getViewKey(), physY)
-        }
+        void deps.scrollToLogicalY(targetY, { smooth: true })
+        scrollCache.set(deps.getViewKey(), targetY)
       } else {
         // 无需滚动 — 立即放下守卫，不必等待停稳。
         deps.endProgrammaticScroll()

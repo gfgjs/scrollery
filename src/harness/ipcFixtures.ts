@@ -1,21 +1,22 @@
 import { IPC } from '../constants/ipc'
-import { getTheme } from '../themes/registry'
 import {
   uiHarnessAvail,
   uiHarnessAvailRatio,
-  uiHarnessBucket,
+  uiHarnessAppearance,
   uiHarnessItems,
+  uiHarnessRenderMode,
   uiHarnessRowHeight,
-  uiHarnessTheme,
-  uiHarnessText,
-  uiHarnessTint,
+  uiHarnessSeed,
   uiHarnessThumbStatus,
 } from './runtime'
+import { serializeThemeSeed } from '../themes/config'
+import { DEFAULT_THEME_DEFINITION } from '../themes/presets'
+import type { ThemeSeed } from '../themes/types'
 import type { IpcCommand } from '../utils/ipc'
 import type { LayoutRow, LayoutRowItem, LayoutSummary, MediaMeta } from '../types/layout'
 import type { AppStats, DirNode, MediaDetail, MediaType, ScanRoot, ThumbResult } from '../types/media'
 import type { DedupStatusSnapshot } from '../types/ipc'
-import type { StartupConfig } from '../stores/uiStore'
+import type { SettingsChange, SettingsSnapshot, StartupPayload } from '../types/config'
 
 const SCENE_VERSION = 1
 
@@ -220,113 +221,167 @@ const stats: AppStats = {
   ).filter(Boolean).length,
 }
 
-const startupConfig: StartupConfig = {
+// ── 设置快照 fixture(设置集中保存,2026-09-16)──────────────────────────────────
+//
+// 真后端以 config.toml 为全部用户设置的唯一真源,快照里每个已注册键都带生效值;harness 只
+// **覆盖视觉基线需要的键**——本表没有的键读取即 undefined,消费方回落到各自的产品默认
+// (与旧 fixture 里留 null 的语义一致:harness 是视觉场景,不是「新装默认」模拟器)。
+const SETTINGS_FIXTURE: Record<string, string> = {
   language: 'zh-CN',
-  timelineScrollWidth: null,
-  timelineAxisWidth: '44',
-  scrollThumbMinHeight: '28',
-  uiFontSize: '15',
-  enableThumbHoverScale: 'true',
+  timeline_axis_width: '44',
+  scroll_thumb_min_height: '28',
+  ui_font_size: '15',
+  enable_thumb_hover_scale: 'true',
   // 行高:显式 &rowHeight= 优先;否则视觉场景 220 / perf 场景 60(既有行为)。
-  gridRowHeight:
+  grid_row_height:
     uiHarnessRowHeight !== null ? String(uiHarnessRowHeight) : uiHarnessItems === null ? '220' : '60',
-  groupBy: 'date',
-  sortWithinGroup: 'datetime',
-  layoutMode: 'justified',
-  closeBehavior: 'ask',
-  pinnedSettings: '[]',
-  guideSeen: 'true',
+  group_by: 'date',
+  sort_within_group: 'datetime',
+  layout_mode: 'justified',
+  close_behavior: 'ask',
+  // 置顶设置/常驻工具:用 schema 默认值(两项常驻工具),使 harness 重置后的结果与真机默认一致。
+  pinned_settings: '["aiFullAnalysis","faceFullAnalysis"]',
   // harness 是**视觉场景**不是「新装默认」模拟器(整套 fixture 本就是 18 张假图):这里刻意把
   // 缩略图信息开满,好让主题矩阵覆盖到徽章类 token(size 半透明黑底 / type 绿橙底 —— 正是 S7
   // 修的那批)。生产默认另有其值(showThumbInfo 默认开、elements 默认空 → 观感无徽章)。
-  showThumbInfo: 'true',
-  thumbInfoElements: '["type","size","status"]',
-  hoverAutoplay: 'false',
-  // &bucket=1 时切生产默认的 bucket 分段引擎(性能基准代表性);缺省保持方案 A 视觉基线。
-  bucketSegmentedScroll: uiHarnessBucket === null ? 'false' : String(uiHarnessBucket),
-  theme: null,
+  show_thumb_info: 'true',
+  thumb_info_elements: '["type","size","status"]',
+  hover_autoplay: 'false',
   appearance: 'light',
-  themeLight: 'fresh-light',
-  themeDark: 'fresh-dark',
-  firstLaunch: 'false',
+  // 主题参数按新模型落两份扁平种子(结构转换由 themes/config.ts 负责,harness 不另拼形状);
+  // 截图矩阵的 &appearance= / &seed=custom 覆盖在 resolveSettingsSnapshot 里,不写进本默认表。
+  theme_light_palette: serializeThemeSeed(DEFAULT_THEME_DEFINITION.light),
+  theme_dark_palette: serializeThemeSeed(DEFAULT_THEME_DEFINITION.dark),
   // 主题矩阵拍的是 DB 目录树的观感,与显示范围无关;留默认态,勿让 harness 走 FS 枚举路径
   // (那条路径在 harness 里没有真实磁盘可枚举)。
-  treeDisplayMode: 'registeredOnly',
+  tree_display_mode: 'registeredOnly',
   // 拖拽手柄(#5):留生产默认开,选中态截图覆盖手柄观感。
-  showDragHandle: 'true',
+  show_drag_handle: 'true',
   // 无缝分组(#1):留生产默认关,视觉基线保分隔符观感。
-  seamlessGroups: 'false',
+  seamless_groups: 'false',
   // 无缝 minimap 轴:留生产默认开(无缝关时不渲染,基线截图不受影响)。
-  seamlessMinimap: 'true',
+  seamless_minimap: 'true',
   // 渲染模式留生产默认缩略图;当前 fixture 不启用 minimap,不改变视觉基线。
-  minimapRenderMode: 'thumbnails',
+  minimap_render_mode: 'thumbnails',
   // harness 不跑真日志管线,留生产默认 info 即可(off 会让 logger.ts 在 harness 里也不入队,
   // 无实际影响,但 'info' 更贴合「模拟正常运行态」的 harness 定位)。
-  logLevel: 'info',
-  // 批次C:5 个前端阈值键(advanced)——harness 是静态视觉场景,留 null 回退生产默认值即可
-  // (hydrateFromStartupConfig 对 null 不覆盖 uiStore ref 的初始默认)。
-  heavyVideoMaxPixels: null,
-  heavyVideoMaxBytes: null,
-  hoverDelayMs: null,
-  searchDebounceMs: null,
-  resizeDebounceMs: null,
-  // 小批 C2:同上——留 null 回退生产默认值(uiStore videoKeyframeCount ref 初始值 10)。
-  videoKeyframeCount: null,
-  // 窗口化沉浸模式(2026-07-23):留 null 回退生产默认关闭(harness 是静态视觉场景,不需要
-  // 边缘唤出交互)。
-  autoHideChromeWindowed: null,
-  // 轴视窗不透明度缩放(2026-07-24):留 null 回退生产默认 100%(CSS 变量缺省 1,基线观感不变)。
-  axisViewportOpacity: null,
-  // 轴形态偏好(2026-07-24):留 null 回退生产默认 'timeline',不改变视觉基线。
-  axisMode: null,
-  // 窗口材质(毛玻璃,2026-08-24):harness 非 Windows 桌面场景,留 null 不启用玻璃层。
+  log_level: 'info',
+  // 窗口材质(毛玻璃,2026-08-24):harness 非 Windows 桌面场景,不启用玻璃层。
   // 浏览器没有 DWM 背板，使用实色材质才能真实核对主题底色与文字对比度。
-  windowMaterial: 'none',
-  // 毛玻璃分层缩放(2026-08-25):视觉 harness 保持生产默认 100,由 uiStore 初始值回退。
-  glassChromeOpacity: null,
-  glassStickyOpacity: null,
-  glassSurfaceOpacity: null,
-  glassControlOpacity: null,
-  // 内容底面缩放(2026-09-06):同上,留 null 回退生产默认 100。
-  glassContentOpacity: null,
-  glassGalleryOpacity: null,
-  // 主题色浓度(2026-09-06):留 null 回退生产默认 60;主题矩阵截图可用 &tint= 覆盖。
-  themeTintStrength: null,
-  // 文字浓度(2026-09-06):留 null 回退生产默认 75;主题矩阵截图可用 &text= 覆盖。
-  themeTextStrength: null,
+  window_material: 'none',
+  window_opacity: '90',
+  // 画廊渲染引擎:留生产默认 canvas;截图矩阵的 &render=dom 覆盖它,好让两条绘制路径都出图。
+  gallery_render_mode: 'canvas',
 }
 
 /**
- * 6 主题视觉矩阵截图(S7)用:`&theme=<id>` 覆盖 fixture 的外观三键。
- *
- * 有意经 startupConfig 而**不是**直接写 `data-theme` —— 后者会让截图为一条产品里不存在的
- * 路径背书。经此处则完整跑真实链:normalizeThemeId 归一化 → resolvedThemeId(外观模式→槽位)
- * → applyAppearance 单点写 documentElement。故非法 id 的行为亦与生产一致(落回槽位默认)。
- *
- * 亮槽恒 light kind、暗槽恒 dark kind 是 uiStore 的模型不变量,故此处按 kind 落槽并把
- * appearance 定为同一 kind,才能让 resolvedThemeId 取到目标主题。
+ * harness 的设置快照状态(进程内):提交与重置只改这一份,并镜像后端的 revision / generation
+ * 语义——revision 每次提交递增(前端据此丢弃过期回执),generation 只在重置时递增(旧代次
+ * 提交被拒,防重置后其他窗口的迟到回写)。
  */
-function resolveStartupConfig(): StartupConfig {
-  const theme = uiHarnessTheme ? getTheme(uiHarnessTheme) : undefined
-  // &tint=<pct>:20–100 合法值覆写主题色浓度(经真实 uiStore 水合链应用 CSS 变量),其余落默认。
-  const tintRaw = Number(uiHarnessTint)
-  const tint = Number.isFinite(tintRaw) && tintRaw >= 20 && tintRaw <= 100
-    ? String(Math.round(tintRaw))
-    : null
-  // &text=<pct>:40–100 合法值覆写文字浓度,其余落默认。
-  const textRaw = Number(uiHarnessText)
-  const text = Number.isFinite(textRaw) && textRaw >= 40 && textRaw <= 100
-    ? String(Math.round(textRaw))
-    : null
-  if (!theme && tint === null && text === null) return startupConfig
-  return {
-    ...startupConfig,
-    appearance: theme ? theme.kind : startupConfig.appearance,
-    themeLight: theme ? (theme.kind === 'light' ? theme.id : startupConfig.themeLight) : startupConfig.themeLight,
-    themeDark: theme ? (theme.kind === 'dark' ? theme.id : startupConfig.themeDark) : startupConfig.themeDark,
-    themeTintStrength: tint,
-    themeTextStrength: text,
+const settingsState = {
+  values: { ...SETTINGS_FIXTURE },
+  revision: 1,
+  generation: 0,
+}
+
+/**
+ * 内部状态(留 DB 的业务标记):启动批只读一次,逐键读写通道也只认这些键。
+ * `first_launch` / `guide_seen` 决定引导是否重放,重置设置不动它们。
+ */
+const appState: Record<string, string> = {
+  first_launch: 'false',
+  guide_seen: 'true',
+  // 备份最近成功时间(后台工作时间戳,非用户设置)。
+  backup_last_success_at: '1784422800',
+}
+const APP_STATE_KEYS = Object.keys(appState)
+
+/**
+ * 截图矩阵的「明显自定义配色」种子(方案 §9 视觉矩阵要求的一组自定义色)。
+ *
+ * 刻意偏离出厂配色且两档极性相反,好让人眼在同一张矩阵里同时核对:自定义浅色、自定义深色、
+ * 以及 accent 与状态色在非默认种子上的可读性。仍是**合法种子**,故走真实的
+ * generateTheme → applyPalette 链路,视觉产物与用户自由选色时完全同源。
+ */
+const CUSTOM_SEEDS: { light: ThemeSeed; dark: ThemeSeed } = {
+  light: {
+    background: '#fff6ec',
+    foreground: '#33241a',
+    accent: '#c2410c',
+    contrast: 70,
+    gallery: 'auto',
+  },
+  dark: {
+    background: '#141026',
+    foreground: '#efeaff',
+    accent: '#f472b6',
+    contrast: 70,
+    gallery: 'auto',
+  },
+}
+
+/**
+ * 截图矩阵用:`&appearance=light|dark` 指定呈现档,`&seed=custom` 换成自定义配色,
+ * `&render=dom|canvas` 指定画廊绘制路径。
+ *
+ * 有意走设置快照而**不是**直接写 data-* / CSS 变量——后者会让截图为一条产品里不存在的路径
+ * 背书。经此处则完整跑真实链:快照 → themeStore 的结构转换与校验 → generateTheme →
+ * applyPalette。故非法值的归位行为亦与生产一致。
+ */
+function resolveSettingsSnapshot(): SettingsSnapshot {
+  const values = { ...settingsState.values }
+  if (uiHarnessAppearance !== null) values.appearance = uiHarnessAppearance
+  if (uiHarnessSeed === 'custom') {
+    values.theme_light_palette = serializeThemeSeed(CUSTOM_SEEDS.light)
+    values.theme_dark_palette = serializeThemeSeed(CUSTOM_SEEDS.dark)
   }
+  if (uiHarnessRenderMode !== null) values.gallery_render_mode = uiHarnessRenderMode
+  return { values, revision: settingsState.revision, generation: settingsState.generation }
+}
+
+/**
+ * 提交一批设置(镜像 set_app_settings):落值 → revision 递增 → 回最新快照与本次真正变化的键。
+ * 与后端一致,回执里 keys 只列真变了的键(同值的键不算变化)。
+ */
+function applySettingsPatch(patch: Record<string, string>): SettingsChange {
+  const keys: string[] = []
+  for (const [key, value] of Object.entries(patch)) {
+    if (settingsState.values[key] === value) continue
+    settingsState.values[key] = value
+    keys.push(key)
+  }
+  settingsState.revision += 1
+  return { snapshot: resolveSettingsSnapshot(), keys, restart_required: [], apply_failed: [] }
+}
+
+/**
+ * 恢复默认设置(镜像 clear_settings):整份回到 fixture 默认 → generation 与 revision 递增。
+ * harness 里「默认」即 SETTINGS_FIXTURE(真后端是 schema 默认模板);不触碰内部状态,故引导
+ * 不会重放。
+ */
+function resetSettingsFixture(): SettingsChange {
+  const before = settingsState.values
+  const after = { ...SETTINGS_FIXTURE }
+  // 键集取两侧并集:被提交写进来、默认表里没有的键同样是「这次重置改变了的键」。
+  const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(
+    (key) => before[key] !== after[key],
+  )
+  settingsState.values = after
+  settingsState.generation += 1
+  settingsState.revision += 1
+  return { snapshot: resolveSettingsSnapshot(), keys, restart_required: [], apply_failed: [] }
+}
+
+/** 内部状态逐键读写:设置类键与外键一律拒绝(与后端 ensure_state_key 同口径)。 */
+function requireAppStateKey(key: unknown): string {
+  const name = String(key ?? '')
+  if (!APP_STATE_KEYS.includes(name)) {
+    throw new Error(
+      `[UI harness] ${name} 不是内部状态键;用户设置请走 get_settings_snapshot / set_app_settings`,
+    )
+  }
+  return name
 }
 
 function mediaDetail(id: number): MediaDetail {
@@ -454,8 +509,39 @@ export async function invokeHarness<T>(
   args?: Record<string, unknown>,
 ): Promise<T> {
   switch (cmd) {
-    case IPC.GET_STARTUP_CONFIG:
-      return resolveStartupConfig() as T
+    case IPC.GET_STARTUP_CONFIG: {
+      // 新契约:设置快照 + 启动内部状态一次往返(不再逐字段列举设置)。
+      const payload: StartupPayload = {
+        settings: resolveSettingsSnapshot(),
+        state: {
+          firstLaunch: appState.first_launch ?? null,
+          guideSeen: appState.guide_seen ?? null,
+        },
+      }
+      return payload as T
+    }
+    case IPC.GET_SETTINGS_SNAPSHOT:
+      return resolveSettingsSnapshot() as T
+    case IPC.SET_APP_SETTINGS: {
+      // patch 的键名与取值保持原样交给 fixture:harness 不代替后端做键校验(那是后端 schema 的活)。
+      const payload = args as { patch?: Record<string, string>; generation?: number } | undefined
+      // 代次契约(与后端同口径):提交必须带上当前代次,缺失或过期一律拒绝。
+      // 少了这道校验,harness 会掩盖「重置后旧窗口的迟到回写被拒」这条核心行为——
+      // 开发页看着一切正常,真机上旧代次却会被后端拒绝。
+      const generation = payload?.generation
+      if (typeof generation !== 'number' || generation !== settingsState.generation) {
+        throw new Error(
+          `[UI harness] set_app_settings 代次不匹配:提交 ${String(generation)}(当前 ${settingsState.generation}),已按后端语义拒绝`,
+        )
+      }
+      const patch = payload?.patch ?? {}
+      const change: SettingsChange = applySettingsPatch(patch)
+      return change as T
+    }
+    case IPC.CLEAR_SETTINGS: {
+      const change: SettingsChange = resetSettingsFixture()
+      return change as T
+    }
     case IPC.GET_CONFIG_STATUS:
       return { path: 'C:/Scrollery UI Harness/config.toml', exists: true, last_error: null } as T
     case IPC.LIST_SCAN_ROOTS:
@@ -676,8 +762,7 @@ export async function invokeHarness<T>(
         backupId: '00112233445566778899aabbccddeeff',
         stagingDir:
           'C:/Scrollery UI Harness/restore-staging/00112233445566778899aabbccddeeff',
-        schemaVersion: 21,
-        needsMigration: false,
+        schemaVersion: 34,
         kind: 'auto',
         createdAtUtc: '2026-07-19T09:00:00Z',
         counts: { items: 18, albums: 3, tags: 12, namedPersons: 4 },
@@ -701,19 +786,12 @@ export async function invokeHarness<T>(
         activeImageFile: '',
         online: false,
       } as T
+    // 内部状态逐键读:设置类键在此一律拒绝(用户设置的唯一入口是快照与批量提交)。
     case IPC.GET_APP_CONFIG:
-      switch (String(args?.key ?? '')) {
-        case 'backup_dir':
-          return 'D:/Scrollery Backups' as T
-        case 'backup_auto_enabled':
-          return 'true' as T
-        case 'backup_retention':
-          return '5' as T
-        case 'backup_last_success_at':
-          return '1784422800' as T
-        default:
-          return null as T
-      }
+      return (appState[requireAppStateKey(args?.key)] ?? null) as T
+    case IPC.SET_APP_CONFIG:
+      appState[requireAppStateKey(args?.key)] = String(args?.value ?? '')
+      return undefined as T
     case IPC.GET_LOG_DIR:
       return 'C:/Scrollery UI Harness/logs' as T
     case IPC.LIST_LOG_FILES:
@@ -733,7 +811,6 @@ export async function invokeHarness<T>(
       } as T
     case IPC.FRONTEND_HEARTBEAT:
     case IPC.LOG_FRONTEND_EVENTS:
-    case IPC.SET_APP_CONFIG:
     case IPC.ENSURE_DOC_THUMB_QUEUE:
     case IPC.REGENERATE_MISSING_THUMB:
     case IPC.START_BACKUP:
@@ -741,7 +818,6 @@ export async function invokeHarness<T>(
     case IPC.RESTORE_ARM:
     case IPC.RELAUNCH_APP:
     case IPC.ACTIVATE_EDITING_FEATURE:
-    case IPC.DEACTIVATE_EDITING_FEATURE:
     case IPC.OPEN_LOG_WINDOW:
       return undefined as T
     case IPC.BATCH_REQUEST_THUMBNAILS: {

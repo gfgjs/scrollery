@@ -1,214 +1,179 @@
-// 主题对比度验证(设计 docs/designs/2026-07-06-前端UI优化与多主题系统.md §7):
-// 对 themes/ 下每套主题计算关键「文本 × 底色」组合的 WCAG 2.x 对比度。
+// 主题对比度门(方案 §4.2/§9):对**生成的**色板计算关键「前景 × 实际承载面」的 WCAG 2.x 对比度。
+//
+// 为什么经 vite-node 跑 TS:色板的唯一真源是 src/themes/generate.ts 的 generateTheme。此前的实现
+// 解析六份主题 CSS 的 --color-* 字面量——那份文件结构正被本方案替换,而任何「在脚本里再写一遍
+// 生成规则」的做法都会立刻与真实色板漂移(门禁给一个不上屏的值背书)。故本脚本直接 import 生成器,
+// 零算法复制。vite-node 是既有工具链自带的运行时(vitest 依赖),不新增依赖、不做构建。
 //
 // 硬门槛(任一不达标 exit 1,输出留作 commit 证据):
-//   text-primary        × bg-primary/secondary/surface/elevated  ≥ 4.5 (正文 AA)
-//   text-secondary      × bg-primary/surface                     ≥ 3.0 (次级,设计 §5.1)
-//   text-secondary      × bg-secondary                            ≥ 4.5 (2026-07-10 新增:
-//                          侧栏群组标签/粘性标题等 bg-secondary 底上的可交互文本,须正文 AA)
-//   text-tertiary       × bg-primary/surface                     ≥ 3.0 (2026-07-10 升门禁:
-//                          元数据/时间戳等真实文本 28 文件消费,原值全线 2.4-2.8)
-//   text-placeholder    × bg-surface                             ≥ 3.0 (2026-07-10 升门禁)
-//   success/warning/error/info × bg-primary/surface              ≥ 4.5 (2026-07-10 新增:
-//                          状态色全库 30+ 处直接作文本色,须按正文 AA 把关)
-//   sidebar-active-text × bg-primary/secondary                   ≥ 4.5 (导航文本)
-//   accent              × bg-primary                             ≥ 3.0 (UI 字形/图形)
-// 其余组合(accent-hover 等)仅报告不拦截。
+//   textPrimary          × background/surface/elevated/inset/canvas  ≥ 4.5 (正文 AA)
+//   textSecondary        × background/surface/elevated                ≥ 4.5 (辅助文字,方案 §4.2 同档)
+//   textTertiary         × background/surface                         ≥ 3.0 (次要元信息)
+//   textPlaceholder      × surface                                    ≥ 3.0 (占位符,非正文)
+//   accentText           × background/surface/selection               ≥ 4.5 (强调色文字)
+//   status 四色          × background/surface                         ≥ 4.5 (状态色直接作文本)
+//   textOnAccent         × accent/accentHover                         ≥ 4.5 (强调填充上的文字)
+//   textOnStatus         × status                                     ≥ 4.5 (状态填充上的文字)
+//   accent               × background                                 ≥ 3.0 (UI 图形/焦点)
+//   controlBorder/Track  × background/surface/elevated                ≥ 3.0 (有含义的控件边界)
+//   canvasText(Secondary) × canvas                                    ≥ 4.5 (画廊/时间轴文字)
+//   状态色 × (subtle 合成底)                                          ≥ 4.5 (合成后再算)
+//   徽标类别色 × scrim ≥ 3.0;白字 × scrim ≥ 4.5
+// 仅报告不拦截:divider(装饰性分隔线,方案 §4.2 明确不套控件门槛)、canvasPlaceholder。
 //
-// 用法: node scripts/check-theme-contrast.mjs
-import { readFileSync, readdirSync } from 'node:fs'
-import { join, dirname, basename } from 'node:path'
-import { fileURLToPath } from 'node:url'
+// 覆盖范围:内置三预设的浅深两档 + 出厂默认。**任意自定义色不承诺达标**(方案 §4.2),
+// 故门禁不在这里硬套;自定义色下的观感由截图矩阵交人眼。
+//
+// 用法:npm run check:contrast
 
-const stylesDir = join(
-  dirname(fileURLToPath(import.meta.url)),
-  '../src/assets/styles',
-)
-const themesDir = join(stylesDir, 'themes')
+import { contrastRatio, parseColorToRgb } from '../src/utils/color.ts'
+import { minContrast } from '../src/themes/colors.ts'
+import { MIN_CONTROL_CONTRAST, MIN_TEXT_CONTRAST, generateTheme } from '../src/themes/generate.ts'
+import { BUILTIN_PRESETS, DEFAULT_THEME_DEFINITION } from '../src/themes/presets.ts'
 
-/** 解析一份主题 CSS 的自定义属性表(--x: value)。 */
-function parseProps(css) {
-  const props = {}
-  for (const m of css.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)) {
-    props[m[1]] = m[2].trim()
-  }
-  return props
-}
+const RGBA = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:[\s,]+([\d.]+))?\s*\)$/i
 
-/** hex/rgb/rgba → [r,g,b](0-255);带 alpha 时按给定底色合成。其他写法返回 null。 */
-function resolveColor(value, bgRgb) {
-  let m = value.match(/^#([0-9a-fA-F]{6})$/)
-  if (m) {
-    const n = parseInt(m[1], 16)
-    return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
-  }
-  m = value.match(/^#([0-9a-fA-F]{3})$/)
-  if (m) {
-    return [...m[1]].map((c) => parseInt(c + c, 16))
-  }
-  // 浓度表达式(2026-09-06,锚点由 check:theme-palette 钉死):按满浓度锚点评估。
-  // 方向不对称,须分开说:底色稀释(底向中性靠拢)让对比单调改善,锚点=最保守界;
-  // 文字稀释(文字向底色靠拢)让对比单调恶化,锚点评估的是出厂满浓度色板——稀释是
-  // 用户在设置页的主动取舍,默认档(75)已实测 primary 6.1–8.0 / secondary 3.3–3.7
-  // 仍守各自门槛(默认底色 tint 60 上,见 status/UI-多主题系统.md 2026-09-06 文字浓度条目)。
-  m = value.match(
-    /^color-mix\(in oklch, (#[0-9a-fA-F]{6}) calc\(var\(--theme-(?:tint|text)-scale, 1\) \* 100%\), /,
+/** 半透明色合成到实际底色上:alpha 颜色必须先合成再算对比,否则会把半透明色当成实心(虚假绿灯)。 */
+function composite(base, overlay) {
+  const top = RGBA.exec(overlay.trim())
+  // 实色(hex)无需合成;不可解析时退回底色(该组合随后必然算成 1:1 而报红,不留假绿)。
+  if (!top) return overlay
+  const rgb = parseColorToRgb(base)
+  if (!rgb) return base
+  const alpha = top[4] === undefined ? 1 : Number(top[4])
+  const channel = (index, under) => Math.round(Number(top[index]) * alpha + under * (1 - alpha))
+  return (
+    '#' +
+    [channel(1, rgb.r), channel(2, rgb.g), channel(3, rgb.b)]
+      .map((value) => value.toString(16).padStart(2, '0'))
+      .join('')
   )
-  if (m) {
-    const n = parseInt(m[1].slice(1), 16)
-    return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
-  }
-  m = value.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/)
-  if (m) {
-    const [r, g, b] = [Number(m[1]), Number(m[2]), Number(m[3])]
-    const a = m[4] === undefined ? 1 : Number(m[4])
-    if (a >= 1 || !bgRgb) return [r, g, b]
-    // alpha 合成到底色(前景文本常见半透明写法)
-    return [0, 1, 2].map((i) => Math.round([r, g, b][i] * a + bgRgb[i] * (1 - a)))
-  }
-  return null
 }
-
-/** WCAG 相对亮度。 */
-function luminance([r, g, b]) {
-  const lin = (c) => {
-    const s = c / 255
-    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4)
-  }
-  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
-}
-
-function contrast(fgRgb, bgRgb) {
-  const l1 = luminance(fgRgb)
-  const l2 = luminance(bgRgb)
-  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05)
-}
-
-// [前景 token, 底色 token, 硬门槛(null=仅报告)]
-const PAIRS = [
-  ['--color-text-primary', '--color-bg-primary', 4.5],
-  ['--color-text-primary', '--color-bg-secondary', 4.5],
-  ['--color-text-primary', '--color-bg-surface', 4.5],
-  ['--color-text-primary', '--color-bg-elevated', 4.5],
-  ['--color-text-secondary', '--color-bg-primary', 3.0],
-  ['--color-text-secondary', '--color-bg-secondary', 4.5],
-  ['--color-text-secondary', '--color-bg-surface', 3.0],
-  ['--color-text-tertiary', '--color-bg-primary', 3.0],
-  ['--color-text-tertiary', '--color-bg-surface', 3.0],
-  ['--color-text-placeholder', '--color-bg-surface', 3.0],
-  ['--color-success', '--color-bg-primary', 4.5],
-  ['--color-success', '--color-bg-surface', 4.5],
-  ['--color-warning', '--color-bg-primary', 4.5],
-  ['--color-warning', '--color-bg-surface', 4.5],
-  ['--color-error', '--color-bg-primary', 4.5],
-  ['--color-error', '--color-bg-surface', 4.5],
-  ['--color-info', '--color-bg-primary', 4.5],
-  ['--color-info', '--color-bg-surface', 4.5],
-  ['--color-sidebar-active-text', '--color-bg-primary', 4.5],
-  ['--color-sidebar-active-text', '--color-bg-secondary', 4.5],
-  ['--color-accent', '--color-bg-primary', 3.0],
-  ['--color-accent-text', '--color-bg-primary', 4.5],
-  ['--color-accent-text', '--color-bg-secondary', 4.5],
-  ['--color-accent-text', '--color-bg-surface', 4.5],
-  ['--color-text-on-accent', '--color-accent', 4.5],
-  ['--color-text-on-accent', '--color-accent-hover', 4.5],
-  ['--color-text-on-success', '--color-success', 4.5],
-  ['--color-text-on-warning', '--color-warning', 4.5],
-  ['--color-text-on-error', '--color-error', 4.5],
-  ['--color-text-on-info', '--color-info', 4.5],
-  // ── 仅报告 ──
-  ['--color-accent-hover', '--color-bg-primary', null],
-]
-
-// 前景 token、半透明浅底 token、浅底所处的实际表面、硬门槛。
-// 透明色必须先合成再计算,否则会把 alpha 颜色误当成实心前景而给出虚假绿灯。
-const COMPOSED_PAIRS = [
-  ['--color-accent-text', '--color-accent-subtle', '--color-bg-primary', 4.5],
-  ['--color-accent-text', '--color-accent-subtle', '--color-bg-surface', 4.5],
-  ['--color-success', '--color-success-subtle', '--color-bg-primary', 4.5],
-  ['--color-success', '--color-success-subtle', '--color-bg-surface', 4.5],
-  ['--color-warning', '--color-warning-subtle', '--color-bg-primary', 4.5],
-  ['--color-warning', '--color-warning-subtle', '--color-bg-surface', 4.5],
-  ['--color-error', '--color-error-subtle', '--color-bg-primary', 4.5],
-  ['--color-error', '--color-error-subtle', '--color-bg-surface', 4.5],
-  ['--color-info', '--color-info-subtle', '--color-bg-primary', 4.5],
-  ['--color-info', '--color-info-subtle', '--color-bg-surface', 4.5],
-]
-
-const SHARED_PROPS = parseProps(readFileSync(join(stylesDir, 'variables.css'), 'utf8'))
 
 let failures = 0
-const files = readdirSync(themesDir).filter((f) => f.endsWith('.css')).sort()
 
-for (const file of files) {
-  const id = basename(file, '.css')
-  const props = {
-    ...SHARED_PROPS,
-    ...parseProps(readFileSync(join(themesDir, file), 'utf-8')),
-  }
-  console.log(`\n═══ ${id} ═══`)
-  for (const [fgKey, bgKey, threshold] of PAIRS) {
-    const bgRgb = resolveColor(props[bgKey] ?? '', null)
-    if (!bgRgb) {
-      console.log(`  ?  ${fgKey} × ${bgKey}: 底色非纯色(${props[bgKey]}),跳过`)
-      continue
-    }
-    const fgRgb = resolveColor(props[fgKey] ?? '', bgRgb)
-    if (!fgRgb) {
-      console.log(`  ?  ${fgKey} × ${bgKey}: 前景不可解析(${props[fgKey]}),跳过`)
-      continue
-    }
-    const r = contrast(fgRgb, bgRgb)
-    const tag =
-      threshold === null ? '·' : r >= threshold ? '✓' : (failures++, '✗')
-    const req = threshold === null ? '(报告)' : `(≥${threshold})`
-    console.log(`  ${tag}  ${fgKey} × ${bgKey}: ${r.toFixed(2)} ${req}`)
-  }
+/** 一条硬门槛;report 为真时只报告不拦截。 */
+function gate(label, foreground, background, threshold, report = false) {
+  const ratio = contrastRatio(foreground, background)
+  const pass = report || ratio >= threshold
+  if (!pass) failures += 1
+  const tag = report ? '·' : pass ? '✓' : '✗'
+  const need = report ? '(报告)' : `(≥${threshold})`
+  console.log(`  ${tag}  ${label}: ${ratio.toFixed(2)} ${need}`)
+  return ratio
+}
 
-  for (const [fgKey, overlayKey, baseKey, threshold] of COMPOSED_PAIRS) {
-    const baseRgb = resolveColor(props[baseKey] ?? '', null)
-    const bgRgb = baseRgb && resolveColor(props[overlayKey] ?? '', baseRgb)
-    const fgRgb = bgRgb && resolveColor(props[fgKey] ?? '', bgRgb)
-    if (!baseRgb || !bgRgb || !fgRgb) {
-      console.log(
-        `  ?  ${fgKey} × ${overlayKey} on ${baseKey}: 色值不可解析,跳过`,
-      )
-      continue
+const STATUS_KEYS = ['success', 'warning', 'error', 'info']
+const ON_STATUS_KEYS = {
+  success: 'textOnSuccess',
+  warning: 'textOnWarning',
+  error: 'textOnError',
+  info: 'textOnInfo',
+}
+const SUBTLE_KEYS = {
+  success: 'successSubtle',
+  warning: 'warningSubtle',
+  error: 'errorSubtle',
+  info: 'infoSubtle',
+}
+
+/** 一份含模式名的色板清单:三预设的浅深两档 + 出厂默认(去重)。 */
+function palettes() {
+  const entries = []
+  const seen = new Set()
+  for (const preset of BUILTIN_PRESETS) {
+    for (const mode of ['light', 'dark']) {
+      const palette = generateTheme(preset.definition[mode], mode)
+      const key = `${preset.id}-${mode}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      entries.push({ label: key, preset, palette })
     }
-    const r = contrast(fgRgb, bgRgb)
-    const tag = r >= threshold ? '✓' : (failures++, '✗')
-    console.log(
-      `  ${tag}  ${fgKey} × ${overlayKey} on ${baseKey}: ${r.toFixed(2)} (≥${threshold})`,
+  }
+  entries.push({
+    label: 'default-definition-light',
+    preset: { id: 'default' },
+    palette: generateTheme(DEFAULT_THEME_DEFINITION.light, 'light'),
+  })
+  entries.push({
+    label: 'default-definition-dark',
+    preset: { id: 'default' },
+    palette: generateTheme(DEFAULT_THEME_DEFINITION.dark, 'dark'),
+  })
+  return entries
+}
+
+console.log('主题对比度门(生成的色板,非 CSS 字面量)')
+
+for (const { label, palette: p } of palettes()) {
+  console.log(`\n═══ ${label} ═══`)
+
+  for (const base of ['background', 'surface', 'elevated', 'inset', 'canvas']) {
+    gate(`textPrimary × ${base}`, p.textPrimary, p[base], MIN_TEXT_CONTRAST)
+  }
+  for (const base of ['background', 'surface', 'elevated']) {
+    gate(`textSecondary × ${base}`, p.textSecondary, p[base], MIN_TEXT_CONTRAST)
+  }
+  for (const base of ['background', 'surface']) {
+    gate(`textTertiary × ${base}`, p.textTertiary, p[base], 3)
+  }
+  gate('textPlaceholder × surface', p.textPlaceholder, p.surface, 3)
+
+  for (const base of ['background', 'surface', 'selection']) {
+    gate(`accentText × ${base}`, p.accentText, p[base], MIN_TEXT_CONTRAST)
+  }
+  gate('textOnAccent × accent', p.textOnAccent, p.accent, MIN_TEXT_CONTRAST)
+  gate('textOnAccent × accentHover', p.textOnAccent, p.accentHover, MIN_TEXT_CONTRAST)
+  gate('accent × background(图形门槛)', p.accent, p.background, MIN_CONTROL_CONTRAST)
+
+  for (const key of STATUS_KEYS) {
+    for (const base of ['background', 'surface']) {
+      gate(`${key} × ${base}`, p[key], p[base], MIN_TEXT_CONTRAST)
+    }
+    gate(`${ON_STATUS_KEYS[key]} × ${key}`, p[ON_STATUS_KEYS[key]], p[key], MIN_TEXT_CONTRAST)
+    // 状态色的浅底是半透明的:必须先在它承载的实际底色上合成再算。
+    gate(
+      `${key} × ${SUBTLE_KEYS[key]} on background`,
+      p[key],
+      composite(p.background, p[SUBTLE_KEYS[key]]),
+      MIN_TEXT_CONTRAST,
+    )
+    gate(
+      `${key} × ${SUBTLE_KEYS[key]} on surface`,
+      p[key],
+      composite(p.surface, p[SUBTLE_KEYS[key]]),
+      MIN_TEXT_CONTRAST,
     )
   }
 
-  // 徽标在照片上必须按最亮极端(白底)合成后验算;scrim 60% 黑在白底上为 #666。
-  const scrimRgb = resolveColor(props['--color-badge-scrim'] ?? '', [255, 255, 255])
-  if (scrimRgb) {
-    const badgePairs = [
-      ['--color-badge-mark-live', null, 3.0],
-      ['--color-badge-mark-audio', null, 3.0],
-      ['--color-badge-mark-document', null, 3.0],
-      ['--color-rating-amber', null, 3.0],
-    ]
-    for (const [fgKey, , threshold] of badgePairs) {
-      const fgRgb = resolveColor(props[fgKey] ?? '', scrimRgb)
-      if (!fgRgb) {
-        console.log(`  ?  ${fgKey} × --color-badge-scrim: 前景不可解析,跳过`)
-        continue
-      }
-      const r = contrast(fgRgb, scrimRgb)
-      const tag = r >= threshold ? '✓' : (failures++, '✗')
-      console.log(
-        `  ${tag}  ${fgKey} × --color-badge-scrim: ${r.toFixed(2)} (≥${threshold})`,
-      )
-    }
-    const badgeTextContrast = contrast([255, 255, 255], scrimRgb)
-    const badgeTextTag = badgeTextContrast >= 4.5 ? '✓' : (failures++, '✗')
+  const controlBases = [p.background, p.surface, p.elevated]
+  for (const key of ['controlBorder', 'controlTrack']) {
+    const lowest = minContrast(p[key], controlBases)
+    if (lowest < MIN_CONTROL_CONTRAST) failures += 1
     console.log(
-      `  ${badgeTextTag}  #ffffff × --color-badge-scrim: ${badgeTextContrast.toFixed(2)} (≥4.5)`,
+      `  ${lowest >= MIN_CONTROL_CONTRAST ? '✓' : '✗'}  ${key} × background/surface/elevated(最低): ${lowest.toFixed(2)} (≥${MIN_CONTROL_CONTRAST})`,
     )
   }
+
+  gate('canvasText × canvas', p.canvasText, p.canvas, MIN_TEXT_CONTRAST)
+  gate('canvasTextSecondary × canvas', p.canvasTextSecondary, p.canvas, MIN_TEXT_CONTRAST)
+
+  // 图片上方的徽标压在不可知的底上:按最亮极端(白底)合成 scrim 后验算。
+  const scrim = composite('#ffffff', p.badgeScrim)
+  for (const key of ['badgeMarkLive', 'badgeMarkAudio', 'badgeMarkDocument', 'ratingAmber']) {
+    gate(`${key} × scrim`, p[key], scrim, MIN_CONTROL_CONTRAST)
+  }
+  gate('#ffffff × scrim', '#ffffff', scrim, MIN_TEXT_CONTRAST)
+
+  // ── 仅报告:装饰性分隔线与占位格面不套控件门槛(方案 §4.2)──
+  gate('divider × background(装饰,报告)', p.divider, p.background, MIN_CONTROL_CONTRAST, true)
+  gate(
+    'canvasPlaceholder × canvas(占位格面,报告)',
+    p.canvasPlaceholder,
+    p.canvas,
+    MIN_CONTROL_CONTRAST,
+    true,
+  )
 }
 
 if (failures > 0) {

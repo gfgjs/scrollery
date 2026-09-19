@@ -4,7 +4,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { Channel } from '@tauri-apps/api/core'
-import { invokeIpc, ipcErrorMessage } from '../utils/ipc'
+import { invokeIpc, ipcErrorMessage, parseAppError } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
 import { useMediaStore } from './mediaStore'
@@ -12,6 +12,34 @@ import { useUiStore } from './uiStore'
 import { useToastStore } from './toastStore'
 import { useAnalysisController } from '../composables/useAnalysisController'
 import type { AiStatusSummary, SearchMode, ModelRegistry, ModelDownloadProgress } from '../types/ai'
+import { useConfirm } from '../composables/useConfirm'
+import i18n from '../i18n'
+
+/** 后端「激活模型文件未就位」的稳定 code（error.rs `AppError::AiModelNotLoaded`）。 */
+const AI_MODEL_NOT_LOADED_CODE = 'AiModelNotLoaded'
+
+/**
+ * 首次使用引导（模型未下载）：弹确认框指明「设置 → AI → 模型库」，确认后只导航，不代用户下载
+ * （变体体积大，带宽与磁盘由用户定）。调用点 onError 是同步回调，故自行收尾 promise。
+ */
+async function guideToModelDownload(): Promise<void> {
+  const { confirm } = useConfirm()
+  const { confirmed } = await confirm({
+    title: i18n.global.t('semantic.modelMissingTitle'),
+    message: i18n.global.t('semantic.modelMissingMsg'),
+    confirmText: i18n.global.t('semantic.modelMissingGo'),
+    cancelText: i18n.global.t('common.cancel'),
+  })
+  if (!confirmed) return
+  try {
+    // 路由单例按需取：静态 import 会让每个间接引到本 store 的模块在模块加载期就建 hash 历史，
+    // 而这些路径几乎不会用到引导。
+    const { default: router } = await import('../router')
+    await router.push('/settings/ai')
+  } catch (e) {
+    logger.error('[AI] Navigate to model library failed | 跳转模型库失败', { error: e })
+  }
+}
 
 export const useAiStore = defineStore('ai', () => {
   // ── State ─────────────────────────────────────────────────────────────────
@@ -58,6 +86,12 @@ export const useAiStore = defineStore('ai', () => {
       // start/restart 的后端拒绝（GPU 槽被人脸占用 / 模型未装）须用户可见 → toast
       // （2026-07-10 审查 U2,对齐 faceStore 同场景）；其余记 logger。
       if (action === 'start' || action === 'restart') {
+        // 模型未下载不是错误而是首次使用必经的一步：改为弹「去哪下载」的指引（侧栏与语义搜索
+        // 面板的起步命令共用本回调，故两侧入口一次覆盖）。
+        if (parseAppError(e).code === AI_MODEL_NOT_LOADED_CODE) {
+          void guideToModelDownload()
+          return
+        }
         useToastStore().addToast('error', ipcErrorMessage(e))
       } else {
         logger.error(`[AI] ${action} 分析出错 | analysis error`, { error: e })

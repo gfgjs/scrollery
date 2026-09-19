@@ -91,8 +91,10 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import type { MonthBucket } from '../../types/layout'
 import { parseColorToRgb } from '../../utils/color'
-import { resolveTokenColor } from '../../utils/cssColor'
+import type { ThemePalette } from '../../themes/types'
 import { performanceRecorder } from '../../perf/performanceRecorder'
+import { writeSettings } from '../../stores/settingsPersistence'
+import { readSettingEnum } from '../../composables/settingsValues'
 import { thumbGeometry, thumbTopToLogicalY } from './mediaScrollbar.helpers'
 import {
   maxBucketCount,
@@ -109,14 +111,16 @@ import {
 } from './timelineScrubber.helpers'
 
 // 密度带视觉形态(方案 §2,可一键切换):bars=离散月条基线(当前行为),envelope=填充包络+轻热力,
-// heat=纯热力色带,spectral=包络+冷暖光谱。持久化 localStorage('timelineVisual')。
+// heat=纯热力色带,spectral=包络+冷暖光谱。存设置键 timeline_visual(设置集中保存,批次B)。
 type VisualMode = 'bars' | 'envelope' | 'heat' | 'spectral'
 const VISUAL_MODES: VisualMode[] = ['bars', 'envelope', 'heat', 'spectral']
+const VISUAL_KEY = 'timeline_visual'
 
 // 坐标系(方案 §1,可一键切换,与视觉正交):item=项累计空间(精确滚动 minimap,零后端),
-// time=日历时间空间(纵向疏密,近 Apple/Google Photos;需 separator.epochDay)。持久化 'timelineCoord'。
+// time=日历时间空间(纵向疏密,近 Apple/Google Photos;需 separator.epochDay)。存设置键 timeline_coord。
 type CoordMode = 'item' | 'time'
 const COORD_MODES: CoordMode[] = ['item', 'time']
+const COORD_KEY = 'timeline_coord'
 
 const props = withDefaults(
   defineProps<{
@@ -126,6 +130,8 @@ const props = withDefaults(
     currentY?: number
     /** 拖动视窗最小高(px):与滚动条 thumb 共享同一设置,二者同高(默认 48)。 */
     minThumb?: number
+    /** 当前主题色板(themeStore.currentPalette):DOM 与 Canvas 消费同一份生成结果。 */
+    themePalette: ThemePalette
   }>(),
   { currentY: 0, minThumb: 48 },
 )
@@ -213,24 +219,25 @@ function onViewportPointerup(e: PointerEvent) {
   ;(e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId)
 }
 
-// 视觉形态(可切换,持久化)。默认 bars = 当前离散月条,切换前零行为变化。
-function loadVisualMode(): VisualMode {
-  const v = localStorage.getItem('timelineVisual')
-  return VISUAL_MODES.includes(v as VisualMode) ? (v as VisualMode) : 'bars'
-}
-const visualMode = ref<VisualMode>(loadVisualMode())
+// 视觉形态(可切换,存设置 timeline_visual)。默认 bars = 当前离散月条,切换前零行为变化。
+// 用户改动经 cycleVisualMode 显式提交;watch(visualMode) 只负责重画,不再承担落盘。
+const visualMode = computed(() => readSettingEnum<VisualMode>(VISUAL_KEY, VISUAL_MODES, 'bars'))
 function cycleVisualMode() {
   const i = VISUAL_MODES.indexOf(visualMode.value)
-  visualMode.value = VISUAL_MODES[(i + 1) % VISUAL_MODES.length]
+  setVisualMode(VISUAL_MODES[(i + 1) % VISUAL_MODES.length])
+}
+/** 用户显式提交视觉形态;写盘失败由中央服务统一提示,此处 catch 只为收掉 promise。 */
+function setVisualMode(mode: VisualMode) {
+  writeSettings({ [VISUAL_KEY]: mode }).catch(() => {})
 }
 // ── 坐标系(item/time,可切换,持久化)──────────────────────────────────────────
 // time 坐标需 separator 带 epochDay(仅 date 分组);且 bars 是 item 空间离散基线,time 坐标只对
 // 密度带(envelope/heat/spectral)有意义 → coordApplies 双重门控:date 分组 + 非 bars 视觉。
-function loadCoordMode(): CoordMode {
-  const v = localStorage.getItem('timelineCoord')
-  return COORD_MODES.includes(v as CoordMode) ? (v as CoordMode) : 'item'
+const coordMode = computed(() => readSettingEnum<CoordMode>(COORD_KEY, COORD_MODES, 'item'))
+/** 用户显式提交坐标系;写盘失败由中央服务统一提示,此处 catch 只为收掉 promise。 */
+function setCoordMode(mode: CoordMode) {
+  writeSettings({ [COORD_KEY]: mode }).catch(() => {})
 }
-const coordMode = ref<CoordMode>(loadCoordMode())
 const hasTime = computed(() => props.separators.some((s) => s.epochDay != null))
 const coordApplies = computed(() => hasTime.value && visualMode.value !== 'bars')
 // 实际生效坐标:仅当用户选 time 且当前上下文支持(date 分组 + 密度带视觉)才为 time,否则回落 item。
@@ -238,7 +245,7 @@ const effectiveCoord = computed<CoordMode>(() =>
   coordMode.value === 'time' && coordApplies.value ? 'time' : 'item',
 )
 function toggleCoordMode() {
-  coordMode.value = coordMode.value === 'time' ? 'item' : 'time'
+  setCoordMode(coordMode.value === 'time' ? 'item' : 'time')
 }
 // 时间比例密度带(§3):仅 time 坐标生效时构建(含 intensity/rowJumpY/日历刻度);否则 null。
 // computed 缓存:数据/尺寸/坐标变时才重算,非每帧。
@@ -300,9 +307,8 @@ const monthFlyoutTopPct = computed(() => {
   return (props.monthBuckets[hoverIndex.value].y / trackTotal.value) * 100
 })
 
-// ── 调色板:canvas 需具体色值,从 CSS 变量读并缓存。只在挂载+主题切换(见 themeMO)时重读,
-// 不放进每帧热路径(getComputedStyle 强制同步样式重算,飞掠时每帧跑会自伤性能)。fontSans 同缓存,
-// 放大镜文本用应用字体(Inter)而非通用 sans-serif,与 DOM 版视觉一致。
+// ── 调色板:颜色只从 props.themePalette 投影(与 DOM/网格 Canvas 同源),不读 DOM 取色、不留第二套
+// 默认色。只有字体族与尺寸从 DOM 读一次(getComputedStyle 强制同步样式重算,不进每帧热路径)。
 interface Palette {
   accent: string
   border: string
@@ -311,18 +317,29 @@ interface Palette {
   text3: string
   hover: string
 }
-let palette: Palette = {
-  accent: '#4a9',
-  border: '#ccc',
-  text1: '#222',
-  text2: '#888',
-  text3: '#aaa',
-  hover: 'rgba(128,128,128,0.15)',
+// 时间轴画在画廊底上,故文字取画廊底派生值:显式 gallery 可与窗口底色反极性,拿窗口
+// textPrimary/secondary 会在「暗界面 + 浅色画廊」上读不清。第三档(最弱)复用辅助档,
+// 靠字号区分层级。
+function projectTimelinePalette(theme: ThemePalette): Palette {
+  return {
+    accent: theme.accent,
+    border: theme.border,
+    text1: theme.canvasText,
+    text2: theme.canvasTextSecondary,
+    text3: theme.canvasTextSecondary,
+    // 中心行底色对齐 DOM 版 .is-center(选中浅底)。
+    hover: theme.selection,
+  }
 }
-// 密度带按强度在 border→accent 插值需 rgb 分量(CSS 变量是字符串,解析一次缓存)。
+// 挂载时赋值(onMounted 先于任何 draw);此处不留占位色,避免第二套默认值。
+let palette!: Palette
+// 密度带按强度在 border→accent 插值需 rgb 分量;生成色板恒为规范 hex,解析失败退回零值只为不崩。
 type Rgb = { r: number; g: number; b: number }
-let accentRgb: Rgb = { r: 68, g: 170, b: 153 }
-let borderRgb: Rgb = { r: 204, g: 204, b: 204 }
+function rgbOf(color: string): Rgb {
+  return parseColorToRgb(color) ?? { r: 0, g: 0, b: 0 }
+}
+let accentRgb: Rgb = { r: 0, g: 0, b: 0 }
+let borderRgb: Rgb = { r: 0, g: 0, b: 0 }
 /** border→accent(或任意两色)线性插值为 rgba 串(t∈[0,1],alpha 独立)。 */
 function rgbaLerp(c0: Rgb, c1: Rgb, t: number, alpha: number): string {
   const r = Math.round(c0.r + (c1.r - c0.r) * t)
@@ -340,29 +357,16 @@ let fontSans = 'sans-serif'
 function fontFor(px: number, bold = false): string {
   return `${bold ? 'bold ' : ''}${px}px ${fontSans}`
 }
-// palette/accentRgb 等是非响应式模块变量(有意,避免深代理),此版本号在 readPalette 后自增,
+// palette/accentRgb 等是非响应式模块变量(有意,避免深代理),此版本号在 applyPalette 后自增,
 // 供依赖色值的 computed(rowFillStyles)感知主题切换。
 const paletteVersion = ref(0)
-function readPalette() {
+function applyPalette() {
   const el = trackRef.value
   if (!el) return
-  const s = getComputedStyle(el)
-  const g = (name: string, fallback: string) => s.getPropertyValue(name).trim() || fallback
-  // 文字 ramp 自 2026-09-06 起是含 var() 的 color-mix 浓度表达式,computed getPropertyValue
-  // 只回原始声明串,canvas fillStyle 消化不了,须经真实渲染树探针解成具体色。
-  const gc = (name: string, fallback: string) => resolveTokenColor(el, name, fallback)
-  palette = {
-    accent: g('--color-accent', '#4a9'),
-    border: g('--color-border', '#ccc'),
-    text1: gc('--color-text-primary', '#222'),
-    text2: gc('--color-text-secondary', '#888'),
-    text3: gc('--color-text-tertiary', '#aaa'),
-    // 中心行底色对齐 DOM 版 .is-center(优先 sidebar-active,回落 bg-hover)。
-    hover: g('--color-sidebar-active-bg', '') || g('--color-bg-hover', 'rgba(128,128,128,0.15)'),
-  }
-  fontSans = g('--font-sans', 'sans-serif')
-  accentRgb = parseColorToRgb(palette.accent) ?? accentRgb // 解析失败保留旧值,不崩
-  borderRgb = parseColorToRgb(palette.border) ?? borderRgb
+  palette = projectTimelinePalette(props.themePalette)
+  fontSans = getComputedStyle(el).getPropertyValue('--font-sans').trim() || 'sans-serif'
+  accentRgb = rgbOf(palette.accent)
+  borderRgb = rgbOf(palette.border)
   paletteVersion.value++
 }
 
@@ -654,7 +658,7 @@ function drawMain() {
   if (!cv || trackW.value <= 0 || trackH.value <= 0) return
   const monitored = performanceRecorder.isActive()
   const startedAt = monitored ? performance.now() : 0
-  // 注:调色板不在此重读——挂载 + 主题切换(themeMO)时已缓存,避免热路径 getComputedStyle 强制样式重算。
+  // 注:调色板不在此重读——挂载 + 主题换代(watch props.themePalette)时已缓存,
   const ctx = fitCanvas(cv, trackW.value, trackH.value)
   if (ctx) {
     drawAxis(ctx, trackW.value, trackH.value)
@@ -692,7 +696,7 @@ function drawLoupe() {
   const cv = loupeRef.value
   const seps = props.separators
   if (!cv || seps.length === 0) return
-  // 注:调色板/字体已缓存(挂载 + themeMO),此处不重读——放大镜是飞掠热路径,每帧省一次强制样式重算。
+  // 注:调色板/字体已缓存(挂载 + 主题换代),此处不重读——放大镜是飞掠热路径,每帧省一次强制样式重算。
   const win = nearestSeparatorWindow(seps, loupeLogicalY / trackTotal.value, props.totalHeight, LOUPE_K)
   const rows = win.end - win.start
   if (rows <= 0) return
@@ -883,7 +887,6 @@ function onBlur() {
 
 // ── 尺寸测量 + 重画触发 ─────────────────────────────────────────────────────
 let trackRO: ResizeObserver | null = null
-let themeMO: MutationObserver | null = null // 监听 data-theme(uiStore 唯一写点)→ 主题切换重着色
 function measure() {
   const el = trackRef.value
   if (!el) return
@@ -892,7 +895,7 @@ function measure() {
   trackH.value = rect.height
 }
 onMounted(() => {
-  readPalette() // 首帧前缓存色值/字体(不再由 drawMain 每帧读)
+  applyPalette() // 首帧前投影色值/字体(不再由 drawMain 每帧读)
   measure()
   scheduleDraw()
   if (typeof ResizeObserver !== 'undefined' && trackRef.value) {
@@ -902,26 +905,19 @@ onMounted(() => {
     })
     trackRO.observe(trackRef.value)
   }
-  // 主题切换/文字浓度变化:canvas 不像 DOM 靠 CSS 变量自动翻色,须显式重读色值 + 重画
-  // (主轴 + 可见的放大镜)。text1/2/3 是 --theme-text-scale 的 color-mix 表达式(2026-09-06
-  // 文字浓度),浓度 setter 写 documentElement 内联 style,故一并观察 style 属性。
-  if (typeof MutationObserver !== 'undefined') {
-    themeMO = new MutationObserver(() => {
-      readPalette()
-      invalidateStaticAxis()
-      if (loupeVisible.value) drawLoupe()
-    })
-    themeMO.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['data-theme', 'style'],
-    })
-  }
 })
+// 主题/配色换代(store 每帧最多发布一次新色板引用):重投影色值 + 重画静态轴层与放大镜。
+watch(
+  () => props.themePalette,
+  () => {
+    applyPalette()
+    invalidateStaticAxis()
+    if (loupeVisible.value) drawLoupe()
+  },
+)
 onBeforeUnmount(() => {
   trackRO?.disconnect()
   trackRO = null
-  themeMO?.disconnect()
-  themeMO = null
   if (rafId !== null) cancelAnimationFrame(rafId)
   cancelViewportMove()
   cancelPendingMove() // 清 pointermove 节流的悬空 rAF
@@ -945,14 +941,11 @@ watch(
 watch(() => props.currentY, scheduleDraw)
 // hover 项变化(光标所在月 / 最近分隔点)→ 重画主轴以更新悬停高亮(DOM 版靠 :hover,canvas 须主动重画)。
 watch([hoverIndex, sepHoverIndex], scheduleDraw)
-// 视觉形态切换 → 持久化 + 重画(rowIntensity 为 computed,数据/尺寸不变时切模式只换绘制路径)。
-watch(visualMode, (m) => {
-  localStorage.setItem('timelineVisual', m)
-  invalidateStaticAxis()
-})
-// 坐标切换 → 持久化 + 重画。effectiveCoord 变化(切坐标 / 切视觉致 coordApplies 变)→ band 数据源换,
-// 一并重画放大镜(若可见)使其中心随新坐标重定位。
-watch(coordMode, (c) => localStorage.setItem('timelineCoord', c))
+// 视觉形态变化(用户切换 / 恢复默认 / 外部改文件)→ 重画(rowIntensity 为 computed,数据/尺寸不变时
+// 切模式只换绘制路径)。落盘由用户 setter 负责,此处只应用。
+watch(visualMode, () => invalidateStaticAxis())
+// 坐标变化 → 重画。effectiveCoord 变化(切坐标 / 切视觉致 coordApplies 变)→ band 数据源换,
+// 一并重画放大镜(若可见)使其中心随新坐标重定位。同上:落盘由 setter 负责。
 watch(effectiveCoord, () => {
   invalidateStaticAxis()
   if (loupeVisible.value) drawLoupe()
@@ -1045,17 +1038,17 @@ defineExpose({ cycleVisualMode, toggleCoordMode, visualMode, coordMode, coordApp
   margin-right: 8px;
   transform: translateY(-50%);
   padding: var(--spacing-2xs) var(--spacing-sm);
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-xs);
   line-height: 1.4;
   color: var(--color-text-primary);
   white-space: nowrap;
   pointer-events: none;
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   z-index: 3;
 }
 .tlc-flyout__count {
@@ -1069,12 +1062,12 @@ defineExpose({ cycleVisualMode, toggleCoordMode, visualMode, coordMode, coordApp
   margin-right: 14px;
   transform: translateY(-50%);
   pointer-events: none;
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   z-index: 4;
 }
 </style>

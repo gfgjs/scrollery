@@ -1,0 +1,166 @@
+{
+  "date": "2026-09-15",
+  "baseline_commit": "e7db489b66f3d939784678ccf4d6849b7eec5304",
+  "source_commit": "31cab793934ec8fa1b634414fee00a0229d07bd7",
+  "method": "Git-tracked UTF-8 physical lines via splitlines; blank/comment lines included; nonblank only strips blank lines; Rust inline tests remain in containing file; third-party public/vditor src/vendor third-party excluded; standalone tests matched .spec/.test and /tests/; config/locks/docs excluded from first-party source. Rust tests.rs and *_tests.rs classified as standalone tests. Configuration bucket includes package-lock.json, separately identified in report.",
+  "current_method_note": "Same baseline file classification; deleted files excluded; new src-tauri/src/db/schema.rs included as host_rust. Source tree committed and unchanged. Documentation/config/locks excluded from this source report.",
+  "baseline_first_party": {
+    "files": 927,
+    "loc": 264655,
+    "nonblank": 244507,
+    "bytes": 10941021
+  },
+  "current_first_party": {
+    "files": 906,
+    "loc": 254057,
+    "nonblank": 234669,
+    "bytes": 10500096
+  },
+  "first_party_loc_reduction": 10598,
+  "groups": {
+    "frontend": {
+      "baseline": {
+        "files": 382,
+        "text_files": 382,
+        "loc": 85395,
+        "nonblank": 79393,
+        "bytes": 3382112
+      },
+      "current": {
+        "files": 376,
+        "loc": 84032,
+        "nonblank": 78150,
+        "bytes": 3325359
+      }
+    },
+    "host_rust": {
+      "baseline": {
+        "files": 251,
+        "text_files": 251,
+        "loc": 113359,
+        "nonblank": 105054,
+        "bytes": 4843908
+      },
+      "current": {
+        "files": 241,
+        "loc": 105966,
+        "nonblank": 98125,
+        "bytes": 4526339
+      }
+    },
+    "crates_rust": {
+      "baseline": {
+        "files": 52,
+        "text_files": 52,
+        "loc": 16173,
+        "nonblank": 15011,
+        "bytes": 665919
+      },
+      "current": {
+        "files": 52,
+        "loc": 16137,
+        "nonblank": 14978,
+        "bytes": 664330
+      }
+    },
+    "standalone_tests": {
+      "baseline": {
+        "files": 180,
+        "text_files": 180,
+        "loc": 34431,
+        "nonblank": 30889,
+        "bytes": 1361441
+      },
+      "current": {
+        "files": 176,
+        "loc": 33358,
+        "nonblank": 29926,
+        "bytes": 1320244
+      }
+    },
+    "dev_probes": {
+      "baseline": {
+        "files": 14,
+        "text_files": 14,
+        "loc": 5006,
+        "nonblank": 4655,
+        "bytes": 200486
+      },
+      "current": {
+        "files": 13,
+        "loc": 4287,
+        "nonblank": 3999,
+        "bytes": 177049
+      }
+    },
+    "engineering_tools": {
+      "baseline": {
+        "files": 40,
+        "text_files": 40,
+        "loc": 9597,
+        "nonblank": 8853,
+        "bytes": 456389
+      },
+      "current": {
+        "files": 40,
+        "loc": 9597,
+        "nonblank": 8853,
+        "bytes": 456384
+      }
+    },
+    "build_and_startup": {
+      "baseline": {
+        "files": 8,
+        "text_files": 8,
+        "loc": 694,
+        "nonblank": 652,
+        "bytes": 30766
+      },
+      "current": {
+        "files": 8,
+        "loc": 680,
+        "nonblank": 638,
+        "bytes": 30391
+      }
+    },
+    "third_party": {
+      "baseline": {
+        "files": 575,
+        "text_files": 492,
+        "loc": 60464,
+        "nonblank": 56580,
+        "bytes": 50091714
+      },
+      "current": {
+        "files": 413,
+        "loc": 36303,
+        "nonblank": 33711,
+        "bytes": 42229443
+      }
+    }
+  },
+  "declarations": {
+    "baseline": {
+      "rust_module_declarations": 531,
+      "rust_trait_declarations": 20,
+      "rust_struct_declarations": 590,
+      "rust_enum_declarations": 137,
+      "ts_interface_declarations": 359
+    },
+    "current": {
+      "rust_module_declarations": 515,
+      "rust_trait_declarations": 17,
+      "rust_struct_declarations": 532,
+      "rust_enum_declarations": 129,
+      "ts_interface_declarations": 351
+    }
+  },
+  "surface_counts": {
+    "registered_count": 232,
+    "ipc_constant_count": 232,
+    "setting_count": 77,
+    "state_count": 36,
+    "root_host_module_count": 32
+  },
+  "configuration_note": "Baseline had 79 declared settings + 19 declared state keys + 17 live reader UI keys implicit in the unknown-key DB fallback = 115 actual keys. Current 77 settings + 36 explicit state/UI keys = 113 actual keys; no new product settings."
+}

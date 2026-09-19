@@ -1,7 +1,7 @@
 // src-tauri/src/state.rs
 //! 在所有 Tauri 命令之间共享的应用程序状态。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
@@ -148,9 +148,6 @@ pub struct AppState {
     /// 全量/增量缩略图生成的最近进度快照。进度传输为 app 级事件(`thumb:gen_progress`)——
     /// webview 刷新后经 `full_thumb_gen_status` 查此快照恢复显示(Channel 随发起它的 webview 一起死)。
     pub thumb_gen_progress: Mutex<Option<crate::ipc::thumbnail_commands::FullThumbProgressPayload>>,
-
-    /// 因视口滚动而取消的缩略图项 ID。
-    pub cancelled_thumb_ids: Mutex<HashSet<i64>>,
 
     /// 多档缩略图源服务的设备像素比(2026-08-16 阶段 2,千分比 ×1000):compute_layout 时由
     /// 前端上报,出口拼装(hydrate_rows)读取做按需选档。几何不依赖 DPR,故 DPR 变化不触发
@@ -730,7 +727,6 @@ impl AppState {
             thumb_gen_token: RunTokenSlot::new(),
             thumb_gen_lifecycle_gate: Mutex::new(()),
             thumb_gen_progress: Mutex::new(None),
-            cancelled_thumb_ids: Mutex::new(HashSet::new()),
             thumb_serve_dpr: AtomicU32::new(1000),
             log_dir,
             log_ring,

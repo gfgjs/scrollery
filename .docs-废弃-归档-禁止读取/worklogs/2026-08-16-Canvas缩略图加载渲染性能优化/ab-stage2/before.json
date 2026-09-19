@@ -1,0 +1,944 @@
+{
+  "meta": {
+    "label": "ab2-before",
+    "scenario": "cold",
+    "profile": "constant",
+    "at": 0.3,
+    "vPxPerMs": 1.2,
+    "seconds": 10,
+    "viewportArg": null,
+    "sampledPid": 31016,
+    "startedAtEpoch": 1786880089081,
+    "build": "tauri dev (真实 WebView2 + 真实后端/asset)"
+  },
+  "session": {
+    "durationMs": 10007.6,
+    "counters": {
+      "gallery.drawRequests": 5200,
+      "gallery.prefetchSlices": 1284,
+      "gallery.prefetchLoadsStarted": 3968,
+      "gallery.coldCellFrames": 28034,
+      "gallery.drawCoalesced": 4009
+    },
+    "gauges": {
+      "gallery.prefetchedCells": 0,
+      "gallery.visibleCells": 310,
+      "gallery.visibleColdCells": 1,
+      "gallery.cacheItems": 5721,
+      "gallery.cacheBytes": 203780912,
+      "gallery.inFlightThumbs": 11
+    },
+    "frame": {
+      "frames": 1191,
+      "budgetMs": 8.333,
+      "refreshRate": 120,
+      "avgFps": 119,
+      "frameTime": {
+        "samples": 1190,
+        "avg": 8.4,
+        "min": 7.8,
+        "p50": 8.3,
+        "p95": 8.4,
+        "p99": 8.5,
+        "max": 16.7
+      },
+      "jankFrames": 9,
+      "jankRatio": 0.0076,
+      "missedVsync": 9
+    },
+    "bitmapLoad": {
+      "samples": 3962,
+      "avg": 40.92,
+      "min": 5.4,
+      "p50": 37.5,
+      "p95": 68.9,
+      "p99": 73.54,
+      "max": 81.3,
+      "overwritten": 0
+    },
+    "imageFallback": {
+      "samples": 0,
+      "avg": 0,
+      "min": 0,
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 0,
+      "overwritten": 0
+    },
+    "draw": {
+      "samples": 1190,
+      "avg": 2.43,
+      "min": 1.5,
+      "p50": 2.4,
+      "p95": 3.1,
+      "p99": 3.6,
+      "max": 7.6,
+      "overwritten": 0
+    },
+    "timeseries": [
+      {
+        "t": 255,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 335,
+          "gallery.visibleColdCells": 2,
+          "gallery.cacheItems": 1845,
+          "gallery.cacheBytes": 65636484,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 112,
+          "gallery.prefetchSlices": 33,
+          "gallery.prefetchLoadsStarted": 81,
+          "gallery.coldCellFrames": 35,
+          "gallery.drawCoalesced": 83
+        },
+        "heapBytes": 33536773
+      },
+      {
+        "t": 507,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 402,
+          "gallery.visibleColdCells": 2,
+          "gallery.cacheItems": 1944,
+          "gallery.cacheBytes": 69089412,
+          "gallery.inFlightThumbs": 26
+        },
+        "counters": {
+          "gallery.drawRequests": 248,
+          "gallery.prefetchSlices": 66,
+          "gallery.prefetchLoadsStarted": 206,
+          "gallery.coldCellFrames": 95,
+          "gallery.drawCoalesced": 188
+        },
+        "heapBytes": 33584779
+      },
+      {
+        "t": 755,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 363,
+          "gallery.visibleColdCells": 2,
+          "gallery.cacheItems": 2067,
+          "gallery.cacheBytes": 73369092,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 394,
+          "gallery.prefetchSlices": 100,
+          "gallery.prefetchLoadsStarted": 303,
+          "gallery.coldCellFrames": 144,
+          "gallery.drawCoalesced": 305
+        },
+        "heapBytes": 36767355
+      },
+      {
+        "t": 1011,
+        "gauges": {
+          "gallery.prefetchedCells": 8,
+          "gallery.visibleCells": 378,
+          "gallery.visibleColdCells": 2,
+          "gallery.cacheItems": 2178,
+          "gallery.cacheBytes": 76613892,
+          "gallery.inFlightThumbs": 28
+        },
+        "counters": {
+          "gallery.drawRequests": 539,
+          "gallery.prefetchSlices": 134,
+          "gallery.prefetchLoadsStarted": 442,
+          "gallery.coldCellFrames": 204,
+          "gallery.drawCoalesced": 420
+        },
+        "heapBytes": 33530696
+      },
+      {
+        "t": 1255,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 339,
+          "gallery.visibleColdCells": 1,
+          "gallery.cacheItems": 2300,
+          "gallery.cacheBytes": 80548356,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 692,
+          "gallery.prefetchSlices": 169,
+          "gallery.prefetchLoadsStarted": 536,
+          "gallery.coldCellFrames": 241,
+          "gallery.drawCoalesced": 543
+        },
+        "heapBytes": 33447054
+      },
+      {
+        "t": 1506,
+        "gauges": {
+          "gallery.prefetchedCells": 15,
+          "gallery.visibleCells": 356,
+          "gallery.visibleColdCells": 1,
+          "gallery.cacheItems": 2378,
+          "gallery.cacheBytes": 83816580,
+          "gallery.inFlightThumbs": 37
+        },
+        "counters": {
+          "gallery.drawRequests": 800,
+          "gallery.prefetchSlices": 203,
+          "gallery.prefetchLoadsStarted": 651,
+          "gallery.coldCellFrames": 271,
+          "gallery.drawCoalesced": 621
+        },
+        "heapBytes": 40567630
+      },
+      {
+        "t": 1756,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 356,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 2485,
+          "gallery.cacheBytes": 87464196,
+          "gallery.inFlightThumbs": 28
+        },
+        "counters": {
+          "gallery.drawRequests": 937,
+          "gallery.prefetchSlices": 237,
+          "gallery.prefetchLoadsStarted": 749,
+          "gallery.coldCellFrames": 278,
+          "gallery.drawCoalesced": 728
+        },
+        "heapBytes": 34613820
+      },
+      {
+        "t": 2005,
+        "gauges": {
+          "gallery.prefetchedCells": 7,
+          "gallery.visibleCells": 406,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 2596,
+          "gallery.cacheBytes": 91317188,
+          "gallery.inFlightThumbs": 7
+        },
+        "counters": {
+          "gallery.drawRequests": 1081,
+          "gallery.prefetchSlices": 268,
+          "gallery.prefetchLoadsStarted": 839,
+          "gallery.coldCellFrames": 278,
+          "gallery.drawCoalesced": 842
+        },
+        "heapBytes": 33982065
+      },
+      {
+        "t": 2255,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 394,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 2603,
+          "gallery.cacheBytes": 91515236,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 1122,
+          "gallery.prefetchSlices": 298,
+          "gallery.prefetchLoadsStarted": 839,
+          "gallery.coldCellFrames": 278,
+          "gallery.drawCoalesced": 853
+        },
+        "heapBytes": 40483325
+      },
+      {
+        "t": 2505,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 410,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 2603,
+          "gallery.cacheBytes": 91515236,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 1152,
+          "gallery.prefetchSlices": 328,
+          "gallery.prefetchLoadsStarted": 839,
+          "gallery.coldCellFrames": 278,
+          "gallery.drawCoalesced": 853
+        },
+        "heapBytes": 32819859
+      },
+      {
+        "t": 2756,
+        "gauges": {
+          "gallery.prefetchedCells": 1,
+          "gallery.visibleCells": 366,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 2657,
+          "gallery.cacheBytes": 93185252,
+          "gallery.inFlightThumbs": 28
+        },
+        "counters": {
+          "gallery.drawRequests": 1236,
+          "gallery.prefetchSlices": 363,
+          "gallery.prefetchLoadsStarted": 921,
+          "gallery.coldCellFrames": 278,
+          "gallery.drawCoalesced": 907
+        },
+        "heapBytes": 37171596
+      },
+      {
+        "t": 3007,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 392,
+          "gallery.visibleColdCells": 42,
+          "gallery.cacheItems": 2764,
+          "gallery.cacheBytes": 96604388,
+          "gallery.inFlightThumbs": 28
+        },
+        "counters": {
+          "gallery.drawRequests": 1374,
+          "gallery.prefetchSlices": 397,
+          "gallery.prefetchLoadsStarted": 1028,
+          "gallery.coldCellFrames": 578,
+          "gallery.drawCoalesced": 1015
+        },
+        "heapBytes": 35641942
+      },
+      {
+        "t": 3255,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 363,
+          "gallery.visibleColdCells": 134,
+          "gallery.cacheItems": 2913,
+          "gallery.cacheBytes": 100861028,
+          "gallery.inFlightThumbs": 13
+        },
+        "counters": {
+          "gallery.drawRequests": 1559,
+          "gallery.prefetchSlices": 427,
+          "gallery.prefetchLoadsStarted": 1162,
+          "gallery.coldCellFrames": 3015,
+          "gallery.drawCoalesced": 1171
+        },
+        "heapBytes": 36030866
+      },
+      {
+        "t": 3505,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 355,
+          "gallery.visibleColdCells": 226,
+          "gallery.cacheItems": 3029,
+          "gallery.cacheBytes": 103691108,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 1705,
+          "gallery.prefetchSlices": 463,
+          "gallery.prefetchLoadsStarted": 1265,
+          "gallery.coldCellFrames": 8576,
+          "gallery.drawCoalesced": 1287
+        },
+        "heapBytes": 34805243
+      },
+      {
+        "t": 3756,
+        "gauges": {
+          "gallery.prefetchedCells": 5,
+          "gallery.visibleCells": 366,
+          "gallery.visibleColdCells": 257,
+          "gallery.cacheItems": 3107,
+          "gallery.cacheBytes": 105567332,
+          "gallery.inFlightThumbs": 36
+        },
+        "counters": {
+          "gallery.drawRequests": 1813,
+          "gallery.prefetchSlices": 499,
+          "gallery.prefetchLoadsStarted": 1379,
+          "gallery.coldCellFrames": 16545,
+          "gallery.drawCoalesced": 1365
+        },
+        "heapBytes": 39773198
+      },
+      {
+        "t": 4007,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 373,
+          "gallery.visibleColdCells": 184,
+          "gallery.cacheItems": 3224,
+          "gallery.cacheBytes": 109172324,
+          "gallery.inFlightThumbs": 35
+        },
+        "counters": {
+          "gallery.drawRequests": 1960,
+          "gallery.prefetchSlices": 529,
+          "gallery.prefetchLoadsStarted": 1495,
+          "gallery.coldCellFrames": 23338,
+          "gallery.drawCoalesced": 1482
+        },
+        "heapBytes": 40782566
+      },
+      {
+        "t": 4260,
+        "gauges": {
+          "gallery.prefetchedCells": 6,
+          "gallery.visibleCells": 412,
+          "gallery.visibleColdCells": 69,
+          "gallery.cacheItems": 3372,
+          "gallery.cacheBytes": 113946212,
+          "gallery.inFlightThumbs": 64
+        },
+        "counters": {
+          "gallery.drawRequests": 2145,
+          "gallery.prefetchSlices": 558,
+          "gallery.prefetchLoadsStarted": 1672,
+          "gallery.coldCellFrames": 27133,
+          "gallery.drawCoalesced": 1638
+        },
+        "heapBytes": 37593389
+      },
+      {
+        "t": 4515,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 452,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 3539,
+          "gallery.cacheBytes": 119466596,
+          "gallery.inFlightThumbs": 29
+        },
+        "counters": {
+          "gallery.drawRequests": 2341,
+          "gallery.prefetchSlices": 587,
+          "gallery.prefetchLoadsStarted": 1804,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 1805
+        },
+        "heapBytes": 33388141
+      },
+      {
+        "t": 4762,
+        "gauges": {
+          "gallery.prefetchedCells": 7,
+          "gallery.visibleCells": 490,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 3641,
+          "gallery.cacheBytes": 122932964,
+          "gallery.inFlightThumbs": 35
+        },
+        "counters": {
+          "gallery.drawRequests": 2471,
+          "gallery.prefetchSlices": 615,
+          "gallery.prefetchLoadsStarted": 1912,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 1907
+        },
+        "heapBytes": 46524232
+      },
+      {
+        "t": 5013,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 451,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 3765,
+          "gallery.cacheBytes": 126968036,
+          "gallery.inFlightThumbs": 36
+        },
+        "counters": {
+          "gallery.drawRequests": 2625,
+          "gallery.prefetchSlices": 645,
+          "gallery.prefetchLoadsStarted": 2037,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2031
+        },
+        "heapBytes": 44509804
+      },
+      {
+        "t": 5264,
+        "gauges": {
+          "gallery.prefetchedCells": 12,
+          "gallery.visibleCells": 452,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 3846,
+          "gallery.cacheBytes": 130640228,
+          "gallery.inFlightThumbs": 35
+        },
+        "counters": {
+          "gallery.drawRequests": 2737,
+          "gallery.prefetchSlices": 675,
+          "gallery.prefetchLoadsStarted": 2117,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2113
+        },
+        "heapBytes": 33834245
+      },
+      {
+        "t": 5506,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 393,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 3959,
+          "gallery.cacheBytes": 134967140,
+          "gallery.inFlightThumbs": 23
+        },
+        "counters": {
+          "gallery.drawRequests": 2889,
+          "gallery.prefetchSlices": 705,
+          "gallery.prefetchLoadsStarted": 2218,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2235
+        },
+        "heapBytes": 47552513
+      },
+      {
+        "t": 5756,
+        "gauges": {
+          "gallery.prefetchedCells": 16,
+          "gallery.visibleCells": 416,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4078,
+          "gallery.cacheBytes": 139346660,
+          "gallery.inFlightThumbs": 16
+        },
+        "counters": {
+          "gallery.drawRequests": 3030,
+          "gallery.prefetchSlices": 738,
+          "gallery.prefetchLoadsStarted": 2330,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2347
+        },
+        "heapBytes": 47585011
+      },
+      {
+        "t": 6006,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 387,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4181,
+          "gallery.cacheBytes": 142816868,
+          "gallery.inFlightThumbs": 31
+        },
+        "counters": {
+          "gallery.drawRequests": 3165,
+          "gallery.prefetchSlices": 770,
+          "gallery.prefetchLoadsStarted": 2448,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2451
+        },
+        "heapBytes": 47238931
+      },
+      {
+        "t": 6256,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 357,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4291,
+          "gallery.cacheBytes": 146069168,
+          "gallery.inFlightThumbs": 25
+        },
+        "counters": {
+          "gallery.drawRequests": 3303,
+          "gallery.prefetchSlices": 798,
+          "gallery.prefetchLoadsStarted": 2552,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2562
+        },
+        "heapBytes": 41452842
+      },
+      {
+        "t": 6506,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 342,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4408,
+          "gallery.cacheBytes": 150431024,
+          "gallery.inFlightThumbs": 15
+        },
+        "counters": {
+          "gallery.drawRequests": 3469,
+          "gallery.prefetchSlices": 833,
+          "gallery.prefetchLoadsStarted": 2659,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2697
+        },
+        "heapBytes": 41377597
+      },
+      {
+        "t": 6755,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 339,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4522,
+          "gallery.cacheBytes": 154727600,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 3598,
+          "gallery.prefetchSlices": 866,
+          "gallery.prefetchLoadsStarted": 2758,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2797
+        },
+        "heapBytes": 39905015
+      },
+      {
+        "t": 7009,
+        "gauges": {
+          "gallery.prefetchedCells": 3,
+          "gallery.visibleCells": 366,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4600,
+          "gallery.cacheBytes": 158188976,
+          "gallery.inFlightThumbs": 23
+        },
+        "counters": {
+          "gallery.drawRequests": 3706,
+          "gallery.prefetchSlices": 899,
+          "gallery.prefetchLoadsStarted": 2859,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2875
+        },
+        "heapBytes": 35004795
+      },
+      {
+        "t": 7257,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 379,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4709,
+          "gallery.cacheBytes": 162638384,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 3846,
+          "gallery.prefetchSlices": 929,
+          "gallery.prefetchLoadsStarted": 2945,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 2985
+        },
+        "heapBytes": 47650315
+      },
+      {
+        "t": 7507,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 376,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4790,
+          "gallery.cacheBytes": 166129712,
+          "gallery.inFlightThumbs": 18
+        },
+        "counters": {
+          "gallery.drawRequests": 3975,
+          "gallery.prefetchSlices": 960,
+          "gallery.prefetchLoadsStarted": 3044,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3083
+        },
+        "heapBytes": 47380758
+      },
+      {
+        "t": 7766,
+        "gauges": {
+          "gallery.prefetchedCells": 7,
+          "gallery.visibleCells": 368,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4880,
+          "gallery.cacheBytes": 170541872,
+          "gallery.inFlightThumbs": 18
+        },
+        "counters": {
+          "gallery.drawRequests": 4080,
+          "gallery.prefetchSlices": 994,
+          "gallery.prefetchLoadsStarted": 3134,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3158
+        },
+        "heapBytes": 47066551
+      },
+      {
+        "t": 8006,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 331,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 4957,
+          "gallery.cacheBytes": 174328496,
+          "gallery.inFlightThumbs": 10
+        },
+        "counters": {
+          "gallery.drawRequests": 4187,
+          "gallery.prefetchSlices": 1024,
+          "gallery.prefetchLoadsStarted": 3203,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3235
+        },
+        "heapBytes": 44139508
+      },
+      {
+        "t": 8255,
+        "gauges": {
+          "gallery.prefetchedCells": 15,
+          "gallery.visibleCells": 326,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 5031,
+          "gallery.cacheBytes": 178506416,
+          "gallery.inFlightThumbs": 15
+        },
+        "counters": {
+          "gallery.drawRequests": 4290,
+          "gallery.prefetchSlices": 1058,
+          "gallery.prefetchLoadsStarted": 3282,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3309
+        },
+        "heapBytes": 42516560
+      },
+      {
+        "t": 8507,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 326,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 5109,
+          "gallery.cacheBytes": 181937840,
+          "gallery.inFlightThumbs": 27
+        },
+        "counters": {
+          "gallery.drawRequests": 4410,
+          "gallery.prefetchSlices": 1093,
+          "gallery.prefetchLoadsStarted": 3372,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3398
+        },
+        "heapBytes": 41153085
+      },
+      {
+        "t": 8757,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 299,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 5216,
+          "gallery.cacheBytes": 185291312,
+          "gallery.inFlightThumbs": 25
+        },
+        "counters": {
+          "gallery.drawRequests": 4539,
+          "gallery.prefetchSlices": 1126,
+          "gallery.prefetchLoadsStarted": 3477,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3497
+        },
+        "heapBytes": 35671176
+      },
+      {
+        "t": 9005,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 298,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 5324,
+          "gallery.cacheBytes": 190630448,
+          "gallery.inFlightThumbs": 0
+        },
+        "counters": {
+          "gallery.drawRequests": 4675,
+          "gallery.prefetchSlices": 1156,
+          "gallery.prefetchLoadsStarted": 3560,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3605
+        },
+        "heapBytes": 35329852
+      },
+      {
+        "t": 9257,
+        "gauges": {
+          "gallery.prefetchedCells": 11,
+          "gallery.visibleCells": 277,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 5377,
+          "gallery.cacheBytes": 193987376,
+          "gallery.inFlightThumbs": 11
+        },
+        "counters": {
+          "gallery.drawRequests": 4758,
+          "gallery.prefetchSlices": 1188,
+          "gallery.prefetchLoadsStarted": 3624,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3658
+        },
+        "heapBytes": 46161846
+      },
+      {
+        "t": 9506,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 274,
+          "gallery.visibleColdCells": 0,
+          "gallery.cacheItems": 5461,
+          "gallery.cacheBytes": 196881200,
+          "gallery.inFlightThumbs": 37
+        },
+        "counters": {
+          "gallery.drawRequests": 4881,
+          "gallery.prefetchSlices": 1222,
+          "gallery.prefetchLoadsStarted": 3734,
+          "gallery.coldCellFrames": 27984,
+          "gallery.drawCoalesced": 3750
+        },
+        "heapBytes": 44424566
+      },
+      {
+        "t": 9756,
+        "gauges": {
+          "gallery.prefetchedCells": 0,
+          "gallery.visibleCells": 308,
+          "gallery.visibleColdCells": 1,
+          "gallery.cacheItems": 5592,
+          "gallery.cacheBytes": 200357168,
+          "gallery.inFlightThumbs": 43
+        },
+        "counters": {
+          "gallery.drawRequests": 5037,
+          "gallery.prefetchSlices": 1252,
+          "gallery.prefetchLoadsStarted": 3871,
+          "gallery.coldCellFrames": 28004,
+          "gallery.drawCoalesced": 3876
+        },
+        "heapBytes": 41167222
+      },
+      {
+        "t": 10011,
+        "gauges": null,
+        "counters": null,
+        "heapBytes": 39696066
+      }
+    ],
+    "selectionEngaged": null,
+    "probe": {
+      "canvasW": 1550,
+      "canvasH": 964,
+      "dpr": 1.5,
+      "scrollH": 177154,
+      "scrollClientH": 964,
+      "originTop": 52857.33203125,
+      "endScrollTop": 64865.33203125
+    }
+  },
+  "procMem": {
+    "pid": 31016,
+    "series": [
+      {
+        "tEpochMs": 618,
+        "workingSetBytes": 156385280
+      },
+      {
+        "tEpochMs": 1118,
+        "workingSetBytes": 156385280
+      },
+      {
+        "tEpochMs": 1649,
+        "workingSetBytes": 159490048
+      },
+      {
+        "tEpochMs": 2133,
+        "workingSetBytes": 154353664
+      },
+      {
+        "tEpochMs": 2625,
+        "workingSetBytes": 153284608
+      },
+      {
+        "tEpochMs": 3132,
+        "workingSetBytes": 153759744
+      },
+      {
+        "tEpochMs": 3640,
+        "workingSetBytes": 153772032
+      },
+      {
+        "tEpochMs": 4148,
+        "workingSetBytes": 153481216
+      },
+      {
+        "tEpochMs": 4654,
+        "workingSetBytes": 152330240
+      },
+      {
+        "tEpochMs": 5156,
+        "workingSetBytes": 153137152
+      },
+      {
+        "tEpochMs": 5666,
+        "workingSetBytes": 153243648
+      },
+      {
+        "tEpochMs": 6165,
+        "workingSetBytes": 154259456
+      },
+      {
+        "tEpochMs": 6668,
+        "workingSetBytes": 153800704
+      },
+      {
+        "tEpochMs": 7179,
+        "workingSetBytes": 154083328
+      },
+      {
+        "tEpochMs": 7684,
+        "workingSetBytes": 154140672
+      },
+      {
+        "tEpochMs": 8195,
+        "workingSetBytes": 154038272
+      },
+      {
+        "tEpochMs": 8695,
+        "workingSetBytes": 154611712
+      },
+      {
+        "tEpochMs": 9209,
+        "workingSetBytes": 154726400
+      },
+      {
+        "tEpochMs": 9705,
+        "workingSetBytes": 154591232
+      },
+      {
+        "tEpochMs": 10215,
+        "workingSetBytes": 154591232
+      },
+      {
+        "tEpochMs": 10716,
+        "workingSetBytes": 154599424
+      },
+      {
+        "tEpochMs": 11222,
+        "workingSetBytes": 154611712
+      },
+      {
+        "tEpochMs": 11731,
+        "workingSetBytes": 154587136
+      },
+      {
+        "tEpochMs": 12233,
+        "workingSetBytes": 151728128
+      },
+      {
+        "tEpochMs": 12747,
+        "workingSetBytes": 153731072
+      }
+    ]
+  }
+}

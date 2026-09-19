@@ -18,7 +18,10 @@ use tracing_subscriber::EnvFilter;
 use scrollery_lib::db::models::MediaItem;
 use scrollery_lib::engine::EngineArena;
 use scrollery_lib::logging::EnvelopeFormat;
-use scrollery_lib::thumbnail::{generate_thumbnail, ThumbConfig};
+use scrollery_lib::thumbnail::{
+    decode_media_step, encode_media_step_with_snapshot, process_deferred_cpu, DecodeResult,
+    ThumbConfig,
+};
 
 /// 全进程只 init 一次(tracing 全局默认 subscriber 只能设一次);用 reload::Handle 在各基准间切档。
 /// writer 套 `tracing_appender::non_blocking` 而非裸 `io::sink`——生产路径的「序列化+入队」
@@ -168,7 +171,29 @@ fn bench_pipeline_thumbnail_batch(
             b.iter(|| {
                 for i in 0..BATCH_N {
                     let item = make_item(i, i, file_size);
-                    let _ = generate_thumbnail(&item, &img_path, &arena, &config);
+                    // 与生产调用点同款两步:decode_media_step 判缓存/直显/分派,编码与
+                    // 延迟 CPU 收尾各自走既有入口(镜像 ipc/thumbnail_full_gen.rs)。
+                    match decode_media_step(&item, &img_path, &arena, &config) {
+                        Ok(DecodeResult::ToEncode {
+                            item_id,
+                            source_revision,
+                            cache_key,
+                            decoded,
+                        }) => {
+                            let _ = encode_media_step_with_snapshot(
+                                item_id,
+                                source_revision,
+                                cache_key,
+                                decoded,
+                                &config,
+                            );
+                        }
+                        Ok(DecodeResult::DeferredToCpu { item, abs_path }) => {
+                            let _ = process_deferred_cpu(&item, &abs_path, &arena, &config);
+                        }
+                        // Ready(缓存命中/直显/非图像)与 Err 均无后续编解码步骤。
+                        _ => {}
+                    }
                 }
             });
         });

@@ -22,7 +22,7 @@ fn plan(c: &Connection, sql: &str) -> String {
 #[test]
 fn canonical_default_view_scans_table_not_sort_index() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
 
     // 默认全量视图：全表扫，不得走 idx_media_sort。（&[] = 无隐藏根，V21）
     let (sql, _) = canonical_layout_sql(&MediaFilter::default(), &[]);
@@ -71,7 +71,7 @@ fn bench_canonical_fat_table_1m() {
     // 页缓存对齐生产(64MB);sync OFF 仅加速灌数据,不影响读基准。
     c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF; PRAGMA cache_size=-64000;")
         .unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
     c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
     c.execute_batch("INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');")
         .unwrap();

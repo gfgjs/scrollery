@@ -470,7 +470,8 @@ function onBlur() {
   margin-right: 4px;
   font-size: 9px;
   line-height: 1;
-  color: var(--color-text-secondary);
+  /* 年份标签浮在画廊底上:取画廊底派生的辅助文字色。 */
+  color: var(--color-canvas-text-secondary);
   white-space: nowrap;
   pointer-events: none;
   opacity: 0.9;
@@ -553,17 +554,17 @@ function onBlur() {
   margin-right: 8px;
   transform: translateY(-50%);
   padding: var(--spacing-2xs) var(--spacing-sm);
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
   font-size: var(--font-size-xs);
   line-height: 1.4;
   color: var(--color-text-primary);
   white-space: nowrap;
   pointer-events: none;
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   z-index: 2;
 }
 .tl-flyout__count {
@@ -581,12 +582,12 @@ function onBlur() {
   pointer-events: none;
   display: flex;
   flex-direction: column;
-  background: var(--material-recipe-float-background-color);
-  border: 1px solid var(--material-recipe-float-border-color);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
-  box-shadow: var(--material-recipe-float-box-shadow);
-  backdrop-filter: var(--material-recipe-float-backdrop-filter);
-  -webkit-backdrop-filter: var(--material-recipe-float-backdrop-filter);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   overflow: hidden;
   z-index: 4;
   font-size: 10px;

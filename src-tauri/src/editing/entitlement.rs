@@ -58,7 +58,7 @@ pub fn require_editing_entitlement(provider: &dyn EntitlementProvider) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exotic::license::{ActivationInfo, LicenseError};
+    use crate::exotic::license::LicenseError;
     use std::sync::Mutex;
 
     struct FakeProvider {
@@ -90,9 +90,9 @@ mod tests {
             _sku: &str,
             _credential: &str,
             _now: i64,
-        ) -> std::result::Result<ActivationInfo, LicenseError> {
+        ) -> std::result::Result<(), LicenseError> {
             *self.status.lock().expect("fake provider lock") = LicenseStatus::Authorized;
-            Ok(ActivationInfo { enc_seed: None })
+            Ok(())
         }
 
         fn deactivate(&self, _plugin_id: &str) -> std::result::Result<(), LicenseError> {

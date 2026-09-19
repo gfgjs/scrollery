@@ -1,0 +1,147 @@
+{
+  "baseline_commit": "e7db489b66f3d939784678ccf4d6849b7eec5304",
+  "date": "2026-09-15",
+  "method": "Git-tracked UTF-8 physical lines via splitlines; blank/comment lines included; nonblank only strips blank lines; Rust inline tests remain in containing file; third-party public/vditor src/vendor third-party excluded; standalone tests matched .spec/.test and /tests/; config/locks/docs excluded from first-party source. Rust tests.rs and *_tests.rs classified as standalone tests. Configuration bucket includes package-lock.json, separately identified in report.",
+  "groups": {
+    "other": {
+      "files": 55,
+      "text_files": 37,
+      "loc": 12697,
+      "nonblank": 11274,
+      "bytes": 668747
+    },
+    "configuration": {
+      "files": 40,
+      "text_files": 40,
+      "loc": 14668,
+      "nonblank": 14484,
+      "bytes": 457330
+    },
+    "build_and_startup": {
+      "files": 8,
+      "text_files": 8,
+      "loc": 694,
+      "nonblank": 652,
+      "bytes": 30766
+    },
+    "crates_rust": {
+      "files": 52,
+      "text_files": 52,
+      "loc": 16173,
+      "nonblank": 15011,
+      "bytes": 665919
+    },
+    "dev_probes": {
+      "files": 14,
+      "text_files": 14,
+      "loc": 5006,
+      "nonblank": 4655,
+      "bytes": 200486
+    },
+    "standalone_tests": {
+      "files": 180,
+      "text_files": 180,
+      "loc": 34431,
+      "nonblank": 30889,
+      "bytes": 1361441
+    },
+    "documentation": {
+      "files": 1025,
+      "text_files": 1025,
+      "loc": 124119,
+      "nonblank": 105100,
+      "bytes": 9363920
+    },
+    "third_party": {
+      "files": 575,
+      "text_files": 492,
+      "loc": 60464,
+      "nonblank": 56580,
+      "bytes": 50091714
+    },
+    "engineering_tools": {
+      "files": 40,
+      "text_files": 40,
+      "loc": 9597,
+      "nonblank": 8853,
+      "bytes": 456389
+    },
+    "host_rust": {
+      "files": 251,
+      "text_files": 251,
+      "loc": 113359,
+      "nonblank": 105054,
+      "bytes": 4843908
+    },
+    "frontend": {
+      "files": 382,
+      "text_files": 382,
+      "loc": 85395,
+      "nonblank": 79393,
+      "bytes": 3382112
+    }
+  },
+  "first_party_source": {
+    "files": 927,
+    "loc": 264655,
+    "nonblank": 244507,
+    "bytes": 10941021
+  },
+  "first_party_extensions": {
+    ".sky": {
+      "files": 1,
+      "loc": 10,
+      "nonblank": 10
+    },
+    ".rs": {
+      "files": 328,
+      "loc": 141006,
+      "nonblank": 130756
+    },
+    ".js": {
+      "files": 3,
+      "loc": 203,
+      "nonblank": 201
+    },
+    ".html": {
+      "files": 1,
+      "loc": 238,
+      "nonblank": 218
+    },
+    ".mjs": {
+      "files": 31,
+      "loc": 8491,
+      "nonblank": 7941
+    },
+    ".ps1": {
+      "files": 3,
+      "loc": 192,
+      "nonblank": 170
+    },
+    ".vue": {
+      "files": 115,
+      "loc": 39595,
+      "nonblank": 36932
+    },
+    ".css": {
+      "files": 18,
+      "loc": 4396,
+      "nonblank": 4099
+    },
+    ".ts": {
+      "files": 419,
+      "loc": 69364,
+      "nonblank": 63213
+    },
+    ".py": {
+      "files": 7,
+      "loc": 1059,
+      "nonblank": 876
+    },
+    ".bat": {
+      "files": 1,
+      "loc": 101,
+      "nonblank": 91
+    }
+  }
+}

@@ -13,7 +13,10 @@ const VER: u64 = 5;
 /// seed 一个根 + 目录 + 3 个媒体项（id 1/2/3，sort_datetime 100/200/300）。
 fn seeded_db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
@@ -37,8 +40,11 @@ fn seeded_db() -> Connection {
 #[test]
 fn canonical_derive_order_matches_sql_order() {
     let c = Connection::open_in_memory().unwrap();
-    // run_migrations 顶部已自注册 TREE_SORT_KEY（方案 B），下方 fixture 回填 UPDATE 依赖它。
-    crate::db::migration::run_migrations(&c).unwrap();
+    // 下方 fixture 回填 UPDATE 依赖 TREE_SORT_KEY;建库不再自注册,此处在夹具内注册。
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES
@@ -133,7 +139,10 @@ fn canonical_derive_order_matches_sql_order() {
 #[test]
 fn filename_derive_order_matches_sql_order() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES
@@ -238,7 +247,10 @@ fn filename_derive_order_matches_sql_order() {
 #[test]
 fn dual_key_cross_axis_derive_matches_sql_order() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES
@@ -375,7 +387,10 @@ fn dual_key_cross_axis_derive_matches_sql_order() {
 #[test]
 fn date_filename_derive_matches_sql_order() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     // 单目录即可（date 分组不涉目录序）；跨 UTC 午夜靠 sort_datetime 值：
     //   day0 = [0,86400)  ts 100/200；day1 = [86400,172800) ts 86500/86600；day2 ts 172900。
     // 自然序 a(5) < img1(3) < img2(2) < img10(1) < img100(4)，与日桶交错。
@@ -478,7 +493,10 @@ fn date_filename_derive_matches_sql_order() {
 /// favorited = {img2(1), img1(3), a(5)}。供 B-file-iii 全局 rank 两测试共用。
 fn global_rank_fixture() -> Connection {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r1');
@@ -645,7 +663,10 @@ fn filter_key_changes_with_file_formats() {
 #[test]
 fn folder_filename_sort_keeps_duplicate_paths_and_names_in_distinct_groups() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap(); // 顶部自注册 TREE_SORT_KEY（方案 B）。
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
          INSERT INTO directories (id, root_id, rel_path, name) VALUES
@@ -687,10 +708,13 @@ fn folder_filename_sort_keeps_duplicate_paths_and_names_in_distinct_groups() {
 #[test]
 fn folder_sql_order_driven_by_stored_tree_sort_key_column() {
     let c = Connection::open_in_memory().unwrap();
-    crate::db::migration::run_migrations(&c).unwrap();
+    crate::db::schema::initialize_schema(&c).unwrap();
+    // 建库不再自注册 TREE_SORT_KEY/NATURAL_CMP;本组用例的 SQL 依赖它,在连接边界注册。
+    crate::db::register_custom_collations(&c).unwrap();
+
     // rel_path 自然序 aaa < zzz；但把 tree_sort_key 反写（aaa→大键 X'FF00'、zzz→小键 X'0100'）。
     // 读存列 → zzz(小键)组先出 [12,11]；读 rel_path/函数 → aaa 组先出 [11,12]。二者可区分。
-    // （run_migrations 在空 directories 表上跑 V19 回填 = no-op，不覆盖下方显式键。）
+    // （建库不再有 tree_sort_key 回填,下方显式键不会被覆盖。）
     c.execute_batch(
         "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
          INSERT INTO directories (id, root_id, rel_path, name, tree_sort_key) VALUES

@@ -1,7 +1,7 @@
 /** 后端稳定错误码 → 前端本地化键。分流只认 code，不匹配双语 message。 */
 const RESTORE_ERROR_KEYS: Readonly<Record<string, string>> = {
   restore_format_unsupported: 'backup.restoreErrorFormat',
-  restore_schema_too_new: 'backup.restoreErrorSchema',
+  restore_schema_incompatible: 'backup.restoreErrorSchema',
   restore_corrupt: 'backup.restoreErrorCorrupt',
   restore_path_invalid: 'backup.restoreErrorPath',
   restore_size_limit: 'backup.restoreErrorSpace',

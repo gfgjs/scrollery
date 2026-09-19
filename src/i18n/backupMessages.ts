@@ -69,7 +69,6 @@ export const backupMessages = {
       restoreValidating: '正在校验并暂存备份包…',
       restorePrivacyWarning:
         '校验已通过。请核对摘要；继续后仍会再次确认，当前资料库在重启前不会被替换。',
-      restoreMigratedNote: '此备份来自较早的资料库版本，已在暂存副本上完成迁移与再次校验。',
       restoreExternalWarning:
         '备份记录了 {count} 个外部文档版本；外部文件本体不在备份包内，恢复后可能需要重新定位。',
       restoreRoots: '扫描根摘要：',
@@ -90,7 +89,7 @@ export const backupMessages = {
       restoreFailed: '恢复未能继续',
       retryValidation: '重新校验',
       restoreErrorFormat: '此备份包格式不受当前版本支持。',
-      restoreErrorSchema: '此备份来自更新版本的 Scrollery，请先升级应用再恢复。',
+      restoreErrorSchema: '此备份的数据库格式与当前版本不一致，请用当前版本重新导出备份，或重置数据库。',
       restoreErrorCorrupt: '备份包损坏或完整性校验失败，请改选另一份备份。',
       restoreErrorPath: '备份包含不安全或冲突的路径，已拒绝解压。',
       restoreErrorSpace: '可用空间不足，无法安全暂存此备份。',
@@ -171,8 +170,6 @@ export const backupMessages = {
       restoreValidating: 'Validating and staging the backup package…',
       restorePrivacyWarning:
         'Validation passed. Review the summary below; there is another confirmation before the live catalog is replaced on restart.',
-      restoreMigratedNote:
-        'This backup used an older catalog version. Its staged copy was migrated and validated again.',
       restoreExternalWarning:
         'The backup references {count} external document version(s). Their files are not inside the package and may need to be located again after restore.',
       restoreRoots: 'Scan-root summary:',
@@ -197,7 +194,7 @@ export const backupMessages = {
       retryValidation: 'Validate Again',
       restoreErrorFormat: 'This backup package format is not supported by the current version.',
       restoreErrorSchema:
-        'This backup came from a newer Scrollery version. Update the app before restoring it.',
+        'The backup database format does not match this version. Export a fresh backup with the current version, or reset the database.',
       restoreErrorCorrupt:
         'The backup is damaged or failed integrity checks. Choose another backup.',
       restoreErrorPath: 'The package contains unsafe or conflicting paths and was not extracted.',
