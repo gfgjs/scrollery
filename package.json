@@ -25,7 +25,8 @@
     "build:video-worker:dev": "node scripts/build-video-worker.mjs --dev",
     "verify:channel": "node scripts/verify-channel-bundle.mjs",
     "check:contrast": "vite-node scripts/check-theme-contrast.mjs",
-    "capture:themes": "node scripts/capture-theme-matrix.mjs"
+    "capture:themes": "node scripts/capture-theme-matrix.mjs",
+    "build:architecture-guide": "node scripts/build-architecture-guide.mjs"
   },
   "dependencies": {
     "@floating-ui/vue": "^2.0.1",
@@ -55,8 +56,11 @@
     "@vue/eslint-config-typescript": "^14.9.0",
     "eslint": "^9.39.4",
     "eslint-plugin-vue": "^9.33.0",
+    "marked": "^18.0.13",
+    "mermaid": "^11.17.2",
     "onnxruntime-node": "^1.26.0",
     "prettier": "^3.9.1",
+    "puppeteer-core": "^25.11.0",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",
     "vitest": "^3.2.6",
