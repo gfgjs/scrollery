@@ -4,6 +4,7 @@
 // 构造闭包或再次调用本工厂(§3.1 红线)。
 import { buildThumbUrl } from './useThumbLoader'
 import { isThumbLoadDeferred } from './useThumbLoadGate'
+import { DEFAULTS } from '../constants/defaults'
 import {
   CANVAS_PREFETCH_AHEAD_FACTOR,
   CANVAS_PREFETCH_BEHIND_FACTOR,
@@ -31,7 +32,8 @@ export type CachedImage = CachedThumb<ThumbSrc>
 
 export interface CanvasThumbPipelineOptions {
   cacheDir: () => string
-  onRequestThumb: (id: number) => void
+  onRequestThumb: (id: number) => Promise<void>
+  onCancelThumb: (id: number) => void
   onRegenerateThumb: (id: number) => void
   scheduleDraw: () => void
   /** 视口宽/高(每帧读取的热路径 getter):拆两个数值访问器而非单个 {w,h} 对象,
@@ -53,6 +55,10 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
   // 故限制全局在途量，完成/失败释放槽位后由重绘继续补齐。64 足以持续喂满 Chromium 解码线程池，
   // 同时把一次放行的同步工作从 O(同屏格数)降到常数。
   const MAX_IN_FLIGHT_THUMBS = 64
+  // 生成尚无 URL，不占位图 loading 槽；单独限制为两批，避免密集视口一次排入数千项。
+  const MAX_THUMB_REQUESTS = DEFAULTS.THUMB_BATCH_SIZE * 2
+  const thumbRequests = new Map<number, Promise<void>>()
+  const visibleIds = new Set<number>()
   /** stale 可续画升级的让位余量:槽接近满时把最后若干槽留给真正缺图的冷格(升级靠后)。 */
   const STALE_UPGRADE_HEADROOM = 8
   /** 每侧保护条目上限,避免密集网格扫描无界增长。 */
@@ -162,6 +168,8 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
    */
   function invalidateAsyncOwnership(releaseNonAbortable = true): void {
     pipelineEpoch++
+    cancelThumbRequests()
+    visibleIds.clear()
     pendingWaitSince.clear()
     visibleDemand.clear()
     cancelPrefetchPlan()
@@ -219,10 +227,19 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
     if (!url) {
       // 快滚只消费已经存在的缩略图/原图源；待生成项无法在当前帧显示，若逐格上抛会绕过
       // loadingCount（尚无 fetch）并一次创建数千 queue 请求，重新引入任务风暴。
-      if (isThumbLoadDeferred()) return cached
+      if (purpose === 'prefetch' || isThumbLoadDeferred()) return cached
+      if (thumbRequests.has(id) || thumbRequests.size >= MAX_THUMB_REQUESTS) return cached
       // status 0(待生成)/ status 3 无路径 → 上抛一次请求(父层生成/解析后回填 → sig 变 → 自动重载)。
       if ((item.thumbStatus === 0 || item.thumbStatus === 3) && thumbState.requestThumbOnce(id)) {
-        opts.onRequestThumb(id)
+        const request = opts.onRequestThumb(id)
+        thumbRequests.set(id, request)
+        const settle = () => {
+          // 离屏后同 id 可能已重新请求；旧 Promise 不得释放新额度或在失活后触发绘制。
+          if (thumbRequests.get(id) !== request) return
+          thumbRequests.delete(id)
+          opts.scheduleDraw()
+        }
+        void request.then(settle, settle)
       }
       return cached
     }
@@ -239,6 +256,15 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
     thumbLoads.set(id, load)
     void loadBitmap(id, url, sig, renderSig, item.w, item.h, bucketH, item.thumbStatus, load)
     return cached
+  }
+
+  function cancelThumbRequests(keep?: ReadonlySet<number>): void {
+    for (const id of thumbRequests.keys()) {
+      if (keep?.has(id)) continue
+      thumbRequests.delete(id)
+      thumbState.cancelThumbRequest(id)
+      opts.onCancelThumb(id)
+    }
   }
 
   /**
@@ -378,11 +404,13 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
   function prioritizeVisibleThumbLoads(rows: LayoutRow[], start: number, end: number) {
     visibleDemand.clear()
     protectIds.clear()
+    visibleIds.clear()
     for (let i = start; i < end; i++) {
       const row = rows[i]
       if (row.rowType !== 'normal') continue
       for (const item of row.items) {
         const id = item.id
+        if (thumbRequests.has(id)) visibleIds.add(id)
         // 先按当前 status/path 对账:旧签名留下的缓存/失败标记会把「换了源的真冷项」误判成
         // 有位图可画,于是既不腾槽也不记账。签名与 getImage 同源(itemDataSig)。
         thumbState.syncSig(id, itemDataSig(item))
@@ -396,6 +424,8 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
         protectIds.add(id)
       }
     }
+    // 生成请求只保留实际视口；即使没有可加载 URL，也必须清掉离屏排队与退避请求。
+    cancelThumbRequests(visibleIds)
     if (visibleDemand.size === 0 || thumbState.loadingCount() < MAX_IN_FLIGHT_THUMBS) return
     addNearProtectIds(rows, start, end, 1)
     addNearProtectIds(rows, start, end, -1)

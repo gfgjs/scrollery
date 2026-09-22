@@ -14,6 +14,15 @@
     <div class="enh">
       <!-- 固定执行序提示。 -->
       <p class="enh__order-hint">{{ $t('enhance.orderHint') }}</p>
+      <p v-if="selectionBlock" role="status">
+        {{ $t(enhanceErrorMessageKey(selectionBlock)) }}
+        <button v-if="selectionBlock === 'enhance_model_missing'" class="enh__ghost-btn" @click="router.push('/settings')">
+          {{ $t('enhance.gateModelMissing') }}
+        </button>
+        <button v-else-if="selectionBlock === 'enhance_unlicensed'" class="enh__ghost-btn" @click="router.push('/plugins')">
+          {{ $t('enhance.gateUnlicensed') }}
+        </button>
+      </p>
 
       <!-- 队列进度（批 5.5）：提交后本对话框可留看进度；关闭对话框也不丢——设置分节面板同款
            数据继续可见，终态另有 toast 即时反馈（即使已关闭对话框）。 -->
@@ -123,6 +132,7 @@ import { useRouter } from 'vue-router'
 import UiDialog from '../ui/UiDialog.vue'
 import BeforeAfterSlider from './BeforeAfterSlider.vue'
 import EnhanceQueuePanel from './EnhanceQueuePanel.vue'
+import { enhanceSelectionBlock } from '../../utils/enhanceCapability'
 import {
   useEnhanceStore,
   ENHANCE_DEFAULT_MODEL,
@@ -182,7 +192,7 @@ const itemCount = computed(() => props.source?.itemIds.length ?? 0)
 const multi = computed(() => itemCount.value > 1)
 
 const canSubmit = computed(
-  () => (denoise.value || dejpeg.value || upscale.value) && itemCount.value > 0,
+  () => (denoise.value || dejpeg.value || upscale.value) && itemCount.value > 0 && !selectionBlock.value,
 )
 
 /** 选中超分档的 scale（未选超分=1）。 */
@@ -235,14 +245,14 @@ function buildParams(): EnhanceParams {
   return { steps, outputFormat: outputFormat.value }
 }
 
-/** 选中任务对应模型是否都已下载（门控 UX 用；后端 enhance_start 亦有真门兜底）。 */
-function selectedModelsInstalled(): boolean {
+/** 预览与提交共同门控，直接消费后端每档 readiness。 */
+const selectionBlock = computed(() => {
   const ids: string[] = []
   if (denoise.value) ids.push(denoiseModel.value)
   if (dejpeg.value) ids.push(dejpegModel.value)
   if (upscale.value) ids.push(upscaleModel.value)
-  return ids.every((id) => enhance.modelById(id)?.installed)
-}
+  return enhanceSelectionBlock(enhance.status, ids)
+})
 
 // ── 「自动」规则映射建议（源为 JPEG 预勾去伪影、小图预勾超分；无源信息则不建议）──────
 const SMALL_IMAGE_PIXELS = 2_000_000
@@ -318,6 +328,7 @@ watch(
 
 // ── 预览──────────────────────────────────────────────────────────────────────
 async function generatePreview() {
+  await enhance.fetchStatus()
   const src = props.source
   if (!src || !canSubmit.value || previewLoading.value) return
   previewLoading.value = true
@@ -345,21 +356,9 @@ async function generatePreview() {
 
 // ── 提交 ────────────────────────────────────────────────────────────────────
 async function submit() {
+  await enhance.fetchStatus()
   const src = props.source
   if (!src || !canSubmit.value || submitting.value) return
-
-  // 门控 UX（后端亦有真门）：未授权 → 插件商店；模型未下载 → 设置分节。
-  if (!enhance.isAuthorized) {
-    const expired = enhance.status?.availability === 'licenseExpired'
-    toast.addToast('info', expired ? t('enhance.errUnlicensed') : t('enhance.gateUnlicensed'))
-    void router.push('/plugins')
-    return
-  }
-  if (!selectedModelsInstalled()) {
-    toast.addToast('info', t('enhance.gateModelMissing'))
-    void router.push('/settings')
-    return
-  }
 
   submitting.value = true
   try {

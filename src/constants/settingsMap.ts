@@ -30,7 +30,7 @@ import {
 } from '@lucide/vue'
 import type { Component } from 'vue'
 
-/** 设置卡分区 id(与 SettingsView 的 CollapsibleCard id 一致)。 */
+/** 控件注册段；面向用户的页面分组与顺序见 settingsLayout。 */
 export type SettingsSection = 'general' | 'thumbnails' | 'video' | 'aiModels' | 'debug' | 'danger'
 
 /** select 类控件的选项:labelKey 走 i18n;语言名等「自名不随界面语言变」的场景用 label 原文。 */
@@ -50,6 +50,12 @@ export interface SettingSpec {
   label: string
   /** 行描述 i18n key;customRow 行的描述结构由 SettingsView 特例模板自带时缺省。 */
   descKey?: string
+  /** 短说明；null 表示仅显示标题，完整 descKey 仍可通过「说明」展开。 */
+  summaryKey?: string | null
+  /** 改名后仍可检索的原术语。 */
+  searchTermsKey?: string
+  /** 数字控件旁的单位。 */
+  unit?: 'px' | '%' | 'KB' | 'MB'
   section: SettingsSection
   /** 控件形态:toggle/select/number 走 DynamicSettingControl 通用分派;
    *  button=动作按钮;segmented/custom=特例控件。 */
@@ -65,7 +71,7 @@ export interface SettingSpec {
 
 /**
  * 注册表本体。
- * ⚠ 插入顺序即设置页各分区内的行序(Object.keys 对字符串键保序),调序=改这里。
+ * 插入顺序是注册段的默认行序；页面按 settingsLayout 中的功能分组展示。
  *
  * 类型锁(2026-07-06 审查 P1-20):用 `satisfies` 而非 `: Record<string, SettingSpec>` 注解——
  * 后者把键宽化为 string,`keyof typeof` 拿不到具体键集,拼错 settingKey 编译期无感(运行时
@@ -78,6 +84,7 @@ export const SETTINGS_MAP = {
     icon: Sun,
     label: 'settings.theme',
     descKey: 'settings.themeDesc',
+    summaryKey: null,
     section: 'general',
     control: 'select',
     // 特例行:设置页控件为下方 ThemeSettings;select 声明仅供侧栏钉住区 compact 控件使用。
@@ -92,6 +99,7 @@ export const SETTINGS_MAP = {
     icon: Globe,
     label: 'settings.language',
     descKey: 'settings.languageDesc',
+    summaryKey: null,
     section: 'general',
     control: 'select',
     options: [
@@ -106,6 +114,8 @@ export const SETTINGS_MAP = {
     icon: Type,
     label: 'settings.uiFontSize',
     descKey: 'settings.uiFontSizeDesc',
+    summaryKey: null,
+    unit: 'px',
     section: 'general',
     control: 'number',
     min: 12,
@@ -117,6 +127,7 @@ export const SETTINGS_MAP = {
     icon: Rows3,
     label: 'settings.titlebarMerged',
     descKey: 'settings.titlebarMergedDesc',
+    summaryKey: 'settings.titlebarSummary',
     section: 'general',
     control: 'toggle',
   },
@@ -125,6 +136,7 @@ export const SETTINGS_MAP = {
     icon: AlignCenter,
     label: 'settings.toolbarAlign',
     descKey: 'settings.toolbarAlignDesc',
+    summaryKey: null,
     section: 'general',
     control: 'select',
     options: [
@@ -139,6 +151,7 @@ export const SETTINGS_MAP = {
     icon: PanelBottom,
     label: 'settings.selectionBarDocked',
     descKey: 'settings.selectionBarDockedDesc',
+    summaryKey: 'settings.selectionBarSummary',
     section: 'general',
     control: 'toggle',
   },
@@ -147,6 +160,7 @@ export const SETTINGS_MAP = {
     icon: AlignHorizontalJustifyCenter,
     label: 'settings.selectionBarAlign',
     descKey: 'settings.selectionBarAlignDesc',
+    summaryKey: 'settings.selectionAlignSummary',
     section: 'general',
     control: 'select',
     options: [
@@ -161,6 +175,8 @@ export const SETTINGS_MAP = {
     icon: Map,
     label: 'settings.timelineAxisWidth',
     descKey: 'settings.timelineAxisDesc',
+    summaryKey: null,
+    unit: 'px',
     section: 'general',
     control: 'number',
     min: 32,
@@ -170,6 +186,8 @@ export const SETTINGS_MAP = {
     icon: Maximize,
     label: 'settings.timelineScrollWidth',
     descKey: 'settings.timelineScrollDesc',
+    summaryKey: null,
+    unit: 'px',
     section: 'general',
     control: 'number',
     min: 2,
@@ -179,6 +197,9 @@ export const SETTINGS_MAP = {
     icon: Rows3,
     label: 'settings.scrollThumbMinHeight',
     descKey: 'settings.scrollThumbMinHeightDesc',
+    summaryKey: 'settings.scrollHeightSummary',
+    searchTermsKey: 'settings.scrollHeightSearchTerms',
+    unit: 'px',
     section: 'general',
     control: 'number',
     min: 24,
@@ -190,6 +211,9 @@ export const SETTINGS_MAP = {
     icon: Map,
     label: 'settings.axisViewportOpacity',
     descKey: 'settings.axisViewportOpacityDesc',
+    summaryKey: 'settings.opacitySummary',
+    searchTermsKey: 'settings.opacitySearchTerms',
+    unit: '%',
     section: 'general',
     control: 'number',
     min: 20,
@@ -199,6 +223,8 @@ export const SETTINGS_MAP = {
     icon: Maximize,
     label: 'settings.hoverScale',
     descKey: 'settings.hoverScaleDesc',
+    summaryKey: null,
+    searchTermsKey: 'settings.hoverScaleSearchTerms',
     section: 'general',
     control: 'toggle',
   },
@@ -206,6 +232,7 @@ export const SETTINGS_MAP = {
     icon: Play,
     label: 'settings.hoverAutoplay',
     descKey: 'settings.hoverAutoplayDesc',
+    summaryKey: 'settings.hoverPreviewSummary',
     section: 'general',
     control: 'toggle',
   },
@@ -215,6 +242,7 @@ export const SETTINGS_MAP = {
     icon: Maximize,
     label: 'settings.autoHideChromeWindowed',
     descKey: 'settings.autoHideChromeWindowedDesc',
+    summaryKey: 'settings.autoHideSummary',
     section: 'general',
     control: 'toggle',
   },
@@ -222,6 +250,7 @@ export const SETTINGS_MAP = {
     icon: XSquare,
     label: 'settings.closeBehavior',
     descKey: 'settings.closeBehaviorDesc',
+    summaryKey: null,
     section: 'general',
     control: 'select',
     options: [
@@ -236,6 +265,8 @@ export const SETTINGS_MAP = {
     icon: Palette,
     label: 'settings.viewerColorTarget',
     descKey: 'settings.viewerColorTargetDesc',
+    summaryKey: 'settings.viewerColorSummary',
+    searchTermsKey: 'settings.viewerColorSearchTerms',
     section: 'general',
     control: 'select',
     options: [
@@ -250,6 +281,7 @@ export const SETTINGS_MAP = {
     icon: Palette,
     label: 'settings.viewerIccManager',
     descKey: 'settings.viewerIccManagerDesc',
+    summaryKey: null,
     section: 'general',
     control: 'custom',
     customRow: true,
@@ -260,6 +292,7 @@ export const SETTINGS_MAP = {
     icon: GripVertical,
     label: 'settings.showDragHandle',
     descKey: 'settings.showDragHandleDesc',
+    summaryKey: null,
     section: 'thumbnails',
     control: 'toggle',
   },
@@ -267,6 +300,7 @@ export const SETTINGS_MAP = {
     icon: Map,
     label: 'settings.minimapRenderMode',
     descKey: 'settings.minimapRenderModeDesc',
+    summaryKey: 'settings.minimapSummary',
     section: 'thumbnails',
     control: 'select',
     options: [
@@ -278,6 +312,7 @@ export const SETTINGS_MAP = {
     icon: MessageSquare,
     label: 'settings.thumbInfoHover',
     descKey: 'settings.thumbInfoHoverDesc',
+    summaryKey: null,
     section: 'thumbnails',
     control: 'toggle',
     // 特例行:开关下挂信息元素多选面板。
@@ -287,6 +322,7 @@ export const SETTINGS_MAP = {
     icon: Cpu,
     label: 'settings.thumbDecodeStrategy',
     descKey: 'settings.thumbDecodeDesc',
+    summaryKey: 'settings.decodeSummary',
     section: 'thumbnails',
     control: 'select',
     options: [
@@ -299,6 +335,7 @@ export const SETTINGS_MAP = {
     icon: Monitor,
     label: 'settings.gpuEngine',
     descKey: 'settings.gpuEngineDesc',
+    summaryKey: null,
     section: 'thumbnails',
     control: 'select',
     options: [{ value: 'wic', labelKey: 'settings.gpuEngineWic' }],
@@ -315,6 +352,7 @@ export const SETTINGS_MAP = {
     icon: Image,
     label: 'settings.thumbSize',
     descKey: 'settings.thumbSizeHint',
+    summaryKey: 'settings.thumbSizeSummary',
     section: 'thumbnails',
     control: 'segmented',
   },
@@ -323,6 +361,7 @@ export const SETTINGS_MAP = {
     icon: Image,
     label: 'settings.thumbWebpQuality',
     descKey: 'settings.thumbWebpQualityDesc',
+    summaryKey: 'settings.thumbQualitySummary',
     section: 'thumbnails',
     control: 'number',
     min: 1,
@@ -332,6 +371,8 @@ export const SETTINGS_MAP = {
     icon: Shield,
     label: 'settings.thumbSkipMaxKb',
     descKey: 'settings.thumbSkipDesc',
+    summaryKey: 'settings.thumbSkipSummary',
+    unit: 'KB',
     section: 'thumbnails',
     control: 'number',
     min: 0,
@@ -341,6 +382,8 @@ export const SETTINGS_MAP = {
     icon: HardDrive,
     label: 'settings.thumbCacheMaxMb',
     descKey: 'settings.thumbCacheDesc',
+    summaryKey: 'settings.thumbCacheSummary',
+    unit: 'MB',
     section: 'thumbnails',
     control: 'number',
     min: 100,
@@ -359,6 +402,7 @@ export const SETTINGS_MAP = {
     icon: Image,
     label: 'settings.fullThumbGen',
     descKey: 'settings.fullThumbGenDesc',
+    summaryKey: 'settings.fullThumbSummary',
     section: 'thumbnails',
     control: 'custom',
     // 特例行:生成进度条 + 启停按钮。
@@ -370,6 +414,7 @@ export const SETTINGS_MAP = {
     icon: Video,
     label: 'settings.enableVideoCover',
     descKey: 'settings.enableVideoCoverDesc',
+    summaryKey: null,
     section: 'video',
     control: 'toggle',
   },
@@ -377,6 +422,7 @@ export const SETTINGS_MAP = {
     icon: Film,
     label: 'settings.enableVideoKeyframes',
     descKey: 'settings.enableVideoKeyframesDesc',
+    summaryKey: 'settings.videoKeyframesSummary',
     section: 'video',
     control: 'toggle',
   },
@@ -384,6 +430,7 @@ export const SETTINGS_MAP = {
     icon: Video,
     label: 'settings.videoDeriveGen',
     descKey: 'settings.videoDeriveGenDesc',
+    summaryKey: 'settings.videoGenerationSummary',
     section: 'video',
     control: 'custom',
     // 特例行:视频封面/关键帧手动提取(增量/全量/停止 + 进度),镜像 fullThumbGen。
@@ -403,6 +450,7 @@ export const SETTINGS_MAP = {
     icon: Image,
     label: 'settings.aiHqCache',
     descKey: 'settings.aiHqCacheDesc',
+    summaryKey: 'settings.aiCacheSummary',
     section: 'aiModels',
     control: 'toggle',
   },
@@ -410,6 +458,7 @@ export const SETTINGS_MAP = {
     icon: Database,
     label: 'settings.aiBatchSize',
     descKey: 'settings.aiBatchSizeDesc',
+    summaryKey: 'settings.aiBatchSummary',
     section: 'aiModels',
     // custom:数字输入外挂固定 batch 钳制与风险提示(DynamicSettingControl 按键特判)。
     control: 'custom',
@@ -420,6 +469,7 @@ export const SETTINGS_MAP = {
     icon: Cpu,
     label: 'settings.aiHardwareStrategy',
     descKey: 'settings.aiHardwareDesc',
+    summaryKey: 'settings.aiHardwareSummary',
     section: 'aiModels',
     control: 'select',
     options: [
@@ -553,7 +603,7 @@ export function getSettingSpec(key: string): SettingSpec | undefined {
   return (SETTINGS_MAP as Record<string, SettingSpec>)[key]
 }
 
-/** 分区内的行键序列(=注册表插入顺序)。SettingsView 各卡片由此驱动逐行渲染。 */
+/** 按注册表顺序读取该段的设置键，供页面分组声明复用。 */
 export function sectionSettingKeys(section: SettingsSection): SettingKey[] {
   return (Object.entries(SETTINGS_MAP) as [SettingKey, SettingSpec][])
     .filter(([, spec]) => spec.section === section)

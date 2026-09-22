@@ -19,6 +19,7 @@ import type { DedupStatusSnapshot } from '../types/ipc'
 import type { SettingsChange, SettingsSnapshot, StartupPayload } from '../types/config'
 
 const SCENE_VERSION = 1
+let officialHarnessActivated = false
 
 const samples = [
   ['山湖晨雾', '#6f8f9d', '#d9e7e8', 1.45],
@@ -117,6 +118,7 @@ let layoutSummary: LayoutSummary = {
   totalRows: 0,
   totalHeight: 0,
   layoutVersion: SCENE_VERSION,
+    orderVersion: SCENE_VERSION,
   totalItems: fixtureItemCount,
   separators: [],
   monthBuckets: [],
@@ -176,6 +178,7 @@ function computeFixtureLayout(containerWidth: number, targetHeight: number, gap:
     totalRows: rows.length,
     totalHeight: y,
     layoutVersion: SCENE_VERSION,
+    orderVersion: SCENE_VERSION,
     totalItems: fixtureItemCount,
     separators,
     monthBuckets: [
@@ -666,12 +669,38 @@ export async function invokeHarness<T>(
     }
     case IPC.GET_MEDIA_DETAIL:
       return mediaDetail(Number(args?.id ?? 1)) as T
-    case IPC.GET_EDITING_ENTITLEMENT:
+    case IPC.LIST_FEATURE_OFFERINGS:
       return {
-        pluginId: 'feature-editing',
-        availability: 'authorized',
+        entitlement: { pluginId: 'scrollery-official', availability: officialHarnessActivated ? 'authorized' : 'installedUnlicensed', sourceTag: 'harness', sku: 'scrollery-official-onetime', storeUrl: null },
+        features: [
+          { id: 'feature-editing', name: 'Image editing', paid: true, builtin: true, availability: 'installedUnlicensed', resources: 'ready' },
+          { id: 'exotic-ocr', name: 'OCR', paid: true, builtin: true, availability: 'availableUninstalled', resources: 'modelMissing' },
+          { id: 'exotic-enhance', name: 'Enhancement', paid: true, builtin: true, availability: 'availableUninstalled', resources: 'manifestUnready' },
+          { id: 'exotic-image-psd', name: 'PSD', paid: true, builtin: false, availability: 'availableUninstalled', resources: 'needsInstall' },
+          { id: 'exotic-image-raw', name: 'RAW', paid: false, builtin: true, availability: 'authorized', resources: 'included' },
+          { id: 'video-extended', name: 'Video formats', paid: false, builtin: true, availability: 'authorized', resources: 'included' },
+        ],
+      } as T
+    case IPC.FETCH_EXOTIC_REGISTRY:
+      return { pluginCount: 0 } as T
+    case IPC.LIST_EXOTIC_REGISTRY:
+    case IPC.LIST_INSTALLED_EXOTIC_PLUGINS:
+      return [] as T
+    case IPC.GET_EXOTIC_PROCESSING_STATUS:
+      return { running: false, pending: 0, processing: 0, done: 0, error: 0, blockedByAvailability: 0 } as T
+    case IPC.ACTIVATE_OFFICIAL_LICENSE:
+      if (args?.token !== 'harness-official') throw { code: 'bad_signature', message: 'Invalid harness token' }
+      officialHarnessActivated = true
+      return undefined as T
+    case IPC.DEACTIVATE_OFFICIAL_LICENSE:
+      officialHarnessActivated = false
+      return undefined as T
+    case IPC.GET_OFFICIAL_ENTITLEMENT:
+      return {
+        pluginId: 'scrollery-official',
+        availability: officialHarnessActivated ? 'authorized' : 'installedUnlicensed',
         sourceTag: 'harness',
-        sku: 'editing-tools-2026',
+        sku: 'scrollery-official-onetime',
         storeUrl: null,
       } as T
     case IPC.GET_EDIT_PREVIEW:
@@ -817,7 +846,6 @@ export async function invokeHarness<T>(
     case IPC.STOP_BACKUP:
     case IPC.RESTORE_ARM:
     case IPC.RELAUNCH_APP:
-    case IPC.ACTIVATE_EDITING_FEATURE:
     case IPC.OPEN_LOG_WINDOW:
       return undefined as T
     case IPC.BATCH_REQUEST_THUMBNAILS: {

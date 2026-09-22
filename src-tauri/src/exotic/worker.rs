@@ -143,6 +143,11 @@ pub struct WorkerConn {
 }
 
 impl WorkerConn {
+    /// Supervisor join 前断开接收端，解除有界 reader 的发送等待。
+    pub(super) fn close_reader(&mut self) {
+        self.rx = crossbeam_channel::bounded(0).1;
+    }
+
     /// 握手：写 Hello → 等 Ready（带超时）→ 校验 worker_id/protocol/capabilities。
     pub fn handshake(
         mut writer: Box<dyn Write + Send>,
@@ -393,11 +398,12 @@ impl WorkerConn {
         match self.run_request(req, timeout, cancelled) {
             RawOutcome::Success { body, blob } => {
                 match validate_thumbnail_output(req, &body, &blob, limits) {
-                    Ok((w, h, mime)) => TaskOutcome::Success {
-                        width: w,
-                        height: h,
-                        mime,
+                    Ok(out) => TaskOutcome::Success {
+                        width: out.width,
+                        height: out.height,
+                        mime: out.mime,
                         blob,
+                        thumbhash: out.thumbhash,
                     },
                     Err(reason) => TaskOutcome::Protocol(reason),
                 }

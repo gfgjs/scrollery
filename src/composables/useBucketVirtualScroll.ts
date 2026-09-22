@@ -45,6 +45,7 @@ import {
   nextTick,
   onMounted,
   onBeforeUnmount,
+  onScopeDispose,
 } from 'vue'
 import type { LayoutRow } from '../types/layout'
 import { logger } from '../utils/logger'
@@ -162,10 +163,21 @@ export function desiredSegmentRange(
   return [first, Math.max(first, last)]
 }
 
+/** 新布局的目标逻辑位置；焦点等副作用在窗口与物理滚动提交后执行。 */
+export interface LayoutRestoreTarget {
+  y: number
+  isCurrent?: () => boolean
+  afterRestore?: () => void
+}
+
 interface UseBucketVirtualScrollOptions {
   totalHeight: () => number
   /// 布局版本:变化即换代重建段表,在途应答按代/按对象丢弃。
   layoutVersion: () => number
+  resolveLayoutTarget?: (
+    version: number,
+    isCurrent: () => boolean,
+  ) => Promise<LayoutRestoreTarget | null>
   fetchBucketRows: (startY: number, endY: number) => Promise<LayoutRow[]>
   containerRef: () => HTMLElement | null
   /// 当前行高(px):驱动自适应段高(clampSegmentPx)。行高变→relayout→layoutVersion 变→rebuild
@@ -193,6 +205,9 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// 换代计数:布局版本变化/开关翻转即 +1;在途应答须同时满足「同代 + 段对象仍在愿望集
   /// 且是同一对象」才落地——飞掠丢弃与幽灵挂载的双保险。
   let generation = 0
+  let restoring = false
+  let disposed = false
+  let desiredTop = 0
   /// 常态单飞；仅当所有在途请求都已离开当前愿望集时，允许最新视口额外旁路一个。
   /// 由 Set 同时承担身份复核与总在途硬上限，避免滚动条横扫演变为 IPC 风暴。
   const activeFetches = new Set<RenderSegment>()
@@ -297,9 +312,11 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// B3:逻辑位 = scrollTop + anchorDelta;远跳时 scrollTop 尚未落位,经 logicalOverride
   /// 显式传入目标逻辑位。
   function syncDesired(force = false, logicalOverride?: number) {
+    if (restoring || disposed) return
     const el = opts.containerRef()
     if (!el) return
     const logicalTop = logicalOverride ?? el.scrollTop + anchorDelta.value
+    desiredTop = logicalTop
     const range = desiredSegmentRange(
       logicalTop,
       el.clientHeight,
@@ -340,7 +357,7 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// 挑下一个要取的段:idle 中距视口中心(逻辑坐标)最近者——远跳后终点段永远最先取。
   function pickNextIdle(): RenderSegment | null {
     const el = opts.containerRef()
-    const center = el ? el.scrollTop + anchorDelta.value + el.clientHeight / 2 : 0
+    const center = desiredTop + (el?.clientHeight ?? 0) / 2
     let best: RenderSegment | null = null
     let bestDist = Infinity
     for (const seg of desired.values()) {
@@ -396,6 +413,7 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
    * 连续横扫最多积压 2 个请求，其中任一落定后都会重新挑当前最近段，不追历史队列。
    */
   function pumpFetch() {
+    if (restoring || disposed) return
     while (true) {
       const limit = activeFetches.size === 0 || hasActiveDesiredFetch() ? 1 : 2
       if (activeFetches.size >= limit) return
@@ -419,6 +437,7 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   const settleWaiters: Array<() => void> = []
 
   function isSettled(): boolean {
+    if (restoring) return false
     for (const seg of desired.values()) {
       if (seg.state === 'idle' || seg.state === 'loading') return false
     }
@@ -435,23 +454,54 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     while (settleWaiters.length) settleWaiters.shift()!()
   }
 
-  function rebuild() {
-    const previous = new Map(desired)
-    generation++
+  async function rebuild() {
+    const previous = new Map(segments.value.map((seg) => [seg.index, seg]))
+    const myGeneration = ++generation
+    const version = opts.layoutVersion()
+    const isCurrent = () => !disposed && generation === myGeneration
+    restoring = true
     desired.clear()
     lastRangeKey = ''
+    for (const seg of previous.values()) seg.state = 'idle'
+    if (settleTimer !== null) clearTimeout(settleTimer)
+    settleTimer = null
+    let target: LayoutRestoreTarget | null = null
+    if (opts.resolveLayoutTarget) {
+      // 首次 setup 时宿主的锚点组合器与模板 ref 尚未装配；这一拍也让新总高先落 DOM。
+      await nextTick()
+      if (!isCurrent()) return
+      target = await opts.resolveLayoutTarget(version, isCurrent)
+      if (!isCurrent()) return
+      if (target?.isCurrent?.() === false) target = null
+    }
     // 行高变(→relayout→layoutVersion→本函数)时重算段高:段高与布局版本同源、一代内恒定。
     segPx = clampSegmentPx(opts.rowHeight())
-    // 布局换代后钳制锚差(总高可能缩水;非映射态自然归 0)。滚动位恢复由宿主的
-    // layoutVersion watcher 经 scrollToLogicalY 完成,此处只保证几何不越界。
     anchorDelta.value = Math.min(anchorDelta.value, Math.max(0, opts.totalHeight() - SPACER_CAP))
+    const el = opts.containerRef()
+    const y = Math.min(Math.max(0, target?.y ?? ((el?.scrollTop ?? 0) + anchorDelta.value)), geometry().logMax)
+    const physical = geometry().mapped ? Math.round(globalPhysical(y)) : y
+    if (target) anchorDelta.value = y - physical
+    logicalScrollTop.value = y
+    scrollVelocityPxMs = 0
+    lastVelocityTs = 0
+    restoring = false
     rebuildSeed = previous
     try {
-      // syncDesired 会先建立带旧 rows 的新代段，再 publish；期间不发布空段表。
-      syncDesired(true)
+      // 新代只从目标窗口取数。旧行可显示,但 mountedRows 与 DOM inert 不将其当作新结果。
+      syncDesired(true, y)
     } finally {
       rebuildSeed = null
     }
+    if (target && el) {
+      await nextTick()
+      if (!isCurrent() || target.isCurrent?.() === false) return
+      internalScroll = el.scrollTop !== physical
+      el.scrollTop = physical
+      lastP = physical
+      lastScrollTs = -Infinity
+      target.afterRestore?.()
+    }
+    flushSettled()
   }
 
   /// 宿主 @scroll 转发入口。非映射态:纯记录 + 算术同步(零映射零补偿——顺滑来源)。
@@ -464,6 +514,7 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   function onScroll(): boolean {
     const el = opts.containerRef()
     if (!el) return false
+    if (restoring || disposed) return true
     const p = el.scrollTop
     if (internalScroll) {
       // 偿债/远跳落点的自触发事件:逻辑位与愿望窗口已就绪,仅更新跳变基准并断开手势链
@@ -509,12 +560,14 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// scrollTop:两写落同一渲染帧,内容零位移、仅滚动条拇指悄然归位。
   async function repayDebt() {
     const el = opts.containerRef()
-    if (!el || !geometry().mapped) return
+    if (!el || restoring || disposed || !geometry().mapped) return
+    const myGeneration = generation
     const logical = el.scrollTop + anchorDelta.value
     const pStar = Math.round(globalPhysical(logical))
     if (Math.abs(pStar - el.scrollTop) < 2) return
     anchorDelta.value = logical - pStar
     await nextTick()
+    if (disposed || myGeneration !== generation) return
     internalScroll = true
     el.scrollTop = pStar
     lastP = pStar
@@ -538,6 +591,7 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   /// 以 1:1 继续滚到真正的逻辑边缘(修复真机「到边一跳一跳还能继续滚」:旧的钉边立即偿债
   /// 在手势中改 scrollTop,与拖拽/惯性互搏)。永不 preventDefault,对原生滚动零干预。
   function onWheel(e: WheelEvent) {
+    if (restoring || disposed) return
     oneToOneUntil = Date.now() + ONE_TO_ONE_STICKY_MS
     const g = geometry()
     if (!g.mapped) return
@@ -614,7 +668,7 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   function mountedRows(): LayoutRow[] {
     const out: LayoutRow[] = []
     for (const seg of segments.value) {
-      if (seg.rows) out.push(...seg.rows)
+      if (seg.state === 'ready' && seg.rows) out.push(...seg.rows)
     }
     return out
   }
@@ -648,6 +702,14 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
       clearTimeout(settleTimer)
       settleTimer = null
     }
+  })
+
+  onScopeDispose(() => {
+    disposed = true
+    generation++
+    restoring = false
+    desired.clear()
+    flushSettled()
   })
 
   return {

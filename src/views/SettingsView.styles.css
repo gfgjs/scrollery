@@ -61,7 +61,7 @@
 .settings-header {
   background: var(--color-bg-primary);
   display: grid;
-  grid-template-columns: minmax(220px, auto) minmax(280px, 520px) minmax(120px, 1fr);
+  grid-template-columns: minmax(150px, 1fr) minmax(220px, 480px) minmax(100px, 1fr);
   align-items: center;
   gap: var(--spacing-xl);
   min-height: 56px;
@@ -81,15 +81,6 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-}
-
-.settings-eyebrow {
-  color: var(--color-text-tertiary);
-  font-size: var(--font-size-2xs);
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  line-height: var(--leading-tight);
-  text-transform: uppercase;
 }
 
 .settings-title {
@@ -257,171 +248,92 @@
 
 .settings-layout {
   display: grid;
-  grid-template-columns: 200px minmax(0, 960px);
+  grid-template-columns: 184px minmax(0, 800px);
   justify-content: center;
-  gap: var(--spacing-xl);
+  gap: var(--spacing-2xl);
   flex: 1;
   min-height: 0;
-  padding: var(--spacing-lg) var(--spacing-xl) 0;
+  padding: var(--spacing-xl) var(--spacing-xl) 0;
 }
-
 .settings-nav {
-  position: sticky;
-  top: 0;
   display: flex;
   flex-direction: column;
   gap: var(--spacing-xs);
   min-width: 0;
-  padding: 0;
   align-self: start;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
 }
 .settings-nav__item {
   width: 100%;
-  min-height: var(--control-size-compact);
-  padding: 0 var(--spacing-sm);
+  min-height: var(--control-size-default);
+  padding: var(--spacing-xs) var(--spacing-md);
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--color-text-secondary);
   text-align: left;
   font-size: var(--font-size-sm);
   cursor: pointer;
-  transition:
-    background-color var(--transition-fast),
-    color var(--transition-fast);
 }
-.settings-nav__item:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
-}
-.settings-nav__item.active {
-  background: var(--color-accent-subtle);
-  color: var(--color-accent-text);
-  font-weight: 500;
-}
-
+.settings-nav__item:hover { background: var(--color-bg-hover); color: var(--color-text-primary); }
+.settings-nav__item.active { background: var(--color-accent-subtle); color: var(--color-accent-text); font-weight: 500; }
 .settings-content {
-  padding: 0 var(--spacing-2xs) var(--spacing-2xl) 0;
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
+  container: settings / inline-size;
+  padding: 0 var(--spacing-sm) var(--spacing-2xl) 0;
   overflow-y: auto;
   min-width: 0;
+  scrollbar-gutter: stable;
 }
-
 .settings-section {
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-md);
+  gap: var(--spacing-xl);
   padding-bottom: var(--spacing-2xl);
 }
-
-.settings-section__heading {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--spacing-lg);
-  padding: var(--spacing-xs) var(--spacing-2xs) 0;
-}
-
+.settings-section__heading { padding: var(--spacing-xs) 0; }
 .settings-section__heading h2 {
   margin: 0;
   color: var(--color-text-primary);
   font-size: var(--font-size-xl);
-  font-weight: 650;
+  font-weight: 600;
   line-height: var(--leading-tight);
 }
-
-.settings-section__heading p {
-  max-width: 68ch;
-  margin: var(--spacing-xs) 0 0;
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-sm);
-  line-height: var(--leading-normal);
-}
-.settings-section--advanced {
-  padding-top: var(--spacing-xs);
-}
-.settings-empty {
-  display: grid;
-  min-height: 240px;
-  place-items: center;
-  color: var(--color-text-tertiary);
-  border: 1px dashed var(--color-border);
-  border-radius: var(--radius-lg);
-}
-
-/* 普通 accordion 展开后融入页面:标题/行分隔线承担层级,避免卡片套卡片。危险区保留独立 surface。 */
+/* 设置页只定义自己的卡片密度；通用卡片及快捷设置继续使用原有全局契约。 */
 .settings-section :deep(.settings-card) {
-  border: 0;
-  border-radius: 0;
-  background: transparent;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-surface);
   box-shadow: none;
-  overflow: visible;
+  overflow: hidden;
 }
-
-.settings-section :deep(.settings-card__header) {
-  padding: var(--spacing-sm) var(--spacing-xs);
-  border-bottom: 1px solid var(--color-divider);
-  color: var(--color-text-tertiary);
-  font-size: var(--font-size-2xs);
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.settings-section :deep(.settings-card__item) {
-  align-items: flex-start;
-  min-height: 60px;
-  padding: var(--spacing-sm) var(--spacing-xs);
-  gap: var(--spacing-md);
-}
-
-.settings-section :deep(.settings-card__label) {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-}
-
+.settings-section :deep(.settings-card__header) { font-size: var(--font-size-sm); }
+.settings-section :deep(.settings-card__item) { min-width: 0; }
+.settings-section :deep(.settings-card__label) { font-size: var(--font-size-sm); font-weight: 500; }
 .settings-section :deep(.settings-card__desc) {
-  max-width: 68ch;
+  max-width: 56ch;
   color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
   line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
 }
-
-.settings-section :deep(.settings-card--collapsed) {
-  border-bottom: 1px solid var(--color-divider);
+.settings-section :deep(.input-number) { width: 80px; }
+.settings-section :deep(.select-wrap) { max-width: 240px; }
+.settings-section :deep(.select) { min-width: 0; max-width: 100%; width: 100%; text-overflow: ellipsis; }
+.settings-section :deep(.settings-card--danger) { border-color: color-mix(in srgb, var(--color-error) 40%, var(--color-border)); }
+.settings-inline-details { color: var(--color-text-secondary); font-size: var(--font-size-xs); }
+.settings-inline-details > summary { cursor: pointer; padding-block: var(--spacing-xs); width: fit-content; }
+.settings-inline-details[open] > summary { margin-bottom: var(--spacing-sm); }
+.settings-section :deep(.settings-search-highlight) { animation: settings-found 1.8s ease-out; }
+@keyframes settings-found {
+  from { box-shadow: inset 0 0 0 2px var(--color-accent); background-color: var(--color-accent-subtle); }
+  to { box-shadow: inset 0 0 0 2px transparent; }
 }
-
-.settings-section :deep(.settings-card--collapsed .settings-card__header) {
-  border-bottom: 0;
+@media (prefers-reduced-motion: reduce) {
+  .settings-section :deep(.settings-search-highlight) { animation-duration: 0.01s; }
 }
-
-.settings-section :deep(.settings-card--danger) {
-  padding: 0 var(--spacing-sm);
-  border: 1px solid color-mix(in srgb, var(--color-error) 45%, var(--color-border));
-  border-radius: var(--radius-lg);
-  background: var(--color-bg-surface);
-}
-
-.settings-section :deep(.settings-card__info) {
-  padding-top: 2px;
-}
-
-/* 固定设置是低频辅助动作：未固定时降噪，hover/focus 仍可发现，已固定状态常驻。 */
-.settings-section :deep(.settings-card__item .pin-btn) {
-  opacity: 0;
-}
-
-.settings-section :deep(.settings-card__item:hover .pin-btn),
-.settings-section :deep(.settings-card__item:focus-within .pin-btn),
-.settings-section :deep(.settings-card__item .pin-btn.active) {
-  opacity: 1;
+@container settings (max-width: 520px) {
+  .settings-section :deep(.setting-row:has(.select-wrap, .batch-size-stack, .setting-actions)) { grid-template-columns: minmax(0, 1fr); }
+  .settings-section :deep(.setting-row__control) { max-width: 100%; }
+  .settings-section :deep(.settings-card__item) { padding-inline: var(--spacing-md); }
 }
 
 /* ── Card overrides (extend global .settings-card) ─────────────────────── */
@@ -591,27 +503,23 @@
 }
 
 /* ── 悬停信息元素多选面板(原内联 style 收进 class,S6)─────────────────── */
-.thumb-info-stack {
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-sm);
-  align-items: flex-end;
-  max-width: 65%;
-}
 .thumb-info-options {
-  display: flex;
-  gap: var(--spacing-md);
-  font-size: var(--font-size-base);
-  align-items: center;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  margin-top: var(--spacing-sm);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--spacing-sm) var(--spacing-md);
+  margin-top: var(--spacing-xs);
   color: var(--color-text-primary);
+  font-size: var(--font-size-xs);
 }
 .thumb-info-option {
   display: flex;
   align-items: center;
-  gap: var(--spacing-2xs);
+  gap: var(--spacing-xs);
+  min-height: var(--control-size-compact);
+}
+.thumb-info-option input {
+  margin: 0;
+  accent-color: var(--color-accent);
 }
 
 /* ── AI 引擎状态描述(原内联 style 收进 class,S6)──────────────────────── */

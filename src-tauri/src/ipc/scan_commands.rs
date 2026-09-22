@@ -941,11 +941,7 @@ pub async fn clear_database(state: State<'_, Arc<AppState>>, app: AppHandle) -> 
                 }
 
                 // 重置内存布局缓存与 S1 items 取数缓存，并 bump 数据版本。
-                *state_arc
-                    .layout_cache
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
-                crate::layout::items_cache::invalidate(&state_arc.layout_items_cache);
+                state_arc.clear_layout_caches();
                 state_arc.dedup_folder_stats_cache.clear();
                 state_arc.bump_data_version();
                 state_arc.tree_snapshots.clear(); // 树快照同批清（R-12：根已全删，全部为死快照）

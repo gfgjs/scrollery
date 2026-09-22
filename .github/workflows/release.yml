@@ -85,7 +85,7 @@ jobs:
           cat release-notes.md
 
       # ── 构建(tauri CLI 在 windows runner 自动拉取 NSIS/WiX 工具链)────────────
-      # 前端只构建一次:dist 由本步 beforeBuildCommand(prepare:legal + vite build + 三个 worker
+      # 前端只构建一次:dist 由本步 beforeBuildCommand(prepare:legal + vite build + 四个 worker
       # 构建)产出,即安装包真正打包的那份;不再另跑一次 npm run build,避免两套产物分叉。
       - name: tauri build(免费版,含 MSI + NSIS 安装包)
         run: npx tauri build
@@ -103,7 +103,7 @@ jobs:
 
       # 发货闭包断言(F-001 候选落地,2026-08-11):ai-worker sidecar + ORT 四件套必须
       # 真实落进安装包载荷。7z 在 windows-latest 预装;CI 下安装包存在即硬验,缺失即红。
-      - name: 安装包内容断言(ai-worker + ORT DLL)
+      - name: 安装包内容断言(raw/ai/video/enhance worker + ORT DLL)
         run: node scripts/verify-bundle-content.mjs
 
       - name: 产物清单 + SHA-256

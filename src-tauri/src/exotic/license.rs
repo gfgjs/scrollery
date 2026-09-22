@@ -167,6 +167,65 @@ impl EntitlementProvider for FreeStubEntitlement {
 mod tests {
     use super::*;
 
+    /// 显式运行的系统凭据集成验证；随机测试账户与正式授权分离，退出时清理。
+    #[test]
+    #[ignore = "requires an available OS credential store; uses a disposable test account"]
+    fn isolated_keyring_preserves_valid_license_and_removes_it() {
+        use crate::exotic::crypto::test_support::{keyset_json, sign, signing_key, KeySpec};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let key = signing_key(73);
+        let keyset = Arc::new(
+            VerifyingKeyset::parse(&keyset_json(&[KeySpec {
+                key_id: "isolated-test",
+                purpose: "license",
+                sk: &key,
+                status: "active",
+                not_before: 0,
+                not_after: None,
+            }]))
+            .unwrap(),
+        );
+        let account = format!(
+            "scrollery-license-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = KeyringLicenseStore::entry(&self.0).and_then(|e| {
+                    e.delete_credential()
+                        .map_err(|err| LicenseError::KeyringUnavailable(err.to_string()))
+                });
+            }
+        }
+        let _cleanup = Cleanup(account.clone());
+        let sku = &crate::official::product().sku;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version":1,"key_id":"isolated-test","license_id":"isolated-test",
+            "plugin_id":account,"sku":sku,"issued_at":0,"not_before":0,"expires_at":null
+        }))
+        .unwrap();
+        let token = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&payload),
+            URL_SAFE_NO_PAD.encode(sign(&key, &payload))
+        );
+        let store = KeyringLicenseStore::new(Arc::clone(&keyset));
+        assert_eq!(store.evaluate(&account, sku, 1), LicenseStatus::Unlicensed);
+        store.activate(&account, sku, &token, 1).unwrap();
+        assert!(store.activate(&account, sku, "invalid-token", 1).is_err());
+        drop(store);
+        // 新实例必须从系统凭据读取，不能靠旧实例内存证明保存成功。
+        let fresh = KeyringLicenseStore::new(keyset);
+        assert_eq!(fresh.evaluate(&account, sku, 1), LicenseStatus::Authorized);
+        fresh.deactivate(&account).unwrap();
+        assert_eq!(fresh.evaluate(&account, sku, 1), LicenseStatus::Unlicensed);
+    }
+
     /// 免费桩(未授权回退)契约锁:恒 Unlicensed、source_tag=free、激活 fail-closed
     /// (`activation_unsupported`)、撤销幂等。
     #[test]

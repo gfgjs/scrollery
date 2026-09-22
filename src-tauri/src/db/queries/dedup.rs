@@ -142,7 +142,9 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DedupScanCand
     })
 }
 
-const CANDIDATE_SELECT: &str = "
+fn candidate_select(size_floor: &str) -> String {
+    format!(
+        "
     SELECT m.id, m.directory_id, m.file_name, m.file_size, m.file_mtime,
            m.file_mtime_ns, m.source_revision, m.availability, m.is_live_photo,
            m.companion_of, r.path, d.rel_path
@@ -164,16 +166,25 @@ const CANDIDATE_SELECT: &str = "
                 AND m2.availability NOT IN ('missing', 'offline')
                 AND r2.is_active = 1
                 AND r2.is_hidden = 0
+                {size_floor}
               GROUP BY m2.file_size
                HAVING COUNT(*) > 1
-       )";
+       )"
+    )
+}
 
-fn pending_candidate_select() -> String {
+fn pending_candidate_select(has_cursor: bool) -> String {
+    // 已走过的大小不会出现在后续页；同大小组不能按 id 截断，否则末成员会被误判为单项。
+    let candidates = candidate_select(if has_cursor {
+        "AND m2.file_size >= ?1"
+    } else {
+        ""
+    });
     // 有效 quick/ready 行已经是可续跑的持久结果，不必在下一轮重复读取；源修订或
     // hash 版本变化会让这条 NOT EXISTS 自动失效，重新进入待分析集合。版本是编译期
     // 常量，游标/其它输入仍全部走绑定参数。
     format!(
-        "{CANDIDATE_SELECT}
+        "{candidates}
        AND NOT EXISTS (
              SELECT 1
                FROM dedup_index_working di_pending
@@ -193,7 +204,7 @@ pub fn list_dedup_scan_candidates(
     limit: usize,
 ) -> Result<Vec<DedupScanCandidate>> {
     let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
-    let mut sql = pending_candidate_select();
+    let mut sql = pending_candidate_select(cursor.is_some());
     if cursor.is_some() {
         sql.push_str(" AND (m.file_size > ?1 OR (m.file_size = ?1 AND m.id > ?2))");
     }
@@ -218,7 +229,7 @@ pub fn list_dedup_scan_candidates(
 
 /// 返回候选总数，用于进度快照；只 count，不加载任何 ID。
 pub fn count_dedup_scan_candidates(conn: &Connection) -> Result<u64> {
-    let sql = format!("SELECT COUNT(*) FROM ({})", pending_candidate_select());
+    let sql = format!("SELECT COUNT(*) FROM ({})", pending_candidate_select(false));
     let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(count.max(0) as u64)
 }
@@ -498,7 +509,7 @@ pub fn list_dedup_quick_collisions(
     cursor: Option<&DedupCandidateCursor>,
     limit: usize,
 ) -> Result<Vec<DedupScanCandidate>> {
-    let mut sql = String::from(CANDIDATE_SELECT);
+    let mut sql = candidate_select("");
     sql.push_str(
         " AND EXISTS (
                 SELECT 1
@@ -553,8 +564,9 @@ pub fn list_dedup_quick_collisions(
 
 /// 返回当前 quick 碰撞候选总数。只读取计数，不把全库成员 ID 物化到 IPC 或任务状态。
 pub fn count_dedup_quick_collisions(conn: &Connection) -> Result<u64> {
+    let candidates = candidate_select("");
     let sql = format!(
-        "SELECT COUNT(*) FROM ({CANDIDATE_SELECT}
+        "SELECT COUNT(*) FROM ({candidates}
           AND EXISTS (
                 SELECT 1
                   FROM dedup_index_working di
@@ -1361,6 +1373,50 @@ mod tests {
         assert_eq!(second.len(), 7);
         assert!(second[0].item_id > first[6].item_id);
         assert_eq!(count_dedup_scan_candidates(&conn).unwrap(), 32);
+    }
+
+    #[test]
+    fn candidate_pages_keep_full_equal_size_group_and_current_visibility() {
+        let conn = mem_db();
+        for (id, size) in [(1, 10), (2, 10), (3, 20), (4, 20), (5, 30), (6, 30)] {
+            add(&conn, id, &format!("{id}.jpg"), size, None);
+        }
+        add_root(&conn, 2, "/hidden");
+        add_directory_in_root(&conn, 11, 2, "", "hidden");
+        add_in_directory(&conn, 7, 11, "hidden.jpg", 40, None);
+        add(&conn, 8, "single-visible.jpg", 40, None);
+        conn.execute("UPDATE scan_roots SET is_hidden=1 WHERE id=2", [])
+            .unwrap();
+        assert_eq!(count_dedup_scan_candidates(&conn).unwrap(), 6);
+        let first = list_dedup_scan_candidates(&conn, None, 1).unwrap();
+        assert_eq!(first[0].item_id, 1);
+        let cursor = DedupCandidateCursor {
+            file_size: 10,
+            item_id: 1,
+        };
+        let ids = || {
+            list_dedup_scan_candidates(&conn, Some(&cursor), 20)
+                .unwrap()
+                .into_iter()
+                .map(|x| x.item_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(), [2, 3, 4, 5, 6], "游标前同大小成员仍参与重复判断");
+        assert!(write_working_ready(&conn, 2, 1, b"done"));
+        assert_eq!(ids(), [3, 4, 5, 6]);
+        conn.execute("UPDATE media_items SET source_revision=2 WHERE id=2", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE media_items SET availability='offline' WHERE id=4",
+            [],
+        )
+        .unwrap();
+        add(&conn, 9, "new-visible.jpg", 40, None);
+        assert_eq!(
+            ids(),
+            [2, 5, 6, 8, 9],
+            "每页重新观察源修订、离线状态和新候选"
+        );
     }
 
     #[test]

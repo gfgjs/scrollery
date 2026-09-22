@@ -76,6 +76,32 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+describe('historyStore：幂等回调失败', () => {
+  it.each(['undo', 'redo'] as const)('%s 失败保留原栈位置与重试入口，不报告成功', async (direction) => {
+    const undo = vi.fn(() => Promise.resolve())
+    const redo = vi.fn(() => Promise.resolve())
+    const history = useHistoryStore()
+    history.pushUndoable({ undo, redo, undoMessage: 'undo done', redoMessage: 'redo done' })
+    if (direction === 'redo') await history.undo()
+    const source = direction === 'undo' ? history.undoStack : history.redoStack
+    const target = direction === 'undo' ? history.redoStack : history.undoStack
+    const action = direction === 'undo' ? undo : redo
+    useToastStore().toasts.splice(0)
+    action.mockRejectedValueOnce(new Error('temporarily unavailable'))
+
+    await history[direction]()
+    expect(source).toHaveLength(1)
+    expect(target).toHaveLength(0)
+    expect(lastToast()?.type).toBe('error')
+    expect(history.busy).toBe(false)
+
+    await history[direction]()
+    expect(source).toHaveLength(0)
+    expect(target).toHaveLength(1)
+    expect(lastToast()?.type).toBe('success')
+  })
+})
+
 describe('historyStore：目录移动', () => {
   it('正常移动进撤销栈，不产生收尾任务', async () => {
     invoke.mockResolvedValue(moveResult())

@@ -23,6 +23,7 @@ import {
   buildPluginZip,
   ensureKey,
   keysetEntry,
+  loadOfficialProduct,
   nextSeq,
   sha256hex,
   signIndex,
@@ -32,12 +33,16 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(repo, '.dev-registry');
 fs.mkdirSync(out, { recursive: true });
 
+// 授权主体单源:registry 条目 SKU 与 license token 取自同一份官方版配置,
+// 否则商店展示的 SKU 会与实际能验过的 token 不一致(2026-09-22 统一授权)。
+const product = loadOfficialProduct(repo);
+
 const PLUGIN_ID = process.env.EXOTIC_PLUGIN_ID || 'exotic-image-psd';
 const TARGET = process.env.EXOTIC_TARGET || 'x86_64-pc-windows-msvc';
 const MEDIA_KIND = process.env.EXOTIC_MEDIA_KIND || 'image';
 const FORMATS = (process.env.EXOTIC_FORMATS || 'psd').split(',').map((s) => s.trim()).filter(Boolean);
 const CAPABILITIES = (process.env.EXOTIC_CAPABILITIES || 'thumbnail').split(',').map((s) => s.trim()).filter(Boolean);
-const SKU = process.env.EXOTIC_SKU || 'psd-engine-2026';
+const SKU = product.sku;
 const MIN_HOST_VERSION = process.env.EXOTIC_MIN_HOST_VERSION || '0.1.0';
 const COMPLIANCE_REVIEW_ID = process.env.EXOTIC_COMPLIANCE_REVIEW_ID || 'dev-local';
 const WORKER_NAME = process.env.EXOTIC_WORKER_NAME || 'psd-worker.exe';

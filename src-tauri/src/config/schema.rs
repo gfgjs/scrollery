@@ -437,15 +437,20 @@ pub const SETTINGS_CARD_IDS: &[&str] = &[
     "enhanceModels",
     "faceModels",
     "galleryBehavior",
+    "galleryTimeline",
     "general",
     "knownVolumes",
+    "layout",
     "modelLibrary",
     "networkStorage",
     "ocrModels",
     "reading",
     "rootVisibility",
+    "thumbnailCache",
+    "thumbnailDisplay",
     "thumbnails",
     "video",
+    "viewerColor",
 ];
 
 /// 阅读器设置面板内的固定分组 ID(与 `ReaderSettingsGroup id` 一致)。
@@ -771,11 +776,12 @@ library / tools / folders / management。默认全部展开。",
         },
         default: "{\"aiModels\":true,\"backup\":true,\"common\":true,\"danger\":false,\
 \"debug\":true,\"enhanceModels\":true,\"faceModels\":true,\"galleryBehavior\":true,\
-\"general\":true,\"knownVolumes\":true,\"modelLibrary\":true,\"networkStorage\":true,\
-\"ocrModels\":true,\"reading\":true,\"rootVisibility\":true,\"thumbnails\":true,\
-\"video\":true}",
-        comment_zh: "设置页各卡片的展开状态(TOML 内联表:卡片 id = true/false)。默认仅\"危险操作\"卡\
-折叠,其余展开。",
+\"galleryTimeline\":false,\"general\":true,\"knownVolumes\":true,\"layout\":true,\
+\"modelLibrary\":true,\"networkStorage\":true,\"ocrModels\":true,\"reading\":true,\
+\"rootVisibility\":true,\"thumbnailCache\":true,\"thumbnailDisplay\":true,\"thumbnails\":true,\
+\"video\":true,\"viewerColor\":true}",
+        comment_zh: "设置页各分组的展开状态(TOML 内联表:分组 id = true/false)。默认收起时间轴\
+与滚动条、危险操作,其余展开。",
         hot: true,
     },
     // ── gallery ─────────────────────────────────────────────────────────────

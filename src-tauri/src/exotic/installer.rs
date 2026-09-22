@@ -132,7 +132,7 @@ pub fn install_staged_zip(
 }
 
 /// 卸载（§6.5）：移走安装目录 + 删 DB 安装记录。**不**删媒体记录与历史任务。
-/// 调用方前置 quiesce + kill/wait Worker。License token 是否保留由命令层 `remove_license` 决定。
+/// 调用方前置 quiesce + kill/wait Worker。插件卸载不移除官方版套装授权。
 pub fn uninstall_plugin(
     install_root: &Path,
     plugin_id: &str,

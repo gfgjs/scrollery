@@ -5,10 +5,71 @@
 
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use super::hdd_io::{DiskBudget, ReadPermit};
 use crate::db::models::ImageMeta;
 use crate::error::{AppError, Result};
+use tokio_util::sync::CancellationToken;
+
+/// 单项诊断与读取生命周期；补读计时包含解析，不能当作纯磁盘等待。
+#[derive(Default)]
+pub(crate) struct ImageReadContext {
+    budget: Option<Arc<DiskBudget>>,
+    cancel: CancellationToken,
+    permit: Option<Arc<ReadPermit>>,
+    disk_read_timed_out: bool,
+    pub file_access_wait: Duration,
+    pub exif_memory: Duration,
+    pub exif_probe: Duration,
+    pub exif_fallback: Duration,
+    pub dimensions_file: bool,
+}
+
+impl ImageReadContext {
+    pub(crate) fn with_disk_budget(
+        budget: Option<Arc<DiskBudget>>,
+        cancel: &CancellationToken,
+    ) -> Self {
+        Self {
+            budget,
+            cancel: cancel.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// 纯缓冲解析不申请名额；首次补读才独占，直到本项及其超时后台读取均结束。
+    pub(crate) fn ensure_file_access(&mut self) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        self.check_io_error()?;
+        if self.permit.is_none() {
+            if let Some(budget) = &self.budget {
+                let started = Instant::now();
+                let acquired = budget.acquire(&self.cancel);
+                self.file_access_wait += started.elapsed();
+                self.disk_read_timed_out = matches!(acquired, Err(AppError::ImageReadTimeout));
+                self.permit = Some(acquired?);
+            }
+        }
+        Ok(())
+    }
+
+    /// 尺寸接口用零值表示普通失败；磁盘超时必须向批次传播，不能写入最小元数据行。
+    pub(crate) fn check_io_error(&self) -> Result<()> {
+        if self.disk_read_timed_out
+            || self
+                .permit
+                .as_ref()
+                .is_some_and(|permit| permit.timed_out())
+        {
+            return Err(AppError::ImageReadTimeout);
+        }
+        Ok(())
+    }
+}
 
 /// TIFF 维度解析的硬超时上限。读文件头本应亚秒级完成；给 5s 余量以容忍慢盘 /
 /// 合法大文件，同时对畸形 TIFF 的无限阻塞兜底。
@@ -18,23 +79,35 @@ const TIFF_DIMENSION_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// 用于给可能无限阻塞的第三方解析（如畸形 TIFF 的 `image::image_dimensions`）设硬上限：
 /// 超时即放弃等待、立即返回，让出当前工作线程。落单线程在后台自行跑完退出——
-/// 最坏情况泄漏一个线程，但远胜永久阻塞 enrich 工作者。
+/// HDD 超时会唤醒同盘等待者报错；后台线程仍持有名额，直到实际读取结束才恢复。
 ///
 /// 注意：`std::thread::scope` 无法实现真超时——其 drop 必须 join 完所有子线程才返回，
 /// 与「超时即放弃」语义互斥；故此处用 detached spawn + `recv_timeout`。
-fn run_with_timeout<T, F>(timeout: Duration, f: F) -> Option<T>
+fn run_with_timeout<T, F>(timeout: Duration, permit: Option<Arc<ReadPermit>>, f: F) -> Option<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
+    let worker_permit = permit.clone();
     std::thread::spawn(move || {
+        // 等待端超时不会中止文件访问，名额必须由真正工作的线程持有。
+        let _permit = worker_permit;
         // 接收端可能已超时丢弃 rx → send 失败属预期，忽略。
         let _ = tx.send(f());
     });
-    // Err 同时覆盖 Timeout 与 Disconnected（线程 panic 未发送即丢弃 tx）——都按失败处理。
-    rx.recv_timeout(timeout).ok()
+    match rx.recv_timeout(timeout) {
+        Ok(value) => Some(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // 等待端也保留一份守卫，避免后台恰好结束时把超时标记写到下一个读取上。
+            if let Some(permit) = permit {
+                permit.mark_timed_out();
+            }
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 // ── EXIF orientation (fast path — for quick scan) ────────────────────────────
@@ -92,10 +165,23 @@ pub fn orientation_needs_swap(orientation: u32) -> bool {
 /// EXIF read (TIFF gets a scoped-thread timeout guard). Returns `(0, 0)` on failure.
 /// 仅读文件头的像素尺寸：不做方向校正、不读 EXIF（TIFF 用作用域线程加超时保护）。失败返回 `(0, 0)`。
 pub fn read_raw_dimensions(abs_path: &Path, ext: &str) -> (i64, i64) {
+    read_raw_dimensions_with_context(abs_path, ext, &mut ImageReadContext::default())
+}
+
+fn read_raw_dimensions_with_context(
+    abs_path: &Path,
+    ext: &str,
+    context: &mut ImageReadContext,
+) -> (i64, i64) {
+    if context.ensure_file_access().is_err() {
+        return (0, 0);
+    }
+    context.dimensions_file = true;
     // TIFF: 解析可能读取大量字节、且畸形文件可能无限阻塞 — 用真超时守卫兜底。
     if ext == "tif" || ext == "tiff" {
         let path = abs_path.to_path_buf();
-        return run_with_timeout(TIFF_DIMENSION_TIMEOUT, move || {
+        let permit = context.permit.clone();
+        return run_with_timeout(TIFF_DIMENSION_TIMEOUT, permit, move || {
             image::image_dimensions(&path).ok()
         })
         .flatten()
@@ -111,8 +197,20 @@ pub fn read_raw_dimensions(abs_path: &Path, ext: &str) -> (i64, i64) {
 /// 头缓冲版尺寸读取(#10):非 TIFF 从缓冲解头(免再开文件);TIFF 保持原路径(IFD 偏移可指向
 /// 文件任意处,截断缓冲不可靠,且需保留超时守卫)。缓冲解不出且缓冲截断 → 原路径回退。
 pub fn read_raw_dimensions_buf(abs_path: &Path, ext: &str, hb: &HeaderBuf) -> (i64, i64) {
+    read_dimensions_with_context(abs_path, ext, Some(hb), &mut ImageReadContext::default())
+}
+
+pub(crate) fn read_dimensions_with_context(
+    abs_path: &Path,
+    ext: &str,
+    hb: Option<&HeaderBuf>,
+    context: &mut ImageReadContext,
+) -> (i64, i64) {
+    let Some(hb) = hb else {
+        return read_raw_dimensions_with_context(abs_path, ext, context);
+    };
     if ext == "tif" || ext == "tiff" {
-        return read_raw_dimensions(abs_path, ext);
+        return read_raw_dimensions_with_context(abs_path, ext, context);
     }
     let reader = image::ImageReader::new(std::io::Cursor::new(&hb.bytes[..]));
     if let Ok(guessed) = reader.with_guessed_format() {
@@ -121,7 +219,7 @@ pub fn read_raw_dimensions_buf(abs_path: &Path, ext: &str, hb: &HeaderBuf) -> (i
         }
     }
     if hb.truncated() {
-        read_raw_dimensions(abs_path, ext)
+        read_raw_dimensions_with_context(abs_path, ext, context)
     } else {
         (0, 0)
     }
@@ -285,7 +383,9 @@ impl HeaderBuf {
 pub enum ExifParsePath {
     /// 头缓冲直接解析成功。
     HeaderBuffer,
-    /// 头缓冲不足，重新打开原文件解析。
+    /// 定位到容器内的 EXIF 块，直接读取载荷并解析，未从头重扫文件。
+    ContainerChunk,
+    /// 头缓冲不足，从原文件开头解析（有保留句柄时复用）。
     FullFileFallback,
     /// 已确认容器结束且没有 EXIF。
     NoMetadata,
@@ -297,8 +397,10 @@ pub enum ExifParsePath {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TruncatedExifProbe {
+    /// PNG 后置 eXIf 的 TIFF 载荷，可直接交给既有解析器。
+    Exif(Vec<u8>),
     /// 已确认没有 EXIF，可以安全跳过整文件回退。
     NoMetadata,
     /// 仍不能判断，必须保留原文件回退以保证元数据不丢失。
@@ -345,7 +447,7 @@ pub fn parse_exif_meta_buf_detailed(
     path: &Path,
     hb: &HeaderBuf,
 ) -> (Result<ImageMeta>, ExifParsePath) {
-    parse_exif_meta_buf_detailed_inner(path, hb, None)
+    parse_exif_meta_buf_detailed_inner(path, hb, None, &mut ImageReadContext::default())
 }
 
 /// 与 [`parse_exif_meta_buf_detailed`] 相同，但复用头读阶段保留的文件句柄。
@@ -354,35 +456,80 @@ pub fn parse_exif_meta_buf_detailed_with_file(
     hb: &HeaderBuf,
     file: &mut std::fs::File,
 ) -> (Result<ImageMeta>, ExifParsePath) {
-    parse_exif_meta_buf_detailed_inner(path, hb, Some(file))
+    parse_exif_meta_buf_detailed_inner(path, hb, Some(file), &mut ImageReadContext::default())
+}
+
+pub(crate) fn parse_exif_with_context(
+    path: &Path,
+    read: Option<&mut HeaderRead>,
+    context: &mut ImageReadContext,
+) -> (Result<ImageMeta>, ExifParsePath) {
+    match read {
+        Some(read) => {
+            parse_exif_meta_buf_detailed_inner(path, &read.header, Some(&mut read.file), context)
+        }
+        None => {
+            let started = Instant::now();
+            let result = context
+                .ensure_file_access()
+                .and_then(|()| parse_exif_meta(path));
+            context.exif_fallback += started.elapsed();
+            (result, ExifParsePath::DirectFile)
+        }
+    }
 }
 
 fn parse_exif_meta_buf_detailed_inner(
     path: &Path,
     hb: &HeaderBuf,
     mut source: Option<&mut std::fs::File>,
+    context: &mut ImageReadContext,
 ) -> (Result<ImageMeta>, ExifParsePath) {
     if is_known_exif_unsupported(&hb.bytes) {
         return (Ok(empty_image_meta()), ExifParsePath::Unsupported);
     }
 
     let mut cursor = std::io::Cursor::new(&hb.bytes[..]);
-    match exif::Reader::new().read_from_container(&mut cursor) {
+    let started = Instant::now();
+    let parsed = exif::Reader::new().read_from_container(&mut cursor);
+    context.exif_memory += started.elapsed();
+    match parsed {
         Ok(exif) => (Ok(extract_image_meta(&exif)), ExifParsePath::HeaderBuffer),
         Err(exif::Error::NotFound(_)) if !hb.truncated() => {
             (Ok(empty_image_meta()), ExifParsePath::NoMetadata)
         }
-        Err(_) if hb.truncated() => match probe_truncated_exif(path, hb, source.as_deref_mut()) {
-            TruncatedExifProbe::NoMetadata => (Ok(empty_image_meta()), ExifParsePath::NoMetadata),
-            TruncatedExifProbe::Unsupported => (Ok(empty_image_meta()), ExifParsePath::Unsupported),
-            TruncatedExifProbe::NeedMore => {
-                let result = match source {
-                    Some(file) => parse_exif_meta_from_file(file),
-                    None => parse_exif_meta(path),
-                };
-                (result, ExifParsePath::FullFileFallback)
+        Err(_) if hb.truncated() => {
+            let started = Instant::now();
+            let probe = probe_truncated_exif(path, hb, source.as_deref_mut(), context);
+            context.exif_probe += started.elapsed();
+            match probe {
+                Err(error) => (Err(error), ExifParsePath::Failed),
+                Ok(TruncatedExifProbe::Exif(data)) => {
+                    let started = Instant::now();
+                    let meta = exif::Reader::new()
+                        .read_raw(data)
+                        .map(|exif| extract_image_meta(&exif))
+                        .map_err(AppError::from);
+                    context.exif_memory += started.elapsed();
+                    (meta, ExifParsePath::ContainerChunk)
+                }
+                Ok(TruncatedExifProbe::NoMetadata) => {
+                    (Ok(empty_image_meta()), ExifParsePath::NoMetadata)
+                }
+                Ok(TruncatedExifProbe::Unsupported) => {
+                    (Ok(empty_image_meta()), ExifParsePath::Unsupported)
+                }
+                Ok(TruncatedExifProbe::NeedMore) => {
+                    let started = Instant::now();
+                    let result = context.ensure_file_access().and_then(|()| match source {
+                        Some(file) => parse_exif_meta_from_file(file),
+                        None => parse_exif_meta(path),
+                    });
+                    context.exif_fallback += started.elapsed();
+                    (result, ExifParsePath::FullFileFallback)
+                }
             }
-        },
+        }
         Err(e) => (Err(AppError::from(e)), ExifParsePath::Failed),
     }
 }
@@ -399,32 +546,27 @@ fn probe_truncated_exif(
     path: &Path,
     hb: &HeaderBuf,
     source: Option<&mut std::fs::File>,
-) -> TruncatedExifProbe {
+    context: &mut ImageReadContext,
+) -> Result<TruncatedExifProbe> {
     if is_known_exif_unsupported(&hb.bytes) {
-        return TruncatedExifProbe::Unsupported;
+        return Ok(TruncatedExifProbe::Unsupported);
     }
-
     if hb.bytes.starts_with(&[0xff, 0xd8]) {
-        return jpeg_exif_probe(&hb.bytes);
+        return Ok(jpeg_exif_probe(&hb.bytes));
     }
-
     if hb.bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return match scan_png_exif_presence(path, source) {
-            Ok(Some(false)) => TruncatedExifProbe::NoMetadata,
-            Ok(Some(true)) | Ok(None) | Err(_) => TruncatedExifProbe::NeedMore,
-        };
+        context.ensure_file_access()?;
+        return Ok(scan_png_exif(path, hb, source).unwrap_or(TruncatedExifProbe::NeedMore));
     }
-
     if hb.bytes.len() >= 12 && &hb.bytes[..4] == b"RIFF" && &hb.bytes[8..12] == b"WEBP" {
-        return match scan_webp_exif_presence(path, source) {
+        context.ensure_file_access()?;
+        return Ok(match scan_webp_exif_presence(path, source) {
             Ok(Some(false)) => TruncatedExifProbe::NoMetadata,
             Ok(Some(true)) | Ok(None) | Err(_) => TruncatedExifProbe::NeedMore,
-        };
+        });
     }
-
-    // TIFF、HEIF/AVIF 和 RAW 的 EXIF 位置可能由偏移表决定；没有格式级索引时保留
-    // 原文件回退，正确性优先于这几个低频格式的额外优化。
-    TruncatedExifProbe::NeedMore
+    // TIFF、HEIF/AVIF 和 RAW 保留原文件回退，实际回退前再申请补读名额。
+    Ok(TruncatedExifProbe::NeedMore)
 }
 
 /// JPEG 在 SOS 之后进入压缩扫描数据，合法 EXIF APP1 只能出现在 SOS 之前。
@@ -480,50 +622,84 @@ fn jpeg_exif_probe(bytes: &[u8]) -> TruncatedExifProbe {
     TruncatedExifProbe::NeedMore
 }
 
-/// 只读取 PNG chunk 头并 seek 跳过 payload，避免为确认没有 eXIf 而读过 IDAT 像素数据。
-/// `Some(false)` 只有在读到 IEND 后才表示确定无 EXIF；其余情况都必须保守回退。
-fn scan_png_exif_presence(
+/// 复用已读头部；头外每块只定位读取 8 字节，不读取 IDAT，不为后置 EXIF 重扫文件。
+fn scan_png_exif(
     path: &Path,
+    hb: &HeaderBuf,
     source: Option<&mut std::fs::File>,
-) -> std::io::Result<Option<bool>> {
+) -> std::io::Result<TruncatedExifProbe> {
     match source {
-        Some(file) => scan_png_exif_presence_file(file),
+        Some(file) => scan_png_exif_chunks(hb, |offset, bytes| read_exact_at(file, offset, bytes)),
         None => {
             let mut file = std::fs::File::open(path)?;
-            scan_png_exif_presence_file(&mut file)
+            scan_png_exif_chunks(hb, |offset, bytes| read_exact_at(&mut file, offset, bytes))
         }
     }
 }
 
-fn scan_png_exif_presence_file(file: &mut std::fs::File) -> std::io::Result<Option<bool>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut signature = [0u8; 8];
-    file.read_exact(&mut signature)?;
-    if signature != *b"\x89PNG\r\n\x1a\n" {
-        return Ok(None);
+/// Windows 的 seek_read / Unix 的 read_at 将偏移和读取合成一次请求，避免逐块 seek。
+fn read_exact_at(
+    file: &mut std::fs::File,
+    mut offset: u64,
+    mut bytes: &mut [u8],
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(file, bytes, offset);
+        #[cfg(not(windows))]
+        let read = std::os::unix::fs::FileExt::read_at(file, bytes, offset);
+        match read {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) => {
+                offset += count as u64;
+                bytes = &mut bytes[count..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
+    Ok(())
+}
 
-    loop {
-        let mut len_buf = [0u8; 4];
-        if file.read_exact(&mut len_buf).is_err() {
-            return Ok(None);
-        }
-        let mut chunk_type = [0u8; 4];
-        if file.read_exact(&mut chunk_type).is_err() {
-            return Ok(None);
-        }
-        let chunk_len = u32::from_be_bytes(len_buf) as u64;
-        if chunk_type == *b"eXIf" {
-            return Ok(Some(true));
-        }
-
-        let skip = match chunk_len.checked_add(4) {
-            Some(value) => value, // chunk data + CRC
-            None => return Ok(None),
+fn scan_png_exif_chunks(
+    hb: &HeaderBuf,
+    mut read_at: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
+) -> std::io::Result<TruncatedExifProbe> {
+    let mut read = |offset: u64, bytes: &mut [u8]| {
+        let cached = if offset < hb.bytes.len() as u64 {
+            let offset = offset as usize;
+            let len = bytes.len().min(hb.bytes.len() - offset);
+            bytes[..len].copy_from_slice(&hb.bytes[offset..offset + len]);
+            len
+        } else {
+            0
         };
-        file.seek(SeekFrom::Current(skip as i64))?;
-        if chunk_type == *b"IEND" {
-            return Ok(Some(false));
+        if cached == bytes.len() {
+            return Ok(());
+        }
+        read_at(offset + cached as u64, &mut bytes[cached..])
+    };
+    let mut offset = 8u64;
+    loop {
+        let mut chunk = [0u8; 8];
+        read(offset, &mut chunk)?;
+        let len = u32::from_be_bytes(chunk[..4].try_into().expect("four-byte length")) as u64;
+        match &chunk[4..] {
+            b"eXIf" => {
+                // 保持单项额外缓冲有界；超大载荷仍交既有文件解析路径，不忽略元数据。
+                if len > ENRICH_HEADER_BUF as u64 {
+                    return Ok(TruncatedExifProbe::NeedMore);
+                }
+                let mut data = vec![0; len as usize];
+                read(offset + 8, &mut data)?;
+                return Ok(TruncatedExifProbe::Exif(data));
+            }
+            b"IEND" => return Ok(TruncatedExifProbe::NoMetadata),
+            _ => {
+                offset = offset
+                    .checked_add(12 + len)
+                    .ok_or(std::io::ErrorKind::InvalidData)?
+            }
         }
     }
 }
@@ -854,9 +1030,57 @@ mod tests {
     }
 
     #[test]
+    fn timeout_keeps_disk_permit_until_actual_read_finishes() {
+        let budget = crate::scanner::hdd_io::test_budget(1);
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut context = ImageReadContext::with_disk_budget(Some(budget.clone()), &token);
+        context.ensure_file_access().unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let result = run_with_timeout(
+            Duration::from_millis(10),
+            context.permit.clone(),
+            move || {
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                42
+            },
+        );
+        assert_eq!(result, None);
+        assert!(matches!(
+            context.check_io_error(),
+            Err(AppError::ImageReadTimeout)
+        ));
+        assert!(matches!(
+            budget.acquire_header(&token),
+            Err(AppError::ImageReadTimeout)
+        ));
+        let mut waiting = ImageReadContext::with_disk_budget(Some(budget.clone()), &token);
+        assert!(matches!(
+            waiting.ensure_file_access(),
+            Err(AppError::ImageReadTimeout)
+        ));
+        drop(context);
+        // 等待者仅持有预算；另一个强引用属于实际读取的守卫。
+        assert_eq!(Arc::strong_count(&budget), 3);
+        assert!(waiting.permit.is_none());
+        drop(waiting.budget.take());
+        assert_eq!(Arc::strong_count(&budget), 2, "实际读取仍必须持有预算");
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(budget.acquire(&token), Err(AppError::ImageReadTimeout)) {
+            assert!(Instant::now() < deadline, "后台结束后应恢复预算");
+            std::thread::yield_now();
+        }
+        // 已经失败的项不能因另一个线程恰好结束就退化成可写库的普通元数据错误。
+        assert!(matches!(
+            waiting.check_io_error(),
+            Err(AppError::ImageReadTimeout)
+        ));
+    }
+
+    #[test]
     fn run_with_timeout_returns_value_for_fast_closure() {
         // 快速闭包应在超时前返回其值。
-        let r = run_with_timeout(Duration::from_secs(5), || 42);
+        let r = run_with_timeout(Duration::from_secs(5), None, || 42);
         assert_eq!(r, Some(42));
     }
 
@@ -864,7 +1088,7 @@ mod tests {
     fn run_with_timeout_gives_up_on_slow_closure() {
         // 慢闭包（模拟畸形 TIFF 挂起）：超时即放弃，返回 None，不等满 10s。
         // 关键：本测试自身只阻塞约 50ms（超时时长），不会真等 10s——证明「不 join」生效。
-        let r: Option<i32> = run_with_timeout(Duration::from_millis(50), || {
+        let r: Option<i32> = run_with_timeout(Duration::from_millis(50), None, || {
             std::thread::sleep(Duration::from_secs(10));
             42
         });
@@ -874,7 +1098,7 @@ mod tests {
     #[test]
     fn run_with_timeout_returns_none_on_panic() {
         // 子线程 panic 未发送即丢弃 tx → recv_timeout 得 Disconnected → None（不传播 panic）。
-        let r: Option<i32> = run_with_timeout(Duration::from_secs(5), || panic!("boom"));
+        let r: Option<i32> = run_with_timeout(Duration::from_secs(5), None, || panic!("boom"));
         assert_eq!(r, None);
     }
 
@@ -945,7 +1169,7 @@ mod tests {
 
     #[test]
     fn header_read_reuses_handle_for_late_png_exif() {
-        // 富化路径传入快扫已知文件大小后，应能在不重新 open 的情况下完成尾部 EXIF 回退。
+        // 富化路径传入快扫已知文件大小后，复用句柄定位尾部 EXIF，不从头重扫容器。
         let tiff = minimal_orientation_tiff(6);
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         png.extend_from_slice(&png_chunk(b"IDAT", &vec![0u8; 100_000]));
@@ -962,7 +1186,7 @@ mod tests {
 
         let HeaderRead { header, mut file } = read;
         let (meta, parse_path) = parse_exif_meta_buf_detailed_with_file(&path, &header, &mut file);
-        assert_eq!(parse_path, ExifParsePath::FullFileFallback);
+        assert_eq!(parse_path, ExifParsePath::ContainerChunk);
         assert_eq!(meta.unwrap().orientation, 6);
     }
 
@@ -1011,8 +1235,18 @@ mod tests {
             file_len: bytes.len() as u64,
             bytes,
         };
-        let dims = read_raw_dimensions_buf(Path::new("/nonexistent/x.png"), "png", &hb);
+        let budget = crate::scanner::hdd_io::test_budget(2);
+        let token = CancellationToken::new();
+        let _busy = budget.acquire(&token).unwrap();
+        let mut context = ImageReadContext::with_disk_budget(Some(budget), &token);
+        let path = Path::new("/nonexistent/x.png");
+        let (meta, route) = parse_exif_meta_buf_detailed_inner(path, &hb, None, &mut context);
+        assert!(meta.is_ok());
+        assert_eq!(route, ExifParsePath::NoMetadata);
+        let dims = read_dimensions_with_context(path, "png", Some(&hb), &mut context);
         assert_eq!(dims, (3, 2));
+        assert!(context.permit.is_none());
+        assert!(!context.dimensions_file);
     }
 
     #[test]
@@ -1025,7 +1259,17 @@ mod tests {
             bytes,
         };
 
-        let (meta, path) = parse_exif_meta_buf_detailed(Path::new("/nonexistent/large.jpg"), &hb);
+        let budget = crate::scanner::hdd_io::test_budget(2);
+        let token = CancellationToken::new();
+        let _busy = budget.acquire(&token).unwrap();
+        let mut context = ImageReadContext::with_disk_budget(Some(budget), &token);
+        let (meta, path) = parse_exif_meta_buf_detailed_inner(
+            Path::new("/nonexistent/large.jpg"),
+            &hb,
+            None,
+            &mut context,
+        );
+        assert!(context.permit.is_none());
         assert_eq!(path, ExifParsePath::NoMetadata);
         assert_eq!(meta.unwrap().orientation, 1);
         assert_eq!(
@@ -1053,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn png_exif_after_large_payload_still_falls_back_and_parses() {
+    fn png_exif_after_large_payload_is_read_directly() {
         // EXIF 位于大 IDAT 后面：不能把“头部没看到 EXIF”误判为无 EXIF。
         let tiff = minimal_orientation_tiff(6);
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -1068,8 +1312,168 @@ mod tests {
         assert!(hb.truncated());
 
         let (meta, parse_path) = parse_exif_meta_buf_detailed(&path, &hb);
+        assert_eq!(parse_path, ExifParsePath::ContainerChunk);
+        assert_eq!(meta.unwrap().orientation, 6);
+    }
+
+    #[test]
+    fn png_small_chunks_named_jpg_preserve_late_exif() {
+        // 实机慢项包含伪装成 jpg 的 PNG，且每个 IDAT 只有 8 KiB。
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        for _ in 0..160 {
+            png.extend_from_slice(&png_chunk(b"IDAT", &[0; 8192]));
+        }
+        png.extend_from_slice(&png_chunk(b"eXIf", &minimal_orientation_tiff(6)));
+        png.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actually-png.jpg");
+        std::fs::write(&path, &png).unwrap();
+        let mut header = read_header_buf_for_ext_with_file_size(&path, "jpg", None).unwrap();
+        let mut context = ImageReadContext::with_disk_budget(
+            Some(crate::scanner::hdd_io::test_budget(2)),
+            &CancellationToken::new(),
+        );
+        let (meta, route) = parse_exif_with_context(&path, Some(&mut header), &mut context);
+        let meta = meta.unwrap();
+        assert_eq!(route, ExifParsePath::ContainerChunk);
+        assert!(context.permit.is_some());
+        assert_eq!(meta.orientation, 6);
+        assert_eq!(
+            format!("{meta:?}"),
+            format!("{:?}", parse_exif_meta(&path).unwrap())
+        );
+    }
+
+    #[test]
+    fn cancelled_context_does_not_start_supplemental_reads() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut context = ImageReadContext::with_disk_budget(
+            Some(crate::scanner::hdd_io::test_budget(2)),
+            &token,
+        );
+        let path = Path::new("/nonexistent/cancelled.png");
+        let header = HeaderBuf {
+            bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
+            file_len: 100_000,
+        };
+        let (meta, _) = parse_exif_meta_buf_detailed_inner(path, &header, None, &mut context);
+        assert!(matches!(meta, Err(AppError::Cancelled)));
+        let (meta, _) = parse_exif_with_context(path, None, &mut context);
+        assert!(matches!(meta, Err(AppError::Cancelled)));
+        assert_eq!(
+            read_dimensions_with_context(path, "png", None, &mut context),
+            (0, 0)
+        );
+        assert!(!context.dimensions_file);
+        assert!(context.permit.is_none());
+    }
+
+    #[test]
+    fn malformed_late_png_exif_remains_an_error() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&png_chunk(b"IDAT", &[0; 100_000]));
+        png.extend_from_slice(&png_chunk(b"eXIf", b"invalid tiff"));
+        png.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-exif.png");
+        std::fs::write(&path, &png).unwrap();
+        let header = read_header_buf_for_ext(&path, "png").unwrap();
+        assert_eq!(
+            parse_exif_meta_buf(&path, &header).unwrap_err().to_string(),
+            parse_exif_meta(&path).unwrap_err().to_string()
+        );
+    }
+
+    #[test]
+    fn png_chunk_probe_reads_only_uncached_headers_and_exif() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        for _ in 0..160 {
+            png.extend_from_slice(&png_chunk(b"IDAT", &[0; 8192]));
+        }
+        let exif_offset = png.len();
+        let tiff = minimal_orientation_tiff(6);
+        png.extend_from_slice(&png_chunk(b"eXIf", &tiff));
+        png.extend_from_slice(&png_chunk(b"IEND", &[]));
+        let hb = HeaderBuf {
+            bytes: png[..131_072].to_vec(),
+            file_len: png.len() as u64,
+        };
+        let mut requests = Vec::new();
+        let probe = scan_png_exif_chunks(&hb, |offset, bytes| {
+            let at = offset as usize;
+            // 任何访问 IDAT payload 的请求都会失败，而不是靠计时推测减少了读取。
+            assert!(
+                (bytes.len() == 8 && at >= 131_072 && (at - 8) % 8204 == 0)
+                    || (at == exif_offset + 8 && bytes.len() == tiff.len())
+            );
+            requests.push((at, bytes.len()));
+            bytes.copy_from_slice(&png[at..at + bytes.len()]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(probe, TruncatedExifProbe::Exif(tiff));
+        // 已缓存前 16 个块头；余下 144 个 IDAT 头 + 1 个 EXIF 头 + 1 次载荷读取。
+        assert_eq!(requests.len(), 146);
+        assert_eq!(requests.iter().map(|(_, size)| size).sum::<usize>(), 1186);
+    }
+
+    #[test]
+    fn png_chunk_probe_reads_split_header_without_rereading_cached_bytes() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&png_chunk(b"IDAT", &[0; 100_000]));
+        let exif_offset = png.len();
+        let tiff = minimal_orientation_tiff(8);
+        png.extend_from_slice(&png_chunk(b"eXIf", &tiff));
+        let boundary = exif_offset + 4;
+        let hb = HeaderBuf {
+            bytes: png[..boundary].to_vec(),
+            file_len: png.len() as u64,
+        };
+        let mut requests = Vec::new();
+        let probe = scan_png_exif_chunks(&hb, |offset, bytes| {
+            let at = offset as usize;
+            requests.push((at, bytes.len()));
+            bytes.copy_from_slice(&png[at..at + bytes.len()]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(probe, TruncatedExifProbe::Exif(tiff.clone()));
+        assert_eq!(requests, vec![(boundary, 4), (exif_offset + 8, tiff.len())]);
+    }
+
+    #[test]
+    fn oversized_png_exif_preserves_file_fallback() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&png_chunk(b"IDAT", &[0; 100_000]));
+        let mut tiff = minimal_orientation_tiff(6);
+        tiff.resize(ENRICH_HEADER_BUF + 1, 0);
+        png.extend_from_slice(&png_chunk(b"eXIf", &tiff));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-exif.png");
+        std::fs::write(&path, &png).unwrap();
+        let hb = read_header_buf_for_ext(&path, "png").unwrap();
+        let (meta, parse_path) = parse_exif_meta_buf_detailed(&path, &hb);
         assert_eq!(parse_path, ExifParsePath::FullFileFallback);
         assert_eq!(meta.unwrap().orientation, 6);
+    }
+
+    #[test]
+    fn truncated_png_chunk_keeps_original_error() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&png_chunk(b"IDAT", &[0; 100_000]));
+        png.extend_from_slice(&png_chunk(b"eXIf", &minimal_orientation_tiff(6)));
+        png.truncate(png.len() - 10);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.png");
+        std::fs::write(&path, &png).unwrap();
+        let hb = read_header_buf_for_ext(&path, "png").unwrap();
+        let (meta, parse_path) = parse_exif_meta_buf_detailed(&path, &hb);
+        assert_eq!(parse_path, ExifParsePath::FullFileFallback);
+        assert_eq!(
+            meta.unwrap_err().to_string(),
+            parse_exif_meta(&path).unwrap_err().to_string()
+        );
     }
 
     #[test]

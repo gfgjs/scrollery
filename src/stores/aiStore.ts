@@ -65,6 +65,8 @@ export const useAiStore = defineStore('ai', () => {
   const matchCount = ref(0)
   const similarityThreshold = ref(0.2)
   const isSearching = ref(false)
+  /** 当前语义意图已有后端结果（含清空成功），失败/被取代不能开放布局入口。 */
+  const semanticLayoutReady = ref(false)
   const searchError = ref<string | null>(null)
   const previousGroupBy = ref<'date' | 'folder' | 'none'>('date')
 
@@ -180,15 +182,19 @@ export const useAiStore = defineStore('ai', () => {
   function clearSemanticSearch({ skipWhenIdle = false } = {}) {
     const semanticInPlay =
       isSearching.value || semanticQuery.value !== '' || matchCount.value > 0
-    searchToken++
+    const token = ++searchToken
     semanticQuery.value = ''
     matchCount.value = 0
     isSearching.value = false
     searchError.value = null
     if (skipWhenIdle && !semanticInPlay) return
-    void invokeIpc(IPC.CLEAR_SEMANTIC_SEARCH).catch((e) => {
-      logger.error('[AI] Clear semantic search error | 清空语义搜索错误', { error: e })
-    })
+    useMediaStore().invalidateViewOrder()
+    semanticLayoutReady.value = false
+    void invokeIpc(IPC.CLEAR_SEMANTIC_SEARCH)
+      .then(() => { if (token === searchToken) semanticLayoutReady.value = true })
+      .catch((e) => {
+        logger.error('[AI] Clear semantic search error | 清空语义搜索错误', { error: e })
+      })
     useMediaStore().invalidateLayout()
   }
 
@@ -207,6 +213,8 @@ export const useAiStore = defineStore('ai', () => {
     }
 
     isSearching.value = true
+    useMediaStore().invalidateViewOrder()
+    semanticLayoutReady.value = false
     searchError.value = null
     semanticQuery.value = query
 
@@ -231,6 +239,7 @@ export const useAiStore = defineStore('ai', () => {
       // 不刷新布局——旧查询的排名不该盖到新视图上(P1-3)。
       if (count === null) return
       matchCount.value = count
+      semanticLayoutReady.value = true
       // 结果已存于 DB 的 ai_search_results 表，这里只需 invalidate layout 让 MediaGrid 重载。
       useMediaStore().invalidateLayout()
     } catch (e) {
@@ -346,6 +355,7 @@ export const useAiStore = defineStore('ai', () => {
     semanticQuery,
     similarityThreshold,
     isSearching,
+    semanticLayoutReady,
     searchError,
     matchCount,
     // computed

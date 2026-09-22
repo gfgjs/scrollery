@@ -283,16 +283,16 @@ pub async fn semantic_search_cmd(
             .pop()
             .ok_or_else(|| AppError::Internal("EncodeText 返回空向量集".into()))?;
 
-        // 装载源:读池全量嵌入行(维度过滤与打包在控制面内的 EmbeddingCache::pack)。
+        // 装载源:在此阻塞线程从读池逐行打包，不物化原始 BLOB 全集。
         let outcome = crate::ai::search_control::run_search(
             &state.ai_search,
             &ticket,
             &query_vec,
             top_k,
             dim,
-            || {
+            |model, dim| {
                 let conn = state.db_read_pool.get().map_err(AppError::from)?;
-                crate::db::queries::get_all_embeddings(&conn, ticket.model())
+                crate::ai::search::EmbeddingCache::load(&conn, model, dim)
             },
             |scored| {
                 // 提交闸门内的落库:检验「仍是最新请求」与整表事务同临界区(无 TOCTOU)。
@@ -991,7 +991,13 @@ mod p1_3_teardown_tests {
         let search = SearchControl::new();
         let warm = search.begin_request("m1");
         search
-            .snapshot_for(&warm, 2, || Ok(vec![(1, blob.clone())]))
+            .snapshot_for(&warm, 2, |model, dim| {
+                Ok(crate::ai::search::EmbeddingCache::pack(
+                    model,
+                    dim,
+                    vec![(1, blob.clone())],
+                ))
+            })
             .unwrap();
         assert!(search.resident_identity().is_some(), "前置:快照已常驻");
         (writer, search, warm.seq() as i64)
@@ -1008,7 +1014,13 @@ mod p1_3_teardown_tests {
         let in_flight = search.begin_request("m1");
         let in_flight_id = in_flight.id().clone();
         search
-            .snapshot_for(&in_flight, 2, || Ok(Vec::new()))
+            .snapshot_for(&in_flight, 2, |model, dim| {
+                Ok(crate::ai::search::EmbeddingCache::pack(
+                    model,
+                    dim,
+                    Vec::new(),
+                ))
+            })
             .unwrap();
 
         // 注入失败:UPDATE media_items 触发 ABORT(模拟后续批失败)。

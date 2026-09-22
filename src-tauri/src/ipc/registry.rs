@@ -100,9 +100,11 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::export_commands::start_export,
         ipc::export_commands::export_status,
         ipc::export_commands::stop_export,
+        ipc::official_commands::get_official_entitlement,
+        ipc::official_commands::list_feature_offerings,
+        ipc::official_commands::activate_official_license,
+        ipc::official_commands::deactivate_official_license,
         // 图片简单编辑（方案 C §6）
-        ipc::edit_commands::get_editing_entitlement,
-        ipc::edit_commands::activate_editing_feature,
         ipc::edit_commands::get_edit_preview,
         ipc::edit_commands::save_edited_image,
         // 查看器渲染色域(B 线,方案 §0①④)
@@ -123,8 +125,6 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::exotic_commands::list_exotic_task_details,
         ipc::exotic_commands::retry_exotic_plugin_failures,
         // exotic 激活 / 移除授权命令（Part3 §6.6）
-        ipc::exotic_commands::activate_exotic_plugin,
-        ipc::exotic_commands::deactivate_exotic_plugin,
         // exotic 安装 / 卸载 / 修复 / 回滚 / Registry 命令（Part3 §6.4-6.6）
         ipc::exotic_commands::fetch_exotic_registry,
         ipc::exotic_commands::list_exotic_registry,

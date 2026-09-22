@@ -14,8 +14,8 @@ use crate::db::queries::{
 use crate::dedup::hash::DEDUP_HASH_VERSION;
 use crate::error::{AppError, Result};
 use crate::layout::cache::{
-    dedup_summary, get_rows_by_y, get_summary, get_view_ids as cache_view_ids,
-    store_layout_with_lens, LayoutCache, LayoutSummary,
+    dedup_summary, get_rows_by_y, get_view_ids as cache_view_ids, prepare_layout, LayoutCache,
+    LayoutSummary,
 };
 use crate::layout::geometry::{median_measured_aspect, HydratedRow, LayoutParams, LayoutRow};
 use crate::layout::grid_pack::compute_grid_layout;
@@ -42,7 +42,6 @@ pub struct ComputeLayoutParams {
     pub group_by: Option<String>,
     pub sort_within_group: Option<String>,
     pub sort_order: Option<String>,
-    pub include_meta: Option<bool>,
     /// 布局模式：None / "justified" = 等高行（默认），"grid" = 均匀宫格（T20）。
     pub layout_mode: Option<String>,
     /// 无缝分组(#1):true 时排序仍按 group_by 聚合,打包按 none 语义(无分隔符、行跨组)。
@@ -56,8 +55,7 @@ pub struct ComputeLayoutParams {
     pub duplicate_lens: Option<DuplicateLensDescriptor>,
 }
 
-/// 普通画廊布局键（S3.1 幂等指纹）。**wire 形状表征锁**（`gen_key_gallery_is_unchanged`
-/// 测试）：重复镜头改造不得触碰普通路径键格式——污染会摧毁普通画廊缓存命中。
+/// 普通画廊的几何输入指纹。元数据展示偏好不参与排版，不能令布局换代。
 #[allow(clippy::too_many_arguments)]
 fn build_gallery_gen_key(
     filter_key: &str,
@@ -68,12 +66,11 @@ fn build_gallery_gen_key(
     target_row_height: f64,
     gap: f64,
     layout_mode: Option<&str>,
-    include_meta: bool,
     seamless: bool,
     dv: u64,
 ) -> String {
     format!(
-        "{}|{}|{}|{}|w{:.2}|h{:.2}|g{:.2}|m{}|meta{}|sl{}|dv{}",
+        "{}|{}|{}|{}|w{:.2}|h{:.2}|g{:.2}|m{}|sl{}|dv{}",
         filter_key,
         group_by,
         sort_within,
@@ -82,7 +79,6 @@ fn build_gallery_gen_key(
         target_row_height,
         gap,
         layout_mode.unwrap_or("justified"),
-        include_meta,
         seamless,
         dv
     )
@@ -102,13 +98,26 @@ fn build_lens_gen_key(
     container_width: f64,
     target_row_height: f64,
     gap: f64,
-    include_meta: bool,
 ) -> String {
     format!(
-        "lens:{mode}|u{show_unique_items}|ov{ordering_version}|ep{dedup_view_epoch}|dv{dv}|hv{}|m{}|w{container_width:.2}|h{target_row_height:.2}|g{gap:.2}|meta{include_meta}",
+        "lens:{mode}|u{show_unique_items}|ov{ordering_version}|ep{dedup_view_epoch}|dv{dv}|hv{}|m{}|w{container_width:.2}|h{target_row_height:.2}|g{gap:.2}",
         DEDUP_HASH_VERSION,
         layout_mode.unwrap_or("justified"),
     )
+}
+
+/// 集合代不因尺寸回填变化；额外的几何代避免同参数误复用旧宽高比。
+fn with_geometry_revision(key: &str, geometry_revision: u64) -> String {
+    format!("{key}|gr{geometry_revision}")
+}
+
+/// 几何与它实际使用的尺寸代一起离开工作线程，发布时不能重新采样输入。
+struct ComputedLayout {
+    rows: Vec<LayoutRow>,
+    total_height: f64,
+    lens_projection: Option<Arc<LensProjection>>,
+    geometry_revision: u64,
+    source_items: Arc<items_cache::ItemsCache>,
 }
 
 /// 为给定 items 构建与之平行的 `filename_rank`（**B-file-iii MISS 取数路径**）：**优先全局
@@ -151,16 +160,14 @@ fn resolve_filename_ranks(
 /// 不符则丢弃白算、绝不误填旧数据。竞态双填由 `OnceLock::set` 天然去重（后者返 Err，忽略）。
 fn ensure_filename_rank_for_hit(
     state: &Arc<AppState>,
+    items: &items_cache::ItemsCache,
     filter: &MediaFilter,
     filter_key: &str,
     data_version: u64,
 ) -> Result<()> {
     // 快速判定：当前命中源是否恰是「datetime 基准 + 键匹配 + 缺 rank」——是才付查询。
     let need = {
-        let guard = state
-            .layout_items_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = items.read().unwrap_or_else(|e| e.into_inner());
         matches!(guard.as_ref(), Some(d) if d.reusable
             && matches!(d.order, CachedOrder::Canonical)
             && d.data_version == data_version
@@ -172,10 +179,7 @@ fn ensure_filename_rank_for_hit(
     }
     // ── 优先全局 rank：读锁内直接映射填充（免 DB）。全局覆盖当前 items（默认基集子集）即成。──
     {
-        let guard = state
-            .layout_items_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = items.read().unwrap_or_else(|e| e.into_inner());
         let Some(d) = guard.as_ref() else {
             return Ok(());
         };
@@ -205,10 +209,7 @@ fn ensure_filename_rank_for_hit(
         rank_of.insert(*id, r as u32);
     }
     // 重取读锁，确认仍是同一 datetime 缓存，构建与 items 平行的 rank 数组并经 &self set。
-    let guard = state
-        .layout_items_cache
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
+    let guard = items.read().unwrap_or_else(|e| e.into_inner());
     if let Some(d) = guard.as_ref() {
         if matches!(d.order, CachedOrder::Canonical)
             && d.data_version == data_version
@@ -239,6 +240,7 @@ pub async fn compute_layout(
     let _span = crate::logging::SpanTimer::debug("ipc:compute_layout");
     // 标记为主动交互，使后台视频派生/AI 节流，不饿死这次 CPU 密集的重排（布局被视频派生阻塞）。
     state.note_interaction();
+    let ticket = state.layout_publication.begin();
 
     let filter = {
         let mut f = params.filters.unwrap_or_default();
@@ -305,7 +307,23 @@ pub async fn compute_layout(
     let filter_key_probe = serde_json::to_string(&filter)
         .map_err(|e| AppError::internal("数据序列化失败 | serialization failed", e))?;
     let dv_probe = state.data_version();
-    // 布局键分流（§12.3）：镜头键含 dedup_view_epoch/契约版本；普通键格式不变（表征锁测试）。
+    let dedup_epoch = state.dedup_view_epoch();
+    let search_source = (filter.ai_search == Some(true)).then(|| state.ai_search.committed());
+    // 顺序身份排除宽度/行高/模式/分隔符等几何参数；镜头集合仍受独有项与分析代约束。
+    let order_key = if let Some(lens) = duplicate_lens {
+        format!(
+            "lens:{:?}|u{}|ov{}|ep{}|dv{}|hv{}",
+            lens.mode,
+            lens.show_unique_items,
+            lens.ordering_version,
+            dedup_epoch,
+            dv_probe,
+            DEDUP_HASH_VERSION
+        )
+    } else {
+        format!("gallery:{filter_key_probe}|{group_by}|{sort_within}|{sort_order}|dv{dv_probe}")
+    };
+    // 布局键分流：镜头键含 dedup_view_epoch/契约版本；尺寸 revision 随实际快照追加。
     let gen_key = if let Some(lens) = &params.duplicate_lens {
         build_lens_gen_key(
             if lens.mode == DuplicateLensMode::Groups {
@@ -315,13 +333,12 @@ pub async fn compute_layout(
             },
             lens.show_unique_items,
             lens.ordering_version,
-            state.dedup_view_epoch(),
+            dedup_epoch,
             dv_probe,
             layout_mode.as_deref(),
             container_width,
             target_row_height,
             gap,
-            params.include_meta.unwrap_or(false),
         )
     } else {
         build_gallery_gen_key(
@@ -333,49 +350,52 @@ pub async fn compute_layout(
             target_row_height,
             gap,
             layout_mode.as_deref(),
-            params.include_meta.unwrap_or(false),
             seamless,
             dv_probe,
         )
     };
-    // 镜头路径在 spawn_blocking 内独立管线（取 dedup 成员 + 全库 canonical 快照）；
-    // 普通路径保持既有 HIT/MISS 管线不动。镜头的幂等复用只看布局键（同键 = 同
-    // mode/epoch/dv/几何 → 布局必然逐项相同）。
-    if params.duplicate_lens.is_some() {
-        if let Some(summary) = dedup_summary(&state.layout_cache, &gen_key) {
-            tracing::info!(
-                "compute_layout LENS DEDUP: v{} unchanged | 同镜头键——复用现行布局(免重排免换代)",
-                summary.layout_version
-            );
-            return Ok(summary);
-        }
-    } else if filter.ai_search != Some(true)
-        && items_cache::is_hit_valid(
-            &state.layout_items_cache,
-            &filter_key_probe,
-            dv_probe,
-            &group_by,
-            &sort_within,
-            &sort_order,
-        )
-    {
-        if let Some(summary) = dedup_summary(&state.layout_cache, &gen_key) {
-            tracing::info!(
-                "compute_layout DEDUP: v{} unchanged, {} rows | 同参数同数据代——复用现行布局(免重排免换代)",
-                summary.layout_version,
-                summary.total_rows
-            );
-            return Ok(summary);
-        }
+    let snapshot = state.layout_items();
+    let geometry_revision = snapshot
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |data| data.geometry_revision);
+    let reusable = duplicate_lens.is_some()
+        || (filter.ai_search != Some(true)
+            && items_cache::is_hit_valid(
+                &snapshot,
+                &filter_key_probe,
+                dv_probe,
+                &group_by,
+                &sort_within,
+                &sort_order,
+            ));
+    let existing = state
+        .layout_publication
+        .publish(ticket, || {
+            if reusable {
+                dedup_summary(
+                    &state.layout_cache,
+                    &with_geometry_revision(&gen_key, geometry_revision),
+                )
+            } else {
+                None
+            }
+        })
+        .ok_or(AppError::LayoutNotReady)?;
+    if let Some(summary) = existing {
+        tracing::info!(
+            version = summary.layout_version,
+            "compute_layout DEDUP | 同输入复用布局"
+        );
+        return Ok(summary);
     }
 
-    let (rows, total_height, lens_projection): (
-        Vec<LayoutRow>,
-        f64,
-        Option<Arc<LensProjection>>,
-    ) = tokio::task::spawn_blocking(
-        move || -> Result<(Vec<LayoutRow>, f64, Option<Arc<LensProjection>>)> {
+    let ComputedLayout { rows, total_height, lens_projection, geometry_revision, source_items } = tokio::task::spawn_blocking(
+        move || -> Result<ComputedLayout> {
             let t0 = std::time::Instant::now();
+            state_arc.layout_publication.publish(ticket, || ()).ok_or(AppError::LayoutNotReady)?;
+            let source_items = snapshot;
             let layout_params = LayoutParams {
                 container_width,
                 target_row_height,
@@ -388,10 +408,10 @@ pub async fn compute_layout(
             //    canonical 快照 → groups 组切片 / folders 关联簇 → 镜头打包。
             //    普通 HIT/MISS 分支完全不参与。
             if let Some(lens) = duplicate_lens {
-                let dv = state_arc.data_version();
-                let (rows, total_height, projection) = match lens.mode {
+                let dv = dv_probe;
+                return match lens.mode {
                     DuplicateLensMode::Groups => {
-                        compute_lens_blocking(&state_arc, &layout_params, layout_mode.as_deref(), dv)?
+                        compute_lens_blocking(&state_arc, &layout_params, layout_mode.as_deref(), dv)
                     }
                     DuplicateLensMode::Folders => compute_lens_folder_blocking(
                         &state_arc,
@@ -399,9 +419,8 @@ pub async fn compute_layout(
                         layout_mode.as_deref(),
                         dv,
                         lens.show_unique_items,
-                    )?,
+                    ),
                 };
-                return Ok((rows, total_height, Some(projection)));
             }
             // ai 搜索视图不可复用（S1/S3）：ai_search_results 随每次搜索整表重写，命中
             // 徒增失效面——每次全量重查；但快照仍驻留（reusable=false）作出口拼装的载荷源。
@@ -416,7 +435,7 @@ pub async fn compute_layout(
                 && (group_by == "none" || group_by == "folder" || group_by == "date");
             // 去重预检已序列化过一次，闭包直接接管该键（同一 filter，键必同一）。
             let filter_key = filter_key_probe;
-            let dv = state_arc.data_version();
+            let dv = dv_probe;
 
             // ── ①⁻ 双键统一缓存的惰性 filename_rank 预填：驻留命中源是 datetime 基准而请求 filename
             //    序时，先在 items 读锁外补一次 id-only NATURAL_CMP 查询得全局位次，映射回缓存建
@@ -424,7 +443,7 @@ pub async fn compute_layout(
             //    best-effort：查询失败仅记日志、不中断——filename_rank 仍缺 → order_ok 退化 MISS 一次。
             if cacheable && is_filename_derivable {
                 if let Err(e) =
-                    ensure_filename_rank_for_hit(&state_arc, &filter, &filter_key, dv)
+                    ensure_filename_rank_for_hit(&state_arc, &source_items, &filter, &filter_key, dv)
                 {
                     tracing::warn!(
                         "filename_rank 惰性预填失败(退化本次 MISS 全量重查): {}",
@@ -436,7 +455,7 @@ pub async fn compute_layout(
             // ── ① 命中：免 SQL —— items 读锁内派生序 + 布局（S1 锁纪律：items 读锁与
             //    layout_cache 写锁绝不重叠，store_layout 在本闭包返回后才执行）────────────
             if cacheable {
-                let guard = state_arc.layout_items_cache.read().unwrap_or_else(|e| e.into_inner());
+                let guard = source_items.read().unwrap_or_else(|e| e.into_inner());
                 if let Some(data) = guard.as_ref() {
                     // 命中判据须与 items_cache::is_hit_valid 逐字同判(S3.1 去重预检镜像本处)：
                     // 轴可派生性共用 can_derive_axis;唯一实现差异是 datetime 基准派 filename 需
@@ -463,6 +482,7 @@ pub async fn compute_layout(
                         && data.data_version == dv
                         && data.filter_key == filter_key
                     {
+                        let derive_started = std::time::Instant::now();
                         let ordered: Vec<&LayoutItem> = match data.order {
                             // 双键统一:任一基准都内存派生请求轴/方向;派生内部按请求轴取次键。
                             CachedOrder::Canonical | CachedOrder::CanonicalFilename => {
@@ -470,7 +490,8 @@ pub async fn compute_layout(
                             }
                             CachedOrder::Sql { .. } => data.items.iter().collect(),
                         };
-                        let t_derive = t0.elapsed();
+                        let derive_ms = derive_started.elapsed().as_secs_f64() * 1000.0;
+                        let layout_started = std::time::Instant::now();
                         // S3.5：中位数缓存于快照（OnceLock,首次现算后驻留）。
                         let aspect = *data
                             .median_aspect
@@ -486,12 +507,12 @@ pub async fn compute_layout(
                             "compute_layout HIT: {} items, {} rows; derive {:.0}ms + layout {:.0}ms (axis={}/{}) | 取数缓存命中(免 SQL)",
                             data.items.len(),
                             rows.len(),
-                            t_derive.as_secs_f64() * 1000.0,
-                            (t0.elapsed() - t_derive).as_secs_f64() * 1000.0,
+                            derive_ms,
+                            layout_started.elapsed().as_secs_f64() * 1000.0,
                             group_by,
                             sort_order
                         );
-                        return Ok((rows, total_height, None));
+                        return Ok(ComputedLayout { rows, total_height, lens_projection: None, geometry_revision: data.geometry_revision, source_items: source_items.clone() });
                     }
                 }
             }
@@ -499,11 +520,11 @@ pub async fn compute_layout(
             // ── ② miss：查询（datetime 家族走基准序免 JOIN 查询）→ 布局 → 回填缓存 ──────
             // 读连接仅在查询期间持有，CPU 密集的布局计算前即释放 —— 否则会把 4 个池连接之一
             // 钉住整个计算，拖慢滚动时并发的可视区读取。
-            let (items, dir_labels, sql_ms, filename_ranks) = {
+            let (items, dir_labels, source_query_ms, pool_ms, rank_ms, labels_ms, filename_ranks) = {
+                let pool_started = std::time::Instant::now();
                 let pool = state_arc.db_read_pool.get().map_err(AppError::from)?;
-                // 布局排序 SQL 本体的独立计时点位：与随后的 query_dir_labels(10^3 级小查询)分离，
-                // 单独量化「取数 + ORDER BY 排序」耗时。B-file-iii 后 filename 亦走 canonical 取数
-                // （datetime 基准、无 collation FFI），仅 folder+similarity(ai) 仍下发 SQL 目录序排序。
+                let pool_ms = pool_started.elapsed().as_secs_f64() * 1000.0;
+                // 来源查询包含 canonical 内存补序；该函数内另记录 SQL 与补序计时。
                 let t_sql = std::time::Instant::now();
                 // **取数一律 canonical**（datetime 基准，无 collation FFI，走 idx_media_sort）——filename
                 // 序由内存 filename_rank 派生（B-file-iii）：把 filename MISS 从全表 NATURAL_CMP filesort
@@ -521,7 +542,8 @@ pub async fn compute_layout(
                         false,
                     )?
                 };
-                let sql_ms = t_sql.elapsed();
+                let source_query_ms = t_sql.elapsed().as_secs_f64() * 1000.0;
+                let rank_started = std::time::Instant::now();
                 // filename 请求 → 预建与 items 平行的 filename_rank（优先全局免 DB；兜底 per-filter
                 // id-only 查询 + 触发后台全局构建）。datetime 请求留空，切 filename 时经 ①⁻ ensure 补。
                 let filename_ranks = if cacheable && is_filename_derivable {
@@ -531,8 +553,11 @@ pub async fn compute_layout(
                 };
                 // 目录标签映射恒取（量级 10^3 的小查询）：缓存驻留后可直接服务后续
                 // folder 轴的内存派生，无需再碰 DB。
+                let rank_ms = rank_started.elapsed().as_secs_f64() * 1000.0;
+                let labels_started = std::time::Instant::now();
                 let dir_labels = query_dir_labels(&pool)?;
-                (items, dir_labels, sql_ms, filename_ranks)
+                let labels_ms = labels_started.elapsed().as_secs_f64() * 1000.0;
+                (items, dir_labels, source_query_ms, pool_ms, rank_ms, labels_ms, filename_ranks)
             };
             let t_query = t0.elapsed();
 
@@ -564,6 +589,7 @@ pub async fn compute_layout(
                 dir_labels,
                 filter: filter.clone(),
                 reusable: cacheable,
+                geometry_revision: 0,
                 median_aspect: std::sync::OnceLock::new(),
                 perm_memo: std::sync::Mutex::new(None),
                 filename_rank,
@@ -588,71 +614,72 @@ pub async fn compute_layout(
             let item_count = data.items.len();
             // S3：无条件驻留（含 ai_search）——快照同时是布局行的载荷源（出口拼装），
             // 不可复用视图（reusable=false）只是不参与命中，仍服务 get_*_rows 取载荷。
-            items_cache::store_items(&state_arc.layout_items_cache, data);
+            let source_items = Arc::new(std::sync::RwLock::new(Some(data)));
             tracing::info!(
-                "compute_layout MISS: {} items, {} rows; sql {:.0}ms + dirlabels {:.0}ms = query {:.0}ms, total {:.0}ms (axis={}/{}) | 取数缓存未命中(重查)",
-                item_count,
-                rows.len(),
-                sql_ms.as_secs_f64() * 1000.0,
-                // 余量 = query_dir_labels + 读池连接获取(t_sql 之前);folder-sort SQL 本体已单列。
-                (t_query - sql_ms).as_secs_f64() * 1000.0,
-                t_query.as_secs_f64() * 1000.0,
-                t0.elapsed().as_secs_f64() * 1000.0,
-                group_by,
-                sort_within
+                items = item_count, rows = rows.len(), source_query_ms, pool_ms, rank_ms, labels_ms,
+                query_total_ms = t_query.as_secs_f64() * 1000.0,
+                total_ms = t0.elapsed().as_secs_f64() * 1000.0,
+                group_by, sort_within, "compute_layout MISS | 取数缓存未命中(重查)"
             );
-            Ok((rows, total_height, None))
+            Ok(ComputedLayout { rows, total_height, lens_projection: None, geometry_revision: 0, source_items })
         })
         .await
         .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
 
-    // S3 布局换代计时（S3.2 后=索引物化+指针交换；旧代 drop 已卸后台线程）。1M 级索引
-    // 物化是 CPU 工作,同样不占 tokio worker——挪进 spawn_blocking(锁纪律不变:此处
-    // 不持任何 items 锁,layout 写锁在 store_layout 内短窗取放)。
-    let t_store = std::time::Instant::now();
     let state_store = state.inner().clone();
-    let version = tokio::task::spawn_blocking(move || {
-        store_layout_with_lens(
+    tokio::task::spawn_blocking(move || {
+        state_store
+            .layout_publication
+            .publish(ticket, || ())
+            .ok_or(AppError::LayoutNotReady)?;
+        let t_store = std::time::Instant::now();
+        let prepared = prepare_layout(
             &state_store.layout_cache,
             rows,
             total_height,
-            gen_key,
+            with_geometry_revision(&gen_key, geometry_revision),
             lens_projection,
-        )
+            Some(source_items.clone()),
+            order_key,
+        );
+        let publish = || {
+            state_store.layout_publication.install(
+                ticket,
+                &state_store.layout_cache,
+                &state_store.layout_items_cache,
+                prepared,
+            )
+        };
+        let committed = if let Some(expected) = search_source {
+            state_store
+                .ai_search
+                .with_committed(&expected, publish)
+                .flatten()
+        } else {
+            publish()
+        };
+        let summary = committed.ok_or(AppError::LayoutNotReady)?;
+        tracing::info!(
+            version = summary.layout_version,
+            elapsed_ms = t_store.elapsed().as_millis(),
+            "store_layout | 索引物化与发布完成"
+        );
+        Ok(summary)
     })
     .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
-    tracing::info!(
-        "store_layout: v{} in {:.0}ms | 布局换代(索引物化;旧代已后台释放)",
-        version,
-        t_store.elapsed().as_secs_f64() * 1000.0
-    );
-
-    // 单次读锁取摘要（此前是三次独立的 get_summary 调用）。
-    Ok(get_summary(&state.layout_cache).unwrap_or(LayoutSummary {
-        total_rows: 0,
-        total_height,
-        layout_version: version,
-        total_items: 0,
-        separators: vec![],
-        month_buckets: vec![],
-    }))
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// 镜头布局阻塞管线（2026-09-02 方案 §12.1，spawn_blocking 内调用）：
 /// dedup 有效成员 → 全库 canonical items 快照 → 组切片组装 + 镜头打包。
 ///
-/// 锁纪律与单槽竞态：items 读锁内组装/布局（与普通 HIT 分支同型——布局可在读锁内，
-/// `store_layout_with_lens` 的 layout 写锁在锁释放后才取）；ensure 后的「命中判据 +
-/// 组装」必须在**同一次读锁**内完成，否则并发视图的 `store_items` 可在窗口内覆盖单槽，
-/// 组装会基于错误快照。故采用两轮结构：读锁 MISS → 全库重查填充 → 重读（刚写入几乎
-/// 必然命中）；两轮后仍不命中（极端并发持续覆盖）→ `LayoutNotReady`，前端重算自愈。
+/// 候选持有自己的 canonical 快照句柄，计算期间不替换当前槽，也无需重试抢占。
 fn compute_lens_blocking(
     state: &Arc<AppState>,
     params: &LayoutParams,
     layout_mode: Option<&str>,
     dv: u64,
-) -> Result<(Vec<LayoutRow>, f64, Arc<LensProjection>)> {
+) -> Result<ComputedLayout> {
     let t0 = std::time::Instant::now();
     // ① dedup 有效成员（读池连接仅在此持有；成员集 = 重复位置数，通常远小于全库）。
     let members = {
@@ -663,61 +690,44 @@ fn compute_lens_blocking(
     let empty_key = serde_json::to_string(&MediaFilter::default())
         .map_err(|e| AppError::internal("数据序列化失败 | serialization failed", e))?;
 
-    // ② 命中判据 + 组装 + 布局，同一次读锁内完成（见函数注释）。
-    let mut filled = false;
-    loop {
-        {
-            let guard = state
-                .layout_items_cache
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let hit = guard.as_ref().is_some_and(|d| {
-                d.reusable
-                    && matches!(d.order, CachedOrder::Canonical)
-                    && d.data_version == dv
-                    && d.filter_key == empty_key
-            });
-            if hit {
-                let data = guard.as_ref().expect("hit 判定后必有快照");
-                let slices = assemble_lens_groups(&members, &data.items, &data.id_to_idx);
-                let projection = Arc::new(build_lens_projection(&slices));
-                let aspect = *data
-                    .median_aspect
-                    .get_or_init(|| median_measured_aspect(&data.items));
-                let (rows, total_height) = if layout_mode == Some("grid") {
-                    compute_lens_layout_grid(&slices, params)
-                } else {
-                    compute_lens_layout_justified(&slices, params, Some(aspect))
-                };
-                tracing::info!(
-                    "compute_layout LENS: {} groups, {} members; members {:.0}ms, total {:.0}ms",
-                    slices.len(),
-                    projection.len(),
-                    t_members.as_secs_f64() * 1000.0,
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-                return Ok((rows, total_height, projection));
-            }
-        }
-        if filled {
-            // 填充后仍被并发覆盖（持续 thrash）→ 让前端重算自愈，不空转。
-            return Err(AppError::LayoutNotReady);
-        }
-        ensure_canonical_items(state, dv, &empty_key)?;
-        filled = true;
-    }
+    let source_items = ensure_canonical_items(state, dv, &empty_key)?;
+    let guard = source_items.read().unwrap_or_else(|e| e.into_inner());
+    let data = guard.as_ref().ok_or(AppError::LayoutNotReady)?;
+    let slices = assemble_lens_groups(&members, &data.items, &data.id_to_idx);
+    let projection = Arc::new(build_lens_projection(&slices));
+    let aspect = *data
+        .median_aspect
+        .get_or_init(|| median_measured_aspect(&data.items));
+    let (rows, total_height) = if layout_mode == Some("grid") {
+        compute_lens_layout_grid(&slices, params)
+    } else {
+        compute_lens_layout_justified(&slices, params, Some(aspect))
+    };
+    tracing::info!(
+        "compute_layout LENS: {} groups, {} members; members {:.0}ms, total {:.0}ms",
+        slices.len(),
+        projection.len(),
+        t_members.as_secs_f64() * 1000.0,
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(ComputedLayout {
+        rows,
+        total_height,
+        lens_projection: Some(projection),
+        geometry_revision: data.geometry_revision,
+        source_items: source_items.clone(),
+    })
 }
 
 /// folders 镜头阻塞管线（2026-09-02 方案 §7/§12.1，P3）：三桶行 → 关联簇组装 →
-/// 文件夹头 + 目录内打包。锁纪律/单槽竞态处理与 [`compute_lens_blocking`] 完全同型
-///（两轮：读锁命中 → 全库重查填充 → 重读）。
+/// 文件夹头 + 目录内打包，与 groups 镜头共用私有候选/命中快照语义。
 fn compute_lens_folder_blocking(
     state: &Arc<AppState>,
     params: &LayoutParams,
     layout_mode: Option<&str>,
     dv: u64,
     show_unique_items: bool,
-) -> Result<(Vec<LayoutRow>, f64, Arc<LensProjection>)> {
+) -> Result<ComputedLayout> {
     let t0 = std::time::Instant::now();
     // ① 三桶行（读池连接仅在此持有；行域 = 纳入文件夹内的全部可见项）。
     let folder_rows = {
@@ -728,80 +738,61 @@ fn compute_lens_folder_blocking(
     let empty_key = serde_json::to_string(&MediaFilter::default())
         .map_err(|e| AppError::internal("数据序列化失败 | serialization failed", e))?;
 
-    let mut filled = false;
-    loop {
-        {
-            let guard = state
-                .layout_items_cache
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let hit = guard.as_ref().is_some_and(|d| {
-                d.reusable
-                    && matches!(d.order, CachedOrder::Canonical)
-                    && d.data_version == dv
-                    && d.filter_key == empty_key
-            });
-            if hit {
-                let data = guard.as_ref().expect("hit 判定后必有快照");
-                // 文件夹头显示路径：DirLabel.display（与 folder 轴组头同一来源）。
-                let dir_display: std::collections::HashMap<i64, String> = data
-                    .dir_labels
-                    .iter()
-                    .map(|(id, dl)| (*id, dl.display.clone()))
-                    .collect();
-                let assembly: LensFolderAssembly = assemble_lens_folder_clusters(
-                    &folder_rows,
-                    &data.items,
-                    &data.id_to_idx,
-                    &dir_display,
-                );
-                let aspect = *data
-                    .median_aspect
-                    .get_or_init(|| median_measured_aspect(&data.items));
-                let (rows, total_height, projection) = compute_lens_folder_layout(
-                    &assembly,
-                    show_unique_items,
-                    params,
-                    Some(aspect),
-                    layout_mode == Some("grid"),
-                );
-                let folder_count: usize = assembly.clusters.iter().map(|c| c.folders.len()).sum();
-                tracing::info!(
-                    "compute_layout LENS FOLDERS: {} clusters, {} folders, {} rows projected; rows {:.0}ms, total {:.0}ms",
-                    assembly.clusters.len(),
-                    folder_count,
-                    projection.len(),
-                    t_members.as_secs_f64() * 1000.0,
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-                return Ok((rows, total_height, Arc::new(projection)));
-            }
-        }
-        if filled {
-            return Err(AppError::LayoutNotReady);
-        }
-        ensure_canonical_items(state, dv, &empty_key)?;
-        filled = true;
-    }
+    let source_items = ensure_canonical_items(state, dv, &empty_key)?;
+    let guard = source_items.read().unwrap_or_else(|e| e.into_inner());
+    let data = guard.as_ref().ok_or(AppError::LayoutNotReady)?;
+    // 文件夹头显示路径：DirLabel.display（与 folder 轴组头同一来源）。
+    let dir_display: std::collections::HashMap<i64, String> = data
+        .dir_labels
+        .iter()
+        .map(|(id, dl)| (*id, dl.display.clone()))
+        .collect();
+    let assembly: LensFolderAssembly =
+        assemble_lens_folder_clusters(&folder_rows, &data.items, &data.id_to_idx, &dir_display);
+    let aspect = *data
+        .median_aspect
+        .get_or_init(|| median_measured_aspect(&data.items));
+    let (rows, total_height, projection) = compute_lens_folder_layout(
+        &assembly,
+        show_unique_items,
+        params,
+        Some(aspect),
+        layout_mode == Some("grid"),
+    );
+    let folder_count: usize = assembly.clusters.iter().map(|c| c.folders.len()).sum();
+    tracing::info!(
+        "compute_layout LENS FOLDERS: {} clusters, {} folders, {} rows projected; rows {:.0}ms, total {:.0}ms",
+        assembly.clusters.len(),
+        folder_count,
+        projection.len(),
+        t_members.as_secs_f64() * 1000.0,
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(ComputedLayout {
+        rows,
+        total_height,
+        lens_projection: Some(Arc::new(projection)),
+        geometry_revision: data.geometry_revision,
+        source_items: source_items.clone(),
+    })
 }
 
-/// 确保 items 单槽持有**全库 canonical** 快照（方案 §12.1：镜头成员 ⊆ 全库，出口
-/// hydrate 亦从该快照取载荷；与普通全库视图共用同一单槽）。MISS 时重查填充。
-/// 只在 `compute_lens_blocking` 的重试循环里调用；调用方随后在同一次读锁内复检。
-fn ensure_canonical_items(state: &Arc<AppState>, dv: u64, empty_key: &str) -> Result<()> {
-    // 双重检查：进入查询前再读一次（尽量免 SQL）。
+/// 获取全库 canonical 快照；MISS 返回私有候选，只在布局成功发布时替换当前槽。
+fn ensure_canonical_items(
+    state: &Arc<AppState>,
+    dv: u64,
+    empty_key: &str,
+) -> Result<Arc<items_cache::ItemsCache>> {
+    let source_items = state.layout_items();
     {
-        let guard = state
-            .layout_items_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = source_items.read().unwrap_or_else(|e| e.into_inner());
         if guard.as_ref().is_some_and(|d| {
             d.reusable
                 && matches!(d.order, CachedOrder::Canonical)
                 && d.data_version == dv
                 && d.filter_key == empty_key
         }) {
-            return Ok(());
+            return Ok(source_items.clone());
         }
     }
     let (items, dir_labels) = {
@@ -826,12 +817,12 @@ fn ensure_canonical_items(state: &Arc<AppState>, dv: u64, empty_key: &str) -> Re
         dir_labels,
         filter: MediaFilter::default(),
         reusable: true,
+        geometry_revision: 0,
         median_aspect: std::sync::OnceLock::new(),
         perm_memo: std::sync::Mutex::new(None),
         filename_rank: std::sync::OnceLock::new(),
     };
-    items_cache::store_items(&state.layout_items_cache, data);
-    Ok(())
+    Ok(Arc::new(std::sync::RwLock::new(Some(data))))
 }
 
 /// 布局段（纯 CPU）：模式分支 + 总高。入参为引用序 —— S1 命中路径直接引用缓存内 items，
@@ -858,24 +849,26 @@ fn run_layout(
 /// 解锁 Part5 T4「选区脱离 DOM」：Shift-range 跨视口、框选命中判定基于 flat_ids 序号而非可视 DOM；
 /// Ctrl+A 全选亦据此（前端只持「全选标记 + 排除集」，批量写再走 `SelectionDescriptor::SelectAll`）。
 ///
-/// 直接返回缓存内已物化的 `flat_ids`（O(1)，无 DB 往返）。`layout_version` 与当前布局不一致 →
+/// 复制缓存内已物化的 `flat_ids`（O(N)，无 DB 往返）。`order_version` 与当前顺序不一致 →
 /// `ViewStale`（前端重算 layout 重取）；压根无布局 → `LayoutNotReady`。
 #[tauri::command]
-pub async fn get_view_ids(
-    layout_version: Option<u64>,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<i64>> {
-    match cache_view_ids(&state.layout_cache, layout_version) {
-        Some(ids) => Ok(ids),
-        // None 二义：无布局 vs 版本不符。无版本约束再取一次以区分，给前端可分流的错误码。
-        None => {
-            if cache_view_ids(&state.layout_cache, None).is_some() {
-                Err(AppError::ViewStale)
-            } else {
-                Err(AppError::LayoutNotReady)
+pub async fn get_view_ids(order_version: u64, state: State<'_, Arc<AppState>>) -> Result<Vec<i64>> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        match cache_view_ids(&state.layout_cache, Some(order_version)) {
+            Some(ids) => Ok(ids),
+            // 区分无布局与版本不符时只读身份，避免失败路径再次复制全集。
+            None => {
+                if crate::layout::cache::current_order_version(&state.layout_cache).is_some() {
+                    Err(AppError::ViewStale)
+                } else {
+                    Err(AppError::LayoutNotReady)
+                }
             }
         }
-    }
+    })
+    .await
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
 /// 三滚动出口共用的出口拼装(P1-5):载荷读锁内只做纯内存工作,磁盘 IO 全走阻塞线程。
@@ -885,21 +878,37 @@ pub async fn get_view_ids(
 /// ③ 的版本重验是新增 await 的配套:② 把「取几何/镜头 → 拼装」窗口从同步微秒拉到慢盘可达
 /// 数百 ms,期间布局可能换代或被清空——旧几何必须连同旧载荷一起作废(拒绝新载荷配旧几何),
 /// 故 IO 后按 ① 前的版本基线复验,不符即返回既有 [`AppError::LayoutNotReady`] 由前端重算重取。
+struct VisibleSource {
+    items: Arc<items_cache::ItemsCache>,
+    lens: Option<Arc<LensProjection>>,
+    version: u64,
+}
+
+/// 行已按这个版本读取；从同一布局取载荷与投影，换代窗口直接拒绝。
+fn visible_source(cache: &LayoutCache, expected: Option<u64>) -> Result<VisibleSource> {
+    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+    let data = guard.as_ref().ok_or(AppError::LayoutNotReady)?;
+    if Some(data.layout_version) != expected {
+        return Err(AppError::LayoutNotReady);
+    }
+    Ok(VisibleSource {
+        items: data.source_items.clone().ok_or(AppError::LayoutNotReady)?,
+        lens: data.lens_projection.clone(),
+        version: data.layout_version,
+    })
+}
+
 async fn hydrate_visible(
     state: &Arc<AppState>,
     rows: Vec<LayoutRow>,
-    lens: Option<Arc<LensProjection>>,
-    layout_version: Option<u64>,
+    source: VisibleSource,
 ) -> Result<Vec<HydratedRow>> {
-    // 版本基线:调用方给了就用它(取行已按它校验过);未给(旧调用方)则快照当前版本,尽力校。
-    let expected_layout_version =
-        layout_version.or_else(|| current_layout_version(&state.layout_cache));
     let dpr = f64::from(
         state
             .thumb_serve_dpr
             .load(std::sync::atomic::Ordering::Relaxed),
     ) / 1000.0;
-    let requests = items_cache::collect_serve_requests(&state.layout_items_cache, &rows, dpr);
+    let requests = items_cache::collect_serve_requests(&source.items, &rows, dpr);
     let serve = if requests.is_empty() {
         None
     } else {
@@ -915,16 +924,16 @@ async fn hydrate_visible(
     };
     apply_visible_rows(
         &state.layout_cache,
-        &state.layout_items_cache,
+        &source.items,
         rows,
         serve.as_ref(),
-        lens.as_deref(),
-        expected_layout_version,
+        source.lens.as_deref(),
+        Some(source.version),
     )
 }
 
 /// 三段式③(应用,生产唯一拼装出口):IO 结束后先复验布局版本(P1-5),再在载荷读锁内零 IO
-/// 拼装线上行。只有真发生了 IO(窗口被拉长)才复验;零请求批的窗口仍是同步微秒级,保持既有行为。
+/// 拼装线上行；无磁盘请求的批次也复验，不能把同步短窗口当作互斥保证。
 fn apply_visible_rows(
     layout_cache: &LayoutCache,
     items_cache: &items_cache::ItemsCache,
@@ -933,9 +942,7 @@ fn apply_visible_rows(
     lens: Option<&LensProjection>,
     expected_layout_version: Option<u64>,
 ) -> Result<Vec<HydratedRow>> {
-    if serve.is_some() {
-        ensure_layout_unchanged(layout_cache, expected_layout_version)?;
-    }
+    ensure_layout_unchanged(layout_cache, expected_layout_version)?;
     Ok(items_cache::hydrate_rows(items_cache, rows, serve, lens))
 }
 
@@ -969,10 +976,11 @@ pub async fn get_layout_rows_by_y(
     // Scrolling = active interaction → throttle background decode (布局被视频派生阻塞).
     // 滚动 = 主动交互 → 节流后台解码。
     state.note_interaction();
+    let layout_version = layout_version.or_else(|| current_layout_version(&state.layout_cache));
     let rows = get_rows_by_y(&state.layout_cache, top_y, bottom_y, layout_version)
         .ok_or(AppError::LayoutNotReady)?;
-    let lens = crate::layout::cache::get_lens_projection(&state.layout_cache);
-    hydrate_visible(state.inner(), rows, lens, layout_version).await
+    let source = visible_source(&state.layout_cache, layout_version)?;
+    hydrate_visible(state.inner(), rows, source).await
 }
 
 /// 取单个 bucket 段的行:y 落在 [start_y, end_y) 的行——精确归属(半开区间),区别于
@@ -987,23 +995,23 @@ pub async fn get_bucket_rows(
 ) -> Result<Vec<HydratedRow>> {
     // 滚动 = 主动交互 → 节流后台解码。
     state.note_interaction();
+    let layout_version = layout_version.or_else(|| current_layout_version(&state.layout_cache));
     let rows =
         crate::layout::cache::get_bucket_rows(&state.layout_cache, start_y, end_y, layout_version)
             .ok_or(AppError::LayoutNotReady)?;
-    let lens = crate::layout::cache::get_lens_projection(&state.layout_cache);
-    hydrate_visible(state.inner(), rows, lens, layout_version).await
+    let source = visible_source(&state.layout_cache, layout_version)?;
+    hydrate_visible(state.inner(), rows, source).await
 }
 
 /// 查找包含给定项 id 的行的 Y 坐标（用于行高重排后把视口重新锚定到之前浏览的项 — 问题1）。
 #[tauri::command]
 pub async fn get_item_y_by_id(
     item_id: i64,
+    layout_version: u64,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<f64>> {
-    Ok(crate::layout::cache::get_item_y_by_id(
-        &state.layout_cache,
-        item_id,
-    ))
+    crate::layout::cache::get_item_y_by_id(&state.layout_cache, item_id, layout_version)
+        .ok_or(AppError::ViewStale)
 }
 
 /// 点击文件夹（按文件夹分组）时的滚动目标：若该文件夹有直接媒体则用它自己的分隔符，否则用
@@ -1043,11 +1051,11 @@ pub async fn get_subtree_scroll_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::cache::store_layout_with_lens;
 
-    /// 表征锁（2026-09-02 方案 §12.3）：普通画廊布局键格式逐字符不变——镜头改造
-    /// 不得污染普通键，否则既有全量用户缓存一次性全失效。
+    /// 普通键只表达排版输入，尺寸回填必须打破旧几何的幂等命中。
     #[test]
-    fn gen_key_gallery_is_unchanged() {
+    fn gen_key_gallery_tracks_geometry_inputs() {
         let key = build_gallery_gen_key(
             "k",
             "date",
@@ -1058,20 +1066,27 @@ mod tests {
             4.0,
             Some("justified"),
             false,
-            false,
             7,
         );
         assert_eq!(
             key,
-            "k|date|datetime|desc|w1200.00|h100.00|g4.00|mjustified|metafalse|slfalse|dv7"
+            "k|date|datetime|desc|w1200.00|h100.00|g4.00|mjustified|slfalse|dv7"
         );
         // grid 模式与 None layout_mode 的缺省写法。
         assert_eq!(
-            build_gallery_gen_key(
-                "k", "none", "filename", "asc", 800.0, 60.5, 0.0, None, true, true, 1
-            ),
-            "k|none|filename|asc|w800.00|h60.50|g0.00|mjustified|metatrue|sltrue|dv1"
+            build_gallery_gen_key("k", "none", "filename", "asc", 800.0, 60.5, 0.0, None, true, 1),
+            "k|none|filename|asc|w800.00|h60.50|g0.00|mjustified|sltrue|dv1"
         );
+        let cache = crate::layout::cache::new_layout_cache();
+        let version =
+            store_layout_with_lens(&cache, vec![], 0.0, with_geometry_revision(&key, 0), None);
+        assert_eq!(
+            dedup_summary(&cache, &with_geometry_revision(&key, 0))
+                .unwrap()
+                .layout_version,
+            version
+        );
+        assert!(dedup_summary(&cache, &with_geometry_revision(&key, 1)).is_none());
     }
 
     /// 镜头键格式锁：lens 前缀 + mode/独有开关/契约版本/镜头代次/数据代/hash 版本/几何。
@@ -1087,30 +1102,23 @@ mod tests {
             1200.0,
             100.0,
             4.0,
-            false,
         );
         assert_eq!(
             key,
             format!(
-                "lens:groups|ufalse|ov1|ep3|dv7|hv{}|mjustified|w1200.00|h100.00|g4.00|metafalse",
+                "lens:groups|ufalse|ov1|ep3|dv7|hv{}|mjustified|w1200.00|h100.00|g4.00",
                 DEDUP_HASH_VERSION
             )
         );
         // folders + 独有项维度进键。
-        let folders = build_lens_gen_key(
-            "folders",
-            true,
-            1,
-            3,
-            7,
-            Some("grid"),
-            1200.0,
-            100.0,
-            4.0,
-            true,
-        );
+        let folders =
+            build_lens_gen_key("folders", true, 1, 3, 7, Some("grid"), 1200.0, 100.0, 4.0);
         assert!(folders.starts_with("lens:folders|utrue|"));
-        assert!(folders.ends_with("|mgrid|w1200.00|h100.00|g4.00|metatrue"));
+        assert!(folders.ends_with("|mgrid|w1200.00|h100.00|g4.00"));
+        assert_ne!(
+            with_geometry_revision(&key, 0),
+            with_geometry_revision(&key, 1)
+        );
     }
 
     /// **P1-5 边界回归**:受控 IO(门闸)**在途**时换布局 / 清布局——IO 结束后的版本复验必须拒绝,
@@ -1146,7 +1154,7 @@ mod tests {
             height: 45.0,
             items: vec![slot],
         }];
-        let items_cache = new_items_cache();
+        let items_cache = Arc::new(new_items_cache());
         let items = vec![LayoutItem {
             id: 1,
             width: 4000,
@@ -1183,6 +1191,7 @@ mod tests {
                 dir_rank,
                 filter: MediaFilter::default(),
                 reusable: true,
+                geometry_revision: 0,
                 median_aspect: std::sync::OnceLock::new(),
                 perm_memo: std::sync::Mutex::new(None),
                 filename_rank: std::sync::OnceLock::new(),
@@ -1193,8 +1202,22 @@ mod tests {
 
         // 取行版本基线:布局代次 v1。
         let layout_cache = new_layout_cache();
-        let v1 = store_layout_with_lens(&layout_cache, rows.clone(), 45.0, String::new(), None);
+        let v1 = crate::layout::cache::publish_layout(
+            &layout_cache,
+            prepare_layout(
+                &layout_cache,
+                rows.clone(),
+                45.0,
+                String::new(),
+                None,
+                Some(items_cache.clone()),
+                String::new(),
+            ),
+        )
+        .layout_version;
         assert_eq!(current_layout_version(&layout_cache), Some(v1));
+        let captured = visible_source(&layout_cache, Some(v1)).unwrap();
+        assert!(Arc::ptr_eq(&captured.items, &items_cache));
 
         // ② 受控 IO:进入后停在门闸内,测试据此把「换布局」精确放到 IO 在途。
         let gate = Arc::new(Gate::default());
@@ -1219,6 +1242,24 @@ mod tests {
             store_layout_with_lens(&layout_cache, rows.clone(), 45.0, "gen-key-2".into(), None);
         assert_ne!(v1, v2, "换代必须递增版本");
         gate.release();
+        assert!(matches!(
+            visible_source(&layout_cache, Some(v1)),
+            Err(AppError::LayoutNotReady)
+        ));
+        assert!(
+            matches!(
+                apply_visible_rows(
+                    &layout_cache,
+                    &items_cache,
+                    rows.clone(),
+                    None,
+                    None,
+                    Some(v1)
+                ),
+                Err(AppError::LayoutNotReady)
+            ),
+            "无磁盘请求也必须拒绝已过期的几何"
+        );
         let serve = fetch
             .await
             .expect("runtime join")

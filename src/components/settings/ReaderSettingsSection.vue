@@ -3,20 +3,21 @@
        与阅读器内设置面板的分工:字号/排版等「边读边调」项留在书内面板(见 ReaderSettingsPanel);
        此处只放**开书前就想定**的默认阅读主题,且是唯一能同时配日/夜两槽的地方
        (书内面板据当前 app 明暗只改一槽)。二者写同一组 app_config 键(doc_reader_theme_*),非双源。 -->
-  <CollapsibleCard id="reading" class="reader-surface-trial" :title="$t('settings.reading')">
+  <CollapsibleCard id="reading" :title="$t('settings.reading')">
     <!-- 提示与分组行各自补横向 var(--spacing-lg)/纵向 var(--spacing-md) 内边距，
          与上下 SettingRow 节(.settings-card__item)的插入对齐。 -->
     <div class="reader-sec">
       <p class="reader-sec__hint">{{ $t('settings.readerThemeHint') }}</p>
       <div v-for="group in groups" :key="group.kind" class="reader-sec__group">
         <div class="reader-sec__group-label">{{ $t(group.labelKey) }}</div>
-        <div class="reader-sec__grid" :style="{ '--reader-cols': maxCols }">
+        <div class="reader-sec__grid">
           <button
             v-for="opt in group.options"
             :key="opt.id"
             class="reader-card"
             :class="{ selected: pick(group.kind) === opt.id }"
 
+            :aria-pressed="pick(group.kind) === opt.id"
             @click="select(group.kind, opt.id)"
           >
             <!-- 阅读预览:真实正文/背景一对色 + 样张字(reader theme 只有 text/bg 两色) -->
@@ -78,9 +79,6 @@ const groups = computed(() => [
   { kind: 'dark' as const, labelKey: 'settings.readerDarkThemes', options: optionsFor('dark') },
 ])
 
-// 两槽用同一列数(取各组选项数最大值),日/夜行的卡片逐列对齐、铺满整行,不留右侧死白;
-// 未来增删 reader theme 也自动跟随,无需改写死列数。
-const maxCols = computed(() => Math.max(...groups.value.map((g) => g.options.length)))
 
 function pick(kind: 'light' | 'dark'): string {
   return kind === 'light' ? lightPick.value : darkPick.value
@@ -106,15 +104,6 @@ watch(
 </script>
 
 <style scoped>
-/* 阅读主题选项与普通设置行共用页面流，不再叠加独立卡片材质。 */
-.reader-surface-trial {
-  background: transparent;
-  border: 0;
-  border-radius: 0;
-  box-shadow: none;
-  overflow: visible;
-}
-
 /* 提示与主题组共处一个表面；各行自行承担内边距，hover 可覆盖完整行宽。 */
 .reader-sec {
   padding-top: var(--spacing-md);
@@ -122,7 +111,7 @@ watch(
 .reader-sec__hint {
   margin: 0;
   padding: 0 var(--spacing-lg) var(--spacing-md);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
   line-height: 1.5;
 }
@@ -143,9 +132,8 @@ watch(
 }
 .reader-sec__grid {
   display: grid;
-  /* 固定列数 = 各组选项最大值(由 --reader-cols 注入),日/夜行卡片逐列对齐并铺满整行;
-     minmax(0,1fr) 允许列在窄面板下正常收缩,不溢出。 */
-  grid-template-columns: repeat(var(--reader-cols, 4), minmax(0, 1fr));
+  /* 窄内容区自动换行，保留主题名称与预览的可读宽度。 */
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
   gap: var(--spacing-sm);
 }
 .reader-card {
@@ -168,7 +156,7 @@ watch(
 .reader-card.selected {
   border-color: var(--color-accent);
   background: var(--color-accent-subtle);
-  box-shadow: inset 0 0 0 2px var(--color-accent);
+  box-shadow: inset 0 0 0 1px var(--color-accent);
 }
 .reader-card:focus-visible {
   outline: 2px solid var(--color-accent);

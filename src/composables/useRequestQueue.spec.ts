@@ -2,13 +2,15 @@
 // cancel 语义分叉(queued 释放 vs inFlight 保留)、finally 兜底、30s 停滞看门狗、released
 // 幂等、按批 slot 判定、targetSize 阶梯、scanStore 簿记(泄漏观测面);
 // 有界退避重试(2026-08-16 阶段3):停滞/缺结果自动重排收敛、上限终拒、cancel 掐断等待期、
-// 重试挂回在途 slot。
+// 退避期新等待者共享重试 slot。
 // node 环境,fake timers;invoke 返回测试持有的 deferred(生产代码链 .catch().finally());
 // 结果经捕获的 Channel stub 手动 onmessage 注入。魔数出处:flush 防抖 50ms、STALL_MS=30000、
 // THUMB_RETRY_MAX=3、THUMB_RETRY_BASE_MS=500——均未导出,此处按字面量对拍。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { DEFAULTS } from '../constants/defaults'
 import type { ThumbResult } from '../types/media'
+import type { LayoutRowNormal } from '../types/layout'
+import { useCanvasThumbPipeline } from './useCanvasThumbPipeline'
 
 type InvokeCall = { cmd: string; args: { itemIds: number[]; targetSize: number; onResult: ChannelStub } }
 type ChannelStub = { onmessage: (msg: ThumbResult) => void }
@@ -82,6 +84,7 @@ afterEach(() => {
   vi.clearAllTimers()
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('去重 single-flight', () => {
@@ -125,6 +128,67 @@ describe('去重 single-flight', () => {
 })
 
 describe('批容量与串行门', () => {
+  it('Canvas 连续滚过 4000 项：旧排队撤销，当前后端批次完成后直接服务最终视口', async () => {
+    vi.stubGlobal('window', { devicePixelRatio: 1 })
+    const q = useRequestQueue()
+    const pipeline = useCanvasThumbPipeline({
+      cacheDir: () => '/cache',
+      onRequestThumb: (id) => q.request(id).then(() => {}),
+      onCancelThumb: q.cancel,
+      onRegenerateThumb: () => {},
+      scheduleDraw: () => {},
+      viewportW: () => 1000,
+      viewportH: () => 100,
+    })
+    const rows: LayoutRowNormal[] = Array.from({ length: 40 }, (_, row) => ({
+      rowType: 'normal',
+      y: row * 100,
+      height: 100,
+      items: Array.from({ length: 100 }, (_, col) => ({
+        id: row * 100 + col,
+        x: col * 10,
+        w: 10,
+        h: 100,
+        fileSize: 0,
+        fileFormat: 'jpg',
+        mediaType: 'image',
+        isLivePhoto: false,
+        durationMs: null,
+        thumbStatus: 0,
+        thumbPath: null,
+        placeholderColor: null,
+        isFavorited: false,
+        rating: 0,
+        colorLabel: 0,
+        availability: 'online',
+        originalWidth: 10,
+        originalHeight: 100,
+        sortDatetime: 0,
+      })),
+    }))
+    pipeline.prioritizeVisibleThumbLoads(rows, 0, 1)
+    for (const item of rows[0].items) pipeline.getImage(item)
+    await vi.advanceTimersByTimeAsync(50)
+    expect(scanMock.autoThumbInFlight).toBe(24)
+    let peakQueued = scanMock.autoThumbQueueSize
+    for (let row = 1; row < rows.length; row++) {
+      pipeline.prioritizeVisibleThumbLoads(rows, row, row + 1)
+      for (const item of rows[row].items) pipeline.getImage(item)
+      peakQueued = Math.max(peakQueued, scanMock.autoThumbQueueSize)
+    }
+    expect(peakQueued).toBe(48)
+    expect(mockState.calls).toHaveLength(1)
+    for (const id of call(0).args.itemIds) call(0).args.onResult.onmessage(result(id))
+    await vi.advanceTimersByTimeAsync(50)
+    expect(call(1).args.itemIds).toEqual(Array.from({ length: 24 }, (_, i) => 3900 + i))
+    pipeline.dispose()
+    expect(scanMock.autoThumbQueueSize).toBe(0)
+    for (const id of call(1).args.itemIds) call(1).args.onResult.onmessage(result(id))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(scanMock.autoThumbInFlight).toBe(0)
+    expect(mockState.calls).toHaveLength(2)
+  })
+
   it('25 个 id:首批恰好 24 个,第 25 个滞留队列(簿记 1/24)', async () => {
     const q = useRequestQueue()
     for (let i = 1; i <= 25; i++) void q.request(i).catch(() => {})
@@ -213,17 +277,20 @@ describe('结算兜底与看门狗', () => {
   it('invoke 整批失败:3 轮退避重试耗尽后终拒(消息不变),无未捕获异常', async () => {
     const q = useRequestQueue()
     const err = catchErr(q.request(1))
+    let joined: Promise<Error> | undefined
     await vi.advanceTimersByTimeAsync(50)
     mockState.deferreds[0].reject(new Error('backend down'))
     await vi.advanceTimersByTimeAsync(0)
     // 退避 500/1000/2000ms(THUMB_RETRY_MAX=3,未导出,按字面量对拍)+ 每轮 50ms 合批
     for (let n = 0; n < 3; n++) {
+      if (n === 2) joined = catchErr(q.request(1)) // 后加入者不能重置逻辑请求预算
       await vi.advanceTimersByTimeAsync(500 * 2 ** n)
       await vi.advanceTimersByTimeAsync(50)
       mockState.deferreds[n + 1].reject(new Error('backend down'))
       await vi.advanceTimersByTimeAsync(0)
     }
     expect((await err).message).toBe('Batch finished without result')
+    expect((await joined)?.message).toBe('Batch finished without result')
     expect(mockState.calls.length).toBe(4)
     expect(scanMock.autoThumbInFlight).toBe(0)
   })
@@ -265,16 +332,17 @@ describe('结算兜底与看门狗', () => {
 
   it('released 幂等:stall 释放后,旧批迟到的 finally 不得冲掉新批', async () => {
     const q = useRequestQueue()
-    void catchErr(q.request(1))
+    const p1 = q.request(1)
     await vi.advanceTimersByTimeAsync(50)
     await vi.advanceTimersByTimeAsync(30_000) // 批 A 停滞释放
     const p2 = q.request(1) // 新批 B
-    await vi.advanceTimersByTimeAsync(50)
+    await vi.advanceTimersByTimeAsync(550) // 同 id 加入既有退避,到期后合批
     expect(mockState.calls.length).toBe(2)
     mockState.deferreds[0].resolve(undefined) // 批 A 的卡死 invoke 迟到结算
     await vi.advanceTimersByTimeAsync(0)
     expect(scanMock.autoThumbInFlight).toBe(1) // 批 B 计数未被清
     call(1).args.onResult.onmessage(result(1))
+    await expect(p1).resolves.toMatchObject({ itemId: 1 })
     await expect(p2).resolves.toMatchObject({ itemId: 1 })
   })
 })
@@ -293,27 +361,38 @@ describe('有界退避重试(2026-08-16 阶段3)', () => {
     await expect(p).resolves.toMatchObject({ itemId: 1 })
   })
 
-  it('cancel 掐断退避等待:不发重试批,原 Promise 拒绝 cancelled', async () => {
+  it('cancel 掐断共享退避:全部等待者拒绝且迟到旧结果不再触发重试', async () => {
     const q = useRequestQueue()
-    const err = catchErr(q.request(1))
+    const first = vi.fn()
+    const second = vi.fn()
+    void catchErr(q.request(1)).then(first)
+    void catchErr(q.request(1)).then(second)
     await vi.advanceTimersByTimeAsync(50)
     await vi.advanceTimersByTimeAsync(30_000) // 停滞 → 500ms 退避起表
+    const joined = vi.fn()
+    void catchErr(q.request(1)).then(joined) // 退避期新等待者共享同一取消
     q.cancel(1)
-    expect((await err).message).toBe('cancelled')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(first).toHaveBeenCalledWith(expect.objectContaining({ message: 'cancelled' }))
+    expect(second).toHaveBeenCalledWith(expect.objectContaining({ message: 'cancelled' }))
+    expect(joined).toHaveBeenCalledWith(expect.objectContaining({ message: 'cancelled' }))
+    call(0).args.onResult.onmessage(result(1))
+    mockState.deferreds[0].resolve(undefined)
     await vi.advanceTimersByTimeAsync(10_000)
     expect(mockState.calls.length).toBe(1) // 定时器已掐,无重试批
     expect(scanMock.autoThumbQueueSize).toBe(0)
   })
 
-  it('退避等待期他人的同 id 请求:重试到期挂回在途 slot,不产生第三次 invoke', async () => {
+  it('退避等待期同 id 请求共享退避,到期后只有一次重试并一并完成', async () => {
     const q = useRequestQueue()
     const p1 = q.request(1)
     await vi.advanceTimersByTimeAsync(50)
     await vi.advanceTimersByTimeAsync(30_000) // p1 停滞,退避 500ms 起表
-    const p2 = q.request(1) // 等待期新请求 → 批 B
+    const p2 = q.request(1) // 等待期新请求加入既有逻辑请求
     await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(2)
-    await vi.advanceTimersByTimeAsync(450) // p1 退避到期,挂回批 B 的 slot
+    expect(mockState.calls.length).toBe(1)
+    await vi.advanceTimersByTimeAsync(450) // 退避到期再排队
+    await vi.advanceTimersByTimeAsync(50)
     expect(mockState.calls.length).toBe(2)
     call(1).args.onResult.onmessage(result(1))
     await expect(p1).resolves.toMatchObject({ itemId: 1 })

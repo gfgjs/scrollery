@@ -9,11 +9,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::db::queries as q;
-use crate::editing::entitlement::{self, EDITING_PLUGIN_ID, EDITING_SKU};
+use crate::editing::entitlement;
 use crate::editing::geometry::{self, EditOps};
 use crate::editing::{adjust, ingest, io as edit_io, memory_budget, metadata, naming, preview};
 use crate::error::{AppError, Result};
-use crate::exotic::PluginEntitlement;
 use crate::state::{AppState, FILE_JOB_EDIT};
 
 /// 与 backup/export 共用的门闩占用码(state.rs `file_job_owner` 文档:「A/B/C 共用」)。
@@ -65,46 +64,6 @@ pub enum EditSaveResult {
         /// 所在 scan_root id,供前端「立即扫描」按钮直接调用既有 rescan 命令。
         root_id: i64,
     },
-}
-
-/// 查询内建图片编辑高级功能的授权态。同步 keyring / 平台收据读取必须离开 async worker。
-#[tauri::command]
-pub async fn get_editing_entitlement(state: State<'_, Arc<AppState>>) -> Result<PluginEntitlement> {
-    let provider = state.entitlement_provider();
-    tokio::task::spawn_blocking(move || entitlement::editing_entitlement(provider.as_ref()))
-        .await
-        .map_err(|_| AppError::System("图片编辑授权查询异常终止".into()))
-}
-
-/// 激活内建编辑 feature。plugin id 与 SKU 均为后端可信常量，前端只提交 token。
-#[tauri::command]
-pub async fn activate_editing_feature(
-    token: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    let provider = state.entitlement_provider();
-    tokio::task::spawn_blocking(move || {
-        provider.activate(
-            EDITING_PLUGIN_ID,
-            EDITING_SKU,
-            token.trim(),
-            unix_now_secs(),
-        )
-    })
-    .await
-    .map_err(|_| AppError::System("图片编辑激活任务异常终止".into()))?
-    .map_err(|e| AppError::Exotic {
-        code: e.code(),
-        message: format!("图片编辑激活失败：{}", e.code()),
-    })?;
-    Ok(())
-}
-
-fn unix_now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// 返回 E0 raw preview packet；二进制主体不走 serde JSON，前端解析固定包头后创建 blob URL。

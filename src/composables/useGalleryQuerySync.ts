@@ -57,6 +57,7 @@ import {
   normalizeDuplicateLensQuery,
 } from '../utils/duplicateLensQuery'
 import { useDuplicateLensStore } from '../stores/duplicateLensStore'
+import { useViewStore } from '../stores/viewStore'
 
 const MANAGED = new Set<string>([
   ...FILTER_QUERY_KEYS,
@@ -81,6 +82,7 @@ export function useGalleryQuerySync(): void {
   const ai = useAiStore()
   const search = useSearchStore()
   const lens = useDuplicateLensStore()
+  const view = useViewStore()
 
   function snapshot(): GalleryFilterSnapshot {
     return {
@@ -284,5 +286,6 @@ export function useGalleryQuerySync(): void {
     .then(() => {
       readUrl()
       hydrated = true
+      view.galleryQueryReady = true
     })
 }

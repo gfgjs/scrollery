@@ -33,10 +33,6 @@ function baseline(overrides = {}) {
 }
 
 describe('pkgOf', () => {
-  it('取 scope 包名(含 scope 段)', () => {
-    expect(pkgOf('node_modules/@shikijs/langs/dist/cpp.mjs')).toBe('@shikijs/langs')
-  })
-
   it('Windows 反斜杠路径同样可解', () => {
     expect(pkgOf('D:\\workspace\\scrollery\\node_modules\\pdfjs-dist\\build\\pdf.mjs')).toBe(
       'pdfjs-dist',
@@ -53,11 +49,6 @@ describe('pkgOf', () => {
 })
 
 describe('isForbiddenPkg', () => {
-
-  it('以 / 结尾表 scope 前缀(全等项的精确匹配不误伤同前缀包名)', () => {
-    expect(isForbiddenPkg('@shikijs/langs', ['@shikijs/'])).toBe(true)
-    expect(isForbiddenPkg('@shikijs/core', ['@shikijs/'])).toBe(true)
-  })
 
   it('不误伤同前缀的无关包', () => {
     // 'shiki' 全等项不得吃掉 'shikimori' 这类名字

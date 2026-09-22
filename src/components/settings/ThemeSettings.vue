@@ -82,6 +82,8 @@
       </ul>
     </section>
 
+    <details class="theme-settings__customize">
+      <summary>{{ t('settings.themeCustomize') }}</summary>
     <!-- 两张配色卡共用同一份草稿,可来回调整;窄屏纵排、宽屏并排。 -->
     <div class="theme-settings__cards">
       <ThemePaletteCard
@@ -96,11 +98,7 @@
       />
     </div>
 
-    <p v-if="contrastWarningModes.length" class="theme-settings__warning">
-      {{ t('settings.themeContrastWarning', { modes: contrastWarningModes.join('、') }) }}
-    </p>
-
-    <!-- 窗口材质:草稿即时预览界面填充,窗口原生材质在应用后生效。 -->
+<!-- 窗口材质:草稿即时预览界面填充,窗口原生材质在应用后生效。 -->
     <section class="theme-settings__group">
       <h4 class="theme-settings__group-title">{{ t('settings.windowMaterial') }}</h4>
       <div class="theme-settings__material">
@@ -129,7 +127,13 @@
       <p class="theme-settings__hint">{{ t('settings.windowMaterialDraftHint') }}</p>
     </section>
 
-    <footer class="theme-settings__actions">
+    </details>
+
+    <p v-if="contrastWarningModes.length" class="theme-settings__warning">
+      {{ t('settings.themeContrastWarning', { modes: contrastWarningModes.join('、') }) }}
+    </p>
+
+        <footer class="theme-settings__actions">
       <UiButton variant="secondary" :disabled="!theme.isEditing" @click="theme.cancelEdit()">
         {{ t('common.cancel') }}
       </UiButton>
@@ -408,11 +412,19 @@ watch(dialog, (value) => {
 </script>
 
 <style scoped>
+.theme-settings__customize > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  padding-block: var(--spacing-sm);
+}
+.theme-settings__customize[open] > summary { margin-bottom: var(--spacing-md); }
+.theme-settings__customize .theme-settings__group { margin-top: var(--spacing-lg); }
 .theme-settings {
   display: flex;
   flex-direction: column;
   gap: var(--spacing-md);
-  padding: var(--spacing-sm) var(--spacing-md) var(--spacing-md);
+  padding: var(--spacing-xs) 0 0;
 }
 
 .theme-settings__mode {

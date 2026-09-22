@@ -65,7 +65,15 @@ pub async fn get_exotic_item_state(
         let snap = state_arc.exotic_catalog.snapshot();
         let resolution = if snap.resolve_format(&item.file_format).is_some() {
             let host = state_arc.exotic_host();
-            Some(host.resolve_format(&item.file_format))
+            let resolved = host.resolve_format(&item.file_format);
+            if resolved
+                .plugin_id
+                .as_deref()
+                .is_some_and(crate::official::includes)
+            {
+                crate::official::entitlement(state_arc.entitlement_provider().as_ref())?;
+            }
+            Some(resolved)
         } else {
             None
         };
@@ -103,6 +111,9 @@ pub async fn get_plugin_entitlement(
     // R1-3：entitlement_of 内含 DB 读 + keyring 验签（同步系统调用），离开 tokio worker。
     let state_arc = state.inner().clone();
     tokio::task::spawn_blocking(move || {
+        if crate::official::includes(&plugin_id) {
+            crate::official::entitlement(state_arc.entitlement_provider().as_ref())?;
+        }
         state_arc
             .exotic_host()
             .entitlement_of(&plugin_id)
@@ -309,75 +320,6 @@ pub async fn retry_exotic_plugin_failures(
     .await?;
     // 用户点重试全部失败：绕过 auto 门控（P2）。
     state.wake_exotic(WakeReason::UserRequested);
-    Ok(())
-}
-
-// ── 激活 / 移除授权（Part3 §6.6）──────────────────────────────────────────────────
-//
-// 命令参数**绝不**接受 URL/路径/hash/可执行路径；sku 取自可信 Catalog，不取自 token（§5.2/§6.6）。
-// 激活失败不覆盖现有有效 token（provider 实现内部先验后存）。
-// 错误只回稳定 code（不泄露 token / subject_hash）。
-//
-// R1-1：激活/撤销一律走 `state.entitlement_provider()`（swap 点装配），不再直构
-// KeyringLicenseStore——evaluate 与 activate 必须持同一信任根（③b 换 swap 点即全路径切换）。
-
-/// 激活插件：用可信 Catalog 的 sku 验证 License token，通过则存 keyring 并唤醒调度（§6.6）。
-#[tauri::command]
-pub async fn activate_exotic_plugin(
-    plugin_id: String,
-    token: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    // sku 取自 Catalog offering（可信来源；绝不取自 token）。snap 绑定到函数作用域，
-    // 使迭代器借用在 sku 求出（clone 为 owned）后才随 snap 一并释放。
-    let snap = state.exotic_catalog.snapshot();
-    let sku = snap
-        .iter_formats()
-        .find(|(_, o)| o.plugin_id == plugin_id)
-        .and_then(|(_, o)| o.sku.clone())
-        .ok_or_else(|| AppError::Exotic {
-            code: "no_sku",
-            message: format!("插件无授权 SKU 或不在 Catalog：{plugin_id}"),
-        })?;
-    drop(snap);
-
-    // 先验签后存；失败不覆盖现有有效 token。错误只回 code（不含 token 材料）。
-    // 信任根不可用时组合根降级 FreeStub → activate 回稳定码 activation_unsupported（同样 fail-closed）。
-    // 2026-07-06 审查 R18:keyring 写是同步系统调用(Windows Credential Manager RPC,可阻塞数百 ms),
-    // 下沉 spawn_blocking 离开 tokio worker(与同文件 uninstall 路径对齐)。
-    let provider = state.entitlement_provider();
-    let (pid, sku_c, tok) = (plugin_id.clone(), sku.clone(), token.clone());
-    tokio::task::spawn_blocking(move || provider.activate(&pid, &sku_c, &tok, now_secs()))
-        .await
-        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-        .map_err(|e| AppError::Exotic {
-            code: e.code(),
-            message: format!("激活失败：{}", e.code()),
-        })?;
-
-    // 激活成功必须唤醒（§6.6）：授权态转 Authorized 后 evaluate_run 放行（auto 开则自动出图）。
-    state.wake_exotic(WakeReason::LicenseActivated);
-    Ok(())
-}
-
-/// 移除授权（卸载时的「移除授权」独立操作，§6.5）。不影响安装目录；撤销后唤醒以重新评估（停领）。
-#[tauri::command]
-pub async fn deactivate_exotic_plugin(
-    plugin_id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<()> {
-    // R18:keyring 删除同步系统调用,下沉 spawn_blocking(与 uninstall 对齐)。
-    let provider = state.entitlement_provider();
-    let pid = plugin_id.clone();
-    tokio::task::spawn_blocking(move || provider.deactivate(&pid))
-        .await
-        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-        .map_err(|e| AppError::Exotic {
-            code: e.code(),
-            message: format!("移除授权失败：{}", e.code()),
-        })?;
-    // 授权撤销 → 重新评估（已在途任务自然结束，不再领新批）。
-    state.wake_exotic(WakeReason::ConfigChanged);
     Ok(())
 }
 
@@ -810,11 +752,10 @@ pub async fn rollback_exotic_plugin(
 }
 
 /// 卸载（§6.5）：quiesce → 移走安装目录 + 删 DB 记录（不删媒体/任务）。
-/// `remove_license=true` 时一并移除 keyring 授权（默认保留，UI 明示差异）。
+/// 只卸载插件；官方版授权由统一入口管理。
 #[tauri::command]
 pub async fn uninstall_exotic_plugin(
     plugin_id: String,
-    remove_license: bool,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
     let _guard = state.exotic_install_lock.lock().await; // 与 install/rollback 串行
@@ -854,15 +795,6 @@ pub async fn uninstall_exotic_plugin(
             message: format!("卸载失败：{e}"),
         })?;
 
-    if remove_license {
-        // R1-1：走注入 provider 撤销；移除授权失败不阻断卸载（目录/DB 已删净）。
-        // R1-3：keyring 删除是同步系统调用，同样离开 tokio worker。
-        let state_arc = state.inner().clone();
-        let pid = plugin_id.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || state_arc.entitlement_provider().deactivate(&pid))
-                .await;
-    }
     state.wake_exotic(WakeReason::ConfigChanged);
     Ok(())
 }

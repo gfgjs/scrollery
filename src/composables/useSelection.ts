@@ -8,7 +8,7 @@
 //
 // 设计依据：docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §3/§4/§6。
 
-import { ref, computed, readonly, watch } from 'vue'
+import { ref, shallowRef, computed, readonly, watch } from 'vue'
 import {
   EMPTY_SELECTION,
   isSelected as isSelectedIn,
@@ -46,11 +46,9 @@ const dragStartId = ref<number | null>(null)
 const lastHoveredId = ref<number | null>(null)
 const hasDragMoved = ref(false)
 const lastClickedId = ref<number | null>(null)
-const dragStartContainer = ref<HTMLElement | null>(null)
+const dragViewIds = shallowRef<readonly number[] | null>(null)
 // 框选基线:拖拽起手时的选区快照（物化为 Set,框选在其上叠加/扣除,支持反向框选与跨行区间）。
 const dragBaseline = ref<Set<number>>(new Set())
-// 上次有效区间:viewIds 未就绪时的 DOM 回退兜底（避免拖拽锚点滚出屏幕后区间断裂）。
-const lastValidRangeIds = ref<number[]>([])
 
 // 移动阈值:必须移动 > 5px 才算拖拽（不是单击）。
 const DRAG_THRESHOLD = 5
@@ -80,6 +78,10 @@ watch(
   },
   { flush: 'sync' },
 )
+// 全选的命中随全集资格变化；Canvas 也需收到重绘信号，不能只观察选区对象。
+watch(viewIds.viewIds, () => {
+  if (state.value.kind === 'all') selectionEpoch.value++
+}, { flush: 'sync' })
 
 // 选区为空时自动退出选择模式。用 isEmptySelection 而非 count===0:
 // all 态在 viewIds 未加载时 count 会暂为 0,但它**不是空选区**,不能误退出（isEmptySelection 对 all 恒 false）。
@@ -103,6 +105,7 @@ function makeCtx(): SelectionContext {
 
 /** 把一个离散意图交当前模式解释为新选区状态,并同步选择模式开关。 */
 function dispatch(intent: SelectionIntent) {
+  if (['range', 'invert', 'selectAll'].includes(intent.type) && !viewIds.isReady()) return
   state.value = classicMode.apply(state.value, intent, makeCtx())
   if (!isEmptySelection(state.value)) isSelectionMode.value = true
   // 置 false 交给上方 watch（空选区 → 退出）,避免两处重复判定。
@@ -131,6 +134,7 @@ export function useSelection() {
    * 区间 id 由布局序 flat_ids 计算（跨视口稳定）,不依赖可视 DOM。
    */
   function selectRange(anchorId: number | null, toId: number) {
+    if (!viewIds.isReady()) return
     const anchor = anchorId ?? firstSelectedAnchor()
     if (anchor === null) {
       toggleSelect(toId)
@@ -156,7 +160,7 @@ export function useSelection() {
   }
 
   function isSelected(id: number): boolean {
-    return isSelectedIn(state.value, id)
+    return (state.value.kind === 'explicit' || viewIds.isReady()) && isSelectedIn(state.value, id)
   }
 
   /**
@@ -176,13 +180,14 @@ export function useSelection() {
    * 选区 → 后端 SelectionDescriptor（R1-2/S4 批量命令的首选出口）。
    * explicit → explicit{ids};all → selectAll{view, excludedIds}——百万级全选 payload 恒定
    * （只含视图描述 + 排除集）,id 物化收敛到后端 SQL 层。
-   * @returns null = 当前视图不可 SQL 描述（语义搜索）,调用方回退 Explicit(materializeIds())。
+   * @returns null = 全集尚未就绪或当前视图不可 SQL 描述（语义搜索）,调用方回退 Explicit(materializeIds())。
    */
   function toBackendDescriptor(): BackendSelectionDescriptor | null {
     if (state.value.kind === 'explicit') {
       // explicit 态不消费 view,传 null 占位（toDescriptor 泛型透传,不读取）。
       return toDescriptor(state.value, null as unknown as ViewDescriptorDto)
     }
+    if (!viewIds.isReady()) return null
     const view = buildCurrentViewDescriptor()
     if (!view) return null
     return toDescriptor(state.value, view)
@@ -192,7 +197,7 @@ export function useSelection() {
 
   function onPointerDown(id: number, event: PointerEvent) {
     // 仅处理主按钮（左键）
-    if (event.button !== 0) return
+    if (event.button !== 0 || !viewIds.isReady()) return
 
     dragStartPos.value = { x: event.clientX, y: event.clientY }
     dragStartId.value = id
@@ -200,15 +205,11 @@ export function useSelection() {
     // 此处不再各自复位——避免双轨复位时机不一致(T5 单 flag 化)。
     lastHoveredId.value = id
 
-    const target = event.target as HTMLElement | null
-    dragStartContainer.value = target?.closest(
-      '.media-grid, .semantic-panel__grid',
-    ) as HTMLElement | null
+    dragViewIds.value = viewIds.allIds()
 
     // 基线快照:扫选相对此基线做「反转」(applyRangeInvert)。物化当前态（all 态亦可,虽扫选起于全选属罕见路径）。
     // 不再区分 select/deselect 模式——本体滑动统一为「对划过区间做一次反转」,起点已选/未选皆由 XOR 自然处理。
     dragBaseline.value = new Set(materializeIds())
-    lastValidRangeIds.value = []
 
     // 注册文档级监听器（在 onPointerUp/onPointerCancel 中清理）。
     // pointercancel 必须监听(2026-07-06 审查 P1-15):触屏被 OS 手势接管/指针设备移除时手势以
@@ -267,46 +268,18 @@ export function useSelection() {
    * 语义:区间内 id 相对基线翻转（含则消、不含则选）——满足「本体滑动=对划过内容做一次反转」,
    * 且每次 move 都全量重算区间,回弹时移出区间的项自动恢复基线,来回滑不重复翻转。
    * 区间优先取自布局序 flat_ids（跨已滚动区间稳定,根治 G1③ 框选漏滚出项）;
-   * viewIds 未就绪时回退到可视 DOM 扫描（绝不比旧实现差）。
+   * 全集尚未就绪或拖拽期间顺序换代时不提交区间，旧 DOM 不能代表新全集。
    */
   function applyDragRange(startId: number, endId: number) {
-    let rangeIds = viewIds.rangeBetween(startId, endId)
-    if (rangeIds.length === 0) {
-      rangeIds = domFallbackRange(startId, endId)
-    } else {
-      lastValidRangeIds.value = rangeIds
-    }
+    if (!viewIds.isReady() || dragViewIds.value !== viewIds.allIds()) return
+    const rangeIds = viewIds.rangeBetween(startId, endId)
+    if (rangeIds.length === 0) return
 
     const newSet = applyRangeInvert(dragBaseline.value, rangeIds)
 
     state.value = { kind: 'explicit', ids: newSet }
     if (newSet.size > 0) isSelectionMode.value = true
     // 空选区 → 退出,交给 isEmptySelection watch。
-  }
-
-  /** viewIds 未就绪时的兜底:在容器内可视 DOM 上算区间（旧逻辑,仅作回退）。 */
-  function domFallbackRange(startId: number, endId: number): number[] {
-    const container = dragStartContainer.value || document
-    const cards = container.querySelectorAll('[data-item-id]')
-    const visibleIds: number[] = []
-    for (let i = 0; i < cards.length; i++) {
-      const id = parseInt((cards[i] as HTMLElement).dataset.itemId || '', 10)
-      if (!isNaN(id)) visibleIds.push(id)
-    }
-
-    const s = visibleIds.indexOf(startId)
-    const e = visibleIds.indexOf(endId)
-    if (s !== -1 && e !== -1) {
-      const lo = Math.min(s, e)
-      const hi = Math.max(s, e)
-      const r = visibleIds.slice(lo, hi + 1)
-      lastValidRangeIds.value = r
-      return r
-    }
-    // 锚点已滚出:沿用上次有效区间 + 当前命中点
-    const r = [...lastValidRangeIds.value]
-    if (!r.includes(endId)) r.push(endId)
-    return r
   }
 
   function onPointerUpGlobal(_event: PointerEvent) {
@@ -325,7 +298,7 @@ export function useSelection() {
     dragStartPos.value = null
     dragStartId.value = null
     lastHoveredId.value = null
-    dragStartContainer.value = null
+    dragViewIds.value = null
     // 注意:不在此复位 hasDragMoved——它必须撑过紧随的尾随 click 以抑制之(框选/拖图结束不应
     // 再触发单击)。复位统一在下次交互起手 beginInteraction() 做(T5)。在 pointerup 复位会让
     // 「小框选在同一卡片上松开」的尾随 click 误判为普通单击(回归)。

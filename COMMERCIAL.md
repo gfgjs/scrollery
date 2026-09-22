@@ -14,7 +14,12 @@ scopes and are not interchangeable:
 - **Official end-user distribution.** The official stable release is planned as
   a paid, one-time purchase under an end-user commercial license. Individuals
   and organizations buy through this channel when they want the official signed
-  build, its updates, and its support rather than building from source.
+  build, its updates, and its support rather than building from source. One
+  perpetual official-edition activation covers advanced image editing, OCR, image
+  enhancement, and the PSD engine. Each feature still requires supported platforms
+  and its runtime resources; image enhancement is not yet ready because release
+  model assets have not been delivered. RAW decoding and video format extensions
+  remain free.
 - **Enterprise / OEM licensing.** For organizations that need to ship
   first-party Scrollery code under terms the AGPL cannot support — closed-source
   integration, white-label, or embedded distribution — the alternative is a
@@ -74,7 +79,10 @@ integration, the term and territory, and the fees and payment terms.
 
 There is no self-serve checkout, no published price list, and no live online
 end-user license agreement or payment flow. Commercial terms are settled
-individually when a concrete need arises.
+individually when a concrete need arises. The application currently displays
+"Purchasing is not yet available". Activation uses one official-edition token;
+uninstalling a plugin preserves that license, and removing the local license
+disables the included paid features without deleting plugins, models, or files.
 
 ## Scope of the AGPL release
 

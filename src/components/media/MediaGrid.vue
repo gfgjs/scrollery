@@ -126,7 +126,7 @@
           @cell-click="handleCardClick"
           @cell-contextmenu="(item, e) => onContextMenu(e, item.id)"
           @cell-pointerdown="onCardPointerDown"
-          @request-thumb="onRequestThumb"
+          :request-thumb="onRequestThumb"
           @cancel-thumb="onCancelThumb"
           @regenerate-thumb="onRegenerateThumb"
           @cell-favorite="handleFavorite"
@@ -145,6 +145,7 @@
             :key="seg.index"
             class="media-grid__segment"
             :class="{ 'media-grid__segment--loading': seg.state !== 'ready' }"
+            :inert="seg.state !== 'ready'"
             :style="{
               position: 'absolute',
               top: seg.start - bucketAnchorDelta + 'px',
@@ -781,6 +782,7 @@ const {
   // route-return 锁窗、`/view` 覆盖层存续与 KeepAlive 失活均不允许布局 IPC；结束后只按最终
   // 宽度回放一次，避免旧防抖或查看器 chrome 的中间几何提交。
   onScreen: () => gridOnScreen && !contentViewerRoute.value && !ui.routeReturnSidebarTransitioning,
+  resolveLayoutTarget,
 })
 
 /** 程序化滚动到逻辑 y(时间轴 / minimap 的统一入口)。 */
@@ -840,29 +842,42 @@ const { showSkeleton, skeletonCount } = useGallerySkeleton({
 })
 
 // 重排锚点(行高/分组/排序/宽度/布局模式整体重排时把浏览项钉在屏内)。
-const { captureReflowAnchor, restoreReflowAnchor } = useReflowAnchor({
+const { captureReflowAnchor, resolveReflowAnchor } = useReflowAnchor({
   gridRef: () => gridRef.value,
   activeRows,
   currentLogicalY: () => currentLogicalY.value,
   getViewKey,
-  scrollToLogicalY: (y) => bucketScroll.scrollToLogicalY(y),
 })
 
 // 镜头排列切换的焦点恢复(§8.1):切换 groups/folders 或开关独有项时按聚焦卡片 item ID 恢复滚动位
-// 与焦点;id 已不在新布局则回顶部并聚焦镜头状态条主标题。挂进布局重算的滚动恢复链(见下方
-// restoreReflowOrLensFocus 注),机制通用,P3 folders 排列切换直接生效。
-const { restoreLensFocus } = useLensFocusRestore({
+// 与焦点;id 已不在新布局则回顶部并聚焦镜头状态条主标题。目标由下方 resolveLayoutTarget
+// 交给 bucket 一次提交,P3 folders 排列切换同样生效。
+const { resolveLensFocus } = useLensFocusRestore({
   gridRef: () => gridRef.value,
-  scrollToLogicalY: (y) => bucketScroll.scrollToLogicalY(y),
   getViewKey,
 })
 
-// 布局重算的滚动恢复链单一顺序:reflow 锚点 → 镜头焦点锚点(§8.1)→ (useGalleryTauriSync 内的)
-// scrollCache 回退。镜头排列切换不捕 reflow 锚点(其 watch 面不含镜头键,且锚点按 viewKey 校验、
-// 排列切换即换键)而必然落入镜头焦点恢复;非镜头路径 pending 恒空、restoreLensFocus 零开销直返。
-async function restoreReflowOrLensFocus(): Promise<boolean> {
-  if (await restoreReflowAnchor()) return true
-  return restoreLensFocus()
+// 只解析坐标,由 bucket 将目标窗口与滚动位一起提交；异步期间切视图/失活则弃用恢复结果。
+async function resolveLayoutTarget(version: number, generationCurrent: () => boolean) {
+  const viewKey = getViewKey()
+  const semanticKey = media.layoutSemanticKey
+  const isCurrent = () => generationCurrent() && gridOnScreen && !contentViewerRoute.value &&
+    version === media.layoutVersion && viewKey === getViewKey() && semanticKey === media.layoutSemanticKey
+  if (!isCurrent() || version <= 0) return null
+  const anchorY = await resolveReflowAnchor(version, isCurrent)
+  if (!isCurrent()) return null
+  const target = anchorY !== null ? { y: anchorY } : await resolveLensFocus(version, isCurrent)
+  if (!isCurrent()) return null
+  const y = target?.y ?? scrollCache.get(viewKey) ?? 0
+  return {
+    y,
+    isCurrent,
+    afterRestore: () => {
+      if (!isCurrent()) return
+      scrollCache.set(viewKey, currentLogicalY.value)
+      target?.afterRestore?.()
+    },
+  }
 }
 
 // 可视项就地 patch(乐观 UI 回写的单一实现)。
@@ -1257,10 +1272,6 @@ onMounted(async () => {
 
   // 初始布局计算 — 在知道宽度之后
 
-  // 在 compute 前消费 dirty 标志，避免通过 layoutDirty watcher
-  // 触发多余的二次重算（Vue watch 默认非 immediate，不会在挂载时触发）。
-  media.consumeLayoutDirty()
-
   // 深链查看器或 KeepAlive 失活期只登记一次 deferred；底层 LayoutCache 保留当前帧，
   // 返回画廊时由 settleRouteReturnLayout/flushIfDeferred 用最终视图补算。
   if (gridOnScreen && !contentViewerRoute.value && !ui.routeReturnSidebarTransitioning) {
@@ -1271,21 +1282,9 @@ onMounted(async () => {
 
   // 初始/重挂载时主动拉一次布局序全集（layoutVersion watcher 仅在变化时触发,挂载不触发）。
   // 镜头是 browse-only，查看器顺序由后端按 layoutVersion 一步解析，不能物化全量 flat_ids。
-  if (!lensActive.value) void viewIds.ensureFresh(media.layoutVersion)
+  if (!lensActive.value && media.orderVersion > 0) void viewIds.ensureFresh(media.orderVersion)
 
-  // 顶栏重构 P4-5:重挂载恢复滚动位。scrollCache 是模块级 Map(跨重挂存活,见 scrollCache.ts
-  // 头注),此前仅在 layoutVersion watcher(布局变化时)读回;而组件重挂载(同视图 component
-  // 重建——从 /collections·/persons·/doc·/audio 等异组件路由返回)走 onMounted 却因版本未变
-  // 不触发该 watcher → 落回 scrollTop=0 丢位。覆盖层时代此路径被「Teleport 保活网格永不卸载」
-  // 掩盖;P4 看图台路由化后开图即卸载网格,本恢复是「返回网格保位不重排」的支柱(计划 P4-5)。
-  // 时序:await nextTick 等段容器总高落到 DOM 后再设 scrollTop,否则大值被容器裁到当前可
-  // 视高(T16 教训:物理 scrollTop 须在总高就绪后设)。恢复位即引擎愿望窗口的重建位,首帧可视
-  // 窗口就在该位算,无 0→saved 双渲染闪跳。saved=0(首次访问无缓存)时跳过,新网格本就在顶。
-  await nextTick()
-  if (gridRef.value) {
-    const saved = scrollCache.get(getViewKey()) || 0
-    if (saved > 0) await bucketScroll.scrollToLogicalY(saved)
-  }
+  // bucket 的 immediate 换代入口也覆盖相同版本的重挂载恢复,不再另发一次滚动。
 })
 
 // ── 缩略图请求处理 ──────────────────────────────────────────────
@@ -1414,6 +1413,7 @@ function handleCardClick(item: LayoutRowItem, event: MouseEvent | KeyboardEvent)
   // 重复镜头(§8.2):打开查看器前只记录布局版本/总数；上一项/下一项由后端布局缓存
   // 按 itemId+offset 解析，避免通过 GET_VIEW_IDS 把百万级 flat_ids 传到前端。
   if (lensActive.value) media.setLensNavContext(media.layoutVersion, media.viewTotalItems)
+  else media.setLayoutNavContext(id)
   if (item.mediaType === 'image' || item.mediaType === 'video') preloadViewerComponent()
   openMediaRoute(router, id, item.mediaType)
 }
@@ -1471,11 +1471,6 @@ onBeforeUnmount(() => {
 useGalleryTauriSync({
   requestCompute,
   refreshCacheDir,
-  // §8.1:镜头排列切换的焦点恢复链在 reflow 锚点之后(见 restoreReflowOrLensFocus 注)。
-  restoreReflowAnchor: restoreReflowOrLensFocus,
-  gridRef: () => gridRef.value,
-  scrollToLogicalY: (y) => bucketScroll.scrollToLogicalY(y),
-  getViewKey,
   shouldLoadViewIds: () => !lensActive.value,
   isLensActive: () => lensActive.value,
   activeRows,

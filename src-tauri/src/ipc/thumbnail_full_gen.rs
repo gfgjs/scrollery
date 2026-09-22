@@ -90,11 +90,7 @@ fn finish_thumb_generation(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(payload.clone());
                 let _ = app.emit(THUMB_GEN_PROGRESS_EVENT, payload);
-                *state
-                    .layout_cache
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
-                crate::layout::items_cache::invalidate(&state.layout_items_cache);
+                state.clear_layout_caches();
             })
             .is_some();
         let finished = state.thumb_gen_token.finish(generation);

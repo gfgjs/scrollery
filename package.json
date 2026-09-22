@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
+    "lint:fix": "eslint --fix",
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -16,17 +16,22 @@
     "tauri": "tauri",
     "tauri:build:lite": "tauri build",
     "tauri:build:perf": "tauri build --features perf -c src-tauri/tauri.perf.conf.json",
-    "tauri:build:direct-release": "tauri build -c src-tauri/tauri.direct-release.conf.json",
+    "tauri:build:direct-release": "node scripts/verify-commercial-release.mjs && tauri build -c src-tauri/tauri.direct-release.conf.json",
     "vendor:licenses": "node scripts/vendor-license-sources.mjs",
     "prepare:legal": "node scripts/prepare-legal-resources.mjs",
     "build:raw-worker": "node scripts/build-raw-worker.mjs",
     "build:ai-worker": "node scripts/build-ai-worker.mjs",
+    "build:enhance-worker": "node scripts/build-enhance-worker.mjs",
+    "build:enhance-worker:dev": "node scripts/build-enhance-worker.mjs --dev",
     "build:video-worker": "node scripts/build-video-worker.mjs",
     "build:video-worker:dev": "node scripts/build-video-worker.mjs --dev",
     "verify:channel": "node scripts/verify-channel-bundle.mjs",
+    "check:ipc": "node scripts/check-ipc-commands.mjs",
+    "check:tests": "node scripts/check-test-budget.mjs",
     "check:contrast": "vite-node scripts/check-theme-contrast.mjs",
     "capture:themes": "node scripts/capture-theme-matrix.mjs",
-    "build:architecture-guide": "node scripts/build-architecture-guide.mjs"
+    "build:architecture-guide": "node scripts/build-architecture-guide.mjs",
+    "verify:commercial": "node scripts/verify-commercial-release.mjs"
   },
   "dependencies": {
     "@floating-ui/vue": "^2.0.1",

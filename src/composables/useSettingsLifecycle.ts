@@ -6,7 +6,7 @@
 // 由退出事件驱动,不依赖任何 unload 钩子。本文件是该协议在前端的唯一实现。
 //
 // 协议(带 request id,避免重入;不搭通用 RPC 框架):
-//   1. 后端在退出/关窗前发 IPC.SETTINGS_FLUSH_REQUESTED,载荷 { requestId }。
+//   1. 后端在退出/关窗前发 EVENTS.SETTINGS_FLUSH_REQUESTED,载荷 { requestId }。
 //   2. 本模块 await flushSettings()(中央保存集合的强制落盘),再经 IPC.SETTINGS_FLUSH_DONE
 //      回执 { requestId, ok }。
 //   3. 同一时刻只跑一次 flush(单飞):重叠到达的请求复用同一个在途 Promise,不会并行写盘。
@@ -18,7 +18,7 @@
 import { ref } from 'vue'
 import { listenAppEvent } from '../utils/appEvents'
 import { invokeIpc } from '../utils/ipc'
-import { IPC } from '../constants/ipc'
+import { EVENTS, IPC } from '../constants/ipc'
 import { logger } from '../utils/logger'
 import { flushSettings } from '../stores/settingsPersistence'
 
@@ -101,7 +101,7 @@ export async function installSettingsLifecycle(): Promise<() => void> {
   if (unlisten) return unlisten
   let disposed = false
   const off = await listenAppEvent<FlushRequestPayload>(
-    IPC.SETTINGS_FLUSH_REQUESTED,
+    EVENTS.SETTINGS_FLUSH_REQUESTED,
     (event) => {
       const requestId = event.payload?.requestId
       if (!requestId) {

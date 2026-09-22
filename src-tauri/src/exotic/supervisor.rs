@@ -33,7 +33,7 @@ use exotic_protocol::{ProgressBody, RequestBody, SuccessBody};
 /// 子进程句柄抽象(R2-5 测试缝):生产实现为 [`Child`] 的 1:1 机械委托。
 /// ExitStatus 被整体擦除——本模块所有调用点本就丢弃它(`let _ = wait()`、try_wait 只
 /// match `Ok(Some(_))`),擦除不损失任何决策信息;kill/wait/try_wait 的调用语义与顺序不变。
-/// 真实 Child 路径仍由 env-gated 冒烟测试(real_worker_thumbnail_and_shutdown)端到端覆盖。
+/// 真实 Child 路径由显式启用的冒烟测试(real_worker_thumbnail_and_shutdown)端到端覆盖。
 trait ChildHandle: Send {
     fn kill(&mut self) -> std::io::Result<()>;
     fn wait(&mut self) -> std::io::Result<()>;
@@ -110,7 +110,8 @@ impl WorkerSupervisor {
         let stderr = child.stderr.take().ok_or("无法获取 Worker stderr")?;
 
         // stdout → 协议帧 channel。
-        let (tx, rx) = crossbeam_channel::unbounded();
+        // 每实例只有一个请求；帧队列背压限制异常 worker 的宿主内存占用。
+        let (tx, rx) = crossbeam_channel::bounded(2);
         let reader_handle = spawn_frame_reader(stdout, tx);
 
         // stderr → 有界环形缓冲（持续排空，防管道写满死锁）+ 行级转发进主 tracing（W4）。
@@ -356,6 +357,8 @@ impl WorkerSupervisor {
     }
 
     fn join_threads(&mut self) {
+        // reader 可能阻塞于满队列；先断开接收端再 join，取消/Drop 也可正常回收。
+        self.conn.close_reader();
         if let Some(h) = self.reader_handle.take() {
             let _ = h.join();
         }
@@ -597,6 +600,34 @@ mod tests {
     }
 
     #[test]
+    fn drop_releases_reader_blocked_by_full_frame_queue() {
+        let (mut sup, _parts) = make_sup(true, never_exits());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ready = ReadyBody {
+            worker_id: "psd-worker".into(),
+            worker_version: "test".into(),
+            protocol_version: 0,
+            capabilities: vec!["thumbnail".into()],
+            max_blob_len: exotic_protocol::MAX_BLOB_LEN,
+        };
+        sup.conn = WorkerConn::from_parts(Box::new(std::io::sink()), rx, ready);
+        let frame = || Ok(Frame::control(FrameType::Shutdown, 0, &serde_json::json!({})).unwrap());
+        tx.send(frame()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        sup.reader_handle.take().unwrap().join().unwrap();
+        sup.reader_handle = Some(std::thread::spawn(move || {
+            assert!(tx.send(frame()).is_err());
+        }));
+        std::thread::spawn(move || {
+            drop(sup);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("满队列不能阻止 Drop 回收");
+    }
+
+    #[test]
     fn dead_instance_guard_skips_conn_and_child() {
         let (mut sup, parts) = make_sup(false, never_exits());
         let out = sup.run_thumbnail(
@@ -823,6 +854,7 @@ mod tests {
                 height: 1,
                 mime: "image/webp".into(),
                 blob: Vec::new(),
+                thumbhash: Vec::new(),
             }),
             "success"
         );
@@ -1008,23 +1040,19 @@ mod tests {
         );
     }
 
-    /// 真实子进程冒烟测试:仅当设置 `EXOTIC_PSD_WORKER_PATH` 指向已构建的 psd-worker 时运行。
-    /// 未设置则跳过（src-tauri 的 cargo test 不会自动构建独立 worker crate）。
+    /// 真实子进程冒烟测试：显式启用时必须提供 `EXOTIC_PSD_WORKER_PATH`，缺条件即失败。
     ///
     /// 构建并运行：
-    ///   cargo build --release --manifest-path crates/exotic-workers/psd-worker/Cargo.toml
-    ///   EXOTIC_PSD_WORKER_PATH=crates/exotic-workers/psd-worker/target/release/psd-worker.exe \
-    ///     cargo test -p scrollery exotic::supervisor::tests::real_worker -- --nocapture
+    ///   cargo build --release -p psd-worker
+    ///   EXOTIC_PSD_WORKER_PATH=target/release/psd-worker.exe \
+    ///     cargo test -p scrollery --lib exotic::supervisor::tests::real_worker -- --ignored --nocapture
     #[test]
+    #[ignore = "需要 EXOTIC_PSD_WORKER_PATH 指向真实 PSD worker"]
     fn real_worker_thumbnail_and_shutdown() {
-        let Some(path) = resolve_psd_worker_path() else {
-            eprintln!("[skip] 未设 EXOTIC_PSD_WORKER_PATH，跳过真实 Worker 冒烟测试");
-            return;
-        };
+        let path = resolve_psd_worker_path().expect("必须设置 EXOTIC_PSD_WORKER_PATH");
         // 写一张合成 PSD 到临时文件。
-        let dir = std::env::temp_dir().join(format!("exotic-sup-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let psd_path = dir.join("synthetic.psd");
+        let dir = tempfile::tempdir().unwrap();
+        let psd_path = dir.path().join("synthetic.psd");
         std::fs::write(&psd_path, make_rgb_psd(300, 200)).unwrap();
 
         let mut sup = WorkerSupervisor::spawn(&test_spec(path), &test_cfg()).expect("spawn+握手");
@@ -1054,6 +1082,59 @@ mod tests {
         }
 
         sup.shutdown(Duration::from_secs(3));
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一真实 RAW 进程先处理畸形输入、再处理缺文件；数据失败不杀进程，最后正常回收。
+    #[test]
+    #[ignore = "需要 EXOTIC_RAW_WORKER_PATH 指向真实 RAW worker"]
+    fn real_raw_worker_failures_and_shutdown() {
+        let exe =
+            std::env::var_os("EXOTIC_RAW_WORKER_PATH").expect("必须设置 EXOTIC_RAW_WORKER_PATH");
+        let spec = WorkerSpec {
+            exe_path: exe.into(),
+            expected_worker_id: "raw-worker".into(),
+            required_capabilities: vec!["thumbnail".into()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("malformed.dng"), [0xabu8; 64]).unwrap();
+        let start = Instant::now();
+        let mut sup = WorkerSupervisor::spawn(&spec, &test_cfg()).expect("RAW spawn+握手");
+        let handshake = start.elapsed();
+        assert!(!sup.worker_version().is_empty());
+        for (file, expected, retryable) in [
+            ("malformed.dng", WorkerErrorCode::MalformedInput, false),
+            ("missing.dng", WorkerErrorCode::IoError, true),
+        ] {
+            let req = RequestBody::Thumbnail {
+                item_id: 42,
+                source_path: dir.path().join(file).to_string_lossy().into_owned(),
+                target_long_edge: 480,
+                input_fingerprint: file.into(),
+            };
+            let out = sup.run_thumbnail(
+                &req,
+                &default_thumbnail_limits(),
+                Duration::from_secs(5),
+                &|| false,
+            );
+            match out {
+                TaskOutcome::Failure(body) => {
+                    assert_eq!(body.code, expected);
+                    assert_eq!(body.retryable, retryable);
+                    assert_eq!(body.item_id, Some(42));
+                    assert_eq!(body.input_fingerprint.as_deref(), Some(file));
+                }
+                other => panic!("期望 RAW Failure，得到 {}", outcome_label(&other)),
+            }
+            assert!(sup.is_alive(), "数据失败后应继续复用进程");
+        }
+        let version = sup.worker_version().to_string();
+        sup.shutdown(Duration::from_secs(3));
+        eprintln!(
+            "RAW version={} handshake_ms={:.2} failure_smoke_total_ms={:.2}",
+            version,
+            handshake.as_secs_f64() * 1000.0,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }

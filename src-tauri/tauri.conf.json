@@ -3,10 +3,10 @@
   "productName": "Scrollery",
   "identifier": "com.scrollery.app",
   "build": {
-    "beforeDevCommand": "npm run prepare:legal && cargo build -p ai-worker && npm run build:video-worker:dev && npm run build:raw-worker && npm run dev",
+    "beforeDevCommand": "npm run prepare:legal && cargo build -p ai-worker && npm run build:video-worker:dev && npm run build:enhance-worker:dev && npm run build:raw-worker && npm run dev",
 
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run prepare:legal && npm run build && npm run build:raw-worker && npm run build:ai-worker && npm run build:video-worker",
+    "beforeBuildCommand": "npm run prepare:legal && npm run build && npm run build:raw-worker && npm run build:ai-worker && npm run build:video-worker && npm run build:enhance-worker",
     "frontendDist": "../dist"
   },
   "app": {
@@ -39,7 +39,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/raw-worker", "binaries/ai-worker", "binaries/video-worker"],
+    "externalBin": ["binaries/raw-worker", "binaries/ai-worker", "binaries/video-worker", "binaries/enhance-worker"],
     "resources": {
       "binaries/onnxruntime.dll": "onnxruntime.dll",
       "binaries/DirectML.dll": "DirectML.dll",

@@ -35,6 +35,10 @@ The plan may be refined in response to preview feedback, but a paid stable distr
 
 The current preview already includes the core image-library workflow, gallery browsing, metadata enrichment, thumbnail generation, and AI semantic search. Broader media support, release packaging, update delivery, and professional components are still evolving.
 
+Image enhancement (denoising, JPEG artifact removal, and upscaling) is **not yet available in this preview**. Windows builds include `enhance-worker` and use the bundled ONNX Runtime libraries, but the five model profiles still lack approved ONNX assets, distribution notices, and pinned download metadata. Downloads and processing remain disabled until those prerequisites are supplied. Successful enhancement and before/after preview in an installed release have not been verified. See the [model delivery requirements](docs/enhance-model-delivery.md).
+
+On 2026-09-22, an isolated Windows release build passed MSI/NSIS payload checks and installed-NSIS checks for worker startup, ONNX Runtime initialization, rejection of missing model files, and unavailable-component UI/IPC gates. Test source images remained byte-for-byte unchanged on these rejected paths; this does not verify successful processing.
+
 ## Architecture highlights
 
 - **Two-phase scanning:** a fast initial pass populates the gallery, followed by background metadata and relationship enrichment.
@@ -83,6 +87,12 @@ cargo check --manifest-path src-tauri/Cargo.toml --tests
 ```
 
 Builds produced from this repository are community/self-built distributions. They do not include the project's release signing keys, code-signing certificates, purchase entitlements, or the official update service.
+
+## Official edition activation
+
+Features & Plugins manages one perpetual official-edition license for advanced image editing, OCR, enhancement, and the PSD engine. RAW decoding and video format extensions remain free. Licensing, plugin installation, and model preparation are shown separately. Uninstalling a plugin preserves the license; removing the local license preserves files, models, and plugins.
+
+Purchasing is not yet available. Production storefront, public keys, and release delivery remain pending. Enhancement also requires release model assets and is not currently usable just by activating a license. This change has focused tests and browser-harness UI checks; end-to-end usage in a new installer has not been verified.
 
 ## Repository layout
 

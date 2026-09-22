@@ -149,6 +149,7 @@ pub fn query_layout_items_canonical(
     conn: &Connection,
     filter: &MediaFilter,
 ) -> Result<Vec<LayoutItem>> {
+    let query_started = std::time::Instant::now();
     let hidden_roots = super::super::scan::hidden_root_ids(conn)?;
     let (sql, extras) = canonical_layout_sql(filter, &hidden_roots);
     let mut stmt = conn.prepare(&sql)?;
@@ -157,7 +158,16 @@ pub fn query_layout_items_canonical(
     let items: Vec<LayoutItem> = rows
         .map(|r| r.map_err(AppError::from))
         .collect::<Result<_>>()?;
-    Ok(sort_canonical(items))
+    let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+    let sort_started = std::time::Instant::now();
+    let items = sort_canonical(items);
+    tracing::debug!(
+        query_ms,
+        canonical_sort_ms = sort_started.elapsed().as_secs_f64() * 1000.0,
+        items = items.len(),
+        "canonical layout source | SQL 取数与内存补序分开计时"
+    );
+    Ok(items)
 }
 
 /// B-file-i 的 **filename 基准序**查询：与 [`query_layout_items_canonical`] 同构(共用

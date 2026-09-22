@@ -12,7 +12,7 @@ import { computed, ref } from 'vue'
 import { useUiStore } from '../stores/uiStore'
 import { useMediaStore } from '../stores/mediaStore'
 import { useJustifiedLayout } from './useJustifiedLayout'
-import { useBucketVirtualScroll } from './useBucketVirtualScroll'
+import { useBucketVirtualScroll, type LayoutRestoreTarget } from './useBucketVirtualScroll'
 import { useSelection } from './useSelection'
 import { useRenderMode } from './useRenderMode'
 import type { LayoutRow } from '../types/layout'
@@ -35,6 +35,7 @@ export interface GalleryVirtualEngineDeps {
    * (真机 round10 #5,详见 useJustifiedLayout 的 enabled 注释)。
    */
   onScreen: () => boolean
+  resolveLayoutTarget: (version: number, isCurrent: () => boolean) => Promise<LayoutRestoreTarget | null>
 }
 
 export function useGalleryVirtualEngine(deps: GalleryVirtualEngineDeps) {
@@ -71,6 +72,7 @@ export function useGalleryVirtualEngine(deps: GalleryVirtualEngineDeps) {
   const bucketScroll = useBucketVirtualScroll({
     totalHeight: () => media.totalHeight,
     layoutVersion: () => media.layoutVersion,
+    resolveLayoutTarget: deps.resolveLayoutTarget,
     fetchBucketRows: (startY, endY) => media.fetchBucketRows(startY, endY),
     containerRef: () => deps.gridRef(),
     // 自适应段高输入:小行高→小段,遏制跨段挂载/反序列化爆帧(§滚动卡顿分析 #3)。

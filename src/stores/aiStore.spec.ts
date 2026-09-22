@@ -9,9 +9,21 @@
 
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
+import { effectScope, type EffectScope } from 'vue'
 import { IPC } from '../constants/ipc'
 
 const invokeIpc = vi.fn()
+const routing = vi.hoisted(() => ({
+  route: { path: '/', query: {} as Record<string, string> },
+  ready: Promise.resolve(),
+  replace: vi.fn(async () => {}),
+}))
+vi.mock('vue-router', async (original) => ({
+  ...await original<typeof import('vue-router')>(),
+  useRoute: () => routing.route,
+  useRouter: () => ({ isReady: () => routing.ready, replace: routing.replace }),
+}))
+vi.mock('../router', () => ({ default: { currentRoute: { value: routing.route }, replace: routing.replace } }))
 vi.mock('../utils/ipc', () => ({
   invokeIpc: (...args: unknown[]) => invokeIpc(...(args as [])),
   ipcErrorMessage: (e: unknown) => String(e),
@@ -41,6 +53,11 @@ vi.mock('./toastStore', () => ({ useToastStore: () => ({ addToast: vi.fn() }) })
 
 import { useAiStore } from './aiStore'
 import { useMediaStore } from './mediaStore'
+import { useViewStore } from './viewStore'
+import { useGalleryQuerySync } from '../composables/useGalleryQuerySync'
+import { useJustifiedLayout } from '../composables/useJustifiedLayout'
+
+let lifecycleScope: EffectScope | undefined
 
 interface Gate<T> {
   promise: Promise<T>
@@ -73,6 +90,10 @@ function wireSearchCommands() {
       arrivals.push('clear')
       return Promise.resolve(undefined)
     }
+    if (cmd === IPC.COMPUTE_LAYOUT) {
+      arrivals.push('layout')
+      return Promise.resolve({ totalRows: 1, totalHeight: 100, layoutVersion: 1, orderVersion: 1, totalItems: 7, separators: [], monthBuckets: [] })
+    }
     return Promise.resolve(undefined)
   })
   return { searches, arrivals }
@@ -97,6 +118,8 @@ describe('aiStore 语义搜索身份（P1-3）', () => {
   })
 
   afterEach(() => {
+    lifecycleScope?.stop()
+    lifecycleScope = undefined
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
@@ -118,6 +141,34 @@ describe('aiStore 语义搜索身份（P1-3）', () => {
     expect(ai.searchError).toBeNull()
     expect(invalidate).not.toHaveBeenCalled()
     expect(ai.isSearching).toBe(false)
+    expect(ai.semanticLayoutReady).toBe(false)
+  })
+
+  it('URL 语义恢复等待路由水合并调用真实搜索入口，结果提交前不发中间布局', async () => {
+    const routeReady = gate<void>()
+    routing.ready = routeReady.promise
+    routing.route.query = { mode: 'semantic', q: 'sunset' }
+    const { searches, arrivals } = wireSearchCommands()
+    lifecycleScope = effectScope()
+    const layout = lifecycleScope.run(() => {
+      useGalleryQuerySync()
+      return useJustifiedLayout(() => 800)
+    })!
+    await layout.compute()
+    expect(useViewStore().galleryQueryReady).toBe(false)
+    expect(arrivals).toEqual([])
+    routeReady.resolve()
+    await vi.waitFor(() => expect(searches).toHaveLength(1))
+    expect(useViewStore().galleryQueryReady).toBe(true)
+    expect(arrivals).toEqual(['clear', 'search:sunset'])
+    expect(useAiStore().semanticLayoutReady).toBe(false)
+    searches[0].resolve(7)
+    await vi.waitFor(() => expect(arrivals).toEqual(['clear', 'search:sunset', 'layout']))
+    expect(useMediaStore().layoutSummary?.totalItems).toBe(7)
+    expect(useMediaStore().layoutDirty).toBe(false)
+    expect(invokeIpc).toHaveBeenCalledWith(IPC.COMPUTE_LAYOUT, expect.objectContaining({
+      params: expect.objectContaining({ filters: expect.objectContaining({ aiSearch: true }) }),
+    }))
   })
 
   it('A 查询在途 → 清空 → B 查询:A 的迟到应答不得覆盖 B 的计数与加载态', async () => {
@@ -148,6 +199,7 @@ describe('aiStore 语义搜索身份（P1-3）', () => {
     expect(ai.matchCount).toBe(7)
     expect(ai.isSearching).toBe(false)
     expect(ai.semanticQuery).toBe('B')
+    expect(ai.semanticLayoutReady).toBe(true)
   })
 
   it('清空后端失败：本地不挂 spinner，也不回滚已清语义', async () => {
@@ -171,6 +223,7 @@ describe('aiStore 语义搜索身份（P1-3）', () => {
     await Promise.resolve()
     expect(ai.isSearching).toBe(false)
     expect(ai.matchCount).toBe(0)
+    expect(ai.semanticLayoutReady).toBe(false)
   })
 
   it('空查询等价清空:本地同步收尾并调后端清空命令', async () => {

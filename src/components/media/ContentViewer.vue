@@ -193,9 +193,9 @@
             >
               {{ media.navContext.currentIndex + 1 }} /
               {{
-                media.navContext.type === 'lens'
-                  ? media.navContext.totalCount
-                  : media.navContext.itemIds.length
+                media.navContext.type === 'search'
+                  ? media.navContext.itemIds.length
+                  : media.navContext.totalCount
               }}
             </span>
             <UiIconButton :label="zoomModeTitle" @click="handleToggleZoom">
@@ -466,7 +466,6 @@
   <!-- Exotic 激活对话框（Part5 T12）：gate 的「已购买？激活」入口 → 输入 token → 后端验签。 -->
   <ExoticActivateDialog
     :open="activateOpen"
-    :plugin-id="exoticGate.entitlement.value?.pluginId ?? ''"
     :feature-name="exoticFeatureName"
     @close="activateOpen = false"
     @activated="onExoticActivated"
@@ -483,6 +482,8 @@
     <PluginGate
       :entitlement="editingGate.entitlement.value"
       :loading="editingGate.loading.value"
+      :failed="!!editingGate.error.value"
+      @retry="editingGate.fetchEntitlement"
       :feature-name="t('edit.premiumName')"
       :feature-desc="t('edit.premiumDesc')"
       @activate="openEditingActivation"
@@ -490,9 +491,7 @@
   </UiDialog>
   <ExoticActivateDialog
     :open="editActivateOpen"
-    :plugin-id="editingGate.entitlement.value?.pluginId ?? 'feature-editing'"
     :feature-name="t('edit.premiumName')"
-    :activation-handler="editingGate.activate"
     @close="onEditingActivationClosed"
     @activated="onEditingActivated"
   />
@@ -524,7 +523,7 @@ import EnhanceDialog from '../enhance/EnhanceDialog.vue'
 import type { EnhanceSource } from '../../types/enhance'
 import { useImageEditor, requestDiscardEdits } from '../../composables/useImageEditor'
 import { useViewerColorSource } from '../../composables/useViewerColorSource'
-import { useEditingEntitlement } from '../../composables/useEditingEntitlement'
+import { useOfficialEntitlement } from '../../composables/useOfficialEntitlement'
 import { useExoticGate } from '../../composables/useExoticGate'
 import { readSettingBool } from '../../composables/settingsValues'
 import { writeSettings } from '../../stores/settingsPersistence'
@@ -601,7 +600,7 @@ const viewer = useViewerStore()
 const { t } = useI18n()
 // 图片简单编辑(方案 C §7):单实例贯穿本组件生命周期,EditOverlay 只呈现、不持有状态。
 const editor = useImageEditor()
-const editingGate = useEditingEntitlement()
+const editingGate = useOfficialEntitlement()
 const editGateOpen = ref(false)
 const editActivateOpen = ref(false)
 let editingActivationSucceeded = false
@@ -746,12 +745,20 @@ const activateOpen = ref(false)
 // gate 只在「有产品未授权」或「纯不可用」时接管视图；已授权 / 放行走原渲染。
 const showExoticGate = computed(() => {
   const m = gateModeFor(exoticGate.entitlement.value)
-  return m === 'purchase' || m === 'blocked'
+  return exoticGate.failed.value || exoticGate.loading.value || m === 'purchase' || m === 'blocked'
 })
 // 传给 gate / 激活对话框的功能名：用格式名（如 PSD）给出上下文；gate 无名时会退回通用标题。
 const exoticFeatureName = computed(() =>
   detail.value ? detail.value.fileFormat.toUpperCase() : '',
 )
+
+function refreshExoticGate(): void {
+  if (detail.value) void exoticGate.resolveForItem(detail.value.id, detail.value.fileFormat)
+}
+useTauriListen(EVENTS.OFFICIAL_LICENSE_CHANGED, () => {
+  void editingGate.fetchEntitlement()
+  refreshExoticGate()
+})
 
 // 查看项变化即重解析（immediate 覆盖「详情已开时组件才挂载」的情形）。
 // 关闭 / 无项时清态，避免上一项的 gate 残留污染下一项。
@@ -897,7 +904,7 @@ async function openEditor(): Promise<void> {
   if (!detail.value) return
   editGateOpen.value = true
   const entitlement = await editingGate.fetchEntitlement()
-  if (entitlement.availability === 'authorized' && detail.value) {
+  if (entitlement?.availability === 'authorized' && detail.value) {
     editGateOpen.value = false
     editor.open(detail.value)
   }
@@ -949,7 +956,7 @@ function onEditingActivationClosed(): void {
 async function onEditingActivated(): Promise<void> {
   editingActivationSucceeded = true
   const entitlement = await editingGate.fetchEntitlement()
-  if (entitlement.availability === 'authorized' && detail.value) editor.open(detail.value)
+  if (entitlement?.availability === 'authorized' && detail.value) editor.open(detail.value)
 }
 
 /** EditOverlay 取消/关闭(已内部走过「有改动则二次确认」)。 */

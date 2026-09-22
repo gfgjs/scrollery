@@ -31,6 +31,7 @@ pub mod layout;
 /// 应用生命周期回调:窗口事件拦截 + `RunEvent`(退出 WAL checkpoint / 后台任务优雅停止)。
 pub mod lifecycle;
 pub mod logging;
+pub mod official;
 pub mod proofread;
 pub mod reader;
 pub mod scanner;

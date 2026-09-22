@@ -1,16 +1,17 @@
 #!/usr/bin/env node
-// 发货闭包内容断言(2026-08-11 起):AI/RAW/video worker 及其运行时必须随安装包分发。
+// 发货闭包内容断言(2026-08-11 起):AI/RAW/video/enhance worker 及其运行时必须随安装包分发。
 // 本脚本防回潮——一旦 externalBin/resources 断链即红。
 //
 // 三层校验:
-//   ① staging 层:src-tauri/binaries/ 下 ai-worker/video-worker/raw-worker + ORT 四件套必须存在;
-//   ② conf 层:tauri.conf.json 的 externalBin 含三个 worker、bundle.resources 声明四 DLL;
+//   ① staging 层:src-tauri/binaries/ 下 ai/video/raw/enhance worker + ORT 四件套必须存在;
+//   ② conf 层:tauri.conf.json 的 externalBin 含四个 worker、bundle.resources 声明四 DLL;
 //   ③ 安装包层:target/release/bundle/ 存在 MSI/NSIS 时,用 7z 拆包断言载荷和法律资源完整。
 //      NSIS 保留原名,归一化后按名比对;MSI 的资源文件被 Tauri 匿名化为 PathFile_<hash>(无扩展名,
 //      Bin_ 前缀侧车保留原名),只能按字节尺寸在条目尺寸集中匹配(缺项/截断都会错开尺寸)。
 //      实测 7-Zip 24+ 会递归展开 MSI 内嵌 app.cab,单次 `7z l -slt` 即拿到全部载荷条目。
 //
 // 用法:node scripts/verify-bundle-content.mjs
+//   --require-bundle:缺安装包/7z 均失败；--installer=<path> 可重复，限定本次待验收产物。
 //   - 安装包缺失或 7z 不可用 → 只跑 ①②,打印说明;
 //   - CI 且安装包存在但 7z 不可用 → 硬失败(发布路径必须做载荷级验证)。
 // 脚本启动先跑内置 selftest(正反样本喂检查器),防止检查器退化成只会 PASS 的空壳。
@@ -25,7 +26,7 @@ const CONFIG_PATH = path.join(ROOT, 'src-tauri', 'tauri.conf.json');
 const BINARIES_DIR = path.join(ROOT, 'src-tauri', 'binaries');
 const BUNDLE_DIR = path.join(ROOT, 'target', 'release', 'bundle');
 
-// 安装包载荷必含项(归一化名)。AI/RAW/video worker + ORT 四件套。
+// 安装包载荷必含项(归一化名)。AI/RAW/video/enhance worker + ORT 四件套。
 const REQUIRED_PAYLOAD = [
   'ai_worker.exe',
   'onnxruntime.dll',
@@ -34,6 +35,7 @@ const REQUIRED_PAYLOAD = [
   'dxil.dll',
   'raw_worker.exe',
   'video_worker.exe',
+  'enhance_worker.exe',
 ];
 
 // AGPL-3.0-only 要求随包提供许可证全文与对应源码入口(§4/§6)。
@@ -115,6 +117,9 @@ export function checkStaged(binariesDir) {
   if (!existsSync(binariesDir)) return [`staging 目录缺失:${binariesDir}`];
   const names = readdirSync(binariesDir);
   const v = [];
+  if (!names.some((n) => /^enhance-worker-.+\.exe$/.test(n))) {
+    v.push('staging 缺 enhance-worker-<triple>.exe(跑 npm run build:enhance-worker)');
+  }
   if (!names.some((n) => /^ai-worker-.+\.exe$/.test(n))) {
     v.push('staging 缺 ai-worker-<triple>.exe(跑 npm run build:ai-worker)');
   }
@@ -134,6 +139,9 @@ export function checkStaged(binariesDir) {
 export function checkConfig(conf) {
   const v = [];
   const ext = conf?.bundle?.externalBin ?? [];
+  if (!ext.includes('binaries/enhance-worker')) {
+    v.push('tauri.conf.json externalBin 缺 binaries/enhance-worker');
+  }
   if (!ext.includes('binaries/ai-worker')) {
     v.push('tauri.conf.json externalBin 缺 binaries/ai-worker');
   }
@@ -286,15 +294,16 @@ function selftest() {
   expect(normalizeEntryName('ai-worker.exe') === 'ai_worker.exe', '归一化漏转连字符');
   expect(normalizeEntryName('ONNXRUNTIME.DLL') === 'onnxruntime.dll', '归一化漏小写');
   expect(
-    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
+    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
     '载荷检查器对完整载荷误报'
   );
   const missing = checkPayloadEntries(['Bin_raw_worker.exe', 'onnxruntime.dll']);
   expect(missing.includes('ai_worker.exe') && missing.includes('dxil.dll'), '载荷检查器漏检缺项');
   expect(missing.includes('video_worker.exe'), '载荷检查器漏检 video-worker');
-  expect(missing.length === 5, '载荷检查器缺项计数错误');
+  expect(missing.includes('enhance_worker.exe'), '载荷检查器漏检 enhance-worker');
+  expect(missing.length === 6, '载荷检查器缺项计数错误');
   expect(
-    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
+    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
     '载荷检查器对 MSI Bin_ 前缀完整载荷误报'
   );
 
@@ -307,7 +316,7 @@ function selftest() {
   };
   expect(
     checkPayloadEntriesMs(
-      ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe',
+      ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe',
         'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d', 'PathFile_I09b10b5e'],
       [50161992, 49535488, 6523904, 9287261, 25355576, 17986400, 18527544, 1508664],
       msiStaged,
@@ -315,23 +324,23 @@ function selftest() {
     'MSI 匿名化载荷检查器对完整样本(PathFile_+Bin_)误报'
   );
   const msiMissing = checkPayloadEntriesMs(
-    ['app.cab', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe',
+    ['app.cab', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe',
       'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d'],
     [50161992, 6523904, 9287261, 25355576, 17986400, 18527544],
     msiStaged,
   );
   expect(msiMissing.length === 1 && msiMissing[0] === 'dxil.dll', 'MSI 匿名化载荷检查器漏检缺项');
   const msiTruncated = checkPayloadEntriesMs(
-    ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe',
+    ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe',
       'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d', 'PathFile_I09b10b5e'],
     [50161992, 49535488, 6523904, 9287261, 25355576, 17986400, 18527544, 1500000],
     msiStaged,
   );
   expect(msiTruncated.length === 1 && msiTruncated[0] === 'dxil.dll', 'MSI 匿名化载荷检查器漏检截断(尺寸不符)');
 
-  const confOk = { bundle: { externalBin: ['binaries/raw-worker', 'binaries/ai-worker', 'binaries/video-worker'], resources: { 'binaries/onnxruntime.dll': 'onnxruntime.dll', 'binaries/DirectML.dll': 'DirectML.dll', 'binaries/dxcompiler.dll': 'dxcompiler.dll', 'binaries/dxil.dll': 'dxil.dll', '../LICENSE': 'LICENSE', '../NOTICE.md': 'NOTICE.md', '../SOURCE.md': 'SOURCE.md', '../COMMERCIAL.md': 'COMMERCIAL.md', '../ADDITIONAL-PERMISSION.md': 'ADDITIONAL-PERMISSION.md', '../target/legal': 'legal' } } };
+  const confOk = { bundle: { externalBin: ['binaries/raw-worker', 'binaries/ai-worker', 'binaries/video-worker', 'binaries/enhance-worker'], resources: { 'binaries/onnxruntime.dll': 'onnxruntime.dll', 'binaries/DirectML.dll': 'DirectML.dll', 'binaries/dxcompiler.dll': 'dxcompiler.dll', 'binaries/dxil.dll': 'dxil.dll', '../LICENSE': 'LICENSE', '../NOTICE.md': 'NOTICE.md', '../SOURCE.md': 'SOURCE.md', '../COMMERCIAL.md': 'COMMERCIAL.md', '../ADDITIONAL-PERMISSION.md': 'ADDITIONAL-PERMISSION.md', '../target/legal': 'legal' } } };
   expect(checkConfig(confOk).length === 0, 'conf 检查器对完整接线误报');
-  expect(checkConfig({ bundle: { externalBin: ['binaries/raw-worker'], resources: {} } }).length === 12, 'conf 检查器漏检断链');
+  expect(checkConfig({ bundle: { externalBin: ['binaries/raw-worker'], resources: {} } }).length === 13, 'conf 检查器漏检断链');
   expect(checkLegalEntries(['LICENSE', 'NOTICE.md', 'SOURCE.md', 'COMMERCIAL.md', 'ADDITIONAL-PERMISSION.md', 'legal/foliate-js/LICENSE', 'legal/LibRaw/COPYRIGHT', 'legal/LibRaw/LICENSE.CDDL', 'legal/LibRaw/LICENSE.LGPL', 'legal/onnxruntime/LICENSE', 'legal/onnxruntime/ThirdPartyNotices.txt', 'legal/ffmpeg/LICENSE.md', 'legal/ffmpeg/COPYING.LGPLv2.1', 'legal/ffmpeg/BtbN-LICENSE', 'legal/graphviz/Graphviz-2.40.1-LICENSE.txt', 'legal/graphviz/Viz.js-2.1.2-LICENSE.txt', 'legal/lute/Lute-1.7.6-LICENSE.txt', 'legal/MANIFEST.json']).length === 0, '法律资源归档检查器误报');
   expect(checkLegalEntries(['LICENSE', 'NOTICE.md']).length === 16, '法律资源归档检查器漏检缺项');
   expect(checkLegalEntriesMs([10, 20, 30], [{ name: 'LICENSE', size: 10 }, { name: 'NOTICE.md', size: 30 }]).length === 0, 'MSI 法律资源尺寸检查器误报');
@@ -348,6 +357,7 @@ function selftest() {
 
 function main() {
   selftest();
+  if (process.argv.includes('--selftest')) return;
   const violations = [];
 
   // ① staging 层
@@ -361,12 +371,14 @@ function main() {
   violations.push(...checkConfig(conf).map((v) => `[conf] ${v}`));
 
   // ③ 安装包层
-  const installers = findInstallers(BUNDLE_DIR);
+  const selected = process.argv.filter((arg) => arg.startsWith('--installer=')).map((arg) => path.resolve(arg.slice('--installer='.length)));
+  const requireBundle = Boolean(process.env.CI) || process.argv.includes('--require-bundle');
+  const installers = selected.length ? selected : findInstallers(BUNDLE_DIR);
   if (installers.length > 0) {
     const sevenZip = find7z();
     if (!sevenZip) {
-      if (process.env.CI) {
-        violations.push('[bundle] CI 环境有安装包但找不到 7z——发布路径必须做载荷级断言');
+      if (requireBundle) {
+        violations.push('[bundle] 找不到 7z——发行验收必须做安装包载荷级断言');
       } else {
         console.warn('[verify-bundle-content] 未找到 7z,跳过安装包载荷断言(仅 staging/conf 层生效)');
       }
@@ -407,7 +419,8 @@ function main() {
       }
     }
   } else {
-    console.warn('[verify-bundle-content] 未找到安装包(target/release/bundle)——仅 staging/conf 层生效');
+    if (requireBundle) violations.push('[bundle] 缺少安装包，不能完成发行载荷校验');
+    else console.warn('[verify-bundle-content] 未找到安装包(target/release/bundle)——仅 staging/conf 层生效');
   }
 
   if (violations.length) {

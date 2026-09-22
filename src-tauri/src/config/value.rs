@@ -953,6 +953,11 @@ mod tests {
         let got = item_to_canonical(d, &item).unwrap();
         assert!(got.text.contains("\"danger\":true"), "{}", got.text);
         assert!(
+            got.text.contains("\"galleryTimeline\":false"),
+            "旧配置缺失时间轴分组时应默认收起:{}",
+            got.text
+        );
+        assert!(
             got.text.contains("\"common\":true"),
             "缺失 ID 应补 schema 默认:{}",
             got.text

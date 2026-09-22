@@ -47,8 +47,7 @@
           <ArrowLeft :size="18" />
         </button>
         <div class="settings-header__title-block">
-          <span class="settings-eyebrow">{{ $t('settings.title') }}</span>
-          <h1 class="settings-title">{{ $t(currentSectionLabelKey) }}</h1>
+          <h1 class="settings-title">{{ $t('settings.title') }}</h1>
         </div>
       </div>
       <div class="settings-search-wrap">
@@ -58,6 +57,9 @@
             v-model.trim="settingsQuery"
             type="search"
             :placeholder="$t('settings.searchPlaceholder')"
+            :aria-label="$t('settings.searchPlaceholder')"
+            @keydown.esc="settingsQuery = ''"
+            @keydown.enter.prevent="searchResults[0] && selectSearchResult(searchResults[0])"
           />
         </label>
         <div
@@ -75,7 +77,7 @@
             <span class="settings-search-result__label">{{ result.label }}</span>
             <span class="settings-search-result__meta">
               {{ $t(result.sectionLabelKey) }}
-              <template v-if="result.description"> · {{ result.description }}</template>
+              <template v-if="result.groupLabel"> · {{ result.groupLabel }}</template>
             </span>
           </button>
           <div v-if="!searchResults.length" class="settings-search-results__empty">
@@ -100,6 +102,7 @@
           type="button"
           class="settings-nav__item"
           :class="{ active: currentSection === section.id }"
+          :aria-current="currentSection === section.id ? 'page' : undefined"
 
           @click="selectSection(section.id)"
         >
@@ -108,67 +111,23 @@
       </nav>
 
       <main id="settings-main" class="settings-content">
-        <div v-if="!hasSearchResults" class="settings-empty">
-          {{ $t('settings.noSearchResults') }}
-        </div>
-
-        <section v-show="currentSection === 'common'" id="settings-common" class="settings-section">
-          <div class="settings-section__heading">
-            <div>
-              <h2>{{ $t('settings.sectionCommon') }}</h2>
-              <p>{{ $t('settings.sectionCommonDesc') }}</p>
-            </div>
-          </div>
-          <CollapsibleCard id="common" :title="$t('settings.common')">
-            <SettingRow v-for="key in generalKeys('common')" :key="key" :setting-key="key" />
-          </CollapsibleCard>
-        </section>
-
-        <section
-          v-show="currentSection === 'appearance'"
-          id="settings-appearance"
-          class="settings-section"
-        >
-          <div class="settings-section__heading">
-            <div>
-              <h2>{{ $t('settings.sectionAppearance') }}</h2>
-              <p>{{ $t('settings.sectionAppearanceDesc') }}</p>
-            </div>
-          </div>
-          <!-- ── 外观与布局 ──────────────────────────────────── -->
-          <!-- 各卡行序与行体均由注册表驱动(设计 §8):行=SettingRow 外壳,特例行就地内嵌。 -->
-          <CollapsibleCard id="general" :title="$t('settings.appearanceGroup')">
-            <template v-for="key in generalKeys('appearance')" :key="key">
-              <!-- 特例:主题行无右侧控件,其控件为下方 ThemeSettings(配色卡与主题库);钉住区仍用 compact select -->
+        <section v-for="section in generalSections" :key="section.id"
+          v-show="currentSection === section.id" :id="`settings-${section.id}`" class="settings-section">
+          <div class="settings-section__heading"><h2>{{ $t(section.labelKey) }}</h2></div>
+          <CollapsibleCard v-for="group in groupsFor(section.id)" :id="group.id" :key="group.id"
+            :title="$t(group.titleKey)" :default-open="group.defaultOpen"
+            :summary="group.id === 'galleryTimeline' ? timelineSummary : undefined">
+            <template v-for="key in group.keys" :key="key">
               <template v-if="key === 'theme'">
-                <SettingRow setting-key="theme" no-control />
-                <ThemeSettings />
+                <SettingRow setting-key="theme" no-control>
+                  <template #extra><ThemeSettings /></template>
+                </SettingRow>
               </template>
-              <SettingRow v-else :setting-key="key" />
-            </template>
-          </CollapsibleCard>
-        </section>
-
-        <section
-          v-show="currentSection === 'gallery'"
-          id="settings-gallery"
-          class="settings-section"
-        >
-          <div class="settings-section__heading">
-            <div>
-              <h2>{{ $t('settings.sectionGallery') }}</h2>
-              <p>{{ $t('settings.sectionGalleryDesc') }}</p>
-            </div>
-          </div>
-          <CollapsibleCard id="galleryBehavior" :title="$t('settings.galleryGroup')">
-            <template v-for="key in generalKeys('gallery')" :key="key">
-              <template v-if="key === 'viewerColorTarget'">
-                <SettingRow v-if="!isMobilePlatform" setting-key="viewerColorTarget" />
-              </template>
-              <template v-else-if="key === 'viewerIccManager'">
-                <SettingRow v-if="!isMobilePlatform" setting-key="viewerIccManager">
+                <SettingRow v-else-if="key === 'viewerIccManager'" setting-key="viewerIccManager">
                   <template #extra>
-                    <div class="icc-profile-list">
+                    <details class="settings-inline-details" :open="config.viewerColorTarget === 'custom'">
+                      <summary>{{ $t('settings.viewerIccProfiles', { count: iccProfiles.length }) }}</summary>
+                      <div class="icc-profile-list">
                       <div v-if="!iccProfiles.length" class="settings-card__desc">
                         {{ $t('settings.viewerIccEmpty') }}
                       </div>
@@ -194,34 +153,32 @@
                           <Trash2 :size="14" />
                         </button>
                       </label>
-                    </div>
+                      </div>
+                    </details>
                   </template>
                   <UiButton @click="importIccProfile">
                     {{ $t('settings.viewerIccImportBtn') }}
                   </UiButton>
                 </SettingRow>
-              </template>
               <SettingRow v-else :setting-key="key" />
             </template>
           </CollapsibleCard>
-          <!-- ── 阅读（R3：阅读主题日/夜配对，字号/排版等在阅读器内面板调）───────── -->
-          <ReaderSettingsSection />
+          <ReaderSettingsSection v-if="section.id === 'gallery'" />
         </section>
 
         <section v-show="currentSection === 'media'" id="settings-media" class="settings-section">
           <div class="settings-section__heading">
             <div>
               <h2>{{ $t('settings.sectionMedia') }}</h2>
-              <p>{{ $t('settings.sectionMediaDesc') }}</p>
             </div>
           </div>
           <!-- ── 缩略图 ───────────────────────────────────────── -->
-          <CollapsibleCard id="thumbnails" :title="$t('settings.thumbnails')">
-            <template v-for="key in sectionSettingKeys('thumbnails')" :key="key">
+          <CollapsibleCard v-for="group in thumbnailGroups" :id="group.id" :key="group.id" :title="$t(group.titleKey)">
+            <template v-for="key in group.keys" :key="key">
               <!-- 特例:悬停信息开关下挂信息元素多选面板 -->
               <SettingRow v-if="key === 'showThumbInfo'" setting-key="showThumbInfo">
-                <div class="thumb-info-stack">
-                  <DynamicSettingControl setting-key="showThumbInfo" />
+                <DynamicSettingControl setting-key="showThumbInfo" />
+                <template #extra>
                   <div v-if="ui.showThumbInfo" class="thumb-info-options">
                     <label
                       v-for="el in THUMB_INFO_ELEMENTS"
@@ -235,7 +192,7 @@
                       />{{ $t(el.labelKey) }}
                     </label>
                   </div>
-                </div>
+                </template>
               </SettingRow>
               <!-- 特例:缓存目录(可点路径描述 + 换目录按钮) -->
               <SettingRow v-else-if="key === 'thumbCacheDir'" setting-key="thumbCacheDir">
@@ -270,7 +227,9 @@
                   </div>
                 </template>
                 <template #extra>
-                  <div v-if="cacheStats" class="cache-stats-grid">
+                  <details v-if="cacheStats" class="settings-inline-details">
+                    <summary>{{ $t('settings.cacheBreakdown') }}</summary>
+                    <div class="cache-stats-grid">
                     <div v-for="row in cacheStatRows" :key="row.labelKey" class="cache-stats-item">
                       <span class="cache-stats-label">{{ $t(row.labelKey) }}</span>
                       <span class="cache-stats-value"
@@ -278,7 +237,8 @@
                         {{ $t('settings.cacheStatsFiles', { n: row.stat.files }) }}</span
                       >
                     </div>
-                  </div>
+                    </div>
+                  </details>
                 </template>
                 <UiButton :disabled="cacheStatsLoading" @click="refreshCacheStats">
                   {{ $t('settings.cacheStatsRefresh') }}
@@ -411,7 +371,6 @@
           <div class="settings-section__heading">
             <div>
               <h2>{{ $t('settings.sectionAi') }}</h2>
-              <p>{{ $t('settings.sectionAiDesc') }}</p>
             </div>
           </div>
           <!-- ── AI 模型配置 ──────────────────────────────────── -->
@@ -461,7 +420,6 @@
           <div class="settings-section__heading">
             <div>
               <h2>{{ $t('settings.sectionStorage') }}</h2>
-              <p>{{ $t('settings.sectionStorageDesc') }}</p>
             </div>
           </div>
           <!-- ── 数据备份与恢复（方案 B §8）───────────────────── -->
@@ -485,7 +443,6 @@
           <div class="settings-section__heading">
             <div>
               <h2>{{ $t('settings.sectionAdvanced') }}</h2>
-              <p>{{ $t('settings.sectionAdvancedDesc') }}</p>
             </div>
           </div>
           <!-- ── 开发者工具 ─────────────────────────────────── -->
@@ -559,7 +516,9 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { useRoute, useRouter } from 'vue-router'
 import { IPC } from '../constants/ipc'
 import { isMobilePlatform } from '../utils/platform'
-import { SETTINGS_MAP, sectionSettingKeys, type SettingKey } from '../constants/settingsMap'
+import { getSettingSpec, sectionSettingKeys, type SettingKey } from '../constants/settingsMap'
+import { SETTINGS_SECTIONS, SETTINGS_GROUPS, type SettingsNavId } from '../constants/settingsLayout'
+import { useSettingsCards } from '../composables/useSettingsCards'
 import { formatFileSize } from '../utils/format'
 import { setThumbCacheDir } from '../utils/thumbCacheDir'
 import SettingRow from '../components/settings/SettingRow.vue'
@@ -603,236 +562,96 @@ const videoDerivePercent = computed(
   () => (derive.videoFinished / Math.max(derive.videoTotal, 1)) * 100,
 )
 
-type SettingsNavId = 'common' | 'appearance' | 'gallery' | 'media' | 'ai' | 'storage' | 'advanced'
-type GeneralViewGroup = 'common' | 'appearance' | 'gallery'
 interface SettingsSearchResult {
   id: string
   section: SettingsNavId
   sectionLabelKey: string
+  groupId: string
+  groupLabel: string
   label: string
   description: string
   settingKey?: SettingKey
 }
 
-const settingsSections: ReadonlyArray<{ id: SettingsNavId; labelKey: string }> = [
-  { id: 'common', labelKey: 'settings.sectionCommon' },
-  { id: 'appearance', labelKey: 'settings.sectionAppearance' },
-  { id: 'gallery', labelKey: 'settings.sectionGallery' },
-  { id: 'media', labelKey: 'settings.sectionMedia' },
-  { id: 'ai', labelKey: 'settings.sectionAi' },
-  { id: 'storage', labelKey: 'settings.sectionStorage' },
-  { id: 'advanced', labelKey: 'settings.sectionAdvanced' },
-]
+const settingsSections = SETTINGS_SECTIONS
+const generalSections = settingsSections.filter(({ id }) => ['common', 'appearance', 'gallery'].includes(id))
 const settingsQuery = ref('')
 const defaultSection: SettingsNavId = 'appearance'
+const cards = useSettingsCards()
 
-// general 的后端注册段仍保留原名；这里仅定义面向用户的任务分组，避免行为层迁移。
-const generalSettingGroups: Record<GeneralViewGroup, readonly SettingKey[]> = {
-  common: ['language', 'closeBehavior'],
-  appearance: [
-    'theme',
-    'uiFontSize',
-    'titlebarMerged',
-    'toolbarAlign',
-    'selectionBarDocked',
-    'selectionBarAlign',
-    'autoHideChromeWindowed',
-  ],
-  gallery: [
-    'timelineAxisWidth',
-    'timelineScrollWidth',
-    'scrollThumbMinHeight',
-    'axisViewportOpacity',
-    'hoverScale',
-    'hoverAutoplay',
-    'viewerColorTarget',
-    'viewerIccManager',
-  ],
+function groupsFor(section: SettingsNavId) {
+  return SETTINGS_GROUPS.filter(group => group.section === section && group.keys.length && (!group.desktopOnly || !isMobilePlatform))
 }
+const thumbnailGroups = groupsFor('media').filter(group => group.id !== 'video')
+const timelineSummary = computed(() => t('settings.timelineSummary', {
+  axis: config.timelineAxisWidth, thumb: config.timelineScrollWidth,
+}))
 
-function generalKeys(group: GeneralViewGroup): SettingKey[] {
-  return [...generalSettingGroups[group]]
-}
-
-function registeredSearchResults(
-  section: SettingsNavId,
-  keys: readonly SettingKey[],
-): SettingsSearchResult[] {
-  const sectionLabelKey = settingsSections.find((item) => item.id === section)?.labelKey ?? ''
-  return keys.map((key) => {
-    const spec = SETTINGS_MAP[key]
-    const descKey = 'descKey' in spec ? spec.descKey : undefined
-    return {
-      id: key,
-      section,
-      sectionLabelKey,
-      label: t(spec.label),
-      description: descKey ? t(descKey) : '',
-      settingKey: key,
-    }
-  })
-}
-
-const searchCatalog = computed<SettingsSearchResult[]>(() => [
-  ...registeredSearchResults('common', generalKeys('common')),
-  ...registeredSearchResults('appearance', generalKeys('appearance')),
-  ...registeredSearchResults('gallery', generalKeys('gallery')),
-  ...registeredSearchResults('media', [
-    ...sectionSettingKeys('thumbnails'),
-    ...sectionSettingKeys('video'),
-  ]),
-  ...registeredSearchResults('ai', sectionSettingKeys('aiModels')),
-  ...registeredSearchResults('advanced', [
-    ...sectionSettingKeys('debug'),
-    ...sectionSettingKeys('danger'),
-  ]),
-  ...[
-    ['reader', 'gallery', 'doc.readerSettings'],
-    ['model-library', 'ai', 'settings.mlTitle'],
-    ['face-models', 'ai', 'settings.fmTitle'],
-    ['ocr-models', 'ai', 'settings.ocrTitle'],
-    ['enhance-models', 'ai', 'settings.enhanceTitle'],
-    ['backup', 'storage', 'backup.sectionTitle'],
-    ['root-visibility', 'storage', 'settings.rootVisTitle'],
-    ['network-storage', 'storage', 'settings.nsTitle'],
-    ['known-volumes', 'storage', 'settings.volTitle'],
-  ].map(([id, section, labelKey]) => ({
-    id,
-    section: section as SettingsNavId,
-    sectionLabelKey: settingsSections.find((item) => item.id === section)?.labelKey ?? '',
-    label: section === 'storage' ? bt(labelKey) : t(labelKey),
-    description: '',
-  })),
-])
-
+const searchCatalog = computed<SettingsSearchResult[]>(() => SETTINGS_GROUPS
+  .filter(group => !group.desktopOnly || !isMobilePlatform)
+  .flatMap(group => {
+    const sectionLabelKey = settingsSections.find(section => section.id === group.section)?.labelKey ?? ''
+    const groupLabel = group.id === 'backup' ? bt(group.titleKey) : t(group.titleKey)
+    const base = { section: group.section, sectionLabelKey, groupId: group.id, groupLabel }
+    if (!group.keys.length) return [{ ...base, id: group.id, label: groupLabel,
+      description: group.id === 'backup' ? bt('backup.searchTerms') : '' }]
+    return group.keys.filter(rowVisible).map(key => {
+      const spec = getSettingSpec(key)!
+      return { ...base, id: key, settingKey: key, label: t(spec.label),
+        description: [spec.descKey, spec.summaryKey, spec.searchTermsKey].filter((key): key is string => !!key).map(key => t(key)).join(' ') }
+    })
+  }))
 const searchResults = computed(() => {
   const query = settingsQuery.value.trim().toLocaleLowerCase()
   if (!query) return []
-  return searchCatalog.value
-    .filter((result) =>
-      [result.label, result.description, t(result.sectionLabelKey)]
-        .join(' ')
-        .toLocaleLowerCase()
-        .includes(query),
-    )
-    .slice(0, 10)
+  return searchCatalog.value.filter(result =>
+    [result.label, result.description, result.groupLabel, t(result.sectionLabelKey)]
+      .join(' ').toLocaleLowerCase().includes(query),
+  ).slice(0, 10)
 })
 
 function normalizeSection(value: unknown): SettingsNavId {
   if (value === 'general') return 'appearance'
-  return settingsSections.some((section) => section.id === value)
-    ? (value as SettingsNavId)
-    : defaultSection
+  return settingsSections.some(section => section.id === value) ? value as SettingsNavId : defaultSection
 }
-
-function settingSearchText(keys: readonly SettingKey[]) {
-  return keys
-    .flatMap((key) => {
-      const spec = SETTINGS_MAP[key]
-      return [t(spec.label), 'descKey' in spec && spec.descKey ? t(spec.descKey) : '']
-    })
-    .join(' ')
-}
-
-const sectionSearchCorpus = computed<Record<SettingsNavId, string>>(() => ({
-  common: [
-    t('settings.sectionCommon'),
-    t('settings.common'),
-    settingSearchText(generalKeys('common')),
-  ].join(' '),
-  appearance: [
-    t('settings.sectionAppearance'),
-    t('settings.appearanceGroup'),
-    settingSearchText(generalKeys('appearance')),
-  ].join(' '),
-  gallery: [
-    t('settings.sectionGallery'),
-    t('settings.galleryGroup'),
-    t('doc.readerSettings'),
-    settingSearchText(generalKeys('gallery')),
-  ].join(' '),
-  media: [
-    t('settings.sectionMedia'),
-    t('settings.thumbnails'),
-    t('settings.video'),
-    settingSearchText(sectionSettingKeys('thumbnails')),
-    settingSearchText(sectionSettingKeys('video')),
-  ].join(' '),
-  ai: [
-    t('settings.sectionAi'),
-    t('settings.aiModels'),
-    t('settings.mlTitle'),
-    t('settings.fmTitle'),
-    t('settings.ocrTitle'),
-    t('settings.enhanceTitle'),
-    settingSearchText(sectionSettingKeys('aiModels')),
-  ].join(' '),
-  storage: [
-    t('settings.sectionStorage'),
-    bt('backup.sectionTitle'),
-    bt('backup.searchTerms'),
-    t('settings.rootVisTitle'),
-    t('settings.nsTitle'),
-    t('settings.volTitle'),
-  ].join(' '),
-  advanced: [
-    t('settings.sectionAdvanced'),
-    t('sidebar.debugSettings'),
-    t('settings.dangerZone'),
-    settingSearchText(sectionSettingKeys('debug')),
-    settingSearchText(sectionSettingKeys('danger')),
-  ].join(' '),
-}))
-
-function sectionMatches(section: SettingsNavId): boolean {
-  const query = settingsQuery.value.trim().toLocaleLowerCase()
-  return !query || sectionSearchCorpus.value[section].toLocaleLowerCase().includes(query)
-}
-
-const hasSearchResults = computed(() =>
-  settingsSections.some((section) => sectionMatches(section.id)),
-)
 const currentSection = ref<SettingsNavId>(normalizeSection(route.params.section))
-const currentSectionLabelKey = computed(
-  () =>
-    settingsSections.find((section) => section.id === currentSection.value)?.labelKey ??
-    'settings.sectionAppearance',
-)
-
 function sectionPath(section: SettingsNavId): string {
   return section === defaultSection ? '/settings' : `/settings/${section}`
 }
-
 function selectSection(section: SettingsNavId) {
   settingsQuery.value = ''
   currentSection.value = section
   void router.replace(sectionPath(section))
 }
-
-watch(
-  () => route.params.section,
-  (section) => {
-    currentSection.value = normalizeSection(section)
-  },
-)
-
-watch(settingsQuery, () => {
-  const query = settingsQuery.value.trim()
-  if (!query) return
-  const firstMatch = settingsSections.find((section) => sectionMatches(section.id))
-  if (firstMatch) currentSection.value = firstMatch.id
+watch(() => route.params.section, section => { currentSection.value = normalizeSection(section) })
+watch(currentSection, async () => {
+  await nextTick()
+  // 窄屏分类横向滚动；搜索跨分类后仍需露出当前分类。
+  document.querySelector<HTMLElement>('.settings-nav__item.active')
+    ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
 })
 
-function selectSearchResult(result: SettingsSearchResult) {
-  currentSection.value = result.section
-  settingsQuery.value = ''
-  void router.replace(sectionPath(result.section))
-  if (!result.settingKey) return
-  void nextTick(() => {
-    document
-      .querySelector<HTMLElement>(`[data-setting-key="${result.settingKey}"]`)
-      ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-  })
+async function selectSearchResult(result: SettingsSearchResult) {
+  selectSection(result.section)
+  cards.expand(result.groupId)
+  await nextTick()
+  const group = document.querySelector<HTMLElement>(`[data-settings-card="${result.groupId}"]`)
+  const target = result.settingKey
+    ? group?.querySelector<HTMLElement>(`[data-setting-key="${result.settingKey}"]`)
+    : group
+  if (!target) return
+  // 配置文件列表按需展开；搜索命中时同时露出当前文件。
+  if (result.settingKey === 'viewerIccManager') {
+    const list = target.querySelector('details.settings-inline-details')
+    if (list instanceof HTMLDetailsElement) list.open = true
+  }
+  target.scrollIntoView({ block: 'center', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' })
+  target.classList.remove('settings-search-highlight')
+  void target.offsetWidth
+  target.classList.add('settings-search-highlight')
+  target.addEventListener('animationend', () => target.classList.remove('settings-search-highlight'), { once: true })
+  const control = target.querySelector<HTMLElement>('input, select, .settings-card__header-toggle, button:not(.pin-btn), summary')
+  control?.focus({ preventScroll: true })
 }
 
 function onBackupCardToggle(open: boolean) {

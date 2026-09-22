@@ -4,16 +4,16 @@
 //! 单一调度器：接收扫描/安装/激活/配置/重试时钟等事件，**幂等**唤醒**唯一**一条 Pipeline。
 //!
 //! 设计：
-//!   - 有界事件通道 + `dirty` 原子位：通道满时不静默丢失最后一次 wake（置 dirty，循环结束后补查）。
+//!   - 原子语义位 + 单槽通知：合并 wake 时保留用户请求与版本对账语义。
 //!   - 串行循环：唯一 owner，commands 只发 wake → 天然「两个并发 start 只启动一条 Pipeline」。
-//!   - 尾部竞态：每条 Pipeline 自然完成后再查 pending + 到期 retry，解决运行期间新增任务（§4.1）。
+//!   - 尾部竞态：运行期间新增任务保留 wake，结束后由下一次通知重新评估。
 //!   - 重试时钟：独立 interval 周期发 `RetryDue`，使到期 retryable 任务被重新评估。
 //!   - 门控（[`evaluate_run`]）：enabled/未暂停/可领取(授权+平台+能力)/有就绪任务/Worker 可用 → 才跑。
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use tauri::{AppHandle, Emitter};
@@ -144,11 +144,15 @@ fn plugin_descriptors(snap: &crate::exotic::catalog::CatalogSnapshot) -> Vec<Plu
             uses_gpu: off.uses_gpu,
         });
     }
+    out.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
     out
 }
 
-/// 事件通道容量（可合并；满时置 dirty 不丢 wake）。
-const WAKE_CHANNEL_CAP: usize = 32;
+const WAKE_PENDING: u8 = 1;
+const WAKE_USER: u8 = 2;
+const WAKE_RECONCILE: u8 = 4;
+/// 启动失败或熔断后暂停自动尝试，安装/用户请求可以提前复位。
+const PLUGIN_COOLDOWN: Duration = Duration::from_secs(60);
 /// 重试时钟周期。
 const RETRY_TICK: Duration = Duration::from_secs(30);
 /// 握手超时。
@@ -171,94 +175,77 @@ pub enum WakeReason {
 
 /// Coordinator 句柄。`wake()` 只通知；实际调度在后台循环串行进行。
 pub struct ExoticCoordinator {
-    tx: mpsc::Sender<WakeReason>,
-    dirty: Arc<AtomicBool>,
+    tx: mpsc::Sender<()>,
+    pending: Arc<AtomicU8>,
 }
 
 impl ExoticCoordinator {
-    /// 启动后台调度循环 + 重试时钟，返回句柄。需在 tokio 运行时内调用（Tauri setup）。
+    /// 启动单一调度循环及重试时钟。
     pub fn start(app: AppHandle, state: Arc<AppState>, host: Arc<ExoticHost>) -> Arc<Self> {
-        let (tx, rx) = mpsc::channel::<WakeReason>(WAKE_CHANNEL_CAP);
-        let dirty = Arc::new(AtomicBool::new(false));
-
-        // 调度循环。
-        {
-            let app = app.clone();
-            let state = Arc::clone(&state);
-            let host = Arc::clone(&host);
-            let dirty = Arc::clone(&dirty);
-            tauri::async_runtime::spawn(async move {
-                run_loop(app, state, host, rx, dirty).await;
-            });
-        }
-
-        let handle = Arc::new(ExoticCoordinator {
-            tx: tx.clone(),
-            dirty,
+        let (tx, rx) = mpsc::channel(1);
+        let pending = Arc::new(AtomicU8::new(0));
+        let handle = Arc::new(Self {
+            tx,
+            pending: Arc::clone(&pending),
         });
-
-        // 重试时钟：周期发 RetryDue（到期 retryable 任务重新评估）。
-        {
-            let tx = tx.clone();
-            tauri::async_runtime::spawn(async move {
-                let mut ticker = tokio::time::interval(RETRY_TICK);
-                ticker.tick().await; // 跳过立即触发
-                loop {
-                    ticker.tick().await;
-                    if tx.send(WakeReason::RetryDue).await.is_err() {
-                        break; // 接收端已关闭
-                    }
+        tauri::async_runtime::spawn(run_loop(app, state, host, rx, pending));
+        let timer = Arc::clone(&handle);
+        tauri::async_runtime::spawn(async move {
+            let mut ticker = tokio::time::interval(RETRY_TICK);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if timer.tx.is_closed() {
+                    break;
                 }
-            });
-        }
-
+                timer.wake(WakeReason::RetryDue);
+            }
+        });
         handle
     }
 
-    /// 幂等唤醒：通知调度循环重新评估。通道满时置 dirty（不丢失最后一次 wake）。
+    /// 先保存语义，再发送通知；通知槽已满时语义仍保留到下一轮原子取走。
     pub fn wake(&self, reason: WakeReason) {
-        match self.tx.try_send(reason) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // 通道满：循环很快会处理；置 dirty 保证结束后补查一次。
-                self.dirty.store(true, Ordering::SeqCst);
+        let flags = WAKE_PENDING
+            | if reason == WakeReason::UserRequested {
+                WAKE_USER
+            } else {
+                0
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                debug!("exotic Coordinator 通道已关闭，wake 丢弃");
-            }
-        }
+            | if needs_reconcile(reason) {
+                WAKE_RECONCILE
+            } else {
+                0
+            };
+        self.pending.fetch_or(flags, Ordering::SeqCst);
+        let _ = self.tx.try_send(());
     }
 }
 
-/// 调度主循环：等 wake → 合并 → 运行直至无就绪 → 处理 dirty 补查。
+/// 每次通知只运行一轮。运行期间新增任务的 wake 保留在 pending，不依赖无进展重跑。
 async fn run_loop(
     app: AppHandle,
     state: Arc<AppState>,
     host: Arc<ExoticHost>,
-    mut rx: mpsc::Receiver<WakeReason>,
-    dirty: Arc<AtomicBool>,
+    mut rx: mpsc::Receiver<()>,
+    pending: Arc<AtomicU8>,
 ) {
-    info!("exotic Coordinator 启动");
-    while let Some(reason) = rx.recv().await {
-        debug!("exotic wake: {reason:?}");
-        // 合并通道内其余 wake；本批只要有一个 UserRequested 即绕过 auto 门控（auto=false 时也运行）。
-        // 病历 #4:PluginInstalled/Startup 额外携带「版本对账」语义(见 needs_reconcile 注)。
-        let mut bypass_auto = reason == WakeReason::UserRequested;
-        let mut force_reconcile = needs_reconcile(reason);
-        while let Ok(r) = rx.try_recv() {
-            bypass_auto |= r == WakeReason::UserRequested;
-            force_reconcile |= needs_reconcile(r);
+    let mut cooldowns = HashMap::new();
+    while rx.recv().await.is_some() {
+        let flags = pending.swap(0, Ordering::SeqCst);
+        if flags == 0 {
+            continue;
         }
-        dirty.store(false, Ordering::SeqCst);
-
-        maybe_run_until_drained(&app, &state, &host, bypass_auto, force_reconcile).await;
-
-        // 运行期间被丢弃的 wake（通道满）→ 再补查一轮（沿用本批 bypass：通道满时无法重建其 reason）。
-        if dirty.swap(false, Ordering::SeqCst) {
-            maybe_run_until_drained(&app, &state, &host, bypass_auto, force_reconcile).await;
-        }
+        maybe_run_until_drained(
+            &app,
+            &state,
+            &host,
+            flags & WAKE_USER != 0,
+            flags & WAKE_RECONCILE != 0,
+            &mut cooldowns,
+        )
+        .await;
     }
-    info!("exotic Coordinator 退出");
 }
 
 /// 是否携带「worker 版本对账」语义(病历 #4,2026-07-05 真机):版本失效
@@ -276,22 +263,29 @@ fn needs_reconcile(reason: WakeReason) -> bool {
     )
 }
 
-/// 反复运行 Pipeline 直至无就绪任务(解决尾部竞态:运行期间新增任务在本轮被消化)。
-/// T13 通用化:按注册表逐 (插件, 能力) 调度,循环体不再写死 PSD;单调度循环串行,
-/// 插件间天然互不并发。
+/// 按稳定顺序评估各插件；每个插件本轮至多一次 Pipeline，期间新增 wake 留给下一轮。
 async fn maybe_run_until_drained(
     app: &AppHandle,
     state: &Arc<AppState>,
     host: &Arc<ExoticHost>,
     bypass_auto: bool,
     force_reconcile: bool,
+    cooldowns: &mut HashMap<String, Instant>,
 ) {
     // 病历 #2(2026-07-05):wake 评估前先清扫过期租约。恢复不能只挂在 pipeline 步骤 0——
     // 「是否启动 pipeline」恰由 has_ready(只认 pending/retryable)决定,硬杀遗留的 stale
     // processing 行会让二者互锁,进度永久停摆(详见 pipeline::recover_stale_exotic_leases)。
     // 运行中跳过:本轮启动时已清扫,活租约由 renew_loop 维持。有恢复即广播,前端进度即时刷新。
-    if !state.is_exotic_running() && recover_stale_exotic_leases(&state.db_writer) > 0 {
-        let _ = app.emit("exotic:status-changed", ());
+    if !state.is_exotic_running() {
+        let recovery_state = Arc::clone(state);
+        let recovered = tokio::task::spawn_blocking(move || {
+            recover_stale_exotic_leases(&recovery_state.db_writer)
+        })
+        .await
+        .unwrap_or(0);
+        if recovered > 0 {
+            let _ = app.emit("exotic:status-changed", ());
+        }
     }
     for desc in plugin_descriptors(&state.exotic_catalog.snapshot()) {
         for &capability in &desc.capabilities {
@@ -303,13 +297,14 @@ async fn maybe_run_until_drained(
                 capability,
                 bypass_auto,
                 force_reconcile,
+                cooldowns,
             )
             .await;
         }
     }
 }
 
-/// 单 (插件, 能力) 的 drained 循环(原 maybe_run_until_drained 主体参数化,T13)。
+/// 单 (插件, 能力) 每轮至多启动一次；无进展返回协调器，避免重复探针。
 #[allow(clippy::too_many_arguments)]
 async fn run_capability_until_drained(
     app: &AppHandle,
@@ -319,7 +314,11 @@ async fn run_capability_until_drained(
     capability: Capability,
     bypass_auto: bool,
     force_reconcile: bool,
+    cooldowns: &mut HashMap<String, Instant>,
 ) {
+    if cooldown_active(cooldowns, &desc.plugin_id, force_reconcile, Instant::now()) {
+        return;
+    }
     // T15 接缝:目前仅 thumbnail 能力有 pipeline 实装;embedding/face_detect_embed 的
     // 批派发随推理核心迁移(T15)落地——届时在此按能力分派 EmbedWorker 管线,并按
     // desc.uses_gpu 走「先 CPU permit 后 GPU 令牌」双取(D2)。
@@ -332,182 +331,176 @@ async fn run_capability_until_drained(
         return;
     }
 
-    // Worker 定位 + 启动前完整性复核(Part3 §3.6):dev env 优先(不验签),否则对已装插件
-    // 重新验签 manifest + 全文件 hash + 协议版本前置比对(P0-3,旧协议插件拒绝拉起、
-    // 免付 spawn 代价),通过才返回路径。信任根解析失败 → 不运行(fail-closed)。
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let worker_path = crate::exotic::trusted_keyset().ok().and_then(|ks| {
-        crate::exotic::installer::resolve_worker_path(
-            &state.exotic_install_dir(),
-            &desc.plugin_id,
-            &ks,
-            now,
-        )
-    });
-    // A3 gating(D-444③):video-extended 的任务化 Thumbnail 依赖 ffmpeg 工具包就绪(sha 钉死
-    // 校验 + `.ready` 标记);未就绪(未下载/下载中)视 worker 不可用 → 不派、任务留 pending,
-    // 不烧重试预算(与「插件未安装即不派」同语义)。非 video 插件恒 true。
-    let ffmpeg_ready = desc.plugin_id != VIDEO_PLUGIN_ID
-        || matches!(
-            crate::exotic::tools::ffmpeg_tool_status(&state.app_data_dir),
-            crate::exotic::tools::ToolStatus::Ready { .. }
-        );
-    let worker_available = worker_path.is_some() && ffmpeg_ready;
-
-    // 版本对账只允许「首轮」免 has_ready(消费一次即失效)——后续轮次须有真实就绪任务,
-    // 否则对账后零任务会无限空转。
-    let mut force_once = force_reconcile;
-    loop {
-        // 门控判定（读配置 + 授权 + 就绪任务）。
-        // rusqlite 下沉 spawn_blocking(2026-07-10 审查 B4,CLAUDE.md 硬化条款零豁免):
-        // evaluate_run 同步跑多条 SQL 且持全局写锁(扫描批提交可持锁数秒),原样直跑
-        // async 正文会占住 tokio worker 并放大 IPC 延迟。JoinError(闭包 panic)视同
-        // 「本轮不运行」——下次 wake 自然重试,不级联。
+    // 先做便宜门控；只有真实任务/版本对账才读插件文件，阻塞操作全部在 blocking 内。
+    let eval_state = Arc::clone(state);
+    let eval_host = Arc::clone(host);
+    let plugin_id = desc.plugin_id.clone();
+    let worker_path = tokio::task::spawn_blocking(move || {
         let should = {
-            let state_for_eval = Arc::clone(state);
-            let host_for_eval = Arc::clone(host);
-            let plugin_id = desc.plugin_id.clone();
-            let force = std::mem::take(&mut force_once);
-            tokio::task::spawn_blocking(move || {
-                let conn = state_for_eval
-                    .db_writer
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                evaluate_run(
-                    &conn,
-                    &state_for_eval.config,
-                    &host_for_eval,
-                    &plugin_id,
-                    capability,
-                    worker_available,
-                    bypass_auto,
-                    force,
-                )
-            })
-            .await
-            .unwrap_or(false)
+            let conn = eval_state
+                .db_writer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            evaluate_run(
+                &conn,
+                &eval_state.config,
+                &eval_host,
+                &plugin_id,
+                capability,
+                true,
+                bypass_auto,
+                force_reconcile,
+            )
         };
         if !should {
-            break;
+            return None;
         }
-        if state.is_exotic_running() {
-            break; // 兜底：不应发生（单循环）
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let keys = crate::exotic::trusted_keyset().ok()?;
+        let path = crate::exotic::installer::resolve_worker_path(
+            &eval_state.exotic_install_dir(),
+            &plugin_id,
+            &keys,
+            now,
+        )?;
+        if plugin_id == VIDEO_PLUGIN_ID
+            && !matches!(
+                crate::exotic::tools::ffmpeg_tool_status(&eval_state.app_data_dir),
+                crate::exotic::tools::ToolStatus::Ready { .. }
+            )
+        {
+            return None;
         }
+        Some(path)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(exe_path) = worker_path else {
+        return;
+    };
+    if state.is_exotic_running() {
+        return;
+    }
 
-        let Some(ref exe_path) = worker_path else {
-            break;
+    // 启动唯一 Pipeline（token 入 AppState；stop 命令可取消）。
+    info!(
+        "启动 exotic Pipeline:{} cap={} uses_gpu={}",
+        desc.plugin_id,
+        capability.as_str(),
+        desc.uses_gpu
+    );
+    let token = state.new_exotic_analysis_token();
+    let _ = app.emit("exotic:status-changed", ());
+    let app_run = app.clone();
+    let state_run = Arc::clone(state);
+    let exe_path = exe_path.clone();
+    // §5.3 派发前授权复核：把 host 移入阻塞任务，供 Claimer 每批领取前调 is_task_runnable。
+    let host_run = Arc::clone(host);
+    let plugin_id = desc.plugin_id.clone();
+    let worker_id = desc.worker_id.clone();
+    let handshake_timeout = desc.handshake_timeout;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let (cache_dir, requested_size) = {
+            let cfg = state_run
+                .thumb_config
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            (cfg.cache_dir.clone(), cfg.size)
         };
-
-        // 启动唯一 Pipeline（token 入 AppState；stop 命令可取消）。
-        info!(
-            "启动 exotic Pipeline:{} cap={} uses_gpu={}",
-            desc.plugin_id,
-            capability.as_str(),
-            desc.uses_gpu
-        );
-        let token = state.new_exotic_analysis_token();
-        let app_run = app.clone();
-        let state_run = Arc::clone(state);
-        let exe_path = exe_path.clone();
-        // §5.3 派发前授权复核：把 host 移入阻塞任务，供 Claimer 每批领取前调 is_task_runnable。
-        let host_run = Arc::clone(host);
-        let plugin_id = desc.plugin_id.clone();
-        let worker_id = desc.worker_id.clone();
-        let handshake_timeout = desc.handshake_timeout;
-
-        let result = tokio::task::spawn_blocking(move || {
-            let (cache_dir, requested_size) = {
-                let cfg = state_run
-                    .thumb_config
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner());
-                (cfg.cache_dir.clone(), cfg.size)
-            };
-            let spec = WorkerSpec {
-                exe_path,
-                expected_worker_id: worker_id,
-                required_capabilities: vec![capability.as_str().to_string()],
-            };
-            let cfg = WorkerConfig {
-                handshake_timeout,
-                host_version: env!("CARGO_PKG_VERSION").to_string(),
-                max_blob_len: exotic_protocol::MAX_BLOB_LEN,
-            };
-            // video-extended:任务化 Thumbnail 无 session/ffmpeg 路径,用 VideoThumbnailFactory
-            // 在派发前先建 ffmpeg 会话(D-444③)。ffmpeg 就绪已在 worker_available 门控,此处
-            // 再取一次路径(idempotent 文件检查);竞态变不就绪则本轮不处理(任务留 pending)。
-            let factory: Box<dyn WorkerFactory> = if plugin_id == VIDEO_PLUGIN_ID {
-                match crate::exotic::tools::ffmpeg_tool_status(&state_run.app_data_dir) {
-                    crate::exotic::tools::ToolStatus::Ready { ffmpeg_exe, .. } => {
-                        // 输出白名单前缀 = {cache_dir}/video(与 VideoWorkerService 同址,§5.2)。
-                        let work_dir = cache_dir.join("video");
-                        let _ = std::fs::create_dir_all(&work_dir);
-                        let init = exotic_protocol::RequestBody::VideoSessionInit {
-                            session_id: 1,
-                            ffmpeg_exe_path: ffmpeg_exe.to_string_lossy().into_owned(),
-                            ffmpeg_sha256: crate::exotic::tools::FFMPEG_EXE_SHA256.to_string(),
-                            work_dir: work_dir.to_string_lossy().into_owned(),
-                        };
-                        Box::new(VideoThumbnailFactory { spec, cfg, init })
-                    }
-                    _ => return crate::exotic::pipeline::PipelineStats::default(),
+        let spec = WorkerSpec {
+            exe_path,
+            expected_worker_id: worker_id,
+            required_capabilities: vec![capability.as_str().to_string()],
+        };
+        let cfg = WorkerConfig {
+            handshake_timeout,
+            host_version: env!("CARGO_PKG_VERSION").to_string(),
+            max_blob_len: exotic_protocol::MAX_BLOB_LEN,
+        };
+        // video-extended:任务化 Thumbnail 无 session/ffmpeg 路径,用 VideoThumbnailFactory
+        // 在派发前先建 ffmpeg 会话(D-444③)。ffmpeg 就绪已在 worker_available 门控,此处
+        // 再取一次路径(idempotent 文件检查);竞态变不就绪则本轮不处理(任务留 pending)。
+        let factory: Box<dyn WorkerFactory> = if plugin_id == VIDEO_PLUGIN_ID {
+            match crate::exotic::tools::ffmpeg_tool_status(&state_run.app_data_dir) {
+                crate::exotic::tools::ToolStatus::Ready { ffmpeg_exe, .. } => {
+                    // 输出白名单前缀 = {cache_dir}/video(与 VideoWorkerService 同址,§5.2)。
+                    let work_dir = cache_dir.join("video");
+                    let _ = std::fs::create_dir_all(&work_dir);
+                    let init = exotic_protocol::RequestBody::VideoSessionInit {
+                        session_id: 1,
+                        ffmpeg_exe_path: ffmpeg_exe.to_string_lossy().into_owned(),
+                        ffmpeg_sha256: crate::exotic::tools::FFMPEG_EXE_SHA256.to_string(),
+                        work_dir: work_dir.to_string_lossy().into_owned(),
+                    };
+                    Box::new(VideoThumbnailFactory { spec, cfg, init })
                 }
-            } else {
-                Box::new(SupervisorFactory { spec, cfg })
-            };
-            let app_evt = app_run.clone();
-            let state_yield = Arc::clone(&state_run);
-            let deps = PipelineDeps {
-                writer: &state_run.db_writer,
-                limiter: &state_run.background_heavy_limiter,
-                token: &token,
-                items_cache: &state_run.layout_items_cache,
-                cache_dir,
-                requested_size,
-                plugin_id: plugin_id.clone(),
-                on_progress: Arc::new(move || {
-                    // 合并发：画廊刷新（复用 enrichment 事件）+ 状态变化。
-                    let _ = app_evt.emit(
-                        "db:media_enriched",
-                        crate::scanner::enricher::MediaEnrichedPayload::refresh_signal(),
-                    );
-                    let _ = app_evt.emit("exotic:status-changed", ());
-                }),
-                should_yield: Arc::new(move || state_yield.should_yield_exotic()),
-                is_runnable: Arc::new(move || host_run.is_task_runnable(&plugin_id, capability)),
-            };
-            run_exotic_pipeline_blocking(&deps, factory.as_ref())
-        })
-        .await;
-
-        // 清理 token 槽（run 已结束）。
-        state.cancel_exotic_analysis();
-
-        match result {
-            Ok(stats) => {
-                info!(
-                    "exotic Pipeline 完成：done={} retried={} terminal={} lease_lost={} circuit={}",
-                    stats.done,
-                    stats.retried,
-                    stats.terminal,
-                    stats.lease_lost,
-                    stats.circuit_opened
+                _ => return crate::exotic::pipeline::PipelineStats::default(),
+            }
+        } else {
+            Box::new(SupervisorFactory { spec, cfg })
+        };
+        let app_evt = app_run.clone();
+        let state_yield = Arc::clone(&state_run);
+        let deps = PipelineDeps {
+            writer: &state_run.db_writer,
+            limiter: &state_run.background_heavy_limiter,
+            token: &token,
+            items_cache: &state_run.layout_items_cache,
+            cache_dir,
+            requested_size,
+            plugin_id: plugin_id.clone(),
+            on_progress: Arc::new(move || {
+                // 合并发：画廊刷新（复用 enrichment 事件）+ 状态变化。
+                let _ = app_evt.emit(
+                    "db:media_enriched",
+                    crate::scanner::enricher::MediaEnrichedPayload::refresh_signal(),
                 );
-                let _ = app.emit("exotic:status-changed", ());
-                if stats.circuit_opened {
-                    break; // 熔断 → 本轮停止，等用户修复/升级
-                }
-                // 尾部竞态：循环再查 pending（含运行期间新增）。无就绪即 evaluate_run 返回 false → break。
+                let _ = app_evt.emit("exotic:status-changed", ());
+            }),
+            should_yield: Arc::new(move || state_yield.should_yield_exotic()),
+            is_runnable: Arc::new(move || host_run.is_task_runnable(&plugin_id, capability)),
+        };
+        run_exotic_pipeline_blocking(&deps, factory.as_ref())
+    })
+    .await;
+
+    // 清理 token 槽（run 已结束）。
+    state.cancel_exotic_analysis();
+
+    match result {
+        Ok(stats) => {
+            info!(?stats, "exotic Pipeline 完成");
+            let _ = app.emit("exotic:status-changed", ());
+            if matches!(
+                stats.stop,
+                crate::exotic::pipeline::PipelineStop::Blocked
+                    | crate::exotic::pipeline::PipelineStop::CircuitOpen
+            ) {
+                cooldowns.insert(desc.plugin_id.clone(), Instant::now() + PLUGIN_COOLDOWN);
             }
-            Err(e) => {
-                warn!("exotic Pipeline 任务 panic：{e}");
-                break;
-            }
+        }
+        Err(e) => {
+            warn!("exotic Pipeline 任务 panic：{e}");
+            cooldowns.insert(desc.plugin_id.clone(), Instant::now() + PLUGIN_COOLDOWN);
         }
     }
+}
+
+fn cooldown_active(
+    cooldowns: &mut HashMap<String, Instant>,
+    plugin_id: &str,
+    reset: bool,
+    now: Instant,
+) -> bool {
+    if reset {
+        cooldowns.remove(plugin_id);
+    }
+    cooldowns.get(plugin_id).is_some_and(|until| *until > now)
 }
 
 /// 门控判定（可单测）：是否应启动 Pipeline。
@@ -593,6 +586,49 @@ pub fn bootstrap(app: AppHandle, state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::exotic::catalog::CatalogStore;
+
+    #[test]
+    fn full_wake_slot_preserves_user_and_reconcile_semantics() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(AtomicU8::new(0));
+        let coord = ExoticCoordinator {
+            tx,
+            pending: Arc::clone(&pending),
+        };
+        coord.wake(WakeReason::RetryDue);
+        coord.wake(WakeReason::UserRequested);
+        coord.wake(WakeReason::PluginInstalled);
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(
+            pending.swap(0, Ordering::SeqCst),
+            WAKE_PENDING | WAKE_USER | WAKE_RECONCILE
+        );
+        // 运行期间的新 wake 留给下一轮，不继承已经消费的 user 位。
+        coord.wake(WakeReason::ScanCommitted);
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert_eq!(pending.swap(0, Ordering::SeqCst), WAKE_PENDING);
+    }
+
+    #[test]
+    fn cooldown_survives_wakes_until_due_or_explicit_reset() {
+        let now = Instant::now();
+        let mut cooldowns = HashMap::from([(PSD_PLUGIN_ID.to_string(), now + PLUGIN_COOLDOWN)]);
+        assert!(cooldown_active(
+            &mut cooldowns,
+            PSD_PLUGIN_ID,
+            false,
+            now + RETRY_TICK
+        ));
+        assert!(!cooldown_active(&mut cooldowns, RAW_PLUGIN_ID, false, now));
+        assert!(!cooldown_active(
+            &mut cooldowns,
+            PSD_PLUGIN_ID,
+            false,
+            now + PLUGIN_COOLDOWN
+        ));
+        assert!(!cooldown_active(&mut cooldowns, PSD_PLUGIN_ID, true, now));
+        assert!(!cooldowns.contains_key(PSD_PLUGIN_ID));
+    }
 
     fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();

@@ -27,8 +27,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "tauri build 失败(exit=$LASTEXITCODE)" }
 
     # 发货闭包断言(F-001 候选落地,2026-08-11):ai-worker sidecar + ORT 四件套必须落进安装包。
-    # 本机无 7z 时脚本自动降级为 staging/conf 层校验并打印说明(CI/release 由 release.yml 硬验)。
-    node scripts/verify-bundle-content.mjs
+    # 安装包内容校验必须有安装包及解包工具，不将 staging 检查当作发行验收。
+    node scripts/verify-bundle-content.mjs --require-bundle
     if ($LASTEXITCODE -ne 0) { throw "安装包内容断言失败(exit=$LASTEXITCODE)" }
 }
 finally {

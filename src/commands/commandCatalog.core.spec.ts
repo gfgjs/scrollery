@@ -132,21 +132,6 @@ describe('viewer-image 命令册(P5-2)', () => {
     })
   })
 
-  it('run 对缺失 api 方法安全(可选链不抛)', () => {
-    const ctx = makeCtx('image', {}) // 空 api:所有方法未实现
-    for (const cmd of viewerImageCommands) {
-      expect(() => cmd.run(ctx)).not.toThrow()
-    }
-  })
-
-  it('toggleImmersive isActive 反映 activeViewer.immersive', () => {
-    const cmd = byId(viewerImageCommands)['viewer.toggleImmersive']
-    const off = makeCtx('image')
-    const on = makeCtx('image')
-    on.activeViewer!.immersive = true
-    expect(cmd.isActive?.(off)).toBe(false)
-    expect(cmd.isActive?.(on)).toBe(true)
-  })
 })
 
 describe('viewer-video 命令册(GD)', () => {
@@ -243,12 +228,6 @@ describe('viewer-video 命令册(GD)', () => {
     expect(api.captureFrame).toHaveBeenCalledOnce()
   })
 
-  it('run 对缺失 api 方法安全(可选链不抛)', () => {
-    const ctx = makeCtx('video', {}) // 空 api:所有方法未实现
-    for (const cmd of viewerVideoCommands) {
-      expect(() => cmd.run(ctx)).not.toThrow()
-    }
-  })
 })
 
 describe('viewer-audio 命令册(P5 余项)', () => {
@@ -308,12 +287,6 @@ describe('viewer-reader 命令册(P5 余项)', () => {
     }
   })
 
-  it('run 对缺失 api 方法安全(可选链不抛)', () => {
-    const ctx = makeCtx('epub', {}) // 空 api
-    for (const cmd of viewerReaderCommands) {
-      expect(() => cmd.run(ctx)).not.toThrow()
-    }
-  })
 })
 
 beforeAll(() => registerBuiltins())

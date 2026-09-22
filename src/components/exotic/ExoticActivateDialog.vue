@@ -1,7 +1,7 @@
-<!-- 插件激活对话框（Part5 T12 增量3）：粘贴授权码 → 后端验签存 keyring。触点自持的聚焦弹窗。 -->
+<!-- 官方版激活对话框（Part5 T12 增量3）：粘贴授权码 → 后端验签存 keyring。触点自持的聚焦弹窗。 -->
 <!--
   前后端职责：本弹窗只把用户输入的 token 原样交后端；验签/存储全在后端
-     （activate_exotic_plugin 内先验后存，失败不覆盖现有有效 token）。前端不解析、不校验 token。
+     （activate_official_license 内先验后存，失败不覆盖现有有效 token）。前端不解析、不校验 token。
 -->
 <template>
   <!-- 外壳迁 UiDialog:恒 Teleport + 焦点陷阱(此前仅聚焦 textarea、Tab 会逃逸)+ 点遮罩/Escape/关闭键三路统一走 onCancel。
@@ -54,18 +54,14 @@ import { useI18n } from 'vue-i18n'
 
 import UiDialog from '../ui/UiDialog.vue'
 import UiButton from '../ui/UiButton.vue'
-import { useExoticGate } from '../../composables/useExoticGate'
+import { activateOfficialLicense } from '../../utils/officialLicense'
 import { useToastStore } from '../../stores/toastStore'
 import type { IpcError } from '../../utils/ipc'
 
 interface Props {
   open: boolean
-  /** 待激活插件 id（取自已解析的 entitlement，非用户任意输入）。 */
-  pluginId: string
   /** 功能名（对话框文案用）。 */
   featureName?: string
-  /** 内建 feature 可注入专用激活命令；缺省仍走 catalog 绑定的 exotic 激活命令。 */
-  activationHandler?: (pluginId: string, token: string) => Promise<void>
 }
 const props = withDefaults(defineProps<Props>(), { featureName: '' })
 
@@ -77,7 +73,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const toast = useToastStore()
-const gate = useExoticGate()
+
 
 const token = ref('')
 const errorCode = ref<string | null>(null)
@@ -107,8 +103,7 @@ async function onSubmit() {
   errorCode.value = null
   activating.value = true
   try {
-    const activate = props.activationHandler ?? gate.activate
-    await activate(props.pluginId, token.value.trim())
+    await activateOfficialLicense(token.value.trim())
     toast.addToast('success', t('exotic.activateSuccess'))
     emit('activated')
     emit('close')

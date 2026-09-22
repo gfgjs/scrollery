@@ -33,6 +33,21 @@ export interface PluginEntitlement {
   storeUrl: string | null
 }
 
+/** 功能展示汇总；授权和资源状态独立，编辑无需伪造格式条目。 */
+export interface FeatureOffering {
+  id: string
+  name: string
+  paid: boolean
+  builtin: boolean
+  availability: Availability
+  resources: 'ready' | 'included' | 'modelMissing' | 'manifestUnready' | 'workerMissing' | 'needsInstall'
+}
+
+export interface FeatureOfferings {
+  entitlement: PluginEntitlement
+  features: FeatureOffering[]
+}
+
 /** 媒体大类（后端 `exotic::MediaKind`，serde 小写）。 */
 export type MediaKind = 'image' | 'video' | 'audio' | 'document'
 

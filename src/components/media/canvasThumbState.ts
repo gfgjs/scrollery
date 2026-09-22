@@ -38,6 +38,8 @@ export interface CanvasThumbState<S> {
   cancelLoad(id: number): boolean
   /** status 0/3-无路径的生成请求去重:首问 true(调用方上抛),同代次再问恒 false。 */
   requestThumbOnce(id: number): boolean
+  /** 离屏撤销生成需求后清除去重标记，允许再次入屏请求同一签名。 */
+  cancelThumbRequest(id: number): boolean
   /**
    * 加载成功落缓存。发起时的 dataSig 已过期 → 关闭 src 并返回 false(调用方不重绘);
    * 现行 → 清在途、LRU 写入(覆盖旧规格即释放其 src,超上限从队首驱逐)并返回 true。
@@ -177,6 +179,7 @@ export function createCanvasThumbState<S>(
       requestedThumbSet.add(id)
       return true
     },
+    cancelThumbRequest: (id) => requestedThumbSet.delete(id),
     commitLoad,
     failLoad,
     clear: () => {

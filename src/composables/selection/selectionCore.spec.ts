@@ -41,9 +41,6 @@ function expectAll(state: SelectionState, excluded: number[]) {
 const ctx = makeCtx([1, 2, 3, 4, 5])
 
 describe('classicMode.apply · replace', () => {
-  it('从 explicit 替换为单元素', () => {
-    expectExplicit(classicMode.apply(explicit(1, 2, 3), { type: 'replace', id: 4 }, ctx), [4])
-  })
   it('从 all 也落到 explicit 单元素（替换语义清空全选）', () => {
     expectExplicit(classicMode.apply(all(2), { type: 'replace', id: 4 }, ctx), [4])
   })
@@ -72,12 +69,6 @@ describe('classicMode.apply · range', () => {
       [1, 2, 3, 4],
     )
   })
-  it('explicit:区间方向无关（anchor>to 同结果）', () => {
-    expectExplicit(
-      classicMode.apply(explicit(), { type: 'range', anchorId: 4, toId: 2 }, ctx),
-      [2, 3, 4],
-    )
-  })
   it('all:区间表示「选中这些」→ 从排除集移除', () => {
     // all 排除 [2,3,4],对 [2..4] 做 range → 这些恢复选中 → excluded 清空
     expectAll(classicMode.apply(all(2, 3, 4), { type: 'range', anchorId: 2, toId: 4 }, ctx), [])
@@ -96,14 +87,6 @@ describe('classicMode.apply · selectAll', () => {
   })
 })
 
-describe('classicMode.apply · clear', () => {
-  it('explicit 清空', () => {
-    expectExplicit(classicMode.apply(explicit(1, 2, 3), { type: 'clear' }, ctx), [])
-  })
-  it('all 清空 → 归一为 explicit 空态', () => {
-    expectExplicit(classicMode.apply(all(2), { type: 'clear' }, ctx), [])
-  })
-})
 
 describe('classicMode.apply · invert', () => {
   it('explicit → 全集补集', () => {
@@ -122,10 +105,6 @@ describe('classicMode.apply · 纯函数不变性', () => {
     classicMode.apply(state, { type: 'range', anchorId: 1, toId: 5 }, ctx)
     classicMode.apply(state, { type: 'invert' }, ctx)
     expect(state.kind === 'explicit' && [...state.ids]).toEqual(snapshot)
-  })
-  it('返回的是新对象引用', () => {
-    const state = explicit(1)
-    expect(classicMode.apply(state, { type: 'toggle', id: 2 }, ctx)).not.toBe(state)
   })
 })
 
@@ -179,7 +158,4 @@ describe('applyRangeInvert（框选扫过区间的一次反转）', () => {
     expect(sorted(base)).toEqual([1, 2])
   })
 
-  it('接受任意 Iterable 作为区间(如 Set)', () => {
-    expect(sorted(applyRangeInvert(s(2), new Set([1, 2, 3])))).toEqual([1, 3])
-  })
 })

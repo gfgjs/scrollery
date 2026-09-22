@@ -15,16 +15,22 @@ use exotic_protocol::{
 use super::outcome::{EmbedItemOutcome, FaceItemOutcome};
 use super::worker::WorkerLimits;
 
-/// 验证缩略图 Success（§3.7）：core/request 核对 + 独立解码器验真尺寸 + 上限。返回 (w,h,mime)。
-///
-/// 用 `image` crate 解码 WebP（独立于 Worker 声明）得到**真实**尺寸——既验证 WebP 自洽，
-/// 又拿到与声明对照的实际宽高（Worker 声明不可信）。缩略图体积小，解码开销可忽略。
+/// 宿主验证产物；ThumbHash 来自本次受限解码，sink 不再重复解码。
+#[derive(Debug)]
+pub struct ValidatedThumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub mime: String,
+    pub thumbhash: Vec<u8>,
+}
+
+/// 验证缩略图回声字段与真实尺寸，在分配像素前限制预算，再解码并计算 ThumbHash。
 pub fn validate_thumbnail_output(
     req: &RequestBody,
     body: &SuccessBody,
     blob: &[u8],
     limits: &WorkerLimits,
-) -> Result<(u32, u32, String), String> {
+) -> Result<ValidatedThumbnail, String> {
     // 核对 item / fingerprint（防错序串扰）。
     if body.item_id != req.item_id() {
         return Err(format!(
@@ -56,11 +62,11 @@ pub fn validate_thumbnail_output(
     if blob.len() < 12 || &blob[0..4] != b"RIFF" || &blob[8..12] != b"WEBP" {
         return Err("WebP 魔数非法".into());
     }
-    // 独立解码取真实尺寸（同时验证 WebP 自洽）。
-    let img = image::load_from_memory_with_format(blob, image::ImageFormat::WebP)
-        .map_err(|e| format!("WebP 独立解码失败：{e}"))?;
-    use image::GenericImageView;
-    let (aw, ah) = img.dimensions();
+    // 只读取真实容器头；不能先物化像素再检查 worker 给出的尺寸。
+    use image::ImageDecoder;
+    let mut decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(blob))
+        .map_err(|e| format!("WebP 头解析失败：{e}"))?;
+    let (aw, ah) = decoder.dimensions();
     // 声明尺寸（若有）必须与实际一致。
     if let Some(dw) = body.width {
         if dw != aw {
@@ -90,7 +96,33 @@ pub fn validate_thumbnail_output(
     if pixels > limits.max_output_pixels {
         return Err(format!("像素 {pixels} 超上限 {}", limits.max_output_pixels));
     }
-    Ok((aw, ah, mime))
+    let mut decode_limits = image::Limits::default();
+    decode_limits.max_image_width = Some(aw);
+    decode_limits.max_image_height = Some(ah);
+    decode_limits.max_alloc = Some(limits.max_output_pixels.saturating_mul(4));
+    decode_limits
+        .reserve(decoder.total_bytes())
+        .map_err(|e| format!("WebP 分配超限：{e}"))?;
+    decoder
+        .set_limits(decode_limits)
+        .map_err(|e| format!("WebP 解码限制：{e}"))?;
+    let rgba = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("WebP 独立解码失败：{e}"))?
+        .into_rgba8();
+    let decoded = crate::engine::traits::DecodedImage {
+        pixels: rgba.into_raw(),
+        width: aw,
+        height: ah,
+        icc: None,
+    };
+    let thumbhash = crate::thumbnail::thumbhash::generate_thumbhash(&decoded)
+        .map_err(|e| format!("ThumbHash 生成失败：{e}"))?;
+    Ok(ValidatedThumbnail {
+        width: aw,
+        height: ah,
+        mime,
+        thumbhash,
+    })
 }
 
 /// 默认缩略图上限：64 MiB blob、4 兆像素（足够 960 档）、64px 长边容差。
@@ -447,9 +479,21 @@ mod tests {
             height: Some(240),
             ..Default::default()
         };
-        let (w, h, mime) = validate_thumbnail_output(&req, &body, &webp, &limits()).unwrap();
-        assert_eq!((w, h), (480, 240));
-        assert_eq!(mime, "image/webp");
+        let out = validate_thumbnail_output(&req, &body, &webp, &limits()).unwrap();
+        assert_eq!((out.width, out.height), (480, 240));
+        assert_eq!(out.mime, "image/webp");
+        let rgba = image::load_from_memory_with_format(&webp, image::ImageFormat::WebP)
+            .unwrap()
+            .into_rgba8();
+        let expected =
+            crate::thumbnail::thumbhash::generate_thumbhash(&crate::engine::traits::DecodedImage {
+                pixels: rgba.into_raw(),
+                width: 480,
+                height: 240,
+                icc: None,
+            })
+            .unwrap();
+        assert_eq!(out.thumbhash, expected);
     }
 
     #[test]
@@ -509,6 +553,27 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_thumbnail_output(&req, &body, b"not a webp at all!!", &limits()).is_err());
+    }
+
+    #[test]
+    fn oversized_header_rejected_before_pixel_decode() {
+        // 仅保留有效 VP8L 尺寸头，没有可解码的像素；应先拒绝像素预算。
+        let mut webp = make_webp(10, 10);
+        assert_eq!(&webp[12..16], b"VP8L");
+        webp.truncate(26);
+        webp[4..8].copy_from_slice(&18u32.to_le_bytes());
+        webp[16..20].copy_from_slice(&6u32.to_le_bytes());
+        let body = SuccessBody {
+            item_id: Some(7),
+            input_fingerprint: Some("fp".into()),
+            mime: Some("image/webp".into()),
+            ..Default::default()
+        };
+        let mut budget = limits();
+        budget.max_output_pixels = 1;
+        let err =
+            validate_thumbnail_output(&thumb_req(7, "fp", 480), &body, &webp, &budget).unwrap_err();
+        assert!(err.contains("像素"), "须先拒绝预算而非尝试像素解码：{err}");
     }
 
     // ── v2 批量输出校验(T15)────────────────────────────────────────────────────────

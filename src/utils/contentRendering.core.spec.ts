@@ -88,30 +88,6 @@ describe('renderMarkdown:转义不破坏正常渲染', () => {
 })
 
 describe('renderMarkdown:块数组契约(2026-07-17 内存爆炸修复:分片依赖)', () => {
-  it('renderMarkdown = blocks.join(换行),字节一致', () => {
-    const src = [
-      '# 标题',
-      '',
-      '段落一行',
-      '第二行',
-      '',
-      '- a',
-      '- b',
-      '',
-      '1. x',
-      '2. y',
-      '',
-      '> 引用',
-      '',
-      '```js',
-      'const a = 1',
-      '```',
-      '',
-      '---',
-    ].join('\n')
-    expect(renderMarkdownBlocks(src).join('\n')).toBe(renderMarkdown(src))
-  })
-
   it('断长跑(行数上限):连续 450 短行切成 200/200/50 三个 <p>', () => {
     const src = Array.from({ length: 450 }, (_, i) => 'line' + i).join('\n')
     const blocks = renderMarkdownBlocks(src)

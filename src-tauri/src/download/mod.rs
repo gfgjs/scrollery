@@ -167,11 +167,13 @@ pub async fn download_to_vec(
 
 /// 把单个文件流式写入 `part_path`，`resume_from>0` 时经 HTTP Range 续传。边收边发节流进度（~5/s）。
 /// 请求了 Range 但服务器返回整文件（200 而非 206）→ 从 0 重写（覆盖 part）。
+/// 写入前以 `expected_size` 封顶（含续传前缀）；短读及哈希仍由调用方最终校验。
 pub async fn download_file(
     client: &reqwest::Client,
     url: &str,
     part_path: &Path,
     resume_from: u64,
+    expected_size: u64,
     on_bytes: &OnBytes<'_>,
 ) -> Result<(), DownloadError> {
     // dev-only file:// 旁路:整文件复制到 part(忽略续传——本地复制幂等,MB 级包无续传
@@ -183,12 +185,7 @@ pub async fn download_file(
                 .await
                 .map_err(|e| DownloadError::Io(e.to_string()))?;
         }
-        let bytes = std::fs::read(&src).map_err(|e| DownloadError::Io(e.to_string()))?;
-        tokio::fs::write(part_path, &bytes)
-            .await
-            .map_err(|e| DownloadError::Io(e.to_string()))?;
-        on_bytes(bytes.len() as u64);
-        return Ok(());
+        return copy_local_download(&src, part_path, expected_size, on_bytes).await;
     }
     require_https(url)?;
     if let Some(parent) = part_path.parent() {
@@ -197,20 +194,59 @@ pub async fn download_file(
             .map_err(|e| DownloadError::Io(e.to_string()))?;
     }
 
+    // 续传偏移必须对应当前 part；超长或过期残留从零请求，不能把错误前缀拼入新响应。
+    let resume_from = valid_resume_offset(part_path, resume_from, expected_size).await;
     let mut req = client.get(url);
     if resume_from > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
     }
-    let mut resp = req
+    let resp = req
         .send()
         .await
         .map_err(|e| DownloadError::Http(e.to_string()))?;
+    write_download_response(resp, part_path, resume_from, expected_size, on_bytes).await
+}
+
+// 响应处理独立于 HTTPS 请求门禁，便于用本地响应验证真实流式写入行为。
+async fn write_download_response(
+    mut resp: reqwest::Response,
+    part_path: &Path,
+    resume_from: u64,
+    expected_size: u64,
+    on_bytes: &OnBytes<'_>,
+) -> Result<(), DownloadError> {
     if !resp.status().is_success() {
         return Err(DownloadError::Status(resp.status().as_u16()));
     }
 
     // 请求了 Range 且服务器以 206 应答 → 追加续写；否则（含 200 整文件）从头创建。
     let appending = resume_from > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let range = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes "))
+            .and_then(|v| v.split_once('/'))
+            .and_then(|(range, total)| {
+                let (start, end) = range.split_once('-')?;
+                Some((
+                    start.parse::<u64>().ok()?,
+                    end.parse::<u64>().ok()?,
+                    total.parse::<u64>().ok()?,
+                ))
+            });
+        if !matches!(range, Some((start, end, total)) if start == resume_from && start <= end && end < total && total == expected_size)
+        {
+            return Err(DownloadError::Http(
+                "续传响应的 Content-Range 不匹配".into(),
+            ));
+        }
+    }
+    let mut file_received = if appending { resume_from } else { 0 };
+    if let Some(length) = resp.content_length() {
+        checked_download_size(file_received, length, expected_size)?;
+    }
     let mut file = if appending {
         tokio::fs::OpenOptions::new()
             .append(true)
@@ -223,17 +259,39 @@ pub async fn download_file(
             .map_err(|e| DownloadError::Io(e.to_string()))?
     };
 
-    let mut file_received = if appending { resume_from } else { 0 };
+    if appending {
+        let got = file
+            .metadata()
+            .await
+            .map_err(|e| DownloadError::Io(e.to_string()))?
+            .len();
+        if got != resume_from {
+            return Err(DownloadError::SizeMismatch {
+                expected: resume_from,
+                got,
+            });
+        }
+    }
     let mut last = std::time::Instant::now();
     while let Some(chunk) = resp
         .chunk()
         .await
         .map_err(|e| DownloadError::Http(e.to_string()))?
     {
+        let next = match checked_download_size(file_received, chunk.len() as u64, expected_size) {
+            Ok(next) => next,
+            Err(e) => {
+                // 已接受的前缀先落盘，镜像回退才能从真实长度续传；超额块不写入。
+                file.flush()
+                    .await
+                    .map_err(|e| DownloadError::Io(e.to_string()))?;
+                return Err(e);
+            }
+        };
         file.write_all(&chunk)
             .await
             .map_err(|e| DownloadError::Io(e.to_string()))?;
-        file_received += chunk.len() as u64;
+        file_received = next;
         if last.elapsed().as_millis() >= 200 {
             last = std::time::Instant::now();
             on_bytes(file_received);
@@ -245,8 +303,72 @@ pub async fn download_file(
     Ok(())
 }
 
+fn checked_download_size(
+    received: u64,
+    additional: u64,
+    expected: u64,
+) -> Result<u64, DownloadError> {
+    received
+        .checked_add(additional)
+        .filter(|n| *n <= expected)
+        .ok_or(DownloadError::TooLarge)
+}
+
+async fn valid_resume_offset(path: &Path, requested: u64, expected: u64) -> u64 {
+    if requested > 0 && requested <= expected {
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.len() == requested {
+                return requested;
+            }
+        }
+    }
+    0
+}
+
+#[cfg(debug_assertions)]
+async fn copy_local_download(
+    src: &Path,
+    dest: &Path,
+    expected_size: u64,
+    on_bytes: &OnBytes<'_>,
+) -> Result<(), DownloadError> {
+    use tokio::io::AsyncReadExt as _;
+    let mut source = tokio::fs::File::open(src)
+        .await
+        .map_err(|e| DownloadError::Io(e.to_string()))?;
+    let length = source
+        .metadata()
+        .await
+        .map_err(|e| DownloadError::Io(e.to_string()))?
+        .len();
+    checked_download_size(0, length, expected_size)?;
+    let mut dest = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| DownloadError::Io(e.to_string()))?;
+    let mut buffer = [0; 64 * 1024];
+    let mut received = 0;
+    loop {
+        let n = source
+            .read(&mut buffer)
+            .await
+            .map_err(|e| DownloadError::Io(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        received = checked_download_size(received, n as u64, expected_size)?;
+        dest.write_all(&buffer[..n])
+            .await
+            .map_err(|e| DownloadError::Io(e.to_string()))?;
+    }
+    dest.flush()
+        .await
+        .map_err(|e| DownloadError::Io(e.to_string()))?;
+    on_bytes(received);
+    Ok(())
+}
+
 /// 按候选源顺序逐一尝试下载到 `part_path`，首个成功即返回；全失败返回最后一次错误。
-/// 镜像重试时从失败尝试留下的 `.part` 处续传；残留 `.part` 超过 `expected_size`（>0 时）则清零重来。
+/// 镜像重试时从失败尝试留下的 `.part` 处续传；残留 `.part` 超过 `expected_size` 则清零重来。
 pub async fn download_with_fallback(
     client: &reqwest::Client,
     urls: &[&str],
@@ -257,7 +379,7 @@ pub async fn download_with_fallback(
 ) -> Result<(), DownloadError> {
     let mut last_err = DownloadError::Http("无候选下载源".to_string());
     for url in urls {
-        match download_file(client, url, part_path, resume_from, on_bytes).await {
+        match download_file(client, url, part_path, resume_from, expected_size, on_bytes).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = e;
@@ -266,7 +388,7 @@ pub async fn download_with_fallback(
                     .await
                     .map(|m| m.len())
                     .unwrap_or(0);
-                if expected_size > 0 && resume_from > expected_size {
+                if resume_from > expected_size {
                     let _ = tokio::fs::remove_file(part_path).await;
                     resume_from = 0;
                 }
@@ -322,6 +444,214 @@ mod tests {
         Box::new(|_| {})
     }
 
+    // 仅测试响应处理：生产入口仍先拒绝非 HTTPS，测试不访问外部网络。
+    async fn response(status: &str, headers: &str, body: &str) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let wire = format!("HTTP/1.1 {status}\r\nConnection: close\r\n{headers}\r\n{body}");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(wire.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let resp = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/file"))
+            .send()
+            .await
+            .unwrap();
+        server.await.unwrap();
+        resp
+    }
+
+    #[tokio::test]
+    async fn chunked_exact_and_short_downloads_preserve_final_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        let resp = response(
+            "200 OK",
+            "Transfer-Encoding: chunked\r\n",
+            "5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await;
+        write_download_response(resp, &path, 0, 5, &|_| {})
+            .await
+            .unwrap();
+        assert!(verify_size_sha(&path, 5, None).is_ok());
+
+        let resp = response(
+            "200 OK",
+            "Transfer-Encoding: chunked\r\n",
+            "3\r\nhel\r\n0\r\n\r\n",
+        )
+        .await;
+        write_download_response(resp, &path, 0, 5, &|_| {})
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_size_sha(&path, 5, None),
+            Err(DownloadError::SizeMismatch {
+                expected: 5,
+                got: 3
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn range_response_appends_and_ignored_range_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        std::fs::write(&path, b"he").unwrap();
+        let resp = response(
+            "206 Partial Content",
+            "Content-Length: 3\r\nContent-Range: bytes 2-4/5\r\n",
+            "llo",
+        )
+        .await;
+        write_download_response(resp, &path, 2, 5, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+
+        let resp = response("200 OK", "Content-Length: 5\r\n", "world").await;
+        write_download_response(resp, &path, 2, 5, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"world");
+    }
+
+    #[tokio::test]
+    async fn chunked_oversend_never_writes_beyond_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        let resp = response(
+            "200 OK",
+            "Transfer-Encoding: chunked\r\n",
+            "5\r\nhello\r\n1\r\n!\r\n0\r\n\r\n",
+        )
+        .await;
+        let result = write_download_response(resp, &path, 0, 5, &|_| {}).await;
+        assert!(matches!(result, Err(DownloadError::TooLarge)), "{result:?}");
+        assert!(std::fs::metadata(&path).unwrap().len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn declared_zero_rejects_nonempty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        let resp = response(
+            "200 OK",
+            "Transfer-Encoding: chunked\r\n",
+            "1\r\nx\r\n0\r\n\r\n",
+        )
+        .await;
+        let result = write_download_response(resp, &path, 0, 0, &|_| {}).await;
+        assert!(matches!(result, Err(DownloadError::TooLarge)), "{result:?}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn resumed_oversend_counts_existing_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        std::fs::write(&path, b"he").unwrap();
+        let resp = response(
+            "206 Partial Content",
+            "Transfer-Encoding: chunked\r\nContent-Range: bytes 2-4/5\r\n",
+            "3\r\nllo\r\n1\r\n!\r\n0\r\n\r\n",
+        )
+        .await;
+        let result = write_download_response(resp, &path, 2, 5, &|_| {}).await;
+        assert!(matches!(result, Err(DownloadError::TooLarge)), "{result:?}");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"he") && bytes.len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn wrong_range_start_does_not_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        std::fs::write(&path, b"he").unwrap();
+        let resp = response(
+            "206 Partial Content",
+            "Content-Length: 3\r\nContent-Range: bytes 1-3/5\r\n",
+            "llo",
+        )
+        .await;
+        assert!(write_download_response(resp, &path, 2, 5, &|_| {})
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"he");
+    }
+
+    #[tokio::test]
+    async fn changed_part_length_does_not_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        std::fs::write(&path, b"hel").unwrap();
+        let resp = response(
+            "206 Partial Content",
+            "Content-Length: 3\r\nContent-Range: bytes 2-4/5\r\n",
+            "llo",
+        )
+        .await;
+        assert!(write_download_response(resp, &path, 2, 5, &|_| {})
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"hel");
+    }
+
+    #[tokio::test]
+    async fn declared_oversend_preserves_existing_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        std::fs::write(&path, b"he").unwrap();
+        let resp = response("200 OK", "Content-Length: 6\r\n", "hello!").await;
+        assert!(matches!(
+            write_download_response(resp, &path, 2, 5, &|_| {}).await,
+            Err(DownloadError::TooLarge)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"he");
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_resume_offset_restarts_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.part");
+        assert_eq!(valid_resume_offset(&path, 2, 5).await, 0);
+        std::fs::write(&path, b"he").unwrap();
+        assert_eq!(valid_resume_offset(&path, 2, 5).await, 2);
+        assert_eq!(valid_resume_offset(&path, 1, 5).await, 0);
+        std::fs::write(&path, b"hello!").unwrap();
+        assert_eq!(valid_resume_offset(&path, 5, 5).await, 0);
+        assert_eq!(valid_resume_offset(&path, 6, 5).await, 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn local_download_enforces_the_same_size_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dest = dir.path().join("file.part");
+        std::fs::write(&src, b"hello").unwrap();
+        std::fs::write(&dest, b"he").unwrap();
+        assert!(matches!(
+            copy_local_download(&src, &dest, 4, &|_| {}).await,
+            Err(DownloadError::TooLarge)
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"he");
+        copy_local_download(&src, &dest, 5, &|n| assert_eq!(n, 5))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
     #[test]
     fn require_https_rejects_http() {
         assert!(matches!(
@@ -351,6 +681,7 @@ mod tests {
             "http://x.invalid/a",
             &dest,
             0,
+            5,
             cb.as_ref(),
         ));
         assert!(matches!(r, Err(DownloadError::NotHttps)));

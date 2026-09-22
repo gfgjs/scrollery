@@ -156,6 +156,12 @@ impl WorkerHandle {
             old.shutdown(SHUTDOWN_GRACE);
         }
         self.session_alive = false; // 新实例无会话（深审 h）
+        if !enhance_worker_ready() {
+            return Err(eerr(
+                "enhance_worker_missing",
+                "增强组件缺失，请重新安装应用",
+            ));
+        }
         let sup = spawn_enhance_worker().map_err(|e| {
             // 深审 e：对外固定串，内部错误只进 tracing（不泄进程/路径细节）。
             tracing::warn!("增强 worker 启动失败:{e}");
@@ -1011,14 +1017,20 @@ fn enhance_model_descriptor(
         &profile.file_fp32
     };
     let path = models_dir.join(file);
-    let meta = std::fs::metadata(&path)
-        .map_err(|_| eerr("enhance_model_missing", "增强模型文件缺失，请先下载"))?;
-    let sha256 = crate::utils::hash::sha256_hex_of_file(&path)
-        .map_err(|_| eerr("enhance_io", "模型指纹计算失败"))?;
+    if !super::registry::enhance_manifest_ready(model_id) {
+        return Err(eerr("enhance_manifest_unready", "增强模型发行清单尚未就绪"));
+    }
+    let asset = super::registry::enhance_assets(model_id)
+        .and_then(|assets| assets.into_iter().find(|asset| asset.dest == *file))
+        .ok_or_else(|| eerr("enhance_manifest_unready", "增强模型发行清单尚未就绪"))?;
+    // 期望值必须来自发行清单；对待校验文件现算哈希会使篡改后的文件也通过 worker 校验。
+    let sha256 = asset
+        .sha256
+        .ok_or_else(|| eerr("enhance_manifest_unready", "增强模型发行清单尚未就绪"))?;
     Ok(ModelDescriptor {
         role: ModelRole::Enhance,
         handle: ModelHandle::Path(path.to_string_lossy().into_owned()),
-        len: meta.len(),
+        len: asset.size_bytes,
         sha256,
         model_id: Some(model_id.to_string()),
     })
@@ -1127,6 +1139,11 @@ fn enhance_worker_exe() -> Result<PathBuf, String> {
     } else {
         Err(format!("enhance-worker 可执行文件不存在:{}", p.display()))
     }
+}
+
+/// 状态查询与执行共用解析路径。仅表达组件文件存在，启动/握手失败另走执行错误。
+pub fn enhance_worker_ready() -> bool {
+    enhance_worker_exe().is_ok()
 }
 
 /// spawn enhance-worker（握手校验 worker_id/能力）。

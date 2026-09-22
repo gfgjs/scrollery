@@ -26,6 +26,13 @@ use crate::session::SessionState;
 /// source_path 回退解码的源文件字节上限(与 psd-worker 同值;拦巨文件吃满内存)。
 const MAX_SOURCE_FILE_BYTES: u64 = 512 << 20;
 
+/// source_path 回退解码的声明像素上限(100 兆像素 ≈ 10000×10000)。**与
+/// ocr.rs::MAX_SOURCE_PIXELS 同值同理由,勿双向漂移**:`MAX_SOURCE_FILE_BYTES`
+/// 的 stat 只拦压缩字节数——一张 30MB PNG 可解出 400MB+ RGBA。先用
+/// `ImageReader::into_dimensions` 只解头拿声明尺寸(不解像素数据),超限即该项
+/// `ResourceLimit`,不进入真正解码分配。
+const MAX_SOURCE_PIXELS: u64 = 100_000_000;
+
 /// 推理子批上限(T18.5b 流水重叠):推理侧从解码 channel 攒到即推,不等全批。
 /// 对动态/bN 导出保留组批效率;B/16 固定 batch=1 导出内部仍逐张,无行为差别。
 const INFER_SUB_BATCH: usize = 16;
@@ -472,12 +479,22 @@ fn load_face_image(ai_cache_dir: &Path, item: &FaceItem) -> Result<DecodedImage,
     let img = if let Some(key) = &item.cache_key {
         load_cache_image(ai_cache_dir, key)?
     } else if let Some(src) = &item.source_path {
-        // 信任语义同 Thumbnail.source_path(host 提供绝对路径);读盘前 stat 拦巨文件。
+        // 信任语义同 Thumbnail.source_path(host 提供绝对路径);读盘前 stat 拦巨文件,
+        // 解码前按声明尺寸拦像素(镜像 ocr.rs::load_ocr_image 的像素级设防)。
         let meta = std::fs::metadata(src).map_err(|_| WorkerErrorCode::IoError)?;
         if meta.len() > MAX_SOURCE_FILE_BYTES {
             return Err(WorkerErrorCode::ResourceLimit);
         }
         let bytes = std::fs::read(src).map_err(|_| WorkerErrorCode::IoError)?;
+        // 只解头拿声明尺寸(不解像素数据):超限在真正解码分配之前拦下。
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|_| WorkerErrorCode::MalformedInput)?
+            .into_dimensions()
+            .map_err(|_| WorkerErrorCode::MalformedInput)?;
+        if (w as u64) * (h as u64) > MAX_SOURCE_PIXELS {
+            return Err(WorkerErrorCode::ResourceLimit);
+        }
         image::load_from_memory(&bytes).map_err(|_| WorkerErrorCode::MalformedInput)?
     } else {
         // cache_key/source_path 至少给一(协议约定);都缺 = host bug。
@@ -493,7 +510,7 @@ fn load_face_image(ai_cache_dir: &Path, item: &FaceItem) -> Result<DecodedImage,
     })
 }
 
-/// 处理 FaceDetectEmbed:分块全并行——块内每项在线程内跑完 解码→letterbox→检测→对齐→嵌入
+/// 处理 FaceDetectEmbed:整批并行领活，每项在线程内跑完 解码→letterbox→检测→对齐→嵌入
 /// 整链(GPU session 由池锁自串行,人脸 API 按图处理、项内多脸已批量);几何走 JSON、
 /// 嵌入走 blob。`det_score_thresh` 为请求快照,覆盖 profile 默认。
 pub fn handle_face(
@@ -531,7 +548,7 @@ pub fn handle_face(
         );
     }
 
-    // 分块全并行(2026-07-03 修订,GUI 人脸批超时根因之二):块内每项在线程内跑完
+    // 全并行(2026-07-03 修订,GUI 人脸批超时根因之二):每项在线程内跑完
     // 解码→letterbox→检测→嵌入 整链;GPU session 由池锁自串行(与进程内 rayon par_iter
     // 同构)。原「并行解码、串行推理」把 letterbox(全尺寸→640 缩放,dev 构建单张秒级)
     // 留在串行段,批耗时被它主导。
@@ -541,87 +558,86 @@ pub fn handle_face(
     let batch_t0 = std::time::Instant::now();
     let mut results = Vec::with_capacity(items.len());
     let mut blob: Vec<u8> = Vec::new();
-    let chunk_size = decode_threads(items.len());
+    // 整批共用一次领活，避免每块最慢项阻止后继项启动。线程数与原来一致，解码图
+    // 仍在项内释放；结果槽保留整批几何/向量，随后按输入顺序装配协议结果。
+    let threads = decode_threads(items.len());
     // 分段耗时累计(ms,2026-07-03 性能取证):解码 / 检测(含 letterbox 与 session 池
     // 等待)/ 嵌入(含对齐与池等待)。线程内逐项测量,串行段汇总,批尾一行输出。
     let (mut sum_decode, mut sum_detect, mut sum_embed) = (0u128, 0u128, 0u128);
     let mut n_ok = 0usize;
     let mut n_faces = 0usize;
-    for chunk in items.chunks(chunk_size.max(1)) {
-        // 线程内产出:Ok(检测+嵌入+实际解码尺寸+分段耗时) / Err((错误码, 可选日志));
-        // 日志带回主线程串行输出,避免多线程交错 stderr。
-        let outs = parallel_map_indexed(chunk_size, chunk.len(), |i| {
-            let item = &chunk[i];
-            let t0 = std::time::Instant::now();
-            let decoded = load_face_image(&sess.ai_cache_dir, item).map_err(|code| (code, None))?;
-            let t1 = std::time::Instant::now();
-            face::detect_faces(detect_pool, &decoded, &fp)
-                .and_then(|faces| {
-                    let t2 = std::time::Instant::now();
-                    face::embed_faces(embed_pool, &decoded, &faces, &fp)
-                        .map(|embs| (faces, embs, t2))
-                })
-                .map(|(faces, embs, t2)| {
-                    let seg_ms = [
-                        t1.duration_since(t0).as_millis(),
-                        t2.duration_since(t1).as_millis(),
-                        t2.elapsed().as_millis(),
-                    ];
-                    (faces, embs, decoded.width, decoded.height, seg_ms)
-                })
-                .map_err(|e| {
-                    (
-                        WorkerErrorCode::InternalError,
-                        Some(format!("item {} 人脸推理失败:{e}", item.item_id)),
-                    )
-                })
-        });
-        for (item, out) in chunk.iter().zip(outs) {
-            match out {
-                Ok((faces, embs, width, height, seg_ms)) => {
-                    sum_decode += seg_ms[0];
-                    sum_detect += seg_ms[1];
-                    sum_embed += seg_ms[2];
-                    n_ok += 1;
-                    n_faces += faces.len();
-                    // 维度红线(terminal):系统性错误,整批 Failure(同 EmbedBatch)。
-                    if embs.iter().any(|e| e.len() != fp.embed_dim) {
-                        return batch_failure(
-                            request_id,
-                            WorkerErrorCode::EmbedDimMismatch,
-                            format!("人脸嵌入维度与契约 {} 不符", fp.embed_dim),
-                        );
-                    }
-                    for emb in &embs {
-                        append_embedding(&mut blob, emb);
-                    }
-                    results.push(FaceItemResult::Ok {
-                        item_id: item.item_id,
-                        fingerprint: item.fingerprint.clone(),
-                        // DetectedFace 与协议 FaceDet 字段同构,逐字段搬运(0 脸也是 Ok)。
-                        faces: faces
-                            .iter()
-                            .map(|f| FaceDet {
-                                bbox: f.bbox,
-                                landmarks: f.landmarks,
-                                score: f.score,
-                            })
-                            .collect(),
-                        // 实际解码尺寸:几何是本图像素坐标,host 归一化/quality 派生依赖它。
-                        width,
-                        height,
-                    });
+    // 线程内产出:Ok(检测+嵌入+实际解码尺寸+分段耗时) / Err((错误码, 可选日志));
+    // 日志带回主线程串行输出,避免多线程交错 stderr。
+    let outs = parallel_map_indexed(threads, items.len(), |i| {
+        let item = &items[i];
+        let t0 = std::time::Instant::now();
+        let decoded = load_face_image(&sess.ai_cache_dir, item).map_err(|code| (code, None))?;
+        let t1 = std::time::Instant::now();
+        face::detect_faces(detect_pool, &decoded, &fp)
+            .and_then(|faces| {
+                let t2 = std::time::Instant::now();
+                face::embed_faces(embed_pool, &decoded, &faces, &fp).map(|embs| (faces, embs, t2))
+            })
+            .map(|(faces, embs, t2)| {
+                let seg_ms = [
+                    t1.duration_since(t0).as_millis(),
+                    t2.duration_since(t1).as_millis(),
+                    t2.elapsed().as_millis(),
+                ];
+                (faces, embs, decoded.width, decoded.height, seg_ms)
+            })
+            .map_err(|e| {
+                (
+                    WorkerErrorCode::InternalError,
+                    Some(format!("item {} 人脸推理失败:{e}", item.item_id)),
+                )
+            })
+    });
+    for (item, out) in items.iter().zip(outs) {
+        match out {
+            Ok((faces, embs, width, height, seg_ms)) => {
+                sum_decode += seg_ms[0];
+                sum_detect += seg_ms[1];
+                sum_embed += seg_ms[2];
+                n_ok += 1;
+                n_faces += faces.len();
+                // 维度红线(terminal):系统性错误,整批 Failure(同 EmbedBatch)。
+                if embs.iter().any(|e| e.len() != fp.embed_dim) {
+                    return batch_failure(
+                        request_id,
+                        WorkerErrorCode::EmbedDimMismatch,
+                        format!("人脸嵌入维度与契约 {} 不符", fp.embed_dim),
+                    );
                 }
-                Err((code, msg)) => {
-                    if let Some(m) = msg {
-                        log_warn(m);
-                    }
-                    results.push(FaceItemResult::Err {
-                        item_id: item.item_id,
-                        fingerprint: item.fingerprint.clone(),
-                        code,
-                    });
+                for emb in &embs {
+                    append_embedding(&mut blob, emb);
                 }
+                results.push(FaceItemResult::Ok {
+                    item_id: item.item_id,
+                    fingerprint: item.fingerprint.clone(),
+                    // DetectedFace 与协议 FaceDet 字段同构,逐字段搬运(0 脸也是 Ok)。
+                    faces: faces
+                        .iter()
+                        .map(|f| FaceDet {
+                            bbox: f.bbox,
+                            landmarks: f.landmarks,
+                            score: f.score,
+                        })
+                        .collect(),
+                    // 实际解码尺寸:几何是本图像素坐标,host 归一化/quality 派生依赖它。
+                    width,
+                    height,
+                });
+            }
+            Err((code, msg)) => {
+                if let Some(m) = msg {
+                    log_warn(m);
+                }
+                results.push(FaceItemResult::Err {
+                    item_id: item.item_id,
+                    fingerprint: item.fingerprint.clone(),
+                    code,
+                });
             }
         }
     }
@@ -635,7 +651,7 @@ pub fn handle_face(
             items.len(),
             n_faces,
             batch_t0.elapsed().as_millis(),
-            chunk_size,
+            threads,
             sum_decode / n_ok as u128,
             sum_detect / n_ok as u128,
             sum_embed / n_ok as u128,
@@ -695,6 +711,19 @@ mod tests {
         assert_eq!(out1, vec![10, 11, 12, 13, 14]);
         // 空批。
         assert!(parallel_map_indexed(4, 0, |i| i).is_empty());
+        // 非整块批次中的末项错误也应占据原槽位，不能让先完成的后继项前移。
+        let out: Vec<Result<usize, usize>> = parallel_map_indexed(4, 15, |i| {
+            if i == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if i == 14 {
+                Err(i)
+            } else {
+                Ok(i)
+            }
+        });
+        assert_eq!(out[..14], (0..14).map(Ok).collect::<Vec<_>>());
+        assert_eq!(out[14], Err(14));
     }
 
     #[test]
@@ -706,5 +735,129 @@ mod tests {
         assert_eq!(&blob[0..4], &1.0f32.to_le_bytes());
         assert_eq!(&blob[4..8], &(-2.5f32).to_le_bytes());
         assert_eq!(&blob[8..12], &0.25f32.to_le_bytes());
+    }
+
+    struct TempPng(PathBuf);
+
+    impl Drop for TempPng {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // 每例只清理自己以 create_new 创建的文件，不递归删除临时目录。
+    fn temp_png(name: &str, bytes: &[u8]) -> TempPng {
+        use std::io::Write as _;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ai-worker-face-{}-{name}-{nonce}.png",
+            std::process::id()
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        TempPng(path)
+    }
+
+    /// 标准 CRC-32(zlib/PNG 用,polynomial 0xEDB88320,reflected,init/final 0xFFFFFFFF)。
+    /// 构造畸形 IHDR fixture 需要在改字段后自行重算 chunk CRC(镜像 ocr.rs::crc32)。
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// 编码一张真实可解的 1×1 PNG 作为 fixture(测试只改头部声明,不生成巨大位图)。
+    fn one_pixel_png() -> Vec<u8> {
+        let mut bytes: Vec<u8> = Vec::new();
+        let img = image::RgbImage::from_pixel(1, 1, image::Rgb([0u8, 0, 0]));
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        // IHDR 是签名(8 字节)后第一个 chunk(PNG 规范强制):
+        // [8..12]=length(13) [12..16]="IHDR" [16..20]=width [20..24]=height [29..33]=CRC。
+        assert_eq!(
+            &bytes[12..16],
+            b"IHDR",
+            "PNG 编码器必须把 IHDR 作为首个 chunk"
+        );
+        bytes
+    }
+
+    /// 就地改写 IHDR 声明的宽高并重算 CRC(其余字节不动 → 像素数据与声明不符)。
+    fn rewrite_png_dims(bytes: &mut [u8], w: u32, h: u32) {
+        bytes[16..20].copy_from_slice(&w.to_be_bytes());
+        bytes[20..24].copy_from_slice(&h.to_be_bytes());
+        let crc = crc32(&bytes[12..29]); // chunk type(4) + data(13)
+        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    fn face_item_source(path: &Path) -> FaceItem {
+        FaceItem {
+            item_id: 1,
+            cache_key: None,
+            source_path: Some(path.to_string_lossy().into_owned()),
+            fingerprint: "fp".into(),
+        }
+    }
+
+    #[test]
+    fn oversized_pixel_header_rejected_before_full_decode() {
+        // 短边 ≤640(host 允许这种原图直接回退)但总像素超上限:640 × 200_000 =
+        // 1.28e8 > MAX_SOURCE_PIXELS(1e8)。into_dimensions 只解头不解像素,超限判定
+        // 必须发生在真正解码分配之前(stat 只拦压缩字节,像素级设防补在此)。
+        let mut bytes = one_pixel_png();
+        rewrite_png_dims(&mut bytes, 640, 200_000);
+
+        let file = temp_png("oversized-pixels", &bytes);
+
+        let err =
+            load_face_image(Path::new("unused-cache"), &face_item_source(&file.0)).unwrap_err();
+        assert_eq!(
+            err,
+            WorkerErrorCode::ResourceLimit,
+            "超像素上限应在解码前判 ResourceLimit(逐项 Err,不连坐)"
+        );
+    }
+
+    #[test]
+    fn normal_small_image_still_decodes() {
+        // 上限内普通图不受新设防影响(避免像素检查误伤正常源)。
+        let file = temp_png("normal-small", &one_pixel_png());
+
+        let img = load_face_image(Path::new("unused-cache"), &face_item_source(&file.0)).unwrap();
+        assert_eq!((img.width, img.height), (1, 1));
+        assert_eq!(img.pixels.len(), 4, "1×1 RGBA = 4 字节");
+    }
+
+    #[test]
+    fn in_budget_header_with_bad_pixels_is_malformed_not_resource_limit() {
+        // 声明尺寸在上限内(1000×1000 = 1e6),但像素数据与声明不符 → 解码必失败。
+        // 契约:像素检查只负责「声明超限」,真实解码失败仍是 MalformedInput,
+        // 不得因解码失败被误判为 ResourceLimit。
+        let mut bytes = one_pixel_png();
+        rewrite_png_dims(&mut bytes, 1000, 1000);
+
+        let file = temp_png("bad-pixels", &bytes);
+
+        let err =
+            load_face_image(Path::new("unused-cache"), &face_item_source(&file.0)).unwrap_err();
+        assert_eq!(err, WorkerErrorCode::MalformedInput);
     }
 }

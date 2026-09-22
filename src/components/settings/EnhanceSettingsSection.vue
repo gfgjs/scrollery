@@ -10,16 +10,16 @@
 
     <!-- 授权态提示：未授权也可预下载模型，enhance_start 才验 license（D-OCR-6）。 -->
     <div
-      v-if="status && status.availability !== 'authorized'"
+      v-if="status?.models.some((model) => model.readiness === 'unlicensed')"
       class="enh-models__auth"
     >
       {{
-        status.availability === 'licenseExpired'
+        status?.availability === 'licenseExpired'
           ? $t('enhance.errUnlicensed')
           : $t('enhance.gateUnlicensed')
       }}
       <a
-        v-if="status.storeUrl"
+        v-if="status?.storeUrl"
         :href="status.storeUrl"
         target="_blank"
         rel="noopener noreferrer"
@@ -29,6 +29,12 @@
     </div>
 
     <!-- 逐档判定：任一档清单未就绪即提示（URL 待回填）。 -->
+    <div v-if="!status" class="enh-models__unready">
+      {{ $t('enhance.errStatusUnavailable') }}
+    </div>
+    <div v-else-if="!status.workerReady" class="enh-models__unready">
+      {{ $t('enhance.errWorkerMissing') }}
+    </div>
     <div v-if="anyManifestUnready" class="enh-models__unready">
       {{ $t('settings.enhanceManifestUnready') }}
     </div>
@@ -52,7 +58,7 @@
           <button
             v-if="!downloading[model.id]"
             class="enh-model__dl-btn"
-            :disabled="!model.manifestReady"
+            :disabled="!model.canDownload"
             @click="download(model.id)"
           >
             {{ $t('settings.enhanceDownload') }}

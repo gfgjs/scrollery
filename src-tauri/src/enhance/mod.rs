@@ -7,6 +7,7 @@
 //!
 //! enhance **不进** exotic 任务化调度（D-OCR-7 同型豁免）；由 IPC `enhance_start` 显式驱动。
 
+pub mod capability;
 pub(crate) mod exif_inject;
 pub mod registry;
 pub mod service;

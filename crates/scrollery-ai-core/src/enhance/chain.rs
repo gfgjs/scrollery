@@ -98,12 +98,16 @@ fn sample_rgb_tile(canvas: &Canvas, src: &Rect, tile: u32) -> Vec<f32> {
     let plane_src = canvas.plane();
     let plane_dst = t * t;
     let mut out = vec![0.0f32; 3 * plane_dst];
+    // x 映射只与列有关,按瓦片预计算一次;逐像素重算会把同一列的 rem_euclid
+    // 重复 t 次，因此按列复用同一映射结果。
+    let xs: Vec<usize> = (0..t)
+        .map(|tx| reflect(src.x + tx as i64, w) as usize)
+        .collect();
     for ty in 0..t {
         let sy = reflect(src.y + ty as i64, h) as usize;
         let row_src = sy * wu;
         let row_dst = ty * t;
-        for tx in 0..t {
-            let sx = reflect(src.x + tx as i64, w) as usize;
+        for (tx, &sx) in xs.iter().enumerate() {
             let s = row_src + sx;
             let d = row_dst + tx;
             for c in 0..3 {
@@ -424,5 +428,79 @@ mod tests {
         let t = sample_rgb_tile(&canvas, &src, 4);
         // planar [3,4,4];通道0 第 0 行 = x(-1,0,1,2)→ reflect-101(w=2)→ idx 1,0,1,0 → 值 0.8,0.2,0.8,0.2。
         assert_eq!(&t[0..4], &[0.8, 0.2, 0.8, 0.2]);
+    }
+
+    /// 表征测试:按逐像素公式(reflect 每像素现算)独立重算期望值,与整块采样逐元素比对。
+    /// 覆盖单像素源轴、内部瓦片、全越界(负/超界)与真图边缘瓦片,锁住采样语义。
+    #[test]
+    fn sample_matches_per_pixel_formula() {
+        /// 逐像素参考实现(不做任何列预计算)。
+        fn reference(canvas: &Canvas, src: &Rect, tile: u32) -> Vec<f32> {
+            let t = tile as usize;
+            let (w, h) = (canvas.w as i64, canvas.h as i64);
+            let plane = canvas.plane();
+            let mut out = vec![0.0f32; 3 * t * t];
+            for ty in 0..t {
+                let sy = reflect(src.y + ty as i64, h) as usize;
+                for tx in 0..t {
+                    let sx = reflect(src.x + tx as i64, w) as usize;
+                    for c in 0..3 {
+                        out[c * t * t + ty * t + tx] =
+                            canvas.data[c * plane + sy * canvas.w as usize + sx];
+                    }
+                }
+            }
+            out
+        }
+
+        fn canvas_of(w: u32, h: u32) -> Canvas {
+            let plane = w as usize * h as usize;
+            let mut data = vec![0.0f32; 3 * plane];
+            for i in 0..plane {
+                data[i] = (i % 251) as f32 / 255.0;
+                data[plane + i] = (i % 97) as f32 / 255.0;
+                data[2 * plane + i] = (i % 53) as f32 / 255.0;
+            }
+            Canvas { data, w, h }
+        }
+
+        // (画布宽, 画布高, 瓦片边长, 采样起点)——含 1 像素轴、内部与越界起点。
+        let cases: &[(u32, u32, u32, i64, i64)] = &[
+            (1, 1, 4, -2, -2),     // 两轴皆单像素:reflect 恒 0
+            (1, 9, 5, -3, 4),      // 宽轴单像素、高轴内部
+            (9, 1, 5, 4, -3),      // 高轴单像素、宽轴内部
+            (8, 8, 4, 0, 0),       // 整块在图内(内部瓦片)
+            (8, 8, 4, -1, -1),     // 左上角瓦片:两轴负越界
+            (8, 8, 4, 5, 5),       // 右下角瓦片:两轴超界
+            (16, 16, 8, -7, 9),    // 宽轴全负越界、高轴超界
+            (37, 23, 16, 21, -16), // 非整周期:周期 2·(n−1) 不整除瓦片
+        ];
+        for &(cw, ch, tile, sx, sy) in cases {
+            let canvas = canvas_of(cw, ch);
+            let src = Rect {
+                x: sx,
+                y: sy,
+                w: tile,
+                h: tile,
+            };
+            assert_eq!(
+                sample_rgb_tile(&canvas, &src, tile),
+                reference(&canvas, &src, tile),
+                "采样与逐像素公式不一致:画布 {cw}×{ch} tile {tile} 起点 ({sx},{sy})"
+            );
+        }
+
+        // 生产几何下的真实瓦片(512/16):边缘与内部瓦片各取,逐元素比对。
+        let canvas = canvas_of(1000, 700);
+        for ts in plan_tiles(1000, 700, 512, 16, 1) {
+            let src = ts.src_rect;
+            assert_eq!(
+                sample_rgb_tile(&canvas, &src, 512),
+                reference(&canvas, &src, 512),
+                "采样与逐像素公式不一致:src ({},{})",
+                src.x,
+                src.y
+            );
+        }
     }
 }

@@ -143,7 +143,6 @@ pub fn ffmpeg_tool_status(app_data: &Path) -> ToolStatus {
 
 /// `verify_size_sha` 对 62MB 级 zip 全量流式读取算 sha256，是同步阻塞调用；在 async fn 内直跑
 /// 会占住 tokio 执行器线程，故统一经 `spawn_blocking` 甩到阻塞线程池。
-/// （备注：`download/fetch.rs:130/150` 同型同步哈希调用是基线存量，此处不修，待随下载引擎线收口。）
 async fn verify_size_sha_blocking(path: PathBuf) -> Result<(), DownloadError> {
     tokio::task::spawn_blocking(move || {
         download::verify_size_sha(&path, BTBN_ZIP_SIZE, Some(BTBN_ZIP_SHA256))

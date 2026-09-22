@@ -104,20 +104,43 @@ pub async fn get_meta_for_viewport(
     read_blocking(&state, move |c| q::get_media_meta_batch(c, &ids)).await
 }
 
-/// 获取相邻的媒体项详细信息。
+/// 获取相邻的媒体项详细信息（T5）。
+///
+/// `order_version` 必填：前端携带打开查看器时**普通**布局的顺序代。只在该顺序代的普通
+/// 布局缓存里按 O(1) id 索引找一步邻居——不借当前已加载的行、不回退别的集合或别的顺序；
+/// 无布局 → `LayoutNotReady`，版本不符 / 当前缓存是镜头布局 / 当前项不在本集合 →
+/// `ViewStale`（前端重算 layout 重取）；只有目标越过首尾才是正常的 `None`。
+///
+/// 查详情是 await（DB 往返）：返回后必须复验**同一 orderVersion**，否则迟到的详情会配到
+/// 已换代（成员/顺序已变）的导航上下文上。纯几何重排沿用 orderVersion，不受影响。
 #[tauri::command]
 pub async fn get_adjacent_media(
     current_id: i64,
     offset: isize,
+    order_version: u64,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<MediaDetail>> {
-    let adj_id = crate::layout::cache::get_adjacent_item(&state.layout_cache, current_id, offset);
-    if let Some(id) = adj_id {
-        let detail = get_media_detail(id, state).await?;
-        Ok(Some(detail))
-    } else {
-        Ok(None)
+    let id = match crate::layout::cache::get_adjacent_item(
+        &state.layout_cache,
+        current_id,
+        offset,
+        order_version,
+    ) {
+        crate::layout::cache::AdjacentLookup::LayoutNotReady => {
+            return Err(AppError::LayoutNotReady)
+        }
+        crate::layout::cache::AdjacentLookup::ViewStale
+        | crate::layout::cache::AdjacentLookup::CurrentMissing => return Err(AppError::ViewStale),
+        crate::layout::cache::AdjacentLookup::OutOfBounds => return Ok(None),
+        crate::layout::cache::AdjacentLookup::Found { id, .. } => id,
+    };
+
+    let detail = get_media_detail(id, state.clone()).await?;
+    // 详情 await 期间顺序可能已换代（成员/顺序变化）：迟到的详情不得落到新上下文。
+    if crate::layout::cache::current_order_version(&state.layout_cache) != Some(order_version) {
+        return Err(AppError::ViewStale);
     }
+    Ok(Some(detail))
 }
 
 /// 按指定布局版本获取重复镜头中的相邻媒体项。
@@ -148,22 +171,26 @@ pub async fn get_lens_adjacent_media(
     );
 
     let (id, index, total_count) = match adjacent {
-        crate::layout::cache::LensAdjacentLookup::LayoutNotReady => {
+        crate::layout::cache::AdjacentLookup::LayoutNotReady => {
             return Err(AppError::LayoutNotReady)
         }
-        crate::layout::cache::LensAdjacentLookup::ViewStale
-        | crate::layout::cache::LensAdjacentLookup::CurrentMissing => {
-            return Err(AppError::ViewStale)
-        }
-        crate::layout::cache::LensAdjacentLookup::OutOfBounds => return Ok(None),
-        crate::layout::cache::LensAdjacentLookup::Found {
+        crate::layout::cache::AdjacentLookup::ViewStale
+        | crate::layout::cache::AdjacentLookup::CurrentMissing => return Err(AppError::ViewStale),
+        crate::layout::cache::AdjacentLookup::OutOfBounds => return Ok(None),
+        crate::layout::cache::AdjacentLookup::Found {
             id,
             index,
             total_count,
         } => (id, index, total_count),
     };
 
-    let detail = get_media_detail(id, state).await?;
+    let detail = get_media_detail(id, state.clone()).await?;
+    // 详情 await 期间镜头布局换代 / 被替换为普通布局 → 旧几何的邻居不得配新详情。
+    if crate::layout::cache::current_lens_layout_version(&state.layout_cache)
+        != Some(layout_version)
+    {
+        return Err(AppError::ViewStale);
+    }
     Ok(Some(LensAdjacentMedia {
         detail,
         index,

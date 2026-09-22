@@ -1,15 +1,14 @@
 // 重排锚点(原「行高锚点」问题1,2026-07-17 泛化到全部整体重排)。
-// 自 MediaGrid.vue 结构拆分抽出,判据/时序逐字保留。
+// 只解析本版目标坐标,滚动与窗口提交由 bucket 协调。
 //
 // 行高滑块、分组/排序切换、无缝分组、布局模式切换、容器宽度变化都会整体重排布局:
 // 旧 scrollTop(layoutVersion watcher 的 scrollCache 兜底路径)映射到完全不同的内容,
 // 用户正在看的项跳走。统一做法:重排前捕获视口顶部项(pickReflowAnchor,纯函数单测),
 // 重算完成后按该项在新布局的 y 回滚,钉在屏内。同一触发爆发(滑块拖动/连续 resize)
 // 只捕获一次,持有到爆发停稳,避免多次重算间漂移。
-import { onBeforeUnmount, watch } from 'vue'
+import { onScopeDispose, watch } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
-import { scrollCache } from '../utils/scrollCache'
 import { IPC } from '../constants/ipc'
 import { useMediaStore } from '../stores/mediaStore'
 import { useUiStore } from '../stores/uiStore'
@@ -22,7 +21,6 @@ export interface ReflowAnchorDeps {
   activeRows: () => LayoutRow[]
   currentLogicalY: () => number
   getViewKey: () => string
-  scrollToLogicalY: (y: number) => Promise<void>
 }
 
 export function useReflowAnchor(deps: ReflowAnchorDeps) {
@@ -33,6 +31,7 @@ export function useReflowAnchor(deps: ReflowAnchorDeps) {
   const ANCHOR_HOLD_MS = 400
   let pendingAnchor: { id: number; screenOffset: number; viewKey: string } | null = null
   let anchorClearTimer: ReturnType<typeof setTimeout> | null = null
+  let disposed = false
 
   function scheduleAnchorClear() {
     if (anchorClearTimer !== null) clearTimeout(anchorClearTimer)
@@ -57,28 +56,24 @@ export function useReflowAnchor(deps: ReflowAnchorDeps) {
     if (picked) pendingAnchor = { ...picked, viewKey: deps.getViewKey() }
   }
 
-  async function restoreReflowAnchor(): Promise<boolean> {
-    if (!pendingAnchor || !deps.gridRef()) return false
+  async function resolveReflowAnchor(layoutVersion: number, isCurrent: () => boolean): Promise<number | null> {
+    if (!pendingAnchor || !deps.gridRef() || disposed) return null
     // 持锚期间切了目录/相册:锚点押的是旧视图的项,拿到新视图里恢复会把滚动位拽去
     // 该项恰好所在的位置——弃锚走 scrollCache(新视图有自己的缓存键)。
     if (pendingAnchor.viewKey !== deps.getViewKey()) {
       pendingAnchor = null
-      return false
+      return null
     }
     const anchor = pendingAnchor
     try {
-      const y = await invokeIpc<number | null>(IPC.GET_ITEM_Y_BY_ID, { itemId: anchor.id })
-      if (y !== null && deps.gridRef()) {
-        const targetY = Math.max(0, y - anchor.screenOffset)
-        // 统一入口(B3 映射态重锚自处理);缓存存逻辑 y(映射态物理位不自足)。
-        await deps.scrollToLogicalY(targetY)
-        scrollCache.set(deps.getViewKey(), targetY)
-        return true
+      const y = await invokeIpc<number | null>(IPC.GET_ITEM_Y_BY_ID, { itemId: anchor.id, layoutVersion })
+      if (y !== null && !disposed && isCurrent() && anchor.viewKey === deps.getViewKey()) {
+        return Math.max(0, y - anchor.screenOffset)
       }
     } catch (e) {
       logger.error('[MediaGrid] restoreReflowAnchor failed', { error: e })
     }
-    return false
+    return null
   }
 
   // 在布局重算前捕获(本 watcher 是 pre-flush;useJustifiedLayout 的重算 watcher 是
@@ -105,7 +100,9 @@ export function useReflowAnchor(deps: ReflowAnchorDeps) {
     },
   )
 
-  onBeforeUnmount(() => {
+  onScopeDispose(() => {
+    disposed = true
+    pendingAnchor = null
     // 重排锚点清除定时器会在 compute 在途时自续命(scheduleAnchorClear),卸载须显式掐断。
     if (anchorClearTimer !== null) {
       clearTimeout(anchorClearTimer)
@@ -113,5 +110,5 @@ export function useReflowAnchor(deps: ReflowAnchorDeps) {
     }
   })
 
-  return { captureReflowAnchor, restoreReflowAnchor }
+  return { captureReflowAnchor, resolveReflowAnchor }
 }

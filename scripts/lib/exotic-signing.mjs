@@ -7,6 +7,35 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
+
+/**
+ * 官方版商品配置(唯一可信源):`src-tauri/resources/official-product.json`。
+ * 签发器、registry 生成器与发行检查都从这里取 product_id/sku,避免各脚本各自硬编码
+ * 单项 SKU 或期限。字段缺失一律抛错(fail-fast),不静默回退占位值。
+ */
+export function loadOfficialProduct(repoDir) {
+  const file = path.join(repoDir, 'src-tauri', 'resources', 'official-product.json');
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (typeof raw.product_id !== 'string' || raw.product_id.length === 0) {
+    throw new Error(`${file} 缺 product_id`);
+  }
+  if (typeof raw.sku !== 'string' || raw.sku.length === 0) {
+    throw new Error(`${file} 缺 sku`);
+  }
+  if (typeof raw.sales_open !== 'boolean') {
+    throw new Error(`${file} 缺 sales_open(布尔)`);
+  }
+  if (raw.store_url !== null && typeof raw.store_url !== 'string') {
+    throw new Error(`${file} 的 store_url 须为字符串或 null`);
+  }
+  return {
+    productId: raw.product_id,
+    sku: raw.sku,
+    salesOpen: raw.sales_open,
+    storeUrl: raw.store_url ?? null,
+  };
+}
 
 /**
  * 与 crates/exotic-protocol/src/frame.rs 的 `PROTOCOL_VERSION` **手动**同步(worker 帧协议版本)。
