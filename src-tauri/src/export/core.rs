@@ -161,7 +161,32 @@ fn record_item_issue(
     }
 }
 
-/// 运行导出(方案 §3.2):逐项 staging 内 `.tmp` → rename,取消检查在每项复制前后,成功后
+// 固定内存分块，使大视频复制期间也能响应取消；不能中断正在进行的单次磁盘系统调用。
+fn copy_cancellable(
+    source: &mut impl std::io::Read,
+    target: &mut impl std::io::Write,
+    cancel: &CancellationToken,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0; 256 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let count = match source.read(&mut buffer) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if cancel.is_cancelled() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        target.write_all(&buffer[..count])?;
+    }
+}
+
+/// 运行导出(方案 §3.2):逐项 staging 内 `.tmp` → rename,复制分块及最终发布前检查取消,成功后
 /// 写 manifest、最后整目录 rename 为正式目录。`items` 已由调用方按目标顺序解析并取好元数据
 /// (本函数不碰 DB)。`on_progress(processed, total)` 内部按项目数动态节流,避免万级导出逐项
 /// 发事件淹没 IPC。
@@ -247,23 +272,27 @@ pub fn run_export(
             continue;
         }
 
-        let src_abs = crate::utils::path::resolve_media_path(
-            &meta.root_path,
-            &meta.rel_path,
-            &meta.file_name,
-        );
         // 审查 P2:tmp 名与最终名脱钩(用循环下标而非 final_name 派生)——此前 `.{final_name}.tmp`
         // 与最终名共用同一目录命名空间,若某项最终名恰为 `.X.tmp`(Original 档下源文件本名如此),
         // 后续最终名为 `X` 的项复制时会直接覆盖它再 rename 走,前者从产出中消失但已计入 succeeded。
         let tmp_target = staging_dir.join(format!(".export-tmp-{index}"));
         let final_target = staging_dir.join(&final_name);
 
-        let copy_result: std::io::Result<()> =
-            std::fs::copy(&src_abs, &tmp_target).and_then(|_| {
-                let mtime = filetime::FileTime::from_unix_time(meta.file_mtime, 0);
-                filetime::set_file_mtime(&tmp_target, mtime)?;
-                std::fs::rename(&tmp_target, &final_target)
-            });
+        let copy_result: std::io::Result<()> = (|| {
+            let mut source = super::source::open(&meta.root_path, &meta.rel_path, &meta.file_name)?;
+            let mut target = std::fs::File::create(&tmp_target)?;
+            copy_cancellable(&mut source, &mut target, cancel)?;
+            target.set_permissions(source.metadata()?.permissions())?;
+            drop(target);
+            let mtime = filetime::FileTime::from_unix_time(meta.file_mtime, 0);
+            filetime::set_file_mtime(&tmp_target, mtime)?;
+            std::fs::rename(&tmp_target, &final_target)
+        })();
+
+        if cancel.is_cancelled() {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(cancelled());
+        }
 
         match copy_result {
             Ok(()) => {
@@ -305,6 +334,10 @@ pub fn run_export(
         }
     }
 
+    if cancel.is_cancelled() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(cancelled());
+    }
     if params.include_manifest {
         let manifest = Manifest::new(params.source.clone(), exported_at_utc, manifest_items);
         if let Err(e) = manifest.write_into(&staging_dir) {
@@ -325,6 +358,10 @@ pub fn run_export(
         suffix += 1;
     }
 
+    if cancel.is_cancelled() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(cancelled());
+    }
     if std::fs::rename(&staging_dir, &final_dir).is_err() {
         let _ = std::fs::remove_dir_all(&staging_dir);
         return Err(err(
@@ -369,6 +406,150 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, b"abc").unwrap();
         p
+    }
+
+    #[test]
+    fn copy_stops_between_chunks_when_cancelled_during_read() {
+        struct CancellingReader {
+            reads: usize,
+            cancel: CancellationToken,
+        }
+        impl std::io::Read for CancellingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    self.cancel.cancel();
+                }
+                buf.fill(7);
+                Ok(buf.len())
+            }
+        }
+        let cancel = CancellationToken::new();
+        let mut source = CancellingReader {
+            reads: 0,
+            cancel: cancel.clone(),
+        };
+        let mut copied = Vec::new();
+        let result = copy_cancellable(&mut source, &mut copied, &cancel);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(source.reads, 2);
+        assert_eq!(copied.len(), 256 * 1024);
+        assert!(copied.iter().all(|byte| *byte == 7));
+    }
+
+    #[test]
+    fn export_rejects_source_parent_traversal() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("root");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        write_src(&outside, "secret.txt");
+        let target = tempfile::tempdir().unwrap();
+        let params = ExportParams {
+            target_parent: target.path(),
+            job_id: "boundary",
+            naming: NamingScheme::Original,
+            conflict: ExportConflict::Rename,
+            include_manifest: true,
+            source: ExportSource::Selection,
+        };
+        let items = [meta(
+            1,
+            &root.to_string_lossy(),
+            "../outside",
+            "secret.txt",
+            "online",
+        )];
+        let result = run_export(
+            &params,
+            &items,
+            &CancellationToken::new(),
+            "boundary",
+            "now".into(),
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.succeeded, 0);
+        assert_eq!(result.skipped_or_failed_total, 1);
+        assert!(!result.final_dir.join("secret.txt").exists());
+    }
+
+    #[test]
+    fn cancellation_during_last_progress_never_publishes() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        write_src(root.path(), "a.jpg");
+        let params = ExportParams {
+            target_parent: target.path(),
+            job_id: "last-cancel",
+            naming: NamingScheme::Original,
+            conflict: ExportConflict::Rename,
+            include_manifest: true,
+            source: ExportSource::Selection,
+        };
+        let items = [meta(
+            1,
+            &root.path().to_string_lossy(),
+            "",
+            "a.jpg",
+            "online",
+        )];
+        let cancel = CancellationToken::new();
+        let result = run_export(
+            &params,
+            &items,
+            &cancel,
+            "last-cancel",
+            "now".into(),
+            |_, _| cancel.cancel(),
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::Export {
+                code: CODE_CANCELLED,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_skipped_last_item_never_publishes() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let params = ExportParams {
+            target_parent: target.path(),
+            job_id: "skip-cancel",
+            naming: NamingScheme::Original,
+            conflict: ExportConflict::Rename,
+            include_manifest: true,
+            source: ExportSource::Selection,
+        };
+        let items = [meta(
+            1,
+            &root.path().to_string_lossy(),
+            "",
+            "missing.jpg",
+            "missing",
+        )];
+        let cancel = CancellationToken::new();
+        let result = run_export(
+            &params,
+            &items,
+            &cancel,
+            "skip-cancel",
+            "now".into(),
+            |_, _| cancel.cancel(),
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::Export {
+                code: CODE_CANCELLED,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
     }
 
     #[test]

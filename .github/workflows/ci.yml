@@ -144,6 +144,12 @@ jobs:
       - name: 路径卫生门禁(check-path-hygiene)
         run: node scripts/check-path-hygiene.mjs
 
+      - name: IPC 一致性门禁自检
+        run: node scripts/check-ipc-commands.mjs --selftest
+
+      - name: IPC 命令定义、注册与前端常量对拍
+        run: npm run check:ipc
+
       # exotic 协议版本跨语言同步门(2026-07-13 事故防复发):Rust frame.rs 与 JS exotic-signing.mjs
       # 的 PROTOCOL_VERSION 必须相等——升 host 漏改 JS 会令打包器把旧版本号烙进插件清单被 installer
       # 启动前复核判 protocol_mismatch 拒装(psd 插件根因)。纯静态读两文件,秒级;先跑 selftest 防退化。
@@ -166,6 +172,9 @@ jobs:
 
       - name: vue-tsc 类型检查
         run: npm run typecheck
+
+      - name: Vitest 展开用例预算（含 each 和跳过项）
+        run: npm run check:tests -- --selftest
 
       - name: vitest 单元测试
         run: npm test

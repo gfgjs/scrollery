@@ -65,7 +65,7 @@ pub struct EnhanceProfile {
     pub fp16_safe: bool,
 }
 
-/// 所有已知增强模型档位（design.md §D 5 模型短名单，全部许可安全）。
+/// 五个候选增强模型档位；实际导出资产及分发许可须在发行清单落地时核验。
 pub fn enhance_profiles() -> Vec<EnhanceProfile> {
     // tile/tile_pad 全部 512/16(design.md §E 定案),文件名 `{id}-fp32.onnx` / `{id}-fp16.onnx`。
     // fp16_safe:仅 SCUNet 为 false(spike-D 实测 DML fp16 PSNR 37.48<40 门,GPU 亦须 fp32);

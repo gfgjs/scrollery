@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::layout::geometry::{GallerySeparatorKind, LayoutRow};
 
 static LAYOUT_VERSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+static ORDER_VERSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +101,8 @@ pub struct LayoutSummary {
     pub total_rows: usize,
     pub total_height: f64,
     pub layout_version: u64,
+    /// 成员与排列的身份；纯几何重排沿用。
+    pub order_version: u64,
     pub total_items: usize,
     pub separators: Vec<SeparatorInfo>,
     /// 月密度桶（date 分组才非空，见 [`MonthBucket`]）。与 separators 同一次行遍历构建，
@@ -156,29 +159,25 @@ impl IdToFlat {
     }
 }
 
-/// 存储在内存布局缓存中的数据。
-///
-/// The flat indices below keep hot navigation lookups O(1) (adjacent item /
-/// re-anchor by id). S3 note: thumbnail/favorite/rating patches no longer touch
-/// this cache — rows carry geometry only; payload freshness comes from the
-/// items cache at hydration time.
-///
-/// 下面的扁平索引让热点导航查找保持 O(1)（相邻项 / 按 id 重锚定）。S3 注：缩略图/
-/// 收藏/评分等 patch 不再触达本缓存——行仅存几何，载荷新鲜度由出口拼装时的 items
-/// 取数缓存保证。
+/// 同一成员顺序共享的全集与索引，让邻接导航和按 ID 重锚定保持 O(1)。
+pub struct ViewOrder {
+    pub version: u64,
+    pub flat_ids: Vec<i64>,
+    pub id_to_flat: IdToFlat,
+}
+
+/// 几何按布局代更新；全集顺序及 ID 索引在几何重排之间共享。
 pub struct LayoutCacheData {
     pub rows: Vec<LayoutRow>,
     pub total_height: f64,
     pub layout_version: u64,
     pub total_items: usize,
 
-    /// 按布局顺序排列的项 id（每个图片项一个，不含分隔符）。
-    pub flat_ids: Vec<i64>,
-    /// 与 `flat_ids` 并行：扁平下标 → (行下标, 行内项下标)。
+    pub order: Arc<ViewOrder>,
+    /// 不含几何的排序输入；必须同时匹配 source_items 的快照身份才允许复用。
+    order_key: String,
+    /// 与 `order.flat_ids` 并行：扁平下标 → (行下标, 行内项下标)。
     pub flat_rowcol: Vec<(u32, u32)>,
-    /// 项 id → 扁平下标。两个热点路径的唯一索引来源。S3.3：密集直址/稀疏哈希双形态，
-    /// 见 [`IdToFlat`]。
-    pub id_to_flat: IdToFlat,
 
     /// S3.1 幂等去重键：本代布局的构建输入指纹（布局参数 + 过滤器键 + 数据代）。
     /// compute_layout 据此短路「同参数同数据代」的重复触发（见 dedup_summary）。
@@ -193,6 +192,8 @@ pub struct LayoutCacheData {
     /// `duplicateBucket`/序号字段。普通画廊布局恒 None（零成本）；镜头布局随本代
     /// 缓存一起换代（gen_key 已含镜头维度与 dedup_view_epoch）。
     pub lens_projection: Option<Arc<crate::layout::lens::LensProjection>>,
+    /// 与几何一起发布的载荷快照。测试/纯几何调用可不提供；生产出口必须有。
+    pub source_items: Option<Arc<crate::layout::items_cache::ItemsCache>>,
 }
 
 /// 布局缓存 — 存储在 `AppState` 中的 `RwLock` 后面。
@@ -223,6 +224,52 @@ pub fn store_layout_with_lens(
     gen_key: String,
     lens_projection: Option<Arc<crate::layout::lens::LensProjection>>,
 ) -> u64 {
+    let prepared = prepare_layout(
+        cache,
+        rows,
+        total_height,
+        gen_key,
+        lens_projection,
+        None,
+        String::new(),
+    );
+    publish_layout(cache, prepared).layout_version
+}
+
+/// 已在锁外物化的布局和摘要。
+pub struct PreparedLayout {
+    pub data: LayoutCacheData,
+    summary: LayoutSummary,
+}
+
+/// 索引和摘要在发布锁外准备，避免大集合物化阻塞请求登记与视口读取。
+/// `order_key` 必须包含所有非几何的顺序输入；空键或无快照时不复用顺序。
+pub fn prepare_layout(
+    cache: &LayoutCache,
+    rows: Vec<LayoutRow>,
+    total_height: f64,
+    gen_key: String,
+    lens_projection: Option<Arc<crate::layout::lens::LensProjection>>,
+    source_items: Option<Arc<crate::layout::items_cache::ItemsCache>>,
+    order_key: String,
+) -> PreparedLayout {
+    // 只证明同一快照与顺序输入，不扫描/哈希全集去猜测两个不同快照是否恰好同序。
+    let reused_order = {
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|data| {
+                !order_key.is_empty()
+                    && data.order_key == order_key
+                    && data
+                        .source_items
+                        .as_ref()
+                        .zip(source_items.as_ref())
+                        .is_some_and(|(old, new)| Arc::ptr_eq(old, new))
+            })
+            .map(|data| data.order.clone())
+    };
+    let order_reused = reused_order.is_some();
     // 在仍持有 `rows` 时一次遍历构建扁平索引。S3.2：预扫总项数（10^5 行级轻扫）
     // 换三容器零重分配/零重哈希——1M 项下多轮扩容重哈希此前占换代耗时大头。
     let total: usize = rows
@@ -232,7 +279,7 @@ pub fn store_layout_with_lens(
             _ => 0,
         })
         .sum();
-    let mut flat_ids: Vec<i64> = Vec::with_capacity(total);
+    let mut flat_ids: Vec<i64> = Vec::with_capacity(if reused_order.is_some() { 0 } else { total });
     let mut flat_rowcol: Vec<(u32, u32)> = Vec::with_capacity(total);
     // 月桶（§3.8.3）：与扁平索引同一次遍历构建。date 分组分隔符 group_id="YYYY-MM"（§3.8.2）→
     // 解析为 (year, month)；同月相邻分隔符并入同桶，Normal 行项数累加进**当前**桶。folder/none
@@ -243,7 +290,9 @@ pub fn store_layout_with_lens(
         match row {
             LayoutRow::Normal { items, .. } => {
                 for (ii, item) in items.iter().enumerate() {
-                    flat_ids.push(item.id);
+                    if reused_order.is_none() {
+                        flat_ids.push(item.id);
+                    }
                     flat_rowcol.push((ri as u32, ii as u32));
                 }
                 // Normal 行紧跟其所属分隔符之后 → 累加进当前（最后一个）月桶；none 分组无桶则跳过。
@@ -304,41 +353,52 @@ pub fn store_layout_with_lens(
     }
     // S3.3：id 索引从 flat_ids 二次构建（顺序读 + 密集时 L2/L3 级随机写直址表），
     // 替代循环内 1M 次哈希插入——后者的随机访存是 store 段的剩余大头。
-    let id_to_flat = IdToFlat::build(&flat_ids);
-    let total_items = flat_ids.len();
-
-    let old_gen;
-    let version;
-    {
-        let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
-        // 版本号必须在**写锁内**递增(审查 R0-3):若在锁外先取号,两个并发 store_layout 可发生
-        // 「后取号者先写入」的写序倒置——缓存最终存着旧行集配小版本号,而前端已握有大版本号,
-        // 后续 get_layout_rows(expected_version) 恒不匹配 → 假性 LayoutNotReady 重取风暴。
-        // 锁内取号保证:版本单调序 == 实际写入序。扁平索引构建(CPU 大头)仍留锁外不受影响。
-        version = LAYOUT_VERSION_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
-        // S3.2:旧代先取出、锁外处置——写锁窗口只剩取号+指针交换,数十万行旧代的堆释放
-        // 不再阻塞滚动中并发的取行读锁。
-        old_gen = guard.take();
-        *guard = Some(LayoutCacheData {
-            rows,
-            total_height,
-            layout_version: version,
-            total_items,
+    let order = reused_order.unwrap_or_else(|| {
+        Arc::new(ViewOrder {
+            version: ORDER_VERSION_COUNTER.fetch_add(1, Ordering::Relaxed) + 1,
+            id_to_flat: IdToFlat::build(&flat_ids),
             flat_ids,
-            flat_rowcol,
-            id_to_flat,
-            gen_key,
-            separators,
-            month_buckets,
-            lens_projection,
-        });
-    }
+        })
+    });
+    let total_items = total;
+
+    let data = LayoutCacheData {
+        rows,
+        total_height,
+        layout_version: 0,
+        total_items,
+        order,
+        order_key,
+        flat_rowcol,
+        gen_key,
+        separators,
+        month_buckets,
+        lens_projection,
+        source_items,
+    };
+    let summary = summary_of(&data);
+    tracing::debug!(
+        order_version = summary.order_version,
+        order_reused,
+        total_items,
+        "layout order index | 顺序索引物化/复用"
+    );
+    PreparedLayout { data, summary }
+}
+
+/// 发布已准备好的布局并返回它自己的摘要，不在发布后重读全局状态。
+pub fn publish_layout(cache: &LayoutCache, mut prepared: PreparedLayout) -> LayoutSummary {
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    prepared.data.layout_version = LAYOUT_VERSION_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    prepared.summary.layout_version = prepared.data.layout_version;
+    let old_gen = guard.replace(prepared.data);
+    drop(guard);
     // 旧代堆释放(数十万 Vec + 1M 索引)卸到后台线程:数据已离开缓存,无锁无共享,纯释放
     // 工作,不必占用重排关键路径(实测 1M 库该段数十 ms)。
     if old_gen.is_some() {
         std::thread::spawn(move || drop(old_gen));
     }
-    version
+    prepared.summary
 }
 
 // ── 失效契约（R1-5 裁决，2026-07-02）───────────────────────────────────────────
@@ -363,20 +423,40 @@ pub fn store_layout_with_lens(
 ///
 /// 直接返回缓存内已物化的 `flat_ids` —— 它由 `compute_layout`（经 `query_layout_items`）产出，与
 /// `view_to_sql` 的 id-only 路径**同源同序**（同一 `push_query_body` 的 ORDER BY），故功能等价于
-/// `resolve_selection(SelectAll{view, []})`，但 **O(1) 无 DB 往返**（设计 §5.3 的性能优化偏移：
+/// `resolve_selection(SelectAll{view, []})`，但无需 DB 往返（复制/传输仍为 O(N)，设计 §5.3：
 /// 百万级 Ctrl+A / 框选不应每次重查 DB；单一事实源诉求由 S3 批量写路径的 `resolve_selection` 承担）。
 ///
-/// `expected_version` 与当前布局不一致 → 返回 `None`，调用方据此抛 `ViewStale` 让前端重算重取。
+/// `expected_version` 与当前顺序不一致 → 返回 `None`；纯几何重排不使全集失效。
 pub fn get_view_ids(cache: &LayoutCache, expected_version: Option<u64>) -> Option<Vec<i64>> {
-    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
-    let data = guard.as_ref()?;
-
-    if let Some(ver) = expected_version {
-        if data.layout_version != ver {
+    let order = {
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+        let data = guard.as_ref()?;
+        if expected_version.is_some_and(|ver| data.order.version != ver) {
             return None;
         }
-    }
-    Some(data.flat_ids.clone())
+        data.order.clone()
+    };
+    Some(order.flat_ids.clone())
+}
+
+/// 只读当前顺序身份，不物化全集或摘要。
+pub fn current_order_version(cache: &LayoutCache) -> Option<u64> {
+    cache
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|data| data.order.version)
+}
+
+/// 只读当前布局的镜头身份：确实是镜头布局时返回其 `layout_version`，普通布局或无布局返回
+/// `None`。镜头邻接的详情 await 后复验用——普通布局不得让迟到的镜头详情落地。
+pub fn current_lens_layout_version(cache: &LayoutCache) -> Option<u64> {
+    cache
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|data| data.lens_projection.is_some())
+        .map(|data| data.layout_version)
 }
 
 /// 从缓存中检索与 [top_y, bottom_y] 相交的行切片。
@@ -469,6 +549,7 @@ fn summary_of(data: &LayoutCacheData) -> LayoutSummary {
         total_rows: data.rows.len(),
         total_height: data.total_height,
         layout_version: data.layout_version,
+        order_version: data.order.version,
         total_items: data.total_items,
         separators: data.separators.clone(),
         month_buckets: data.month_buckets.clone(),
@@ -497,25 +578,13 @@ fn parse_year_month(group_id: &str) -> Option<(i32, u32)> {
     }
 }
 
-/// 从缓存布局中获取相邻项 ID
-pub fn get_adjacent_item(cache: &LayoutCache, current_id: i64, offset: isize) -> Option<i64> {
-    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
-    let data = guard.as_ref()?;
-    // 通过 id 索引 O(1) 完成 — 不再每步导航都展平全表。
-    let current_idx = data.id_to_flat.get(current_id)?;
-    let target_idx = (current_idx as isize).checked_add(offset)?;
-    if target_idx < 0 {
-        return None;
-    }
-    data.flat_ids.get(target_idx as usize).copied()
-}
-
-/// 镜头查看器的一步邻接查询结果。
+/// 一步邻接查询结果（普通画廊与镜头两个入口共用）。
 ///
-/// 该枚举把缓存状态、镜头语义、当前项缺失与正常首尾边界分开，调用方可以只把
-/// `OutOfBounds` 映射为「没有上一项/下一项」，其它不一致都拒绝静默落回普通顺序。
+/// 该枚举把缓存状态、上下文归属、当前项缺失与真实首尾边界分开，调用方可以只把
+/// `OutOfBounds` 映射为「没有上一项/下一项」，其它不一致一律拒绝——不静默落回别的
+/// 集合、别的顺序或当前已加载的行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LensAdjacentLookup {
+pub enum AdjacentLookup {
     LayoutNotReady,
     ViewStale,
     CurrentMissing,
@@ -527,37 +596,66 @@ pub enum LensAdjacentLookup {
     },
 }
 
-/// 在同一把缓存读锁内验证「版本 + lens 布局 + 当前项」并解析一步相邻项。
+/// 在已持读锁的缓存数据上解析一步相邻项（版本与布局类别由两个入口各自先行判定）。
+fn adjacent_in_order(data: &LayoutCacheData, current_id: i64, offset: isize) -> AdjacentLookup {
+    // 通过 id 索引 O(1) 完成 — 不再每步导航都展平全表。
+    let Some(current_idx) = data.order.id_to_flat.get(current_id) else {
+        return AdjacentLookup::CurrentMissing;
+    };
+    let Some(target_idx) = (current_idx as isize).checked_add(offset) else {
+        return AdjacentLookup::OutOfBounds;
+    };
+    if target_idx < 0 {
+        return AdjacentLookup::OutOfBounds;
+    }
+    let Some(&id) = data.order.flat_ids.get(target_idx as usize) else {
+        return AdjacentLookup::OutOfBounds;
+    };
+    AdjacentLookup::Found {
+        id,
+        index: target_idx as usize,
+        total_count: data.total_items,
+    }
+}
+
+/// 普通画廊的一步邻接查询，必须携带打开查看器时的 `order_version`。
+///
+/// 只认同一顺序代的**普通**布局：镜头布局有各自契约，不能冒充普通邻接序（版本相同也不
+/// 例外）。版本不符或当前缓存是镜头布局 → `ViewStale`；当前项不在本顺序集合 →
+/// `ViewStale`（不得借当前已加载行或别的集合虚构邻居）；目标越过首尾才是
+/// `OutOfBounds`。纯几何重排沿用同一 `order_version`，故不使导航失效。
+pub fn get_adjacent_item(
+    cache: &LayoutCache,
+    current_id: i64,
+    offset: isize,
+    order_version: u64,
+) -> AdjacentLookup {
+    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+    let Some(data) = guard.as_ref() else {
+        return AdjacentLookup::LayoutNotReady;
+    };
+    if data.order.version != order_version || data.lens_projection.is_some() {
+        return AdjacentLookup::ViewStale;
+    }
+    adjacent_in_order(data, current_id, offset)
+}
+
+/// 镜头查看器的一步邻接查询，沿用既有 `layoutVersion` 契约（镜头几何换代即过期），
+/// 并要求当前缓存确实是镜头布局——普通布局不得冒充镜头导航序。
 pub fn get_lens_adjacent_item(
     cache: &LayoutCache,
     current_id: i64,
     offset: isize,
     expected_version: u64,
-) -> LensAdjacentLookup {
+) -> AdjacentLookup {
     let guard = cache.read().unwrap_or_else(|e| e.into_inner());
     let Some(data) = guard.as_ref() else {
-        return LensAdjacentLookup::LayoutNotReady;
+        return AdjacentLookup::LayoutNotReady;
     };
     if data.layout_version != expected_version || data.lens_projection.is_none() {
-        return LensAdjacentLookup::ViewStale;
+        return AdjacentLookup::ViewStale;
     }
-    let Some(current_idx) = data.id_to_flat.get(current_id) else {
-        return LensAdjacentLookup::CurrentMissing;
-    };
-    let Some(target_idx) = (current_idx as isize).checked_add(offset) else {
-        return LensAdjacentLookup::OutOfBounds;
-    };
-    if target_idx < 0 {
-        return LensAdjacentLookup::OutOfBounds;
-    }
-    let Some(&id) = data.flat_ids.get(target_idx as usize) else {
-        return LensAdjacentLookup::OutOfBounds;
-    };
-    LensAdjacentLookup::Found {
-        id,
-        index: target_idx as usize,
-        total_count: data.total_items,
-    }
+    adjacent_in_order(data, current_id, offset)
 }
 
 /// Find the Y coordinate of the row containing the item with `item_id` (O(1) via the
@@ -568,12 +666,27 @@ pub fn get_lens_adjacent_item(
 /// 查找包含 `item_id` 的行的 Y 坐标（通过 id 索引 O(1)）。用于在布局重排（如缩略图
 /// 行高变化）后把视口重新锚定到之前浏览的项：总高度变化后，旧的物理 scrollTop 对应的
 /// 逻辑位置已不同，因此查出该项的新行 Y 并滚回去。
-pub fn get_item_y_by_id(cache: &LayoutCache, item_id: i64) -> Option<f64> {
+///
+/// `expected_version` 为调用方持有的布局代；同一读锁内校验，无布局或版本不符 → 外层
+/// `None`（调用方据此重算 layout）；版本一致但当前布局无此项 → `Some(None)`（该项确已
+/// 不在本视图，区别于「缓存还没就绪」）。
+pub fn get_item_y_by_id(
+    cache: &LayoutCache,
+    item_id: i64,
+    expected_version: u64,
+) -> Option<Option<f64>> {
     let guard = cache.read().unwrap_or_else(|e| e.into_inner());
     let data = guard.as_ref()?;
-    let flat = data.id_to_flat.get(item_id)?;
-    let &(ri, _ii) = data.flat_rowcol.get(flat)?;
-    data.rows.get(ri as usize).map(|r| r.y())
+    if data.layout_version != expected_version {
+        return None;
+    }
+    let Some(flat) = data.order.id_to_flat.get(item_id) else {
+        return Some(None);
+    };
+    let Some(&(ri, _ii)) = data.flat_rowcol.get(flat) else {
+        return Some(None);
+    };
+    Some(data.rows.get(ri as usize).map(|r| r.y()))
 }
 
 /// Find the FIRST separator (in layout order) whose group_id is in `ids`, returning its
@@ -701,7 +814,8 @@ mod tests {
     fn get_view_ids_returns_flat_order_and_guards_version() {
         // T18 S2：flat_ids 即按布局序的视图全集 id（分隔符不计）。
         let cache = new_layout_cache();
-        let version = store_layout(&cache, sample_layout(), 240.0, String::new());
+        store_layout(&cache, sample_layout(), 240.0, String::new());
+        let version = current_order_version(&cache).unwrap();
 
         // 无版本约束 → 直接拿 flat 序 [10, 11, 12]。
         assert_eq!(get_view_ids(&cache, None), Some(vec![10, 11, 12]));
@@ -834,23 +948,318 @@ mod tests {
         store_layout(&cache, sample_layout(), 240.0, String::new());
         let guard = cache.read().unwrap();
         let data = guard.as_ref().unwrap();
-        assert_eq!(data.flat_ids, vec![10, 11, 12]);
+        assert_eq!(data.order.flat_ids, vec![10, 11, 12]);
         assert_eq!(data.total_items, 3);
-        assert_eq!(data.id_to_flat.get(11), Some(1));
+        assert_eq!(data.order.id_to_flat.get(11), Some(1));
         assert_eq!(data.flat_rowcol[1], (1, 1), "id 11 应在第 1 行第 1 列");
     }
 
     #[test]
-    fn test_get_adjacent_item_is_correct_at_boundaries() {
+    fn geometry_reflow_preserves_flat_order_and_updates_item_position() {
         let cache = new_layout_cache();
-        store_layout(&cache, sample_layout(), 240.0, String::new());
+        let source = Arc::new(crate::layout::items_cache::new_items_cache());
+        let first = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                sample_layout(),
+                240.0,
+                "wide".into(),
+                None,
+                Some(source.clone()),
+                "filename:asc".into(),
+            ),
+        );
+        let original_order = cache.read().unwrap().as_ref().unwrap().order.clone();
+        let ids = get_view_ids(&cache, None).unwrap();
+        let rows = vec![
+            LayoutRow::Normal {
+                y: 0.0,
+                height: 100.0,
+                items: vec![mk_item(10)],
+            },
+            LayoutRow::Normal {
+                y: 100.0,
+                height: 100.0,
+                items: vec![mk_item(11), mk_item(12)],
+            },
+        ];
+        let second = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                rows,
+                200.0,
+                "narrow".into(),
+                None,
+                Some(source),
+                "filename:asc".into(),
+            ),
+        );
+        assert_ne!(first.layout_version, second.layout_version);
+        assert_eq!(first.order_version, second.order_version);
+        assert!(
+            Arc::ptr_eq(
+                &original_order,
+                &cache.read().unwrap().as_ref().unwrap().order
+            ),
+            "几何重排不重新物化全集和 ID 索引"
+        );
+        assert_eq!(
+            get_view_ids(&cache, Some(first.order_version)).unwrap(),
+            ids
+        );
+        assert_eq!(
+            get_item_y_by_id(&cache, 11, second.layout_version),
+            Some(Some(100.0))
+        );
+        assert_eq!(
+            get_item_y_by_id(&cache, 11, first.layout_version),
+            None,
+            "几何换代后旧版本不得再定位"
+        );
+        assert_eq!(
+            get_item_y_by_id(&cache, 999, second.layout_version),
+            Some(None),
+            "版本一致但项不在本布局 → Some(None)"
+        );
+        assert_eq!(
+            cache.read().unwrap().as_ref().unwrap().flat_rowcol[1],
+            (1, 0)
+        );
+    }
 
-        assert_eq!(get_adjacent_item(&cache, 10, 1), Some(11));
-        assert_eq!(get_adjacent_item(&cache, 11, 1), Some(12));
-        assert_eq!(get_adjacent_item(&cache, 12, 1), None); // past end
-        assert_eq!(get_adjacent_item(&cache, 11, -1), Some(10));
-        assert_eq!(get_adjacent_item(&cache, 10, -1), None); // before start
-        assert_eq!(get_adjacent_item(&cache, 999, 1), None); // unknown id
+    #[test]
+    fn changed_source_or_order_key_cannot_reuse_order_identity() {
+        let cache = new_layout_cache();
+        let source = Arc::new(crate::layout::items_cache::new_items_cache());
+        let first = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                sample_layout(),
+                240.0,
+                "a".into(),
+                None,
+                Some(source.clone()),
+                "asc".into(),
+            ),
+        );
+        let second = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                sample_layout(),
+                240.0,
+                "b".into(),
+                None,
+                Some(source),
+                "desc".into(),
+            ),
+        );
+        assert_ne!(first.order_version, second.order_version);
+        assert!(get_view_ids(&cache, Some(first.order_version)).is_none());
+        let new_source = Arc::new(crate::layout::items_cache::new_items_cache());
+        let third = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                sample_layout(),
+                240.0,
+                "c".into(),
+                None,
+                Some(new_source),
+                "desc".into(),
+            ),
+        );
+        assert_ne!(
+            second.order_version, third.order_version,
+            "不同 SQL/语义快照不能靠相同排序键复用"
+        );
+    }
+
+    /// T5：普通邻接只在同一 orderVersion 的普通布局里按 O(1) 索引找一步邻居。
+    /// 真实首尾边界（OutOfBounds）与「当前项不在本集合」（ViewStale）必须区分开——
+    /// 后者不得被当作正常无结果，也不得回退别的集合。
+    #[test]
+    fn normal_adjacent_requires_order_version_and_distinguishes_boundary() {
+        let cache = new_layout_cache();
+        assert_eq!(
+            get_adjacent_item(&cache, 10, 1, 1),
+            AdjacentLookup::LayoutNotReady
+        );
+
+        store_layout(&cache, sample_layout(), 240.0, String::new());
+        let order_version = current_order_version(&cache).unwrap();
+        assert_eq!(
+            get_adjacent_item(&cache, 10, 1, order_version),
+            AdjacentLookup::Found {
+                id: 11,
+                index: 1,
+                total_count: 3,
+            }
+        );
+        assert_eq!(
+            get_adjacent_item(&cache, 11, -1, order_version),
+            AdjacentLookup::Found {
+                id: 10,
+                index: 0,
+                total_count: 3,
+            }
+        );
+        assert_eq!(
+            get_adjacent_item(&cache, 12, 1, order_version),
+            AdjacentLookup::OutOfBounds,
+            "越过末尾是正常无结果"
+        );
+        assert_eq!(
+            get_adjacent_item(&cache, 10, -1, order_version),
+            AdjacentLookup::OutOfBounds,
+            "越过开头是正常无结果"
+        );
+        assert_eq!(
+            get_adjacent_item(&cache, 999, 1, order_version),
+            AdjacentLookup::CurrentMissing,
+            "当前项不在本集合不得冒充正常边界"
+        );
+        assert_eq!(
+            get_adjacent_item(&cache, 10, 1, order_version + 99),
+            AdjacentLookup::ViewStale,
+            "旧 orderVersion 必须拒绝"
+        );
+    }
+
+    /// T5：同一 currentId 在不同成员顺序下邻居不同；换代后旧 orderVersion 失效，
+    /// 新版本给出新邻居（不得沿用旧序缓存）。
+    #[test]
+    fn same_current_id_yields_different_neighbor_per_order_version() {
+        let cache = new_layout_cache();
+        let source = Arc::new(crate::layout::items_cache::new_items_cache());
+        let asc = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                sample_layout(),
+                240.0,
+                "a".into(),
+                None,
+                Some(source.clone()),
+                "asc".into(),
+            ),
+        );
+        // 反转成员顺序（不同排序键 → 新 orderVersion）。
+        let reversed_rows = vec![
+            LayoutRow::Normal {
+                y: 0.0,
+                height: 100.0,
+                items: vec![mk_item(12)],
+            },
+            LayoutRow::Normal {
+                y: 100.0,
+                height: 100.0,
+                items: vec![mk_item(11), mk_item(10)],
+            },
+        ];
+        let desc = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                reversed_rows,
+                200.0,
+                "b".into(),
+                None,
+                Some(source),
+                "desc".into(),
+            ),
+        );
+        assert_ne!(asc.order_version, desc.order_version);
+        assert_eq!(
+            get_adjacent_item(&cache, 11, 1, asc.order_version),
+            AdjacentLookup::ViewStale,
+            "换代后旧序不得再产出邻居"
+        );
+        assert_eq!(
+            get_adjacent_item(&cache, 11, 1, desc.order_version),
+            AdjacentLookup::Found {
+                id: 10,
+                index: 2,
+                total_count: 3,
+            },
+            "同 currentId 在新顺序下邻居不同"
+        );
+    }
+
+    /// T5：纯几何重排沿用同一 orderVersion，导航保持有效。
+    #[test]
+    fn geometry_reflow_keeps_normal_adjacent_usable() {
+        let cache = new_layout_cache();
+        let source = Arc::new(crate::layout::items_cache::new_items_cache());
+        let first = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                sample_layout(),
+                240.0,
+                "wide".into(),
+                None,
+                Some(source.clone()),
+                "filename:asc".into(),
+            ),
+        );
+        let reflowed_rows = vec![
+            LayoutRow::Normal {
+                y: 0.0,
+                height: 100.0,
+                items: vec![mk_item(10)],
+            },
+            LayoutRow::Normal {
+                y: 100.0,
+                height: 100.0,
+                items: vec![mk_item(11), mk_item(12)],
+            },
+        ];
+        let second = publish_layout(
+            &cache,
+            prepare_layout(
+                &cache,
+                reflowed_rows,
+                200.0,
+                "narrow".into(),
+                None,
+                Some(source),
+                "filename:asc".into(),
+            ),
+        );
+        assert_ne!(first.layout_version, second.layout_version);
+        assert_eq!(first.order_version, second.order_version);
+        assert_eq!(
+            get_adjacent_item(&cache, 11, 1, first.order_version),
+            AdjacentLookup::Found {
+                id: 12,
+                index: 2,
+                total_count: 3,
+            },
+            "几何重排沿用 orderVersion，导航仍可用"
+        );
+    }
+
+    /// T5：镜头布局即使 orderVersion 相同也不能冒充普通邻接序（反之亦然）。
+    #[test]
+    fn lens_layout_cannot_serve_normal_adjacent() {
+        let cache = new_layout_cache();
+        store_layout_with_lens(
+            &cache,
+            sample_layout(),
+            240.0,
+            String::new(),
+            Some(Arc::new(crate::layout::lens::LensProjection::new())),
+        );
+        let order_version = current_order_version(&cache).unwrap();
+        assert_eq!(
+            get_adjacent_item(&cache, 10, 1, order_version),
+            AdjacentLookup::ViewStale,
+            "镜头序不得作为普通邻接序"
+        );
     }
 
     #[test]
@@ -859,7 +1268,7 @@ mod tests {
         let normal_version = store_layout(&cache, sample_layout(), 240.0, String::new());
         assert_eq!(
             get_lens_adjacent_item(&cache, 10, 1, normal_version),
-            LensAdjacentLookup::ViewStale,
+            AdjacentLookup::ViewStale,
             "普通布局不能作为镜头导航序"
         );
 
@@ -872,16 +1281,16 @@ mod tests {
         );
         assert_eq!(
             get_lens_adjacent_item(&cache, 10, 1, lens_version - 1),
-            LensAdjacentLookup::ViewStale
+            AdjacentLookup::ViewStale
         );
         assert_eq!(
             get_lens_adjacent_item(&cache, 999, 1, lens_version),
-            LensAdjacentLookup::CurrentMissing,
+            AdjacentLookup::CurrentMissing,
             "当前项不在镜头缓存时不能把它误当作正常边界"
         );
         assert_eq!(
             get_lens_adjacent_item(&cache, 11, 1, lens_version),
-            LensAdjacentLookup::Found {
+            AdjacentLookup::Found {
                 id: 12,
                 index: 2,
                 total_count: 3,
@@ -889,9 +1298,46 @@ mod tests {
         );
         assert_eq!(
             get_lens_adjacent_item(&cache, 12, 1, lens_version),
-            LensAdjacentLookup::OutOfBounds,
+            AdjacentLookup::OutOfBounds,
             "只有目标越过首尾才是正常无结果"
         );
+    }
+
+    /// T5：镜头邻接的详情 await 后复验身份——普通布局或无布局都不得让迟到镜头详情落地。
+    #[test]
+    fn lens_layout_version_identity_rejects_normal_layout() {
+        let cache = new_layout_cache();
+        assert_eq!(
+            current_lens_layout_version(&cache),
+            None,
+            "无布局 → 无镜头身份"
+        );
+
+        store_layout(&cache, sample_layout(), 240.0, String::new());
+        assert_eq!(
+            current_lens_layout_version(&cache),
+            None,
+            "普通布局不得冒充镜头身份"
+        );
+
+        let lens_version = store_layout_with_lens(
+            &cache,
+            sample_layout(),
+            240.0,
+            String::new(),
+            Some(Arc::new(crate::layout::lens::LensProjection::new())),
+        );
+        assert_eq!(current_lens_layout_version(&cache), Some(lens_version));
+        // 几何换代（重新发布镜头布局）→ 身份随 layoutVersion 改变。
+        let newer = store_layout_with_lens(
+            &cache,
+            sample_layout(),
+            240.0,
+            String::new(),
+            Some(Arc::new(crate::layout::lens::LensProjection::new())),
+        );
+        assert_eq!(current_lens_layout_version(&cache), Some(newer));
+        assert_ne!(lens_version, newer);
     }
 
     /// S3.3：id 直址索引——密集走 Dense、稀疏退 Sparse，两形态查询行为等价。
@@ -904,12 +1350,12 @@ mod tests {
             let guard = cache.read().unwrap();
             let data = guard.as_ref().unwrap();
             assert!(
-                matches!(data.id_to_flat, IdToFlat::Dense(_)),
+                matches!(data.order.id_to_flat, IdToFlat::Dense(_)),
                 "紧凑 id 域应走直址"
             );
-            assert_eq!(data.id_to_flat.get(10), Some(0));
-            assert_eq!(data.id_to_flat.get(999), None);
-            assert_eq!(data.id_to_flat.get(-1), None);
+            assert_eq!(data.order.id_to_flat.get(10), Some(0));
+            assert_eq!(data.order.id_to_flat.get(999), None);
+            assert_eq!(data.order.id_to_flat.get(-1), None);
         }
         // 稀疏:单项 id=1_000_000 ≫ 4N+1024 → Sparse,行为等价。
         let rows = vec![LayoutRow::Normal {
@@ -921,11 +1367,11 @@ mod tests {
         let guard = cache.read().unwrap();
         let data = guard.as_ref().unwrap();
         assert!(
-            matches!(data.id_to_flat, IdToFlat::Sparse(_)),
+            matches!(data.order.id_to_flat, IdToFlat::Sparse(_)),
             "稀疏 id 域应退哈希表"
         );
-        assert_eq!(data.id_to_flat.get(1_000_000), Some(0));
-        assert_eq!(data.id_to_flat.get(10), None);
+        assert_eq!(data.order.id_to_flat.get(1_000_000), Some(0));
+        assert_eq!(data.order.id_to_flat.get(10), None);
     }
 
     /// S3.1：幂等去重探针——键相等才复用摘要；空键/键不等/空缓存皆不命中。

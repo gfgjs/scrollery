@@ -14,6 +14,7 @@
 // 阶段(--stage):
 //   boot   无头:PICASA_SMOKE_TEST=1 拉起验收包,断言 exit 0 且隔离 app-data 内出现启动日志(CI 用)。
 //   ready  经 WebView2 CDP attach:断言 IPC 往返、前端挂载、后端 Ready 日志、零页面异常,再 exit_app 收干净。
+//   enhance 安装后增强负向验收：worker/ORT 运行、模型文件缺失、清单未就绪、worker 缺失及原图哈希。
 //   chain  完整链路:首启 → 加根扫描 → 缩略图 → 查看 → 标记 → 导出 → 备份 → 重启核对。
 //          --restore-drill 追加恢复演练(restore_stage → restore_arm → 重启后由 boot swap 收口)。
 //          其中含目录移动取证:把 fixture 的 movable/ 子目录经真实 IPC move_directory 搬到
@@ -70,7 +71,7 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const ACCEPTANCE_IDENTIFIER = 'com.scrollery.app.acceptance';
 const USER_IDENTIFIER = 'com.scrollery.app';
 const EOL = '\n';
-const STAGES = ['boot', 'ready', 'chain'];
+const STAGES = ['boot', 'ready', 'chain', 'enhance'];
 // 用户已装应用默认落点(NSIS currentUser):验收脚本绝不触碰;落点经 Windows known folder 解析
 // 得到(userInstallDir),不用环境变量拼路径。
 
@@ -837,7 +838,7 @@ function countFiles(dir, ext) {
 }
 
 function listPayload(exeDir) {
-  const want = ['raw-worker.exe', 'ai-worker.exe', 'video-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll'];
+  const want = ['raw-worker.exe', 'ai-worker.exe', 'video-worker.exe', 'enhance-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll'];
   const present = [];
   const missing = [];
   for (const n of want) {
@@ -1448,6 +1449,13 @@ async function stageReady(ctx) {
       }
       return { exceptions: 0 };
     });
+    if (ctx.stage === 'enhance') {
+      const { verifyEnhanceGates } = await import('./enhance-gates.mjs');
+      await verifyEnhanceGates(ctx, cdp, {
+        runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree, handshakeWorker,
+        exotFrame, exotTakeFrame,
+      });
+    }
     await runStep('ready:clean-exit', async () => {
       const code = await requestCleanExit(cdp, child);
       if (code !== 0) throw new Error('exit_app 后退出码 ' + code + '(期望 0:退出路径含 WAL checkpoint)');
@@ -2573,7 +2581,7 @@ async function main() {
   }
   const t0 = Date.now();
   if (ctx.stage === 'boot') await stageBoot(ctx);
-  else if (ctx.stage === 'ready') await stageReady(ctx);
+  else if (ctx.stage === 'ready' || ctx.stage === 'enhance') await stageReady(ctx);
   else await stageChain(ctx);
   await runStep('isolation:user-library-top-level-unchanged', () => {
     if (!ctx.verifyUserLibrary) return { skipped: '未加 --verify-user-library-untouched' };
@@ -2649,13 +2657,13 @@ async function main() {
   clearInterval(KEEPALIVE);
   // 阶段完整性:chain 必须真的跑到终态哨兵。缺失 = 中途异常退出(例如事件循环空转),
   // 不能因为「没有失败步骤」就判通过。
-  if (ctx.stage === 'chain' && !results.some((r) => r.name === 'chain:done')) {
+  if (['chain', 'enhance'].includes(ctx.stage) && !results.some((r) => r.name === ctx.stage + ':done')) {
     report.incomplete = true;
-    report.incompleteReason = '缺少终态哨兵 chain:done(实际执行 ' + results.length + ' 步)';
+    report.incompleteReason = '缺少终态哨兵 ' + ctx.stage + ':done(实际执行 ' + results.length + ' 步)';
     fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + EOL);
-    console.error('== chain 未跑完:' + report.incompleteReason + ' ==');
+    console.error('== ' + ctx.stage + ' 未跑完:' + report.incompleteReason + ' ==');
     console.error('报告:' + reportPath);
-    const err = new Error('chain 未跑完:' + report.incompleteReason);
+    const err = new Error(ctx.stage + ' 未跑完:' + report.incompleteReason);
     err.__alreadyReported = true;
     throw err;
   }

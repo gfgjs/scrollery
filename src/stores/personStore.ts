@@ -2,7 +2,7 @@
 // 人物墙状态（F6）—— 人物簇列表 + 命名/合并/隐藏 + 单图人脸框。
 
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, shallowRef } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import { getThumbCacheDir } from '../utils/thumbCacheDir'
@@ -10,9 +10,9 @@ import { IPC } from '../constants/ipc'
 import type { PersonSummary, FaceBox, LikelyMatchGroup } from '../types/person'
 
 export const usePersonStore = defineStore('person', () => {
-  const persons = ref<PersonSummary[]>([])
+  const persons = shallowRef<PersonSummary[]>([])
   // 误检桶(is_ignored)人物簇 —— 服务端 list_persons 排除之,单独拉取供「显示已忽略」管理视图。
-  const ignoredPersons = ref<PersonSummary[]>([])
+  const ignoredPersons = shallowRef<PersonSummary[]>([])
   const isLoading = ref(false)
   // 应用缓存目录（用于解析封面脸缩略图 URL）；只取一次。
   const cacheDir = ref('')
@@ -50,30 +50,21 @@ export const usePersonStore = defineStore('person', () => {
     }
   }
 
-  /** 命名（空→未命名）；原地更新。 */
+  /** 命名（空→未命名）；成功后发布新数组，失败交调用方提示。 */
   async function rename(personId: number, name: string) {
-    try {
-      await invokeIpc(IPC.RENAME_FACE_PERSON, { personId, name })
-      const p = persons.value.find((p) => p.id === personId)
-      if (p) {
-        const trimmed = name.trim()
-        p.name = trimmed || null
-        p.isNamed = !!trimmed
-      }
-    } catch (e) {
-      logger.error('[Person] rename failed', { error: e })
-    }
+    await invokeIpc(IPC.RENAME_FACE_PERSON, { personId, name })
+    const trimmed = name.trim()
+    persons.value = persons.value.map((p) =>
+      p.id === personId ? { ...p, name: trimmed || null, isNamed: !!trimmed } : p,
+    )
   }
 
-  /** 显示/隐藏；原地更新。 */
+  /** 显示/隐藏；成功后发布新数组，失败交调用方提示。 */
   async function setHidden(personId: number, hidden: boolean) {
-    try {
-      await invokeIpc(IPC.SET_FACE_PERSON_HIDDEN, { personId, hidden })
-      const p = persons.value.find((p) => p.id === personId)
-      if (p) p.isHidden = hidden
-    } catch (e) {
-      logger.error('[Person] setHidden failed', { error: e })
-    }
+    await invokeIpc(IPC.SET_FACE_PERSON_HIDDEN, { personId, hidden })
+    persons.value = persons.value.map((p) =>
+      p.id === personId ? { ...p, isHidden: hidden } : p,
+    )
   }
 
   /** 标记为误检桶（审查 G1）：非人脸误检（雕像/海报），置位后不上墙、重建按锚定保护。
@@ -95,14 +86,10 @@ export const usePersonStore = defineStore('person', () => {
     }
   }
 
-  /** 合并 `srcIds` 到 `dstId`，然后重载（计数/质心已变）。 */
+  /** 合并 `srcIds` 到 `dstId`，成功后重载（计数/质心已变）；写入失败交调用方提示。 */
   async function merge(srcIds: number[], dstId: number) {
-    try {
-      await invokeIpc(IPC.MERGE_FACE_PERSONS, { srcIds, dstId })
-      await load()
-    } catch (e) {
-      logger.error('[Person] merge failed', { error: e })
-    }
+    await invokeIpc(IPC.MERGE_FACE_PERSONS, { srcIds, dstId })
+    await load()
   }
 
   /** 一张图中的人脸（详情叠加）。 */

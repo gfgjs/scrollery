@@ -15,7 +15,8 @@ use crate::engine::EngineArena;
 use crate::exotic::CatalogStore;
 use crate::layout::cache::new_layout_cache;
 use crate::layout::items_cache::{
-    new_global_rank_cell, new_items_cache, GlobalRankCell, ItemsCache,
+    new_global_rank_cell, new_items_cache, new_items_cache_slot, GlobalRankCell, ItemsCache,
+    ItemsCacheSlot,
 };
 use crate::layout::LayoutCache;
 use crate::thumbnail::generator::ThumbConfig;
@@ -92,7 +93,10 @@ pub struct AppState {
 
     /// S1 视图取数缓存（compute_layout 的百万级 SQL 段跳过器，Part2 重排提速 2026-07-04）。
     /// 命中键 = filter JSON + data_version + 序形态；详见 layout/items_cache.rs 模块文档。
-    pub layout_items_cache: ItemsCache,
+    pub layout_items_cache: ItemsCacheSlot,
+    /// 发布锁序：搜索提交闸门 → items 槽 → 布局发布闸门 → layout；不跨 await。
+    /// 输入写先登记，再在闸门外等待 items 锁；去重预检也在闸门外读取 items。
+    pub layout_publication: crate::layout::publication::LayoutPublication,
 
     /// B-file-iii：全局 **filter-invariant** filename 自然序 rank（全库一份，开机后台建一次）。
     /// filename 序是与 filter 无关的全序 → 一份服务所有筛选子集；把 B-file-i「每 filter 付一次
@@ -705,7 +709,8 @@ impl AppState {
             database_lifecycle_active: AtomicBool::new(true),
             database_lifecycle_transition_gate: Mutex::new(()),
             layout_cache: new_layout_cache(),
-            layout_items_cache: new_items_cache(),
+            layout_items_cache: new_items_cache_slot(),
+            layout_publication: Default::default(),
             tree_snapshots: std::sync::Arc::new(crate::tree::cache::DirSnapshotCache::new()),
             global_filename_rank: new_global_rank_cell(),
             global_rank_building: std::sync::atomic::AtomicBool::new(false),
@@ -782,7 +787,9 @@ impl AppState {
 
     /// bump 全局数据版本（S1 失效契约，调用清单见 `data_version` 字段文档）。
     pub fn bump_data_version(&self) {
-        self.data_version.fetch_add(1, Ordering::Release);
+        self.layout_publication.change(|| {
+            self.data_version.fetch_add(1, Ordering::Release);
+        });
     }
 
     /// 读全局数据版本（compute_layout 的填充/命中判定用）。
@@ -798,7 +805,35 @@ impl AppState {
     /// 发布新去重镜头视图代次。唯一调用点在去重任务「完整成功完成」的收尾路径；
     /// ordering 惯例与 `data_version` 一致（写 Release / 读 Acquire）。
     pub fn bump_dedup_view_epoch(&self) {
-        self.dedup_view_epoch.fetch_add(1, Ordering::Release);
+        self.layout_publication.change(|| {
+            self.dedup_view_epoch.fetch_add(1, Ordering::Release);
+        });
+    }
+
+    /// 只复制快照句柄；计算候选不能提前替换当前载荷。
+    pub fn layout_items(&self) -> Arc<ItemsCache> {
+        self.layout_items_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 两层缓存一起清空并吊销在途候选，旧体在发布锁外释放。
+    pub fn clear_layout_caches(&self) {
+        let old = self.layout_publication.change(|| {
+            let mut slot = self
+                .layout_items_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let items = std::mem::replace(&mut *slot, Arc::new(new_items_cache()));
+            let layout = self
+                .layout_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            (items, layout)
+        });
+        drop(old);
     }
 
     /// B-file-iii：从全局 filename rank 为给定 items 构建平行 `rank` 数组（Stage 3 消费）。
@@ -878,28 +913,59 @@ impl AppState {
     /// 浏览期的持续缩略图生成若走失效，取数缓存将长期冰冷）。S3 后布局行仅存几何，
     /// 出口拼装自 items 缓存取载荷，patch 单点即达（D3 布局侧 patch 已退役）。
     pub fn apply_thumb_results(&self, results: &[crate::db::models::ThumbResult]) {
-        crate::layout::items_cache::apply_thumb_results(&self.layout_items_cache, results);
+        let slot = self
+            .layout_items_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::layout::items_cache::apply_thumb_results(&slot, results);
     }
 
     /// 可视区尺寸回填 → items 缓存就地 patch（布局行几何须经重排产生，不 patch layout_cache）。
     pub fn set_dimensions_cached(&self, dims: &[(i64, i64, i64)]) {
-        crate::layout::items_cache::set_dimensions(&self.layout_items_cache, dims);
+        if dims.is_empty() {
+            return;
+        }
+        self.layout_publication.change(|| {
+            let slot = self
+                .layout_items_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::layout::items_cache::set_dimensions(&slot, dims);
+        });
     }
 
     /// 收藏写 → items 缓存就地 patch（S3 单点，滚出滚回新鲜度由出口拼装保证）；
     /// favoritedOnly 视图（写改成员）由 items_cache 内部降级不可复用（下次 compute 重查）。
     pub fn set_favorite_cached(&self, ids: &[i64], value: bool) {
-        crate::layout::items_cache::set_favorite(&self.layout_items_cache, ids, value);
+        self.layout_publication.change(|| {
+            let slot = self
+                .layout_items_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::layout::items_cache::set_favorite(&slot, ids, value);
+        });
     }
 
     /// 评分写 → items 缓存就地 patch（S3 单点）；minRating 过滤视图降级不可复用。
     pub fn set_rating_cached(&self, ids: &[i64], rating: i64) {
-        crate::layout::items_cache::set_rating(&self.layout_items_cache, ids, rating);
+        self.layout_publication.change(|| {
+            let slot = self
+                .layout_items_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::layout::items_cache::set_rating(&slot, ids, rating);
+        });
     }
 
     /// 色标写 → items 缓存就地 patch（S3 单点）；colorLabel 过滤视图降级不可复用。
     pub fn set_color_label_cached(&self, ids: &[i64], color_label: i64) {
-        crate::layout::items_cache::set_color_label(&self.layout_items_cache, ids, color_label);
+        self.layout_publication.change(|| {
+            let slot = self
+                .layout_items_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::layout::items_cache::set_color_label(&slot, ids, color_label);
+        });
     }
 
     /// 丢弃常驻嵌入快照，使下次语义搜索重新加载。在嵌入向量写入或重置时调用。

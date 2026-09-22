@@ -11,6 +11,7 @@ pub mod hcache;
 pub mod horizontal;
 // S1 视图取数缓存(Part2 重排提速):把「取数」从「几何」拆出,滑块/窗宽/轴切换免 SQL。
 pub mod items_cache;
+pub mod publication;
 pub mod justified;
 // 重复镜头布局(2026-09-02 主画廊重复项浏览方案 §6/§11/§12):groups 模式的组切片
 // 组装、duplicateGroup 组头打包与逐项投影;folders 模式是 P3。

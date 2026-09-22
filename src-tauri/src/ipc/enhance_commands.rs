@@ -4,9 +4,7 @@
 //! `download_assets`）/ `delete_enhance_model` / `enhance_preview`（单 tile 前后对比）/
 //! `enhance_start`（付费门控 + 入队 + 后台驱动）/ `enhance_cancel` / `get_enhance_queue`。
 //!
-//! **capabilities 结论（核验，无需改动）**：七命令均为经 `invoke_handler` 注册的 app 自有
-//! command，`core:default` 权限即覆盖（同 OCR 先例 T7，plugin-store-map §6），不引入新
-//! Tauri 插件；`src-tauri/capabilities/` 无需新增条目。
+//! 自有命令通过 AppManifest/permissions/capabilities 显式授权。
 //!
 //! 错误全走 `AppError::Enhance { code, message }`（serde::Serialize + 稳定 code），不泄内部串。
 
@@ -16,7 +14,9 @@ use scrollery_ai_core::enhance_profile::enhance_profiles;
 use serde::Serialize;
 use tauri::State;
 
+use crate::enhance::capability::{readiness, EnhanceReadiness};
 use crate::enhance::registry::{enhance_assets, enhance_manifest_ready, enhance_model_installed};
+use crate::enhance::service::enhance_worker_ready;
 use crate::enhance::service::{validate_strengths, PreviewPaths};
 use crate::enhance::{EnhanceParams, JobDto};
 use crate::error::{AppError, Result};
@@ -29,19 +29,34 @@ fn join_err(e: tokio::task::JoinError) -> AppError {
     AppError::internal("后台任务异常 | blocking task failed", e)
 }
 
-/// 门控 helper（付费门控，D-OCR-6 同型）：availability 非 Authorized → 稳定码。
-fn ensure_enhance_authorized(state: &AppState) -> Result<()> {
-    match state.exotic_host().resolve_format("enhance").availability {
-        Availability::Authorized => Ok(()),
-        Availability::LicenseExpired => Err(AppError::Enhance {
-            code: "enhance_unlicensed",
-            message: "影像增强授权已过期，请续订".into(),
-        }),
-        _ => Err(AppError::Enhance {
-            code: "enhance_unlicensed",
-            message: "影像增强插件尚未激活".into(),
-        }),
+/// 入队及预览前使用与状态查询相同的判定；不创建必然失败的 job。
+fn ensure_enhance_ready(state: &AppState, params: &EnhanceParams) -> Result<()> {
+    if params.steps.is_empty() {
+        return Err(AppError::Enhance {
+            code: "enhance_invalid_params",
+            message: "未选择任何增强任务".into(),
+        });
     }
+    let authorized =
+        state.exotic_host().resolve_format("enhance").availability == Availability::Authorized;
+    let worker_ready = enhance_worker_ready();
+    let models_dir = crate::ai::runtime_config::models_dir(state);
+    for step in &params.steps {
+        if enhance_assets(&step.model_id).is_none() {
+            return Err(AppError::Enhance {
+                code: "enhance_invalid_params",
+                message: "未知增强模型档位".into(),
+            });
+        }
+        readiness(
+            authorized,
+            worker_ready,
+            enhance_manifest_ready(&step.model_id),
+            enhance_model_installed(&models_dir, &step.model_id),
+        )
+        .ensure_ready()?;
+    }
+    Ok(())
 }
 
 // ── DTO ──────────────────────────────────────────────────────────────────────
@@ -56,6 +71,9 @@ pub struct EnhanceModelDto {
     pub installed: bool,
     /// 该档下载清单是否已钉定 URL、字节数与 sha256。
     pub manifest_ready: bool,
+    pub readiness: EnhanceReadiness,
+    /// 保留先下后购，但组件或发行清单缺失时禁止下载。
+    pub can_download: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,7 +81,8 @@ pub struct EnhanceModelDto {
 pub struct EnhanceStatusDto {
     pub availability: Availability,
     pub store_url: Option<String>,
-    /// 当前推理执行提供器回声（worker 会话就绪后写回；P0 未起会话时为 None）。
+    pub worker_ready: bool,
+    /// 增强协议尚无提供器回声，当前为 None；不得填入其他 worker 的提供器。
     pub provider: Option<String>,
     pub models: Vec<EnhanceModelDto>,
 }
@@ -75,30 +94,36 @@ pub struct EnhanceStatusDto {
 pub async fn enhance_status(state: State<'_, Arc<AppState>>) -> Result<EnhanceStatusDto> {
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || -> Result<EnhanceStatusDto> {
+        crate::official::entitlement(state.entitlement_provider().as_ref())?;
         let resolution = state.exotic_host().resolve_format("enhance");
         let models_dir = crate::ai::runtime_config::models_dir(&state);
+        let worker_ready = enhance_worker_ready();
+        let authorized = resolution.availability == Availability::Authorized;
         let models = enhance_profiles()
             .into_iter()
-            .map(|p| EnhanceModelDto {
-                installed: enhance_model_installed(&models_dir, &p.id),
-                manifest_ready: enhance_manifest_ready(&p.id),
-                task: serde_json::to_value(p.task)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default(),
-                scale: p.scale,
-                id: p.id,
+            .map(|p| {
+                let installed = enhance_model_installed(&models_dir, &p.id);
+                let manifest_ready = enhance_manifest_ready(&p.id);
+                EnhanceModelDto {
+                    installed,
+                    manifest_ready,
+                    readiness: readiness(authorized, worker_ready, manifest_ready, installed),
+                    can_download: worker_ready && manifest_ready,
+                    task: serde_json::to_value(p.task)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default(),
+                    scale: p.scale,
+                    id: p.id,
+                }
             })
             .collect();
-        // P24:ai_provider 是 DB STATE_KEYS(worker 会话回声),不在 config.toml schema 内——
-        // 从 ConfigManager 读恒 None,必须回真源 DB(app_config 表),否则增强状态永远缺 provider。
-        let provider = {
-            let pool = state.db_read_pool.get().map_err(AppError::from)?;
-            crate::db::queries::get_config(&pool, "ai_provider")?
-        };
+        // ai_provider 是另一个 ai-worker 的回声；增强协议暂未回传 provider，不冒充增强实测。
+        let provider = None;
         Ok(EnhanceStatusDto {
             availability: resolution.availability,
             store_url: resolution.store_url,
+            worker_ready,
             provider,
             models,
         })
@@ -115,6 +140,12 @@ pub async fn download_enhance_model(
     on_progress: tauri::ipc::Channel<DownloadProgress>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
+    let worker_ready = tokio::task::spawn_blocking(enhance_worker_ready)
+        .await
+        .map_err(join_err)?;
+    if !worker_ready {
+        return EnhanceReadiness::WorkerMissing.ensure_ready();
+    }
     let assets = enhance_assets(&model_id).ok_or_else(|| AppError::Enhance {
         code: "enhance_model_missing",
         message: format!("未知增强模型档位:{model_id}"),
@@ -127,10 +158,12 @@ pub async fn download_enhance_model(
     }
 
     let models = crate::ai::runtime_config::models_dir(&state);
-    std::fs::create_dir_all(&models).map_err(|_| AppError::Enhance {
-        code: "enhance_io",
-        message: "模型目录创建失败".into(),
-    })?;
+    tokio::fs::create_dir_all(&models)
+        .await
+        .map_err(|_| AppError::Enhance {
+            code: "enhance_io",
+            message: "模型目录创建失败".into(),
+        })?;
 
     let mirror_first = state.config.get("ai_download_source").as_deref() == Some("mirror");
     let client = crate::download::secure_client(crate::download::TimeoutPolicy::LargeFile)
@@ -196,7 +229,8 @@ pub async fn enhance_preview(
     // 付费门控（后端真门，同 enhance_start）。
     {
         let gate = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || ensure_enhance_authorized(&gate))
+        let gate_params = params.clone();
+        tokio::task::spawn_blocking(move || ensure_enhance_ready(&gate, &gate_params))
             .await
             .map_err(join_err)??;
     }
@@ -222,7 +256,8 @@ pub async fn enhance_start(
     // 付费门控（后端真门：绕过前端直接 invoke 亦拦）。
     {
         let state_gate = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || ensure_enhance_authorized(&state_gate))
+        let gate_params = params.clone();
+        tokio::task::spawn_blocking(move || ensure_enhance_ready(&state_gate, &gate_params))
             .await
             .map_err(join_err)??;
     }

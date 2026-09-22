@@ -6,7 +6,7 @@
 // 勾选 → 手动提取带 video_keyframes;不勾 → 只提 video_cover。
 
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, watch, onScopeDispose } from 'vue'
 import { invokeIpc, generateOperationId, ipcErrorMessage } from '../utils/ipc'
 import { IPC } from '../constants/ipc'
 import { useConfigStore } from './configStore'
@@ -54,29 +54,42 @@ export const useDerivationStore = defineStore('derivation', () => {
     return config.enableVideoKeyframes ? [VIDEO_COVER, VIDEO_KEYFRAMES] : [VIDEO_COVER]
   }
 
-  async function fetchVideoStatus() {
+  let statusGeneration = 0
+  let statusInFlight: Promise<void> | null = null
+
+  function invalidateStatus() {
+    statusGeneration++
+    statusInFlight = null
+    return statusGeneration
+  }
+
+  function fetchVideoStatus(): Promise<void> {
+    if (statusInFlight) return statusInFlight
+    const generation = statusGeneration
     // 计数范围跟随勾选:不勾关键帧时,keyframes 的存量 pending 不应把进度分母撑大。
-    const s = await invokeIpc<DerivationStatus>(IPC.DERIVATION_STATUS, {
+    const request: Promise<void> = invokeIpc<DerivationStatus>(IPC.DERIVATION_STATUS, {
       kinds: videoKinds(),
-    }).catch(() => null)
-    if (s) {
-      videoStatus.value = s
-      if (isVideoRunning.value) ensurePolling()
-    }
+    })
+      .then((s) => {
+        // 控制动作或 kind 变化后的旧快照不得覆盖当前状态,也不得启停当前轮询。
+        if (generation !== statusGeneration) return
+        videoStatus.value = s
+        if (isVideoRunning.value) ensurePolling()
+        else stopPolling()
+      })
+      .catch(() => {}) // 保留最后已知状态,下一轮仍可重试。
+      .finally(() => {
+        if (statusInFlight === request) statusInFlight = null
+      })
+    statusInFlight = request
+    return request
   }
 
   let pollTimer: ReturnType<typeof setInterval> | null = null
   function ensurePolling() {
     if (pollTimer) return
     pollTimer = setInterval(() => {
-      void (async () => {
-        const s = await invokeIpc<DerivationStatus>(IPC.DERIVATION_STATUS, {
-          kinds: videoKinds(),
-        }).catch(() => null)
-        if (s) videoStatus.value = s
-        // 流水线收尾(自然完成/停止)即停表,避免空转轮询。
-        if (!isVideoRunning.value) stopPolling()
-      })()
+      void fetchVideoStatus()
     }, POLL_INTERVAL_MS)
   }
   function stopPolling() {
@@ -85,6 +98,19 @@ export const useDerivationStore = defineStore('derivation', () => {
       pollTimer = null
     }
   }
+
+  watch(
+    () => useConfigStore().enableVideoKeyframes,
+    () => {
+      invalidateStatus()
+      void fetchVideoStatus()
+    },
+    { flush: 'sync' },
+  )
+  onScopeDispose(() => {
+    invalidateStatus()
+    stopPolling()
+  })
 
   /// 增量提取:backfill 补缺行 + 续跑 pending/中断项,已完成跳过。
   async function startVideoIncremental() {
@@ -105,8 +131,9 @@ export const useDerivationStore = defineStore('derivation', () => {
       useToastStore().addToast('error', ipcErrorMessage(e))
       return
     }
+    const generation = invalidateStatus()
     await fetchVideoStatus()
-    ensurePolling()
+    if (generation === statusGeneration) ensurePolling()
   }
 
   // 停止 = 全局 stop_derivation(清续传标志)。派生流水线全局唯一,音频/文档 kind 的在途任务
@@ -121,6 +148,7 @@ export const useDerivationStore = defineStore('derivation', () => {
       return
     }
     stopPolling()
+    invalidateStatus()
     await fetchVideoStatus()
   }
 

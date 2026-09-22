@@ -10,6 +10,8 @@ import type { Collection } from '../types/media'
 import { useSelection } from '../composables/useSelection'
 
 export const useViewStore = defineStore('view', () => {
+  /** 初次 URL/设置恢复完成后才允许画廊提交布局。 */
+  const galleryQueryReady = ref(false)
   // ── 四个互斥的视图筛选维度 ─────────────────────────────────────────────
   const activeSmartAlbum = ref<SmartAlbum>('all')
   const activeDirectoryId = ref<number | null>(null)
@@ -55,6 +57,7 @@ export const useViewStore = defineStore('view', () => {
   }
 
   return {
+    galleryQueryReady,
     activeSmartAlbum,
     activeDirectoryId,
     activeCollection,

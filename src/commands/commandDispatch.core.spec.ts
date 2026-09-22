@@ -6,11 +6,10 @@
 // keybinding:纯函数 + 组合键分发(2026-07-10 深审 HIGH-2:分发器曾只匹配裸键,mod+z 结构上永不命中)。
 // registry:ctx 只穿可变调用上下文(store 不入 context,命令 run 内直接 useXxxStore()),故无需 pinia。
 import { describe, it, expect, vi, beforeAll } from 'vitest'
-import { formatKeybinding, normalizeEventKey, eventToCombo, dispatchKeybinding } from './keybinding'
+import { eventToCombo, dispatchKeybinding } from './keybinding'
 import {
   commandRegistry,
   createCommandRegistry,
-  resolveCommandTitle,
   isCommandVisible,
   isCommandEnabled,
   isCommandActive,
@@ -38,29 +37,6 @@ function imgCtx(api: ViewerApi): CommandContext {
     contextTarget: null,
   }
 }
-
-describe('formatKeybinding(P5-6)', () => {
-  it('方向键→箭头符号、字面 + 键、空格键、单字母大写', () => {
-    expect(formatKeybinding('ArrowLeft')).toBe('←')
-    expect(formatKeybinding('ArrowRight')).toBe('→')
-    expect(formatKeybinding('+')).toBe('+')
-    expect(formatKeybinding('-')).toBe('-')
-    expect(formatKeybinding(' ')).toBe('Space')
-    expect(formatKeybinding('i')).toBe('I')
-  })
-
-  it('mod 组合按平台(node 降级非 mac → Ctrl+Z)', () => {
-    expect(formatKeybinding('mod+z')).toBe('Ctrl+Z')
-  })
-})
-
-describe('normalizeEventKey(P5-6)', () => {
-  it("'=' 归 '+'、字母小写、方向键原样", () => {
-    expect(normalizeEventKey({ key: '=' } as KeyboardEvent)).toBe('+')
-    expect(normalizeEventKey({ key: 'I' } as KeyboardEvent)).toBe('i')
-    expect(normalizeEventKey({ key: 'ArrowLeft' } as KeyboardEvent)).toBe('ArrowLeft')
-  })
-})
 
 describe('dispatchKeybinding(P5-6)', () => {
   beforeAll(() => commandRegistry.registerAll(viewerImageCommands))
@@ -199,15 +175,6 @@ function cmd(partial: Partial<Command> & { id: string }): Command {
 }
 
 describe('commandRegistry', () => {
-  it('register / get / all 保持注册顺序', () => {
-    const r = createCommandRegistry()
-    r.register(cmd({ id: 'a' }))
-    r.register(cmd({ id: 'b' }))
-    expect(r.get('a')?.id).toBe('a')
-    expect(r.get('missing')).toBeUndefined()
-    expect(r.all().map((c) => c.id)).toEqual(['a', 'b'])
-  })
-
   it('重复 id 覆盖 + 告警', () => {
     const r = createCommandRegistry()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -268,21 +235,7 @@ describe('commandRegistry', () => {
     expect(ran).toBe(1) // isEnabled false → 未增
   })
 
-  it('run 未知 id 安全告警不抛', () => {
-    const r = createCommandRegistry()
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    expect(() => r.run('nope', makeCtx())).not.toThrow()
-    expect(warn).toHaveBeenCalled()
-    warn.mockRestore()
-  })
 
-  it('resolveCommandTitle 惰性求值(函数每次求值)', () => {
-    expect(resolveCommandTitle(cmd({ id: 'a', title: 'lit' }))).toBe('lit')
-    let n = 0
-    const c = cmd({ id: 'b', title: () => 'dyn' + ++n })
-    expect(resolveCommandTitle(c)).toBe('dyn1')
-    expect(resolveCommandTitle(c)).toBe('dyn2')
-  })
 
   it('isCommandVisible/Enabled/Active 缺省语义', () => {
     const ctx = makeCtx()

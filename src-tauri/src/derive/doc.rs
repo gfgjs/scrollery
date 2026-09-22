@@ -21,6 +21,10 @@ use crate::derive::kind::{DerivationContext, DerivationOutput};
 use crate::error::{AppError, Result};
 use crate::thumbnail::generator::{encode_media_step_with_snapshot, snap_to_tier, ThumbConfig};
 
+// 缩略图只需要容器元数据和单张封面；限制单条目展开量，避免小压缩包耗尽宿主内存。
+const MAX_EPUB_XML_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_EPUB_COVER_BYTES: u64 = 32 * 1024 * 1024;
+
 /// 为文档生成首页/封面缩略图（P4）。
 ///
 /// 仅处理 epub（后端 zip 取封面）；pdf/svg 由前端离屏渲染并经 `store_doc_thumbnail` 回传，
@@ -80,29 +84,62 @@ pub fn run_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
 /// 从 EPUB（zip 容器）中抽取封面图字节 + spine 页数：container.xml → OPF → 封面 href → 读取条目字节；
 /// 同一份 OPF 顺带数 spine 的 `<itemref>` 作为页数近似（§3.8.2 / T10），避免二次开包。
 fn extract_epub_cover_and_pages(path: &Path) -> Result<(Vec<u8>, Option<i64>)> {
+    extract_epub_cover_with_limits(path, MAX_EPUB_XML_BYTES, MAX_EPUB_COVER_BYTES)
+}
+
+fn read_epub_entry(reader: impl Read, declared: u64, limit: u64) -> Result<Vec<u8>> {
+    let oversize = || {
+        AppError::DocumentRender(
+            "EPUB 条目展开超过缩略图资源上限 | EPUB entry exceeds thumbnail expansion limit".into(),
+        )
+    };
+    if declared > limit {
+        return Err(oversize());
+    }
+    let mut bytes = Vec::new();
+    // 声明长度用于提前拒绝；实际读取再封顶，不能只信任压缩包元数据。
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(AppError::from)?;
+    if bytes.len() as u64 > limit {
+        return Err(oversize());
+    }
+    Ok(bytes)
+}
+
+fn read_epub_xml(reader: impl Read, declared: u64, limit: u64) -> Result<String> {
+    String::from_utf8(read_epub_entry(reader, declared, limit)?)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
+}
+
+fn extract_epub_cover_with_limits(
+    path: &Path,
+    xml_limit: u64,
+    cover_limit: u64,
+) -> Result<(Vec<u8>, Option<i64>)> {
     let file = std::fs::File::open(path).map_err(AppError::from)?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| AppError::Internal(format!("open epub failed | 打开 epub 失败: {e}")))?;
 
     // 1) META-INF/container.xml → OPF 路径（相对 zip 根）。
     let opf_path = {
-        let mut f = zip.by_name("META-INF/container.xml").map_err(|_| {
+        let f = zip.by_name("META-INF/container.xml").map_err(|_| {
             AppError::Internal("epub missing container.xml | 缺少 container.xml".into())
         })?;
-        let mut s = String::new();
-        f.read_to_string(&mut s).map_err(AppError::from)?;
+        let size = f.size();
+        let s = read_epub_xml(f, size, xml_limit)?;
         find_opf_path(&s)
             .ok_or_else(|| AppError::Internal("epub rootfile not found | 未找到 OPF".into()))?
     };
 
     // 2) 解析 OPF → 封面 href（相对 OPF 所在目录）。
     let opf_xml = {
-        let mut f = zip.by_name(&opf_path).map_err(|_| {
+        let f = zip.by_name(&opf_path).map_err(|_| {
             AppError::Internal(format!("epub OPF not found: {opf_path} | OPF 缺失"))
         })?;
-        let mut s = String::new();
-        f.read_to_string(&mut s).map_err(AppError::from)?;
-        s
+        let size = f.size();
+        read_epub_xml(f, size, xml_limit)?
     };
     let cover_href = find_cover_href(&opf_xml)
         .ok_or_else(|| AppError::Internal("epub cover not found | 未找到 epub 封面".into()))?;
@@ -112,13 +149,13 @@ fn extract_epub_cover_and_pages(path: &Path) -> Result<(Vec<u8>, Option<i64>)> {
     // 3) href 相对 OPF 目录解析 + 读取封面字节。
     let opf_dir = opf_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let cover_path = normalize_zip_path(opf_dir, &percent_decode(&cover_href));
-    let mut f = zip.by_name(&cover_path).map_err(|_| {
+    let f = zip.by_name(&cover_path).map_err(|_| {
         AppError::Internal(format!(
             "epub cover entry not found: {cover_path} | 封面条目缺失"
         ))
     })?;
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes).map_err(AppError::from)?;
+    let size = f.size();
+    let bytes = read_epub_entry(f, size, cover_limit)?;
     Ok((bytes, page_count))
 }
 
@@ -279,7 +316,99 @@ fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::count_epub_spine;
+    use super::*;
+    use std::io::{Cursor, Write as _};
+
+    const CONTAINER: &str = r#"<container><rootfiles><rootfile full-path="OEBPS/package.opf"/></rootfiles></container>"#;
+    const OPF2: &str = r#"<package><metadata><meta name="cover" content="c"/></metadata><manifest><item id="c" href="images/cover%20page.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
+    const OPF3: &str = r#"<package><manifest><item id="cover" href="wrong.jpg" media-type="image/jpeg"/><item id="actual" properties="nav cover-image" href="images/cover%20page.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="c1"/></spine></package>"#;
+
+    fn epub(container: &[u8], opf: &[u8], cover: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut archive = zip::ZipWriter::new(&mut file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in [
+            ("META-INF/container.xml", container),
+            ("OEBPS/package.opf", opf),
+            ("OEBPS/images/cover page.jpg", cover),
+        ] {
+            archive.start_file(name, options).unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        file
+    }
+
+    fn assert_limit(error: AppError) {
+        assert!(matches!(error, AppError::DocumentRender(_)), "{error:?}");
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["code"],
+            "DocumentRender"
+        );
+    }
+
+    #[test]
+    fn epub2_keeps_cover_path_decoding_and_spine_count() {
+        let file = epub(CONTAINER.as_bytes(), OPF2.as_bytes(), b"jpeg");
+        assert_eq!(
+            extract_epub_cover_and_pages(file.path()).unwrap(),
+            (b"jpeg".to_vec(), Some(2))
+        );
+    }
+
+    #[test]
+    fn epub3_cover_property_wins_at_exact_byte_limit() {
+        let file = epub(CONTAINER.as_bytes(), OPF3.as_bytes(), b"jpeg");
+        assert_eq!(
+            extract_epub_cover_with_limits(file.path(), 1024, 4).unwrap(),
+            (b"jpeg".to_vec(), Some(1))
+        );
+    }
+
+    #[test]
+    fn rejects_large_container_in_small_archive() {
+        let container = format!("{CONTAINER}{}", " ".repeat(4096));
+        let file = epub(container.as_bytes(), OPF2.as_bytes(), b"jpeg");
+        assert!(file.as_file().metadata().unwrap().len() < 1024);
+        assert_limit(extract_epub_cover_with_limits(file.path(), 1024, 32).unwrap_err());
+    }
+
+    #[test]
+    fn rejects_large_opf_in_small_archive() {
+        let opf = format!("{OPF2}{}", " ".repeat(4096));
+        let file = epub(CONTAINER.as_bytes(), opf.as_bytes(), b"jpeg");
+        assert_limit(extract_epub_cover_with_limits(file.path(), 1024, 32).unwrap_err());
+    }
+
+    #[test]
+    fn rejects_large_cover_in_small_archive() {
+        let file = epub(CONTAINER.as_bytes(), OPF2.as_bytes(), &[0; 4096]);
+        assert!(file.as_file().metadata().unwrap().len() < 1024);
+        assert_limit(extract_epub_cover_with_limits(file.path(), 1024, 32).unwrap_err());
+    }
+
+    #[test]
+    fn declared_oversize_is_rejected_without_reading() {
+        let mut input = Cursor::new(vec![0; 128]);
+        assert_limit(read_epub_entry(&mut input, 128, 32).unwrap_err());
+        assert_eq!(input.position(), 0);
+    }
+
+    #[test]
+    fn understated_size_still_stops_actual_read_at_limit_plus_one() {
+        let mut input = Cursor::new(vec![0; 128]);
+        assert_limit(read_epub_entry(&mut input, 1, 32).unwrap_err());
+        assert_eq!(input.position(), 33);
+    }
+
+    #[test]
+    fn actual_size_at_limit_is_accepted() {
+        assert_eq!(
+            read_epub_entry(Cursor::new(vec![7; 32]), 1, 32).unwrap(),
+            vec![7; 32]
+        );
+    }
 
     /// spine 的 itemref 计数 = 页数近似（含自闭合 `<itemref/>` 与带属性形式）。
     #[test]

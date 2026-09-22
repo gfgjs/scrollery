@@ -81,6 +81,7 @@ interface MediaCopyResult {
  * **闭包 ≠ 退回 toast 那套**（真机 round10 #7 的病根）：toast 的 `actions` 住在 toast 对象里，
  * `removeToast` 一 splice 回调就不可达——**撤销的寿命成了提示条时长的副产品**，没人决定过它只有 5 秒。
  * 本记录的闭包与 store 同寿（整个会话）。不变量：**撤销的寿命由撤销栈决定，不由提示条决定。**
+ * 幂等回调失败时保留原栈位置，供重试；成功后才移到另一栈。
  */
 interface CallbackRecord {
   type: 'callback'
@@ -414,9 +415,9 @@ export const useHistoryStore = defineStore('history', () => {
       }
       settleHistory('undo', rec, reversedMovePending, msg)
     } catch (e) {
-      // 记录的操作已失效（目标被外部改动等）。丢弃它，避免卡在损坏的历史项上。
+      // 文件操作可能已失效（目标被外部改动等），照旧丢弃；幂等回调保留供重试。
       // 注：半完成移动不走这里——它由 runMove 返回 'pending' 并已登记恢复任务。
-      dropTop(undoStack, rec)
+      if (rec.type !== 'callback') dropTop(undoStack, rec)
       toast.addToast('error', i18n.global.t('common.undoFailed', { error: e }))
     } finally {
       busy.value = false
@@ -460,7 +461,7 @@ export const useHistoryStore = defineStore('history', () => {
       }
       settleHistory('redo', rec, reversedMovePending, msg)
     } catch (e) {
-      dropTop(redoStack, rec)
+      if (rec.type !== 'callback') dropTop(redoStack, rec)
       toast.addToast('error', i18n.global.t('history.redoFailed', { error: e }))
     } finally {
       busy.value = false

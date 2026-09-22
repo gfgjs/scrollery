@@ -1,8 +1,8 @@
 // src/composables/useJustifiedLayout.ts
 // 消费后端行数据并驱动 compute_layout 重新运行。
 
-import { computed, watch, onBeforeUnmount } from 'vue'
-import { useMediaStore } from '../stores/mediaStore'
+import { computed, watch, onScopeDispose } from 'vue'
+import { useMediaStore, type LayoutComputeResult } from '../stores/mediaStore'
 import { useFilterStore } from '../stores/filterStore'
 import { useUiStore } from '../stores/uiStore'
 import { useViewStore } from '../stores/viewStore'
@@ -11,7 +11,6 @@ import { useScanStore } from '../stores/scanStore'
 import { useDuplicateLensStore } from '../stores/duplicateLensStore'
 import { DEFAULTS } from '../constants/defaults'
 import { resolveView } from '../utils/resolveView'
-import { logger } from '../utils/logger'
 
 export interface UseJustifiedLayoutOptions {
   /**
@@ -57,23 +56,41 @@ export function useJustifiedLayout(
   // 失活期累积的重算请求（见 UseJustifiedLayoutOptions.enabled）。
   let deferredWhileDisabled = false
 
+  let disposed = false
+  let attemptGeneration = 0
+  const queryReady = computed(() => viewStore.galleryQueryReady &&
+    (lens.mode !== null || !ai.isSemanticMode || ai.semanticLayoutReady))
+
   function isEnabled(): boolean {
-    return options?.enabled ? options.enabled() : true
+    return !disposed && queryReady.value && (options?.enabled?.() ?? true)
   }
 
-  async function compute(width?: number) {
-    const cw = width ?? containerWidthRef()
-
-    // 容器尚未准备好，延迟到下一个 tick 并重试一次。
+  async function attemptCompute(width?: number): Promise<LayoutComputeResult | 'deferred'> {
+    const generation = ++attemptGeneration
+    if (!isEnabled()) {
+      deferredWhileDisabled = true
+      return 'deferred'
+    }
+    let cw = width ?? containerWidthRef()
     if (cw < 100) {
       await new Promise((r) => setTimeout(r, 50))
-      const retryW = containerWidthRef()
-
-      if (retryW < 100) {
-        logger.warn('[JustifiedLayout] compute() retry failed: width still <100, giving up')
-        return
+      // 等宽度期间可能离屏、销毁或已有更新请求；旧重试不能重开入口。
+      if (generation !== attemptGeneration) return 'superseded'
+      cw = containerWidthRef()
+      if (!isEnabled() || cw < 100) {
+        deferredWhileDisabled = true
+        return 'deferred'
       }
-      return compute(retryW)
+    }
+    deferredWhileDisabled = false
+    const dirtyRevision = media.layoutDirtyRevision
+    async function send(params: Parameters<typeof media.computeLayout>[0]): Promise<LayoutComputeResult> {
+      const result = await media.computeLayout(params)
+      if (generation === attemptGeneration) {
+        if (result === 'committed') media.consumeLayoutDirty(dirtyRevision)
+        else if (result === 'failed') deferredWhileDisabled = true
+      }
+      return result
     }
 
     const directoryId = viewStore.activeDirectoryId
@@ -86,7 +103,7 @@ export function useJustifiedLayout(
     // 宫格⇄等高行继续可用(§5.1);扫描期强制宫格与普通路径同款。镜头关闭时走下方原路径,零变化。
     const lensMode = lens.mode
     if (lensMode !== null) {
-      await media.computeLayout({
+      return send({
         filters: {},
         containerWidth: cw,
         rowHeight: ui.gridRowHeight,
@@ -99,7 +116,6 @@ export function useJustifiedLayout(
           orderingVersion: 1,
         },
       })
-      return
     }
 
     // Record<string, unknown> 与 mediaStore.computeLayout 的 filters 入参同型，
@@ -150,7 +166,7 @@ export function useJustifiedLayout(
       filters.aiThreshold = ai.similarityThreshold
     }
 
-    await media.computeLayout({
+    return send({
       directoryId,
       filters,
       containerWidth: cw,
@@ -165,6 +181,11 @@ export function useJustifiedLayout(
       // 无缝分组(#1):排序仍按 groupBy 聚合,打包无分隔符、行跨组。
       seamless: ui.seamlessGroups,
     })
+  }
+
+  /** 所有来源共用前台/水合闸门，包含显式调用和尺寸回填。 */
+  async function compute(width?: number): Promise<void> {
+    await attemptCompute(width)
   }
 
   // 防抖调整大小处理程序
@@ -188,7 +209,7 @@ export function useJustifiedLayout(
 
   /**
    * watcher/resize 的取数入口：不在屏上只记 dirty、不发 IPC（见 UseJustifiedLayoutOptions.enabled）。
-   * 导出的 compute() 不经此闸——那是调用方显式发起的，调用方自知上下文。
+   * 显式 compute、尺寸回填和宽度重试最终也经过同一闸门。
    */
   function requestCompute(): boolean {
     if (!isEnabled()) {
@@ -207,53 +228,44 @@ export function useJustifiedLayout(
    */
   async function flushIfDeferred(): Promise<boolean> {
     if (!deferredWhileDisabled) return false
-    deferredWhileDisabled = false
-    await compute()
-    // dirty 是布局请求的附加信号；失活期间保留，激活补算后一起消费。
-    media.consumeLayoutDirty()
-    return true
+    return (await attemptCompute()) === 'committed'
   }
 
-  // 当过滤器或活动视图改变时重新计算。
-  // totalItems、layoutDirty 与后端事件由 useGalleryTauriSync 统一转入同一个 requestCompute 闸门。
+  // 水合/真实语义结果就绪后补最终需求；前台几何仍由宿主激活流程测量后提交。
+  watch(queryReady, (ready) => {
+    if (!ready) deferredWhileDisabled = true
+    else if (deferredWhileDisabled && isEnabled()) void flushIfDeferred()
+  }, { flush: 'post' })
+
+  // 顺序意图先同步撤销选区资格；离屏时也不能继续消费前一视图的全集。
+  // 与 post 阶段的重算共用输入列表，几何参数不使已有顺序缓存失效。
+  const orderInputs = [
+    () => filter.apiFilterKey,
+    () => viewStore.activeSmartAlbum,
+    () => viewStore.activeDirectoryId,
+    () => viewStore.activeCollection,
+    () => viewStore.activePersonId,
+    () => ui.searchQuery,
+    () => ui.searchScope,
+    () => ui.groupBy,
+    () => ui.sortWithinGroup,
+    () => ui.sortOrder,
+    () => ai.isSemanticMode,
+    () => ai.similarityThreshold,
+    () => lens.mode,
+    () => lens.showUniqueItems,
+  ]
+  watch(orderInputs, () => media.invalidateViewOrder(), { flush: 'sync' })
+  // totalItems、脏代与后端事件由 useGalleryTauriSync 转入同一个前台闸门。
   watch(
-    [
-      // 筛选维度整体看一个键(filterStore.apiFilterKey = toApiFilter() 的稳定序列化)。
-      //
-      // 原先手工枚举 mediaTypes/favoritedOnly/…/dateTo 共 7 条,而 compute() 喂后端的筛选部分
-      // 恰是 toApiFilter() 的输出——两份列表本应同一份却各抄一次。抄漏不报错,症状是点了 chip
-      // 画廊不更新(colorLabel 已漏过一次,T16 遗留)。改看单键后新维度自动进入,不再靠人记得抄。
-      //
-      // 一处有意的行为变化:只填日期一端时原先会触发一次重算,而 toApiFilter 在两端皆备前不下发
-      // dateRange,那次重算与上一次逐字节相同,是可证明的空转,现在不再触发。
-      () => filter.apiFilterKey,
-      () => viewStore.activeSmartAlbum,
-      () => viewStore.activeDirectoryId,
-      () => viewStore.activeCollection,
-      () => viewStore.activePersonId,
-      () => ui.searchQuery,
-      () => ui.searchScope,
-      () => ui.gridRowHeight,
-      () => ui.groupBy,
-      () => ui.sortWithinGroup,
-      () => ui.sortOrder,
-      // 布局模式切换（T20）→ 重算（后端换排版算法，前端同一取行通路）。
-      // 看 effective 而非 ui.layoutMode:扫描起止对等高用户 = 模式真实切换(grid⇄justified),
-      // 对宫格用户 = 无变化不触发;用户手动切换恒触发。
-      () => effectiveLayoutMode.value,
-      () => ui.seamlessGroups,
-      () => ai.isSemanticMode,
-      () => ai.similarityThreshold,
-      // 重复镜头(§10.1):模式(groups⇄folders)与独有项开关都是「集合+顺序」的切换 → 重算。
-      // 镜头⇄普通画廊的往返同样由 mode 置 null/非 null 驱动本 watch 命中。
-      () => lens.mode,
-      () => lens.showUniqueItems,
-    ],
+    [...orderInputs, () => ui.gridRowHeight, () => effectiveLayoutMode.value, () => ui.seamlessGroups],
     () => requestCompute(),
     { flush: 'post' },
   )
 
-  onBeforeUnmount(() => {
+  onScopeDispose(() => {
+    disposed = true
+    attemptGeneration++
     cancelPendingResize()
   })
 

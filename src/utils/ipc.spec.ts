@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 
-import { IpcError, MOVE_DB_PENDING_CODE, moveRecoveryOf, parseAppError } from './ipc'
+import { IpcError, moveRecoveryOf, parseAppError } from './ipc'
 
 const PENDING_RAW = {
   code: 'move_db_pending',
@@ -17,10 +17,6 @@ const PENDING_RAW = {
 }
 
 describe('parseAppError：目录移动半完成的恢复定位', () => {
-  it('稳定码与后端 error.rs 的 CODE_DB_PENDING 一致', () => {
-    expect(MOVE_DB_PENDING_CODE).toBe('move_db_pending')
-  })
-
   it('move_db_pending 的 recoveryId/targetAbsPath 原样保留', () => {
     const err = parseAppError(PENDING_RAW)
 

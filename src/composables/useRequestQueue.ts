@@ -40,8 +40,10 @@ interface RequestWaiter {
 
 interface RequestSlot {
   id: number
-  state: 'queued' | 'inFlight'
+  state: 'queued' | 'inFlight' | 'retrying'
   waiters: RequestWaiter[]
+  retryCount: number
+  retryTimer: ReturnType<typeof setTimeout> | null
 }
 
 /** 拒绝原因分类:cancelled=调用方主动放弃,不重试;stalled/incomplete=可按上限退避重试。 */
@@ -62,8 +64,6 @@ export function useRequestQueue() {
   let flushTimer: ReturnType<typeof setTimeout> | null = null
   const inFlight = new Set<RequestSlot>()
   const activeSlots = new Map<number, RequestSlot>()
-  // 退避等待中的重试链:id → 定时器 + 外层 Promise 的 reject(cancel 需能掐断等待期)。
-  const retryPending = new Map<number, { timer: ReturnType<typeof setTimeout>; reject: (e: unknown) => void }>()
 
   let isFlushing = false
 
@@ -87,9 +87,31 @@ export function useRequestQueue() {
   }
 
   function rejectSlot(slot: RequestSlot, err: unknown) {
+    if (slot.retryTimer !== null) {
+      clearTimeout(slot.retryTimer)
+      slot.retryTimer = null
+    }
     const waiters = slot.waiters.splice(0)
     waiters.forEach((cb) => cb.reject(err))
     detachSlot(slot)
+  }
+
+  function retryOrRejectSlot(slot: RequestSlot, err: unknown) {
+    inFlight.delete(slot)
+    if (slot.waiters.length === 0 || !isRetryable(err) || slot.retryCount >= THUMB_RETRY_MAX) {
+      rejectSlot(slot, err)
+      return
+    }
+    // 重试属于同一个逻辑 slot,新等待者也共用退避和预算,取消可一次收尾全部 Promise。
+    slot.state = 'retrying'
+    slot.retryTimer = setTimeout(() => {
+      slot.retryTimer = null
+      slot.state = 'queued'
+      queue.push(slot)
+      syncStats()
+      scheduleFlush()
+    }, THUMB_RETRY_BASE_MS * 2 ** slot.retryCount)
+    slot.retryCount++
   }
 
   function flush() {
@@ -126,7 +148,7 @@ export function useRequestQueue() {
       if (rejectErr !== undefined) {
         for (const slot of Array.from(pending)) {
           pending.delete(slot)
-          rejectSlot(slot, rejectErr)
+          retryOrRejectSlot(slot, rejectErr)
         }
         logger.warn(`[useRequestQueue] ${reason}`)
       } else {
@@ -190,23 +212,7 @@ export function useRequestQueue() {
 
   function request(id: number): Promise<ThumbResult> {
     return new Promise((resolve, reject) => {
-      // 有界退避重试:槽位拒绝先看可重试性与次数上限,可重试则等退避后重排同一 id
-      // (走正常 enqueue 路径,复用 50ms 合批与 single-flight 去重);不可重试或超限才
-      // 把拒绝交给调用方。attemptNo 从 0 起,>= THUMB_RETRY_MAX 即终拒。
-      const run = (attemptNo: number): void => {
-        enqueue(id, resolve, (err) => {
-          if (!isRetryable(err) || attemptNo >= THUMB_RETRY_MAX) {
-            reject(err)
-            return
-          }
-          const timer = setTimeout(() => {
-            retryPending.delete(id)
-            run(attemptNo + 1)
-          }, THUMB_RETRY_BASE_MS * 2 ** attemptNo)
-          retryPending.set(id, { timer, reject })
-        })
-      }
-      run(0)
+      enqueue(id, resolve, reject)
     })
   }
 
@@ -214,7 +220,7 @@ export function useRequestQueue() {
     const existing = activeSlots.get(id)
     if (existing) {
       existing.waiters.push({ resolve, reject })
-      // 已排队或已在后端处理中：复用同一个 slot，确保重复 Promise 一起收尾。
+      // 排队、在途和退避均复用同一个 slot,避免新请求绕过退避或重新获取重试预算。
       return
     }
 
@@ -222,6 +228,8 @@ export function useRequestQueue() {
       id,
       state: 'queued',
       waiters: [{ resolve, reject }],
+      retryCount: 0,
+      retryTimer: null,
     }
     activeSlots.set(id, slot)
     queue.push(slot)
@@ -230,19 +238,10 @@ export function useRequestQueue() {
   }
 
   function cancel(id: number) {
-    // 退避等待中的重试链:先掐断(否则 cancel 后定时器仍会把该 id 重新排进队列)。
-    // 与下方 slot 路径不互斥——等待期与新建 slot 可并存(他人在退避期重新 request 同 id)。
-    const pending = retryPending.get(id)
-    if (pending) {
-      clearTimeout(pending.timer)
-      retryPending.delete(id)
-      pending.reject(new ThumbRequestError('cancelled', 'cancelled'))
-    }
-
     const slot = activeSlots.get(id)
     if (!slot) return
 
-    if (slot.state === 'queued') {
+    if (slot.state !== 'inFlight') {
       const idx = queue.indexOf(slot)
       if (idx >= 0) {
         queue.splice(idx, 1)
@@ -253,6 +252,8 @@ export function useRequestQueue() {
       // in-flight 请求不能安全地按 id 取消：同一 id 很可能马上重新进入视口。
       // 这里只取消当前前端等待者，保留后端 single-flight；新 Promise 会挂回同一 slot 并随结果 resolve。
       slot.waiters.splice(0).forEach((cb) => cb.reject(new ThumbRequestError('cancelled', 'cancelled')))
+      // 原逻辑请求已取消,后来重新加入在途工作的等待者从新的重试预算开始。
+      slot.retryCount = 0
     }
   }
 

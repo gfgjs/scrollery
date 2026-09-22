@@ -338,7 +338,11 @@ impl ExoticHost {
             display_name: off.display_name.clone(),
             capabilities: off.capabilities.clone(),
             availability,
-            store_url: off.store_url.clone(),
+            store_url: if crate::official::includes(&off.plugin_id) {
+                crate::official::store_url()
+            } else {
+                None
+            },
             installed_version,
             builtin: off.builtin,
         }
@@ -365,14 +369,14 @@ impl ExoticHost {
         // builtin offering(D-OCR-5):无安装包,跳过安装态门,直接验 license。
         if off.builtin {
             // free 档(D-427 一期免费 RAW):显式判 license_tier=="free" 才放行,
-            // 不可用"无 sku 即放行"代替——否则会误放行 builtin 的 paid 插件(sku 缺失时应 fail-closed)。
+            // 付费能力只有固定套装权益可验权，不能因配置缺 SKU 放行。
             if off.license_tier == "free" {
                 return Availability::Authorized;
             }
-            let Some(sku) = off.sku.as_deref() else {
+            if !crate::official::includes(&off.plugin_id) {
                 return Availability::InstalledUnlicensed;
-            };
-            return match self.licenses.evaluate(&off.plugin_id, sku, now_secs()) {
+            }
+            return match crate::official::status(self.licenses.as_ref(), now_secs()) {
                 LicenseStatus::Authorized => Availability::Authorized,
                 LicenseStatus::Expired => Availability::LicenseExpired,
                 // 有意与 package 流(KeyringUnavailable→InstalledUnlicensed)分叉:builtin 无安装态可退,
@@ -390,12 +394,13 @@ impl ExoticHost {
             install_state::DISABLED => return Availability::Disabled,
             _ => {}
         }
-        // 已安装且启用 → 查授权。expected_sku 取自**可信** Catalog（绝不取 token 自身，§5.2）。
-        let Some(sku) = off.sku.as_deref() else {
-            // paid 插件却无 SKU = 无法验签 → 已装也只能未授权。
+        if off.license_tier == "free" {
+            return Availability::Authorized;
+        }
+        if !crate::official::includes(&off.plugin_id) {
             return Availability::InstalledUnlicensed;
-        };
-        match self.licenses.evaluate(&off.plugin_id, sku, now_secs()) {
+        }
+        match crate::official::status(self.licenses.as_ref(), now_secs()) {
             LicenseStatus::Authorized => Availability::Authorized,
             LicenseStatus::Expired => Availability::LicenseExpired,
             // 无 token / 不匹配 / keyring 不可用 → 已装未授权（不可证明授权即按未授权，fail-closed）。
@@ -447,7 +452,8 @@ impl ExoticHost {
             plugin_id: plugin_id.to_string(),
             availability: res.availability,
             source_tag: self.licenses.source_tag().to_string(),
-            sku: off.sku.clone(),
+            sku: (off.license_tier != "free" && crate::official::includes(plugin_id))
+                .then(|| crate::official::product().sku.clone()),
             store_url: res.store_url,
         })
     }
@@ -522,7 +528,9 @@ mod tests {
     /// 测试假源：固定返回某授权态。
     struct FakeLicense(LicenseStatus);
     impl EntitlementProvider for FakeLicense {
-        fn evaluate(&self, _plugin_id: &str, _sku: &str, _now: i64) -> LicenseStatus {
+        fn evaluate(&self, plugin_id: &str, sku: &str, _now: i64) -> LicenseStatus {
+            assert_eq!(plugin_id, crate::official::product().product_id);
+            assert_eq!(sku, crate::official::product().sku);
             self.0
         }
         fn source_tag(&self) -> &'static str {

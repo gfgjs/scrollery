@@ -200,7 +200,7 @@ impl SearchControl {
         &self,
         ticket: &SearchTicket,
         dim: usize,
-        load: impl FnMut() -> Result<Vec<(i64, Vec<u8>)>>,
+        load: impl FnMut(&str, usize) -> Result<EmbeddingCache>,
     ) -> Result<Arc<EmbeddingCache>> {
         self.load_snapshot_for(ticket, dim, load, || {})
     }
@@ -211,7 +211,7 @@ impl SearchControl {
         &self,
         ticket: &SearchTicket,
         dim: usize,
-        mut load: impl FnMut() -> Result<Vec<(i64, Vec<u8>)>>,
+        mut load: impl FnMut(&str, usize) -> Result<EmbeddingCache>,
         mut before_install: impl FnMut(),
     ) -> Result<Arc<EmbeddingCache>> {
         let model = ticket.model();
@@ -231,8 +231,7 @@ impl SearchControl {
         for attempt in 1..=MAX_LOAD_ATTEMPTS {
             let epoch = self.cache_epoch();
             let t0 = std::time::Instant::now();
-            let rows = load()?;
-            let candidate = Arc::new(EmbeddingCache::pack(model, dim, rows));
+            let candidate = Arc::new(load(model, dim)?);
 
             before_install();
 
@@ -372,6 +371,19 @@ impl SearchControl {
         self.lock_gate_state().committed.clone()
     }
 
+    /// 布局发布与语义结果换代互斥，避免复核后被另一份搜索结果穿插。
+    pub fn with_committed<T>(
+        &self,
+        expected: &Option<SearchRequestId>,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let gate = self.lock_gate_state();
+        if &gate.committed != expected {
+            return None;
+        }
+        Some(publish())
+    }
+
     /// 常驻快照身份(模型, 维度);`None` = 未驻留。
     pub fn resident_identity(&self) -> Option<(String, usize)> {
         self.lock_cache_slot_read()
@@ -439,7 +451,7 @@ pub fn run_search(
     query_vec: &[f32],
     top_k: usize,
     dim: usize,
-    load: impl FnMut() -> Result<Vec<(i64, Vec<u8>)>>,
+    load: impl FnMut(&str, usize) -> Result<EmbeddingCache>,
     write: impl FnOnce(&[(i64, f32)]) -> Result<usize>,
 ) -> Result<SearchCommit> {
     // 已经过期就不再付全量装载/打分的账(嵌入全量读以 GB 计)。
@@ -472,9 +484,13 @@ mod tests {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    /// 构造 SQLite 原始行(小端 f32),与 get_all_embeddings 的输出同形。
-    fn rows(entries: &[(i64, &[f32])]) -> Vec<(i64, Vec<u8>)> {
-        entries.iter().map(|(id, v)| (*id, blob(v))).collect()
+    /// 构造装载完成的快照，身份由控制面传入，转换使用生产的逐行打包逻辑。
+    fn rows(model: &str, dim: usize, entries: &[(i64, &[f32])]) -> EmbeddingCache {
+        EmbeddingCache::pack(
+            model,
+            dim,
+            entries.iter().map(|(id, v)| (*id, blob(v))).collect(),
+        )
     }
 
     /// 生产接线的测试替身:真 SQLite 内存库(含 ai_search_results 真实 DDL 与外键)+ 控制面。
@@ -574,7 +590,9 @@ mod tests {
 
         let ticket_a = control.begin_request("m1");
         let snapshot_a = control
-            .snapshot_for(&ticket_a, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&ticket_a, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
 
         let ticket_b = control.begin_request("m1");
@@ -584,7 +602,7 @@ mod tests {
             &[0.0, 1.0],
             10,
             DIM,
-            || Ok(rows(&[(2, &[0.0, 1.0])])),
+            |model, dim| Ok(rows(model, dim, &[(2, &[0.0, 1.0])])),
             table_b.writer(2),
         )
         .unwrap();
@@ -613,7 +631,7 @@ mod tests {
                 &[1.0, 0.0],
                 10,
                 DIM,
-                || Ok(rows(&[(1, &[1.0, 0.0])])),
+                |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0])])),
                 table.writer(1),
             )
             .unwrap(),
@@ -630,7 +648,7 @@ mod tests {
                 &[0.0, 1.0],
                 10,
                 DIM,
-                || Ok(rows(&[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])])),
+                |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])])),
                 table.writer(2),
             )
             .unwrap(),
@@ -639,6 +657,23 @@ mod tests {
         assert_eq!(table.writer_tags(), vec![1, 2]);
         assert_eq!(table.content()[0].0, 2);
         assert_eq!(control.committed().unwrap().seq, second.seq());
+    }
+
+    #[test]
+    fn layout_publication_requires_the_same_committed_search() {
+        let control = SearchControl::new();
+        let first = control.begin_request("m1");
+        control.commit(&first, || Ok(1)).unwrap();
+        let source = control.committed();
+        assert_eq!(control.with_committed(&source, || 7), Some(7));
+        let second = control.begin_request("m1");
+        control.commit(&second, || Ok(1)).unwrap();
+        assert!(control
+            .with_committed(&source, || panic!("旧语义候选不得发布"))
+            .is_none());
+        let source = control.committed();
+        control.clear(|| Ok(())).unwrap();
+        assert!(control.with_committed(&source, || ()).is_none());
     }
 
     /// 清空后旧提交:清空吊销在途请求,迟到的旧提交不得复活结果表;之后新请求照常。
@@ -655,7 +690,7 @@ mod tests {
                 &[1.0, 0.0],
                 10,
                 DIM,
-                || Ok(rows(&[(1, &[1.0, 0.0])])),
+                |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0])])),
                 table.writer(1),
             )
             .unwrap(),
@@ -665,7 +700,9 @@ mod tests {
         // 用户又发了一次查询(在途),随后清空搜索。
         let in_flight = control.begin_request("m1");
         let _snapshot = control
-            .snapshot_for(&in_flight, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&in_flight, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
         control.clear(table.wipe()).unwrap();
         assert!(table.content().is_empty(), "清空须擦除结果表");
@@ -686,7 +723,7 @@ mod tests {
                 &[1.0, 0.0],
                 10,
                 DIM,
-                || Ok(rows(&[(5, &[1.0, 0.0])])),
+                |model, dim| Ok(rows(model, dim, &[(5, &[1.0, 0.0])])),
                 table.writer(10),
             )
             .unwrap(),
@@ -707,8 +744,8 @@ mod tests {
         // A:在清空之前登记并装载快照(在途)。同库同模型,故快照含全部向量,供 B 复用。
         let ticket_a = control.begin_request("m1");
         control
-            .snapshot_for(&ticket_a, DIM, || {
-                Ok(rows(&[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])]))
+            .snapshot_for(&ticket_a, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])]))
             })
             .unwrap();
 
@@ -724,7 +761,7 @@ mod tests {
                 &[0.0, 1.0],
                 10,
                 DIM,
-                || unreachable!("同身份快照已常驻,不得重新装载"),
+                |_, _| unreachable!("同身份快照已常驻,不得重新装载"),
                 |scored| {
                     let mut c = conn.lock().unwrap();
                     crate::ai::search::replace_search_results(&mut c, scored)
@@ -780,7 +817,7 @@ mod tests {
                 &[1.0, 0.0],
                 10,
                 DIM,
-                || Ok(rows(&[(1, &[1.0, 0.0])])),
+                |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0])])),
                 |scored| {
                     let mut c = conn.lock().unwrap();
                     crate::ai::search::replace_search_results(&mut c, scored)
@@ -828,7 +865,9 @@ mod tests {
 
         let stale = control.begin_request("m1");
         let _snapshot = control
-            .snapshot_for(&stale, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&stale, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
         assert_eq!(
             control
@@ -857,7 +896,7 @@ mod tests {
                 &[0.0, 1.0],
                 10,
                 DIM,
-                || Ok(rows(&[(2, &[0.0, 1.0])])),
+                |model, dim| Ok(rows(model, dim, &[(2, &[0.0, 1.0])])),
                 |scored| {
                     let mut c = conn.lock().unwrap();
                     crate::ai::search::replace_search_results(&mut c, scored)
@@ -914,7 +953,7 @@ mod tests {
                 &[0.0, 1.0],
                 10,
                 DIM,
-                || Ok(rows(&[(7, &[0.0, 1.0])])),
+                |model, dim| Ok(rows(model, dim, &[(7, &[0.0, 1.0])])),
                 |scored| {
                     let mut c = conn.lock().unwrap();
                     crate::ai::search::replace_search_results(&mut c, scored)
@@ -946,7 +985,7 @@ mod tests {
                 &[1.0, 0.0],
                 10,
                 DIM,
-                || Ok(rows(&[(1, &[1.0, 0.0])])),
+                |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0])])),
                 table.writer(1),
             )
             .unwrap(),
@@ -957,7 +996,9 @@ mod tests {
         // 在途请求 + 清空失败。
         let in_flight = control.begin_request("m1");
         control
-            .snapshot_for(&in_flight, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&in_flight, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
         let err = control.clear(FakeTable::failing_wipe()).unwrap_err();
         assert!(matches!(err, AppError::Internal(_)), "擦除失败须如实上报");
@@ -987,7 +1028,9 @@ mod tests {
 
         let warm = control.begin_request("m1");
         control
-            .snapshot_for(&warm, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&warm, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
         assert!(control.resident_identity().is_some(), "前置:常驻缓存已装载");
 
@@ -1017,7 +1060,9 @@ mod tests {
 
         let warm = control.begin_request("m1");
         control
-            .snapshot_for(&warm, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&warm, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
         assert_eq!(control.resident_identity(), Some(("m1".to_string(), DIM)));
 
@@ -1036,9 +1081,9 @@ mod tests {
         let loads = AtomicUsize::new(0);
         let ticket = control.begin_request("m2");
         let snapshot = control
-            .snapshot_for(&ticket, DIM, || {
+            .snapshot_for(&ticket, DIM, |model, dim| {
                 loads.fetch_add(1, AtomicOrdering::SeqCst);
-                Ok(rows(&[(7, &[0.0, 1.0])]))
+                Ok(rows(model, dim, &[(7, &[0.0, 1.0])]))
             })
             .unwrap();
         assert_eq!(loads.load(AtomicOrdering::SeqCst), 1, "新模型须自行装载");
@@ -1054,15 +1099,17 @@ mod tests {
 
         let m1 = control.begin_request("m1");
         control
-            .snapshot_for(&m1, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&m1, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
 
         let loads = AtomicUsize::new(0);
         let m2 = control.begin_request("m2");
         let snapshot = control
-            .snapshot_for(&m2, DIM, || {
+            .snapshot_for(&m2, DIM, |model, dim| {
                 loads.fetch_add(1, AtomicOrdering::SeqCst);
-                Ok(rows(&[(2, &[0.0, 1.0])]))
+                Ok(rows(model, dim, &[(2, &[0.0, 1.0])]))
             })
             .unwrap();
         assert_eq!(loads.load(AtomicOrdering::SeqCst), 1, "换模型须重新装载");
@@ -1078,13 +1125,17 @@ mod tests {
 
         let four = control.begin_request("m1");
         let wide = control
-            .snapshot_for(&four, 4, || Ok(rows(&[(1, &[1.0, 0.0, 0.0, 0.0])])))
+            .snapshot_for(&four, 4, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0, 0.0, 0.0])]))
+            })
             .unwrap();
         assert_eq!(wide.dim, 4);
 
         let two = control.begin_request("m1");
         let narrow = control
-            .snapshot_for(&two, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&two, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
         assert_eq!(narrow.dim, DIM);
         assert_eq!(narrow.ids, vec![1]);
@@ -1105,7 +1156,7 @@ mod tests {
                 &[1.0, 0.0],
                 10,
                 DIM,
-                || Ok(rows(&[(1, &[1.0, 0.0])])),
+                |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0])])),
                 table.writer(1),
             )
             .unwrap(),
@@ -1119,7 +1170,7 @@ mod tests {
             &[1.0, 0.0, 0.0],
             10,
             DIM,
-            || Ok(rows(&[(1, &[1.0, 0.0])])),
+            |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0])])),
             table.writer(2),
         )
         .unwrap_err();
@@ -1139,7 +1190,9 @@ mod tests {
 
         let in_flight = control.begin_request("m1");
         control
-            .snapshot_for(&in_flight, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&in_flight, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
 
         control.invalidate_cache();
@@ -1152,9 +1205,9 @@ mod tests {
         let loads = AtomicUsize::new(0);
         let next = control.begin_request("m1");
         let snapshot = control
-            .snapshot_for(&next, DIM, || {
+            .snapshot_for(&next, DIM, |model, dim| {
                 loads.fetch_add(1, AtomicOrdering::SeqCst);
-                Ok(rows(&[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])]))
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])]))
             })
             .unwrap();
         assert_eq!(loads.load(AtomicOrdering::SeqCst), 1);
@@ -1176,16 +1229,16 @@ mod tests {
             std::thread::spawn(move || {
                 let ticket = control.begin_request("m1");
                 control
-                    .snapshot_for(&ticket, DIM, || {
+                    .snapshot_for(&ticket, DIM, |model, dim| {
                         let attempt = loads.fetch_add(1, AtomicOrdering::SeqCst);
                         if attempt == 0 {
                             entered_tx.send(()).unwrap();
                             release_rx
                                 .recv_timeout(Duration::from_secs(5))
                                 .expect("装载未被放行");
-                            Ok(rows(&[(1, &[1.0, 0.0])]))
+                            Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
                         } else {
-                            Ok(rows(&[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])]))
+                            Ok(rows(model, dim, &[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])]))
                         }
                     })
                     .map(|snapshot| snapshot.ids.clone())
@@ -1207,7 +1260,7 @@ mod tests {
         assert_eq!(ids, vec![1, 2], "对外快照应是重读后的新数据");
 
         let resident = control
-            .snapshot_for(&control.begin_request("m1"), DIM, || {
+            .snapshot_for(&control.begin_request("m1"), DIM, |_, _| {
                 unreachable!("常驻快照应命中,不得再次装载")
             })
             .unwrap();
@@ -1233,12 +1286,13 @@ mod tests {
             .load_snapshot_for(
                 &ticket,
                 DIM,
-                move || {
+                move |model, dim| {
                     let attempt = load_attempts.fetch_add(1, AtomicOrdering::SeqCst);
                     if attempt == 0 {
-                        Ok(rows(&[(1, &[1.0, 0.0])])) // 陈旧候选:失效前的库状态
+                        Ok(rows(model, dim, &[(1, &[1.0, 0.0])])) // 陈旧候选:失效前的库状态
                     } else {
-                        Ok(rows(&[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])])) // 失效后重读
+                        Ok(rows(model, dim, &[(1, &[1.0, 0.0]), (2, &[0.0, 1.0])]))
+                        // 失效后重读
                     }
                 },
                 move || {
@@ -1266,7 +1320,7 @@ mod tests {
             "常驻的必须是重读后的新快照"
         );
         let resident = control
-            .snapshot_for(&control.begin_request("m1"), DIM, || {
+            .snapshot_for(&control.begin_request("m1"), DIM, |_, _| {
                 unreachable!("常驻快照应命中,不得再次装载")
             })
             .unwrap();
@@ -1285,10 +1339,10 @@ mod tests {
             let inner = Arc::clone(&control);
             let loads = Arc::clone(&loads);
             outer
-                .snapshot_for(&ticket, DIM, move || {
+                .snapshot_for(&ticket, DIM, move |model, dim| {
                     loads.fetch_add(1, AtomicOrdering::SeqCst);
                     inner.invalidate_cache();
-                    Ok(rows(&[(3, &[1.0, 0.0])]))
+                    Ok(rows(model, dim, &[(3, &[1.0, 0.0])]))
                 })
                 .unwrap()
         };
@@ -1354,7 +1408,9 @@ mod tests {
         // 旧模型的在途请求(切模型前登记)。
         let stale = control.begin_request(&active.lock().unwrap().clone());
         control
-            .snapshot_for(&stale, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&stale, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
 
         // 切模型:配置先写(生产序),随后吊销在途请求并作废缓存。
@@ -1371,9 +1427,9 @@ mod tests {
         let ticket = control.begin_request_resolved(|| active.lock().unwrap().clone());
         assert_eq!(ticket.model(), "m2", "身份须现读,不得沿用切模型前的取值");
         let snapshot = control
-            .snapshot_for(&ticket, DIM, || {
+            .snapshot_for(&ticket, DIM, |model, dim| {
                 loads.fetch_add(1, AtomicOrdering::SeqCst);
-                Ok(rows(&[(9, &[0.0, 1.0])]))
+                Ok(rows(model, dim, &[(9, &[0.0, 1.0])]))
             })
             .unwrap();
         assert_eq!(snapshot.model_name, "m2");
@@ -1385,7 +1441,7 @@ mod tests {
                 &[0.0, 1.0],
                 10,
                 DIM,
-                || unreachable!("快照已在常驻位"),
+                |_, _| unreachable!("快照已在常驻位"),
                 table.writer(9),
             )
             .unwrap(),
@@ -1453,7 +1509,7 @@ mod tests {
             &[1.0, 0.0],
             10,
             DIM,
-            || unreachable!("已过期请求不得再读全量嵌入"),
+            |_, _| unreachable!("已过期请求不得再读全量嵌入"),
             table.writer(1),
         )
         .unwrap();
@@ -1474,7 +1530,7 @@ mod tests {
             &[1.0, 0.0],
             10,
             DIM,
-            || Ok(Vec::new()),
+            |model, dim| Ok(rows(model, dim, &[])),
             table.writer(1),
         )
         .unwrap();
@@ -1491,7 +1547,9 @@ mod tests {
 
         let warm = control.begin_request("m1");
         control
-            .snapshot_for(&warm, DIM, || Ok(rows(&[(1, &[1.0, 0.0])])))
+            .snapshot_for(&warm, DIM, |model, dim| {
+                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
+            })
             .unwrap();
 
         let mut handles = Vec::new();

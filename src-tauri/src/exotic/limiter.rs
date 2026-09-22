@@ -69,13 +69,27 @@ impl BackgroundHeavyLimiter {
 
     /// 公平取一个 permit；阻塞直到拿到或 `token` 取消。取消返回 `None`（已退队，不泄漏）。
     pub fn acquire(self: &Arc<Self>, token: &CancellationToken) -> Option<HeavyPermit> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let ticket = state.next_ticket;
-        state.next_ticket += 1;
-        state.queue.push_back(ticket);
+        self.acquire_cancellable(&|| token.is_cancelled())
+    }
+
+    /// 公平取额度，等待期间允许调用方按取消、熔断或授权状态退队。
+    /// 判定在额度锁外执行，不能将调用方的状态锁带进共享 FIFO 临界区。
+    pub(crate) fn acquire_cancellable(
+        self: &Arc<Self>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<HeavyPermit> {
+        let ticket = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let ticket = state.next_ticket;
+            state.next_ticket += 1;
+            state.queue.push_back(ticket);
+            ticket
+        };
 
         loop {
-            if token.is_cancelled() {
+            let cancelled = cancelled();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if cancelled {
                 remove_ticket(&mut state.queue, ticket);
                 // 退队可能让出队首 → 唤醒其余等待者重新评估。
                 self.cv.notify_all();
@@ -89,11 +103,11 @@ impl BackgroundHeavyLimiter {
                     limiter: Arc::clone(self),
                 });
             }
-            let (s, _timeout) = self
+            let (state, _timeout) = self
                 .cv
                 .wait_timeout(state, CANCEL_POLL)
                 .unwrap_or_else(|e| e.into_inner());
-            state = s;
+            drop(state);
         }
     }
 
@@ -263,6 +277,36 @@ mod tests {
         b.join().unwrap();
         let got = order.lock().unwrap().clone();
         assert_eq!(got, vec!["A", "B"], "FIFO：先入队者先获 permit");
+    }
+
+    #[test]
+    fn caller_cancellation_removes_ticket_without_holding_limiter_lock() {
+        let lim = BackgroundHeavyLimiter::new(1);
+        let token = CancellationToken::new();
+        let held = lim.acquire(&token).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let (checked_tx, checked_rx) = crossbeam_channel::bounded(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let finished = thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = lim.acquire_cancellable(&|| {
+                    assert!(lim.state.try_lock().is_ok(), "调用方判定不能持有额度锁");
+                    let _ = checked_tx.try_send(());
+                    cancelled.load(Ordering::SeqCst)
+                });
+                let _ = done_tx.send(result.is_none());
+            });
+            let checked = checked_rx.recv_timeout(Duration::from_secs(2));
+            cancelled.store(true, Ordering::SeqCst);
+            let finished = done_rx.recv_timeout(Duration::from_secs(1));
+            // 失败路径也释放持有者，防止回归卡住测试进程。
+            drop(held);
+            assert!(checked.is_ok());
+            finished
+        });
+        assert_eq!(finished, Ok(true), "取消不能等到额度归还才生效");
+        assert!(lim.state.lock().unwrap().queue.is_empty());
+        assert_eq!(lim.available(), 1);
     }
 }
 

@@ -36,3 +36,5 @@ pub mod tree_commands;
 pub mod video_commands;
 pub mod viewer_color_commands;
 pub mod volume_commands;
+
+pub mod official_commands;

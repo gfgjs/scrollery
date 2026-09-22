@@ -41,28 +41,47 @@ impl EmbeddingCache {
         self.ids.is_empty()
     }
 
-    /// 由 SQLite 原始行打包常驻快照:跳过维度 ≠ `dim` 的行(含其它模型/变体的向量)。
-    /// `data` 行主序,行序与 `ids` 一致;元素按小端 f32 读入转 f16。
-    pub fn pack(model_name: &str, dim: usize, raw: Vec<(i64, Vec<u8>)>) -> Self {
-        let mut ids: Vec<i64> = Vec::with_capacity(raw.len());
-        let mut data: Vec<f16> = Vec::with_capacity(raw.len() * dim);
-        for (id, blob) in raw {
-            if blob.len() != dim * 4 {
-                continue;
-            }
-            ids.push(id);
-            for chunk in blob.as_chunks::<4>().0 {
-                data.push(f16::from_f32(f32::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3],
-                ])));
-            }
-        }
+    /// 在阻塞线程逐行读库并构造常驻快照，不保留原始 f32 BLOB 全集。
+    pub fn load(conn: &Connection, model_name: &str, dim: usize) -> Result<Self> {
+        let count = crate::db::queries::count_embeddings_for_model(conn, model_name)? as usize;
+        let mut cache = Self::with_capacity(model_name, dim, count);
+        crate::db::queries::for_each_embedding(conn, model_name, |id, blob| {
+            cache.push_blob(id, blob);
+        })?;
+        Ok(cache)
+    }
+
+    fn with_capacity(model_name: &str, dim: usize, count: usize) -> Self {
         Self {
             model_name: model_name.to_string(),
-            ids,
-            data,
+            ids: Vec::with_capacity(count),
+            data: Vec::with_capacity(count * dim),
             dim,
         }
+    }
+
+    // 维度不同的旧向量继续跳过；借用仅持续当前行，转换后只保留 f16。
+    fn push_blob(&mut self, id: i64, blob: &[u8]) {
+        if blob.len() != self.dim * 4 {
+            return;
+        }
+        self.ids.push(id);
+        self.data.extend(
+            blob.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f16::from_f32(f32::from_le_bytes(*chunk))),
+        );
+    }
+
+    /// 测试夹具与生产逐行装载共用相同转换与维度过滤。
+    #[cfg(test)]
+    pub fn pack(model_name: &str, dim: usize, raw: Vec<(i64, Vec<u8>)>) -> Self {
+        let mut cache = Self::with_capacity(model_name, dim, raw.len());
+        for (id, blob) in raw {
+            cache.push_blob(id, &blob);
+        }
+        cache
     }
 
     /// 快照身份判定:模型名与维度必须整体一致才可复用。
@@ -108,9 +127,16 @@ pub fn score_top_k(
         })
         .collect();
 
-    // 按相似度降序排序,取 Top-K。
-    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // NaN 无可用相似度，不能参与排序或写入结果表；±Infinity 已由 clamp 收敛。
+    scored.retain(|(_, score)| score.is_finite());
+    // 同分按 ID 固定边界，只对留下的 k 项排序，避免为未返回的结果做全量排序。
+    let compare =
+        |a: &(i64, f32), b: &(i64, f32)| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0));
+    if top_k < scored.len() {
+        scored.select_nth_unstable_by(top_k, compare);
+    }
     scored.truncate(top_k);
+    scored.sort_unstable_by(compare);
     Ok(scored)
 }
 
@@ -175,6 +201,39 @@ mod tests {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
+    #[test]
+    fn database_load_preserves_model_dimension_and_f16_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_embeddings (item_id INTEGER, model_name TEXT, embedding BLOB);",
+        )
+        .unwrap();
+        for (id, model, values) in [
+            (1, "m1", vec![0.12345, -0.54321]),
+            (2, "m2", vec![1.0, 0.0]),
+            (3, "m1", vec![1.0]),
+            (4, "m1", vec![0.0, 1.0]),
+        ] {
+            conn.execute(
+                "INSERT INTO ai_embeddings VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, model, blob(&values)],
+            )
+            .unwrap();
+        }
+        let cache = EmbeddingCache::load(&conn, "m1", 2).unwrap();
+        assert!(cache.matches("m1", 2));
+        assert_eq!(cache.ids, [1, 4]);
+        assert_eq!(cache.data, [0.12345, -0.54321, 0.0, 1.0].map(f16::from_f32));
+        assert_eq!(
+            score_top_k(&cache, &[0.0, 1.0], 2)
+                .unwrap()
+                .iter()
+                .map(|x| x.0)
+                .collect::<Vec<_>>(),
+            [4, 1]
+        );
+    }
+
     /// 打包:维度不符的行(含其它模型/变体的向量)必须被跳过,不能混进本快照。
     #[test]
     fn pack_filters_rows_of_other_dims() {
@@ -200,6 +259,52 @@ mod tests {
         assert!(cache.matches("m1", 2));
         assert!(!cache.matches("m1", 4), "同模型错维不得复用");
         assert!(!cache.matches("m2", 2), "同维错模型不得复用");
+    }
+
+    #[test]
+    fn top_k_matches_full_ranking_at_tied_cutoffs() {
+        let rows = (1..=257)
+            .rev()
+            .map(|id| (id, blob(&[((id % 17) as f32 - 8.0) / 8.0, 0.0])))
+            .collect();
+        let cache = EmbeddingCache::pack("m1", 2, rows);
+        let mut expected: Vec<_> = cache
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, cache.data[i * 2].to_f32()))
+            .collect();
+        expected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0)));
+        for k in [0, 1, 8, 32, 256, 257, 300] {
+            assert_eq!(
+                score_top_k(&cache, &[1.0, 0.0], k).unwrap(),
+                expected[..k.min(expected.len())],
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_k_excludes_nan_and_keeps_clamped_infinities() {
+        let cache = EmbeddingCache::pack(
+            "m1",
+            1,
+            vec![
+                (3, blob(&[f32::NAN])),
+                (2, blob(&[f32::INFINITY])),
+                (1, blob(&[f32::NEG_INFINITY])),
+                (4, blob(&[0.5])),
+            ],
+        );
+        assert_eq!(
+            score_top_k(&cache, &[1.0], 10).unwrap(),
+            [(2, 1.0), (4, 0.5), (1, -1.0)]
+        );
+        assert_eq!(
+            score_top_k(&cache, &[1.0], 2).unwrap(),
+            [(2, 1.0), (4, 0.5)]
+        );
+        assert!(score_top_k(&cache, &[f32::NAN], 2).unwrap().is_empty());
     }
 
     /// 打分:降序取 Top-K,空库/空 K 返回空。

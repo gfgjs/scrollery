@@ -132,7 +132,10 @@ import {
 import { invokeIpc } from './utils/ipc'
 import { logger } from './utils/logger'
 import { dismissStartupLayer } from './utils/startupLayer'
-import { IPC } from './constants/ipc'
+import { IPC, EVENTS } from './constants/ipc'
+import { useTauriListen } from './composables/useTauriListen'
+import { resetOcrStatusCache } from './composables/useOcr'
+import { useEnhanceStore } from './stores/enhanceStore'
 import {
   applyTimelineScrollWidth,
   applyTimelineAxisWidth,
@@ -281,6 +284,11 @@ const showToolbarBar = computed(
 )
 // 非画廊页在该条上显示的页面标题(i18n 键存在 route.meta.title,与窗口标题同源;取法同 router/index.ts)。
 const pageTitleKey = computed(() => route.meta.title as string | undefined)
+
+useTauriListen(EVENTS.OFFICIAL_LICENSE_CHANGED, () => {
+  resetOcrStatusCache()
+  void useEnhanceStore().fetchStatus()
+})
 
 // 首启向导显隐（T17）：onMounted 检测 first_launch 配置缺省时置真。
 const showOnboarding = ref(false)

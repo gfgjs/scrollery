@@ -14,7 +14,7 @@
 //!   - **让步**（R1）：Claimer 派发新任务前 `should_yield_exotic()`（scan/thumbnail/interaction）；
 //!     在途解码不 sleep 抢占，只自然完成或超时 kill。
 //!   - **公平后台重活池**（R4）：每次 run 前取 `BackgroundHeavyLimiter` permit（与 derivation 同预算）。
-//!   - **先文件后 DB**（§4.4）：Sink 原子 rename 后才在条件事务里写 task done + media_items。
+//!   - **受租约保护的发布**（§4.4）：锁外准备临时文件，条件写事务内 rename，随后提交 DB。
 //!   - **熔断**：进程级/协议级失败计 strike；坏数据（unsupported/malformed）不计 strike。
 //!
 //! Worker 经 [`ThumbnailWorker`] trait 抽象 → 单测用 mock worker + 内存 DB，不起真实进程。
@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use rusqlite::Connection;
@@ -34,7 +34,7 @@ use exotic_protocol::{RequestBody, WorkerErrorCode};
 use crate::db::queries as q;
 use crate::exotic::fingerprint::thumbnail_fingerprint;
 use crate::exotic::limiter::BackgroundHeavyLimiter;
-use crate::exotic::sink::write_thumbnail_atomic;
+use crate::exotic::sink::prepare_thumbnail;
 use crate::exotic::worker::{default_thumbnail_limits, TaskOutcome, WorkerLimits};
 
 // U-P3(2026-07-16):Worker trait 分类学拆至 `super::worker_traits`(EmbedWorker 只服务
@@ -58,7 +58,7 @@ const YIELD_POLL: Duration = Duration::from_millis(200);
 const CRASH_BACKOFF: Duration = Duration::from_millis(500);
 /// 重试上限（崩溃/超时）。
 const MAX_ATTEMPTS: i64 = 3;
-/// 插件熔断 strike 阈值（进程级/协议级失败累计）。本卷在内存内按 run 计；跨 run 持久化留 Part3。
+/// 插件熔断 strike 阈值（进程级/协议级失败累计）；单轮计数，跨轮冷却由 coordinator 负责。
 const STRIKE_THRESHOLD: u32 = 5;
 /// Worker 池上限（Part2：PSD 快，permits 已封顶并发，进程数无需多）。
 const MAX_POOL: usize = 2;
@@ -73,12 +73,12 @@ pub struct PipelineDeps<'a> {
     pub token: &'a CancellationToken,
     /// items 取数缓存：缩略图结果就地 patch（S3 后唯一 patch 目标——布局行仅存几何，
     /// 出口拼装自本缓存取载荷；真实接线 = AppState 字段）。
-    pub items_cache: &'a crate::layout::items_cache::ItemsCache,
+    pub items_cache: &'a crate::layout::items_cache::ItemsCacheSlot,
     pub cache_dir: PathBuf,
     /// 当前缩略图档位请求尺寸（吸附在指纹/Worker 内做）。
     pub requested_size: u32,
     pub plugin_id: String,
-    /// 合并事件回调（落地一批产物后触发一次；真实接线发 db:media_enriched + exotic:status-changed）。
+    /// 有状态变更时每 500ms 合并通知，退出补发（媒体刷新与任务状态变化）。
     pub on_progress: Arc<dyn Fn() + Send + Sync>,
     /// 让步判定（R1）：scan/thumbnail/interaction 活动时为 true。真实接线注入
     /// `state.should_yield_exotic()`；测试默认返回 false。
@@ -89,6 +89,16 @@ pub struct PipelineDeps<'a> {
     pub is_runnable: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
+/// 流水线退出原因；阻塞与熔断由协调器冷却，取消不消耗失败预算。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineStop {
+    #[default]
+    Drained,
+    Blocked,
+    Cancelled,
+    CircuitOpen,
+}
+
 /// 一次运行统计。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PipelineStats {
@@ -96,8 +106,7 @@ pub struct PipelineStats {
     pub retried: u64,
     pub terminal: u64,
     pub lease_lost: u64,
-    /// 插件是否在本次 run 内熔断。
-    pub circuit_opened: bool,
+    pub stop: PipelineStop,
 }
 
 const CAPABILITY: &str = "thumbnail";
@@ -174,6 +183,12 @@ pub fn run_exotic_pipeline_blocking(
     deps: &PipelineDeps<'_>,
     factory: &dyn WorkerFactory,
 ) -> PipelineStats {
+    if deps.token.is_cancelled() {
+        return PipelineStats {
+            stop: PipelineStop::Cancelled,
+            ..Default::default()
+        };
+    }
     let instance_id = new_instance_id();
     let plugin_id = deps.plugin_id.clone();
 
@@ -192,20 +207,29 @@ pub fn run_exotic_pipeline_blocking(
         Ok(w) => w,
         Err(e) => {
             warn!("exotic：无法创建 Worker（{e}）→ 本次跳过，任务保持 pending");
-            return PipelineStats::default();
+            return PipelineStats {
+                stop: PipelineStop::Blocked,
+                ..Default::default()
+            };
         }
     };
     let worker_version = probe.worker_version();
 
-    // ── 2. Worker 升级失效：把该插件「done 但 worker_version 不同」的任务退回 pending。──
+    // ── 2. Worker 升级失效：把该插件执行版本变化的已完成/失败任务退回 pending。──
     {
         let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
         match q::invalidate_exotic_tasks_for_plugin_version(&conn, &plugin_id, &worker_version) {
             Ok(n) if n > 0 => {
-                info!("exotic：worker 升级失效 {n} 个 done 任务（版本 {worker_version}）")
+                info!("exotic：worker 升级重置 {n} 个缩略图任务（版本 {worker_version}）")
             }
             Ok(_) => {}
-            Err(e) => warn!("exotic：worker 版本失效失败：{e}"),
+            Err(e) => {
+                warn!("exotic：worker 版本失效失败：{e}");
+                return PipelineStats {
+                    stop: PipelineStop::Blocked,
+                    ..Default::default()
+                };
+            }
         }
     }
 
@@ -215,7 +239,7 @@ pub fn run_exotic_pipeline_blocking(
     let (result_tx, result_rx) = bounded::<WorkerResult>(pool_size * 2);
     // 探到的 Worker 放入种子槽，供池线程复用（避免二次 spawn）。
     let seed: Arc<Mutex<Vec<Box<dyn ThumbnailWorker>>>> = Arc::new(Mutex::new(vec![probe]));
-    // 熔断闸：strike 达阈值置位 → Claimer 停止领取。
+    // 熔断闸：停止领取和派发新请求，在途结果仍按原租约收尾。
     let circuit_open = Arc::new(AtomicBool::new(false));
 
     let stats = Arc::new(Mutex::new(PipelineStats::default()));
@@ -232,6 +256,7 @@ pub fn run_exotic_pipeline_blocking(
 
         // Claimer
         {
+            let stats = Arc::clone(&stats);
             let circuit_open = Arc::clone(&circuit_open);
             let plugin_id = plugin_id.clone();
             let worker_version = worker_version.clone();
@@ -244,6 +269,7 @@ pub fn run_exotic_pipeline_blocking(
                     &instance_id,
                     task_tx,
                     &circuit_open,
+                    &stats,
                 );
             });
         }
@@ -254,8 +280,17 @@ pub fn run_exotic_pipeline_blocking(
             let result_tx = result_tx.clone();
             let seed = Arc::clone(&seed);
             let limits = limits.clone();
+            let circuit_open = Arc::clone(&circuit_open);
             s.spawn(move || {
-                worker_loop(deps, factory, &seed, task_rx, result_tx, &limits);
+                worker_loop(
+                    deps,
+                    factory,
+                    &seed,
+                    task_rx,
+                    result_tx,
+                    &limits,
+                    &circuit_open,
+                );
             });
         }
         drop(task_rx);
@@ -295,11 +330,16 @@ pub fn run_exotic_pipeline_blocking(
     }
 
     let mut out = stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    out.circuit_opened = circuit_open.load(Ordering::SeqCst);
+    if deps.token.is_cancelled() {
+        out.stop = PipelineStop::Cancelled;
+    } else if circuit_open.load(Ordering::SeqCst) {
+        out.stop = PipelineStop::CircuitOpen;
+    }
     out
 }
 
 /// Claimer：让步门控 → 原子领取 → 构造请求 → 入 task channel。空批即结束（关闭 channel）。
+#[allow(clippy::too_many_arguments)]
 fn claimer_loop(
     deps: &PipelineDeps<'_>,
     plugin_id: &str,
@@ -307,40 +347,39 @@ fn claimer_loop(
     instance_id: &str,
     task_tx: Sender<ClaimedTask>,
     circuit_open: &AtomicBool,
+    stats: &Mutex<PipelineStats>,
 ) {
     loop {
-        if deps.token.is_cancelled() || circuit_open.load(Ordering::SeqCst) {
+        if deps.dispatch_stopped(circuit_open) {
             break;
         }
         // R1 让步：scan/thumbnail/interaction 活动时暂缓领取新任务（在途不抢占）。
-        while deps.should_yield() && !deps.token.is_cancelled() {
+        while deps.should_yield() && !deps.dispatch_stopped(circuit_open) {
             std::thread::sleep(YIELD_POLL);
         }
-        if deps.token.is_cancelled() {
-            break;
-        }
-        // §5.3 派发前授权复核：运行期 License 失效/插件禁用/卸载 → 停领新批（在途自然完成）。
-        // 与 evaluate_run 的「Pipeline 启动前」检查互补，覆盖「运行期间授权变化」窗口。
-        if !(deps.is_runnable)() {
-            info!("exotic：授权/可领取态在运行期失效，停止领取新批");
+        if deps.dispatch_stopped(circuit_open) {
             break;
         }
 
         let claimed = {
             let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
-            match q::claim_exotic_tasks(
+            q::claim_exotic_tasks(
                 &conn,
                 plugin_id,
                 CAPABILITY,
                 CLAIM_BATCH,
                 instance_id,
                 now_secs(),
-            ) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    warn!("exotic：领取失败：{e}");
-                    break;
-                }
+                worker_version,
+            )
+        };
+        // Writer 先取统计锁再写库；领取失败也必须释放 DB 锁后才更新统计，避免反向等待。
+        let claimed = match claimed {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!("exotic：领取失败：{e}");
+                stats.lock().unwrap_or_else(|e| e.into_inner()).stop = PipelineStop::Blocked;
+                break;
             }
         };
         if claimed.is_empty() {
@@ -348,7 +387,7 @@ fn claimer_loop(
         }
 
         for row in claimed {
-            if deps.token.is_cancelled() {
+            if deps.dispatch_stopped(circuit_open) {
                 return;
             }
             // 取源信息 → 指纹 → 构造请求。
@@ -362,7 +401,7 @@ fn claimer_loop(
                     // 源不可读（item 删除等）→ 标 retryable io，跳过。
                     warn!("exotic：item {} 源不可读：{e}", row.item_id);
                     let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = q::fail_exotic_task(
+                    let failed = q::fail_exotic_task(
                         &conn,
                         row.id,
                         instance_id,
@@ -372,6 +411,11 @@ fn claimer_loop(
                         "源不可读",
                         now_secs() + 30,
                     );
+                    drop(conn);
+                    stats
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_failure(failed);
                     continue;
                 }
             };
@@ -413,39 +457,70 @@ fn worker_loop(
     task_rx: Receiver<ClaimedTask>,
     result_tx: Sender<WorkerResult>,
     limits: &WorkerLimits,
+    circuit_open: &AtomicBool,
 ) {
     let mut worker: Option<Box<dyn ThumbnailWorker>> = None;
-    for task in task_rx {
-        if deps.token.is_cancelled() {
+    'tasks: for task in task_rx {
+        if deps.dispatch_stopped(circuit_open) {
             break;
         }
-        // R4：取共享后台重活 permit（与 derivation 同预算，FIFO 公平）。取消 → 退出（任务由结束清理退回）。
-        let permit = match deps.limiter.acquire(deps.token) {
-            Some(p) => p,
-            None => break,
-        };
-
-        // 确保有活 Worker：先用种子，再 factory.spawn（带崩溃退避）。
-        if worker.as_ref().map(|w| !w.is_alive()).unwrap_or(true) {
-            worker = None;
-            let seeded = seed.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            worker = match seeded {
-                Some(w) => Some(w),
-                None => match factory.spawn() {
-                    Ok(w) => Some(w),
-                    Err(e) => {
-                        warn!("exotic：补充 Worker 失败：{e} → 任务按断开重试");
-                        let _ = result_tx.send(WorkerResult {
-                            task,
-                            outcome: TaskOutcome::Disconnected,
-                        });
-                        drop(permit);
-                        std::thread::sleep(CRASH_BACKOFF);
-                        continue;
-                    }
-                },
+        let permit = loop {
+            // 等待额度期间也可能出现前台活动；取到后再检查，等待让步时不占共享额度。
+            while deps.should_yield() && !deps.dispatch_stopped(circuit_open) {
+                std::thread::sleep(YIELD_POLL);
+            }
+            if deps.dispatch_stopped(circuit_open) {
+                break 'tasks;
+            }
+            let Some(permit) = deps.limiter.acquire_cancellable(&|| {
+                deps.dispatch_stopped(circuit_open) || deps.should_yield()
+            }) else {
+                // 让步时退队等前台空闲；停止派发则由下一轮的同一判定退出。
+                continue;
             };
-        }
+            if deps.should_yield() {
+                drop(permit);
+                continue;
+            }
+            if deps.dispatch_stopped(circuit_open) {
+                break 'tasks;
+            }
+
+            // 确保有活 Worker：先用种子，再 factory.spawn（带崩溃退避）。
+            if worker.as_ref().map(|w| !w.is_alive()).unwrap_or(true) {
+                worker = None;
+                let seeded = seed.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                worker = match seeded {
+                    Some(w) => Some(w),
+                    None => match factory.spawn() {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            drop(permit);
+                            if deps.dispatch_stopped(circuit_open) {
+                                break 'tasks;
+                            }
+                            warn!("exotic：补充 Worker 失败：{e} → 任务按断开重试");
+                            let _ = result_tx.send(WorkerResult {
+                                task,
+                                outcome: TaskOutcome::Disconnected,
+                            });
+                            std::thread::sleep(CRASH_BACKOFF);
+                            continue 'tasks;
+                        }
+                    },
+                };
+            }
+
+            // 握手可能耗时数秒；其间出现停止/前台活动时，不能沿用取额度时的资格。
+            if deps.dispatch_stopped(circuit_open) {
+                break 'tasks;
+            }
+            if deps.should_yield() {
+                drop(permit);
+                continue;
+            }
+            break permit;
+        };
 
         let w = worker.as_mut().unwrap();
         let cancelled = || deps.token.is_cancelled();
@@ -505,9 +580,24 @@ fn writer_loop(
     stats: &Mutex<PipelineStats>,
 ) {
     let mut strikes: u32 = 0;
-    let mut landed_any = false;
+    let mut changed = false;
+    let mut last_notify = Instant::now();
+    const NOTIFY_INTERVAL: Duration = Duration::from_millis(500);
 
-    for res in result_rx {
+    loop {
+        let res = match result_rx.recv_timeout(NOTIFY_INTERVAL) {
+            Ok(res) => res,
+            Err(RecvTimeoutError::Timeout) => {
+                if changed {
+                    (deps.on_progress)();
+                    changed = false;
+                    last_notify = Instant::now();
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        changed = true;
         let WorkerResult { task, outcome } = res;
         let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
@@ -515,16 +605,17 @@ fn writer_loop(
                 width,
                 height,
                 blob,
+                thumbhash,
                 ..
             } => {
                 debug!("exotic：item {} 出图 {}x{}", task.item_id, width, height);
-                match finalize_success(deps, &task, worker_version, instance_id, &blob) {
+                match finalize_success(deps, &task, worker_version, instance_id, &blob, &thumbhash)
+                {
                     Ok(true) => {
                         s.done += 1;
-                        landed_any = true;
                     }
                     Ok(false) => {
-                        // 租约已失（孤儿被另一实例/恢复处理）→ 丢弃，文件留作可回收孤儿。
+                        // 租约或源已失效：丢弃临时文件，不替换当前文件。
                         s.lease_lost += 1;
                     }
                     Err(e) => {
@@ -537,8 +628,8 @@ fn writer_loop(
                             true,
                             WorkerErrorCode::IoError,
                             "sink 失败",
+                            &mut s,
                         );
-                        s.retried += 1;
                     }
                 }
             }
@@ -546,13 +637,15 @@ fn writer_loop(
                 // 数据类错误（unsupported/malformed/resource）→ terminal，不计 strike；
                 // io/internal → retryable。
                 let retryable = body.retryable && body.code.default_retryable();
-                if retryable {
-                    fail_task(deps, &task, instance_id, true, body.code, &body.message);
-                    s.retried += 1;
-                } else {
-                    fail_task(deps, &task, instance_id, false, body.code, &body.message);
-                    s.terminal += 1;
-                }
+                fail_task(
+                    deps,
+                    &task,
+                    instance_id,
+                    retryable,
+                    body.code,
+                    &body.message,
+                    &mut s,
+                );
             }
             TaskOutcome::TimedOut | TaskOutcome::Disconnected => {
                 // 进程级失败 → retryable + strike。
@@ -564,8 +657,8 @@ fn writer_loop(
                     true,
                     WorkerErrorCode::InternalError,
                     "worker 超时/断开",
+                    &mut s,
                 );
-                s.retried += 1;
             }
             TaskOutcome::Protocol(reason) => {
                 // 协议级/非法输出 → terminal invalid_worker_output + strike。
@@ -578,24 +671,29 @@ fn writer_loop(
                     false,
                     WorkerErrorCode::InternalError,
                     "invalid_worker_output",
+                    &mut s,
                 );
-                s.terminal += 1;
             }
         }
         drop(s);
+        if last_notify.elapsed() >= NOTIFY_INTERVAL {
+            (deps.on_progress)();
+            changed = false;
+            last_notify = Instant::now();
+        }
 
         if strikes >= STRIKE_THRESHOLD && !circuit_open.load(Ordering::SeqCst) {
-            warn!("exotic：插件 {plugin_id} strike 达 {strikes} → 本次熔断，停止领取");
+            warn!("exotic：插件 {plugin_id} strike 达 {strikes} → 本次熔断，停止领取与派发");
             circuit_open.store(true, Ordering::SeqCst);
         }
     }
 
-    if landed_any {
+    if changed {
         (deps.on_progress)();
     }
 }
 
-/// 成功路径：原子落盘 → 条件事务（finish task + update media_items）→ layout cache。
+/// 成功路径：准备临时文件 → 条件事务内发布 → 提交 → items cache。
 /// 返回 Ok(true)=本实例落库成功；Ok(false)=租约已失（丢弃）；Err=落盘/DB 错误。
 fn finalize_success(
     deps: &PipelineDeps<'_>,
@@ -603,9 +701,10 @@ fn finalize_success(
     worker_version: &str,
     instance_id: &str,
     blob: &[u8],
+    thumbhash: &[u8],
 ) -> crate::error::Result<bool> {
     // 0. 先做短快照预检并立即释放 writer 锁。source_revision/cache_key 已变化时，
-    // 直接丢弃迟到结果，避免它先覆盖同一 cache_key 的文件；最终 DB CAS 仍在落盘后复核。
+    // 直接丢弃迟到结果，避免无用文件 IO；最终 DB CAS 在发布前复核源与租约。
     let source_current = {
         let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
         q::is_exotic_source_current(&conn, task.item_id, task.source_revision, task.cache_key)?
@@ -614,11 +713,11 @@ fn finalize_success(
         return Ok(false);
     }
 
-    // 1. 先文件：原子落盘 + Host 计算 thumbhash。
-    let sink = write_thumbnail_atomic(&deps.cache_dir, task.tier, task.cache_key, blob)?;
+    // 1. 慢文件 IO 在锁外准备，暂不替换最终文件。ThumbHash 已由宿主受限解码计算。
+    let sink = prepare_thumbnail(&deps.cache_dir, task.tier, task.cache_key, blob)?;
 
-    // 2. 后 DB：条件事务（status=1 AND lease_owner=instance），同事务回填 media_items。
-    let committed = {
+    // 2. 条件 UPDATE 取得跨进程 SQLite 写锁后才允许 rename；提交前其他 owner 无法抢租约。
+    {
         let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         let ok = q::finish_exotic_task(
@@ -639,32 +738,33 @@ fn finalize_success(
                 task.cache_key,
                 1,
                 Some(&sink.thumb_db_path),
-                Some(&sink.thumbhash),
+                Some(thumbhash),
             )? == 1
         } else {
             false
         };
+        if !ok || !thumb_applied {
+            return Ok(false);
+        }
+        sink.publish()?;
         tx.commit()?;
-        (ok, thumb_applied)
-    };
+    }
 
     // 3. 同步 items 取数缓存（S3：布局行仅存几何，出口拼装自 items 缓存取载荷——
     //    patch 单点即可使产物在滚出再滚回时立即可见，无需整表重算）。
-    if committed.0 && committed.1 {
-        let thumb = crate::db::models::ThumbResult {
-            item_id: task.item_id,
-            thumb_status: 1,
-            thumb_path: Some(sink.thumb_db_path),
-            thumbhash: Some(sink.thumbhash),
-            source_revision: task.source_revision,
-            cache_key: task.cache_key,
-        };
-        crate::layout::items_cache::apply_thumb_results(
-            deps.items_cache,
-            std::slice::from_ref(&thumb),
-        );
+    let thumb = crate::db::models::ThumbResult {
+        item_id: task.item_id,
+        thumb_status: 1,
+        thumb_path: Some(sink.thumb_db_path.clone()),
+        thumbhash: Some(thumbhash.to_vec()),
+        source_revision: task.source_revision,
+        cache_key: task.cache_key,
+    };
+    {
+        let slot = deps.items_cache.read().unwrap_or_else(|e| e.into_inner());
+        crate::layout::items_cache::apply_thumb_results(&slot, std::slice::from_ref(&thumb));
     }
-    Ok(committed.0)
+    Ok(true)
 }
 
 /// 失败路径：条件 fail（retryable 计退避，terminal 不退避）。
@@ -675,6 +775,7 @@ fn fail_task(
     retryable: bool,
     code: WorkerErrorCode,
     message: &str,
+    stats: &mut PipelineStats,
 ) {
     let next_retry_at = if retryable {
         now_secs() + backoff_secs(task.attempts, code)
@@ -682,7 +783,7 @@ fn fail_task(
         0
     };
     let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = q::fail_exotic_task(
+    stats.record_failure(q::fail_exotic_task(
         &conn,
         task.task_id,
         instance_id,
@@ -691,8 +792,20 @@ fn fail_task(
         code.as_str(),
         message,
         next_retry_at,
-    ) {
-        warn!("exotic：标记失败写库错误：{e}");
+    ));
+}
+
+impl PipelineStats {
+    fn record_failure(&mut self, result: crate::error::Result<q::ExoticFailureOutcome>) {
+        match result {
+            Ok(q::ExoticFailureOutcome::RetryScheduled) => self.retried += 1,
+            Ok(q::ExoticFailureOutcome::Terminal) => self.terminal += 1,
+            Ok(q::ExoticFailureOutcome::LeaseLost) => self.lease_lost += 1,
+            Err(e) => {
+                warn!("exotic：标记失败写库错误：{e}");
+                self.stop = PipelineStop::Blocked;
+            }
+        }
     }
 }
 
@@ -709,6 +822,11 @@ fn backoff_secs(attempts: i64, code: WorkerErrorCode) -> i64 {
 }
 
 impl<'a> PipelineDeps<'a> {
+    /// 仅约束尚未开始的请求；在途请求是否中断仍由用户取消 token 决定。
+    fn dispatch_stopped(&self, circuit_open: &AtomicBool) -> bool {
+        self.token.is_cancelled() || circuit_open.load(Ordering::SeqCst) || !(self.is_runnable)()
+    }
+
     /// 让步判定（注入闭包；测试默认不让步）。
     fn should_yield(&self) -> bool {
         (self.should_yield)()
@@ -733,6 +851,7 @@ mod tests {
     #[derive(Clone)]
     enum Behavior {
         Success,
+        SuccessAndOpenCircuit(Arc<AtomicBool>),
         Failure {
             code: WorkerErrorCode,
             retryable: bool,
@@ -759,15 +878,22 @@ mod tests {
             req: &RequestBody,
             _limits: &WorkerLimits,
             _timeout: Duration,
-            _cancelled: &dyn Fn() -> bool,
+            cancelled: &dyn Fn() -> bool,
         ) -> TaskOutcome {
             match self.behavior.clone() {
-                Behavior::Success => TaskOutcome::Success {
-                    width: 480,
-                    height: 240,
-                    mime: "image/webp".into(),
-                    blob: make_webp(480, 240),
-                },
+                Behavior::Success | Behavior::SuccessAndOpenCircuit(_) => {
+                    if let Behavior::SuccessAndOpenCircuit(circuit) = &self.behavior {
+                        circuit.store(true, Ordering::SeqCst);
+                        assert!(!cancelled(), "熔断不应中断已在途请求");
+                    }
+                    TaskOutcome::Success {
+                        width: 480,
+                        height: 240,
+                        mime: "image/webp".into(),
+                        blob: make_webp(480, 240),
+                        thumbhash: vec![1, 2, 3],
+                    }
+                }
                 Behavior::Failure { code, retryable } => TaskOutcome::Failure(FailureBody {
                     item_id: req.item_id(),
                     input_fingerprint: req.input_fingerprint().map(String::from),
@@ -804,6 +930,337 @@ mod tests {
         buf
     }
 
+    fn claim_test_task(conn: &Connection, item_id: i64, owner: &str) -> ClaimedTask {
+        let row = q::claim_exotic_tasks(conn, PID, CAPABILITY, 1, owner, 1000, "mock-1.0.0")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let src = q::exotic_item_source(conn, item_id).unwrap();
+        ClaimedTask {
+            task_id: row.id,
+            item_id,
+            source_revision: src.source_revision,
+            cache_key: src.cache_key,
+            fingerprint: "fp".into(),
+            tier: TIER,
+            attempts: row.attempts,
+            request: RequestBody::Thumbnail {
+                item_id,
+                source_path: src.abs_path,
+                target_long_edge: TIER,
+                input_fingerprint: "fp".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn startup_failure_exits_without_claiming_or_retrying() {
+        struct FailingFactory(std::sync::atomic::AtomicUsize);
+        impl WorkerFactory for FailingFactory {
+            fn spawn(&self) -> Result<Box<dyn ThumbnailWorker>, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("unavailable".into())
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _) = setup_db(&conn);
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let factory = FailingFactory(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            run_exotic_pipeline_blocking(&d, &factory).stop,
+            PipelineStop::Blocked
+        );
+        assert_eq!(factory.0.load(Ordering::SeqCst), 1);
+        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 0);
+        token.cancel();
+        assert_eq!(
+            run_exotic_pipeline_blocking(&d, &factory).stop,
+            PipelineStop::Cancelled
+        );
+        assert_eq!(factory.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn foreground_activity_after_permit_prevents_new_decode() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _) = setup_db(&conn);
+        let task = claim_test_task(&conn, item_id, "A");
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let cancelled = token.clone();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        d.should_yield = Arc::new(move || {
+            if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                false
+            } else {
+                cancelled.cancel();
+                true
+            }
+        });
+        let (tasks, task_rx) = bounded(1);
+        tasks.send(task).unwrap();
+        drop(tasks);
+        let (results, result_rx) = bounded(1);
+        let factory = MockFactory {
+            behavior: Behavior::Success,
+        };
+        worker_loop(
+            &d,
+            &factory,
+            &Arc::new(Mutex::new(Vec::new())),
+            task_rx,
+            results,
+            &default_thumbnail_limits(),
+            &AtomicBool::new(false),
+        );
+        assert!(result_rx.try_recv().is_err(), "已让步的任务不得继续解码");
+        assert_eq!(limiter.available(), limiter.total());
+    }
+
+    #[test]
+    fn authorization_revoked_during_yield_exits_without_claiming() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _) = setup_db(&conn);
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let allowed = Arc::new(AtomicBool::new(true));
+        let observed = Arc::clone(&allowed);
+        d.is_runnable = Arc::new(move || observed.load(Ordering::SeqCst));
+        let (yielding, entered) = bounded(1);
+        d.should_yield = Arc::new(move || {
+            let _ = yielding.try_send(());
+            true
+        });
+        let factory = MockFactory {
+            behavior: Behavior::Success,
+        };
+        let (done_tx, done_rx) = bounded(1);
+        let finished = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = done_tx.send(run_exotic_pipeline_blocking(&d, &factory));
+            });
+            let entered_wait = entered.recv_timeout(Duration::from_secs(2));
+            allowed.store(false, Ordering::SeqCst);
+            let finished = done_rx.recv_timeout(Duration::from_secs(1));
+            // 无论断言结果如何都解除旧实现的等待，不能让失败回归挂住整个测试进程。
+            token.cancel();
+            assert!(entered_wait.is_ok());
+            finished
+        });
+        assert!(finished.is_ok(), "授权失效应结束让步等待，无需用户另点取消");
+        let conn = writer.lock().unwrap();
+        assert_eq!(task_status(&conn, item_id), 0);
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT attempts FROM exotic_tasks WHERE item_id=?1",
+                [item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn circuit_during_permit_wait_exits_without_new_decode() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _) = setup_db(&conn);
+        let task = claim_test_task(&conn, item_id, "A");
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(1);
+        let token = CancellationToken::new();
+        let held = limiter.acquire(&token).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let (checked, entered) = bounded(1);
+        d.is_runnable = Arc::new(move || {
+            let _ = checked.try_send(());
+            true
+        });
+        let (tasks, task_rx) = bounded(1);
+        tasks.send(task).unwrap();
+        drop(tasks);
+        let (results, result_rx) = bounded(1);
+        let seed = Arc::new(Mutex::new(Vec::new()));
+        let limits = default_thumbnail_limits();
+        let circuit = AtomicBool::new(false);
+        let factory = MockFactory {
+            behavior: Behavior::Success,
+        };
+        let (done_tx, done_rx) = bounded(1);
+        let finished = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                worker_loop(&d, &factory, &seed, task_rx, results, &limits, &circuit);
+                let _ = done_tx.send(());
+            });
+            let entered_wait = entered.recv_timeout(Duration::from_secs(2));
+            circuit.store(true, Ordering::SeqCst);
+            let finished = done_rx.recv_timeout(Duration::from_secs(1));
+            token.cancel();
+            assert!(entered_wait.is_ok());
+            finished
+        });
+        assert!(
+            finished.is_ok(),
+            "熔断应退出额度等待，不必等其他任务释放额度"
+        );
+        assert!(result_rx.try_recv().is_err());
+        assert_eq!(limiter.available(), 0, "已有持有者不受影响");
+        drop(held);
+        assert_eq!(limiter.available(), 1);
+    }
+
+    #[test]
+    fn authorization_revoked_during_spawn_prevents_new_decode() {
+        struct RevokingFactory(Arc<AtomicBool>);
+        impl WorkerFactory for RevokingFactory {
+            fn spawn(&self) -> Result<Box<dyn ThumbnailWorker>, String> {
+                self.0.store(false, Ordering::SeqCst);
+                MockFactory {
+                    behavior: Behavior::Success,
+                }
+                .spawn()
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _) = setup_db(&conn);
+        let task = claim_test_task(&conn, item_id, "A");
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(1);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let allowed = Arc::new(AtomicBool::new(true));
+        let observed = Arc::clone(&allowed);
+        d.is_runnable = Arc::new(move || observed.load(Ordering::SeqCst));
+        let (tasks, task_rx) = bounded(1);
+        tasks.send(task).unwrap();
+        drop(tasks);
+        let (results, result_rx) = bounded(1);
+        worker_loop(
+            &d,
+            &RevokingFactory(allowed),
+            &Arc::new(Mutex::new(Vec::new())),
+            task_rx,
+            results,
+            &default_thumbnail_limits(),
+            &AtomicBool::new(false),
+        );
+        assert!(result_rx.try_recv().is_err(), "握手后失去授权不得开始解码");
+        assert_eq!(limiter.available(), 1);
+    }
+
+    #[test]
+    fn in_flight_result_survives_circuit_opening() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _) = setup_db(&conn);
+        let task = claim_test_task(&conn, item_id, "A");
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(1);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let circuit = Arc::new(AtomicBool::new(false));
+        let factory = MockFactory {
+            behavior: Behavior::SuccessAndOpenCircuit(Arc::clone(&circuit)),
+        };
+        let (tasks, task_rx) = bounded(1);
+        tasks.send(task).unwrap();
+        drop(tasks);
+        let (results, result_rx) = bounded(1);
+        worker_loop(
+            &d,
+            &factory,
+            &Arc::new(Mutex::new(Vec::new())),
+            task_rx,
+            results,
+            &default_thumbnail_limits(),
+            &circuit,
+        );
+        assert!(circuit.load(Ordering::SeqCst));
+        // 已在途的有效结果继续交给原 Writer，验证它仍能正常提交。
+        let stats = Mutex::new(PipelineStats::default());
+        writer_loop(&d, PID, "mock-1.0.0", "A", result_rx, &circuit, &stats);
+        assert_eq!(stats.lock().unwrap().done, 1);
+        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 2);
+        assert_eq!(limiter.available(), 1);
+    }
+
+    #[test]
+    fn writer_notifies_before_close_and_counts_exhausted_retry_as_terminal() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, _) = setup_db(&conn);
+        conn.execute("UPDATE exotic_tasks SET attempts=2", [])
+            .unwrap();
+        let task = claim_test_task(&conn, item_id, "A");
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let (notified_tx, notified_rx) = std::sync::mpsc::channel();
+        d.on_progress = Arc::new(move || {
+            let _ = notified_tx.send(());
+        });
+        let (tx, rx) = bounded(1);
+        let stats = Mutex::new(PipelineStats::default());
+        let circuit = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| writer_loop(&d, PID, "mock-1.0.0", "A", rx, &circuit, &stats));
+            tx.send(WorkerResult {
+                task,
+                outcome: TaskOutcome::Failure(FailureBody {
+                    item_id: Some(item_id),
+                    input_fingerprint: Some("fp".into()),
+                    code: WorkerErrorCode::IoError,
+                    retryable: true,
+                    message: "busy".into(),
+                }),
+            })
+            .unwrap();
+            let notified = notified_rx.recv_timeout(Duration::from_secs(2));
+            drop(tx);
+            assert!(notified.is_ok(), "通道尚未结束时应已通知进度");
+        });
+        let stats = stats.into_inner().unwrap();
+        assert_eq!((stats.retried, stats.terminal), (0, 1));
+        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 4);
+    }
+
+    #[test]
+    fn publish_failure_rolls_back_done_and_removes_temporary_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, cache_key) = setup_db(&conn);
+        let task = claim_test_task(&conn, item_id, "A");
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        // 最终路径是目录，制造 rename 失败，验证未提交的 done 会回滚。
+        std::fs::create_dir_all(crate::thumbnail::cache::thumb_path(
+            dir.path(),
+            TIER,
+            cache_key,
+        ))
+        .unwrap();
+        assert!(finalize_success(&d, &task, "mock-1.0.0", "A", &make_webp(20, 20), &[1]).is_err());
+        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 1);
+        assert!(!walkdir::WalkDir::new(dir.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|e| e.path().extension().is_some_and(|ext| ext == "tmp")));
+    }
+
     /// 建库 + 插入 root/dir/media(psd) + 播种 thumbnail 任务。返回 (item_id, cache_key)。
     fn setup_db(conn: &Connection) -> (i64, i64) {
         crate::db::schema::initialize_schema(conn).unwrap();
@@ -835,10 +1292,10 @@ mod tests {
     }
 
     /// 测试共享的进程级 items 缓存（初始 None、测试不读它——真实接线见 coordinator）。
-    fn test_items_cache() -> &'static crate::layout::items_cache::ItemsCache {
-        static CACHE: std::sync::OnceLock<crate::layout::items_cache::ItemsCache> =
+    fn test_items_cache() -> &'static crate::layout::items_cache::ItemsCacheSlot {
+        static CACHE: std::sync::OnceLock<crate::layout::items_cache::ItemsCacheSlot> =
             std::sync::OnceLock::new();
-        CACHE.get_or_init(crate::layout::items_cache::new_items_cache)
+        CACHE.get_or_init(crate::layout::items_cache::new_items_cache_slot)
     }
 
     fn deps<'a>(
@@ -908,10 +1365,11 @@ mod tests {
     fn stale_source_snapshot_cannot_finalize_or_patch_cover() {
         let conn = Connection::open_in_memory().unwrap();
         let (item_id, _cache_key) = setup_db(&conn);
-        let claimed = q::claim_exotic_tasks(&conn, PID, CAPABILITY, 1, "old-worker", 1000)
-            .unwrap()
-            .pop()
-            .unwrap();
+        let claimed =
+            q::claim_exotic_tasks(&conn, PID, CAPABILITY, 1, "old-worker", 1000, "mock-1.0.0")
+                .unwrap()
+                .pop()
+                .unwrap();
         let source = q::exotic_item_source(&conn, item_id).unwrap();
         let task = ClaimedTask {
             task_id: claimed.id,
@@ -947,10 +1405,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_dir);
         let d = deps(&writer, &limiter, &token, cache_dir.clone());
 
-        assert!(
-            !finalize_success(&d, &task, "mock-1.0.0", "old-worker", &make_webp(480, 240),)
-                .unwrap()
-        );
+        assert!(!finalize_success(
+            &d,
+            &task,
+            "mock-1.0.0",
+            "old-worker",
+            &make_webp(480, 240),
+            &[1, 2, 3]
+        )
+        .unwrap());
 
         let conn = writer.lock().unwrap();
         let task_status: i64 = conn
@@ -987,8 +1450,16 @@ mod tests {
         let (item_id, _) = setup_db(&conn);
         // 模拟已死实例的过期租约:claimed_at 早于 now - LEASE_TTL_SECS。
         let stale_at = now_secs() - LEASE_TTL_SECS - 60;
-        let claimed =
-            q::claim_exotic_tasks(&conn, PID, CAPABILITY, 10, "dead-instance", stale_at).unwrap();
+        let claimed = q::claim_exotic_tasks(
+            &conn,
+            PID,
+            CAPABILITY,
+            10,
+            "dead-instance",
+            stale_at,
+            "mock-1.0.0",
+        )
+        .unwrap();
         assert_eq!(claimed.len(), 1);
         // 死锁面:此刻无就绪任务 → Coordinator 的 evaluate_run 不会启动 pipeline。
         assert!(!q::has_ready_exotic_task(&conn, PID, CAPABILITY, now_secs()).unwrap());
@@ -1003,7 +1474,16 @@ mod tests {
         );
         assert!(q::has_ready_exotic_task(&conn, PID, CAPABILITY, now_secs()).unwrap());
         // 对偶面:活租约(claimed_at=now)不得被误清。
-        let _ = q::claim_exotic_tasks(&conn, PID, CAPABILITY, 10, "alive", now_secs()).unwrap();
+        let _ = q::claim_exotic_tasks(
+            &conn,
+            PID,
+            CAPABILITY,
+            10,
+            "alive",
+            now_secs(),
+            "mock-1.0.0",
+        )
+        .unwrap();
         let writer = Mutex::new(conn);
         assert_eq!(recover_stale_exotic_leases(&writer), 0, "活租约不得回收");
     }
@@ -1134,20 +1614,39 @@ mod tests {
         b
     }
 
-    /// 端到端：**真实** psd-worker 子进程穿过整条 Pipeline + 原子 Sink（仅设
-    /// `EXOTIC_PSD_WORKER_PATH` 时运行）。证明 spawn→握手→解 PSD→Host 验证→落盘→条件 DB 全链路。
+    /// 真实 psd-worker 穿过 Pipeline + Sink。显式 `--ignored` 启用并提供
+    /// `EXOTIC_PSD_WORKER_PATH`，证明 spawn→握手→解 PSD→Host 验证→落盘→条件 DB 全链路。
+    /// 可用 `EXOTIC_PSD_SAMPLE_PATH` 注入真实样本（仅复制到临时目录），
+    /// `EXOTIC_PSD_OUTPUT_PATH` 可保留产物供目视验收。
     #[test]
+    #[ignore = "需要 EXOTIC_PSD_WORKER_PATH 指向真实 PSD worker"]
     fn real_worker_pipeline_end_to_end() {
         use crate::exotic::worker::resolve_psd_worker_path;
-        let Some(exe) = resolve_psd_worker_path() else {
-            eprintln!("[skip] 未设 EXOTIC_PSD_WORKER_PATH，跳过真实 Worker pipeline e2e");
-            return;
-        };
-        // 用专属临时目录做 scan_root，写入真实合成 PSD。
-        let root = std::env::temp_dir().join(format!("exotic-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("synthetic.psd"), make_rgb_psd(300, 200)).unwrap();
+        let exe = resolve_psd_worker_path().expect("必须设置 EXOTIC_PSD_WORKER_PATH");
+        // 真实样本也复制到独立 scan_root，避免验收过程中写入用户样本目录。
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = root.join("synthetic.psd");
+        if let Some(sample) = std::env::var_os("EXOTIC_PSD_SAMPLE_PATH") {
+            std::fs::copy(sample, &source).expect("复制 PSD 验收样本");
+        } else {
+            std::fs::write(&source, make_rgb_psd(300, 200)).unwrap();
+        }
+        use std::io::Read;
+        let mut header = [0u8; 26];
+        std::fs::File::open(&source)
+            .unwrap()
+            .read_exact(&mut header)
+            .unwrap();
+        assert_eq!(&header[..4], b"8BPS");
+        let source_height = u32::from_be_bytes(header[14..18].try_into().unwrap());
+        let source_width = u32::from_be_bytes(header[18..22].try_into().unwrap());
+        assert!(source_width > 0 && source_height > 0);
+        let scale = (TIER as f64 / source_width.max(source_height) as f64).min(1.0);
+        let expected_dims = (
+            (source_width as f64 * scale).round().max(1.0) as u32,
+            (source_height as f64 * scale).round().max(1.0) as u32,
+        );
 
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::initialize_schema(&conn).unwrap();
@@ -1194,11 +1693,161 @@ mod tests {
                 max_blob_len: exotic_protocol::MAX_BLOB_LEN,
             },
         };
+        let start = Instant::now();
         let stats = run_exotic_pipeline_blocking(&d, &factory);
-        assert_eq!(stats.done, 1, "真实 Worker 应出图 1 张");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            stats,
+            PipelineStats {
+                done: 1,
+                ..Default::default()
+            },
+            "真实 Worker 应完成 1 张，无重试/终态/租约丢失"
+        );
         assert_eq!(task_status(&writer.lock().unwrap(), item_id), 2);
-        assert!(crate::thumbnail::cache::thumb_path(&cache_dir, TIER, cache_key).exists());
-        let _ = std::fs::remove_dir_all(&root);
+        let output = crate::thumbnail::cache::thumb_path(&cache_dir, TIER, cache_key);
+        let webp = std::fs::read(&output).expect("完成任务必须有落盘文件");
+        let decoded = image::load_from_memory_with_format(&webp, image::ImageFormat::WebP)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(decoded.dimensions(), expected_dims);
+        let expected_hash =
+            crate::thumbnail::thumbhash::generate_thumbhash(&crate::engine::traits::DecodedImage {
+                width: decoded.width(),
+                height: decoded.height(),
+                pixels: decoded.into_raw(),
+                icc: None,
+            })
+            .unwrap();
+        let conn = writer.lock().unwrap();
+        let (status, path, hash): (i64, String, Vec<u8>) = conn
+            .query_row(
+                "SELECT thumb_status, thumb_path, thumbhash FROM media_items WHERE id=?1",
+                rusqlite::params![item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, 1);
+        assert_eq!(cache_dir.join("thumbnails").join(path), output);
+        assert_eq!(hash, expected_hash);
+        if let Some(destination) = std::env::var_os("EXOTIC_PSD_OUTPUT_PATH") {
+            let destination = PathBuf::from(destination);
+            std::fs::create_dir_all(destination.parent().expect("产物须指定父目录")).unwrap();
+            std::fs::copy(&output, destination).expect("保留 PSD 验收产物");
+        }
+        eprintln!(
+            "PSD source={}x{} output={}x{} webp_bytes={} pipeline_ms={:.2}",
+            source_width,
+            source_height,
+            expected_dims.0,
+            expected_dims.1,
+            webp.len(),
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
+    /// 真实 RAW worker 的 Failure 穿过领取、回声校验、失败预算与 DB 写回，不依赖相机样张。
+    #[test]
+    #[ignore = "需要 EXOTIC_RAW_WORKER_PATH 指向真实 RAW worker"]
+    fn real_raw_worker_pipeline_failures() {
+        let exe =
+            std::env::var_os("EXOTIC_RAW_WORKER_PATH").expect("必须设置 EXOTIC_RAW_WORKER_PATH");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("malformed.dng"), [0xabu8; 64]).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let (malformed_id, _) = setup_db(&conn);
+        const RAW_PID: &str = "exotic-image-raw";
+        conn.execute(
+            "UPDATE scan_roots SET path=?1",
+            rusqlite::params![dir.path().to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE media_items SET file_name=?1, file_format=?2 WHERE id=?3",
+            rusqlite::params!["malformed.dng", "dng", malformed_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE exotic_tasks SET plugin_id=?1 WHERE item_id=?2",
+            rusqlite::params![RAW_PID, malformed_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items
+                (directory_id, file_name, file_size, file_mtime, file_format,
+                 media_type, width, height, sort_datetime, cache_key)
+             SELECT directory_id, ?1, file_size, file_mtime, file_format,
+                    media_type, width, height, sort_datetime, cache_key+1
+             FROM media_items WHERE id=?2",
+            rusqlite::params!["missing.dng", malformed_id],
+        )
+        .unwrap();
+        let missing_id = conn.last_insert_rowid();
+        q::seed_exotic_tasks_for_item(&conn, missing_id, RAW_PID, &[CAPABILITY.into()]).unwrap();
+
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let cache_dir = dir.path().join("cache");
+        let mut d = deps(&writer, &limiter, &token, cache_dir.clone());
+        d.plugin_id = RAW_PID.into();
+        let notifications = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&notifications);
+        d.on_progress = Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let factory = SupervisorFactory {
+            spec: WorkerSpec {
+                exe_path: exe.into(),
+                expected_worker_id: "raw-worker".into(),
+                required_capabilities: vec![CAPABILITY.into()],
+            },
+            cfg: WorkerConfig {
+                handshake_timeout: Duration::from_secs(5),
+                host_version: "0.1.0".into(),
+                max_blob_len: exotic_protocol::MAX_BLOB_LEN,
+            },
+        };
+        let start = Instant::now();
+        let stats = run_exotic_pipeline_blocking(&d, &factory);
+        assert_eq!(
+            stats,
+            PipelineStats {
+                terminal: 1,
+                retried: 1,
+                ..Default::default()
+            }
+        );
+        assert!(notifications.load(Ordering::SeqCst) > 0);
+        let conn = writer.lock().unwrap();
+        for (id, expected_status, expected_code) in [
+            (malformed_id, 4, "malformed_input"),
+            (missing_id, 3, "io_error"),
+        ] {
+            conn.query_row(
+                "SELECT status, attempts, last_error_code, next_retry_at, lease_owner, worker_version
+                 FROM exotic_tasks WHERE item_id=?1",
+                rusqlite::params![id],
+                |row| {
+                    assert_eq!(row.get::<_, i64>(0)?, expected_status);
+                    assert_eq!(row.get::<_, i64>(1)?, 1);
+                    assert_eq!(row.get::<_, String>(2)?, expected_code);
+                    assert_eq!(
+                        row.get::<_, Option<i64>>(3)?.is_some(),
+                        expected_status == 3
+                    );
+                    assert!(row.get::<_, Option<String>>(4)?.is_none());
+                    assert!(!row.get::<_, String>(5)?.is_empty());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert!(!cache_dir.exists(), "失败任务不应写入缩略图");
+        eprintln!(
+            "RAW failure_pipeline_ms={:.2}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     #[test]
@@ -1225,5 +1874,59 @@ mod tests {
             0,
             "取消后任务仍 pending"
         );
+    }
+
+    #[test]
+    fn late_owner_cannot_replace_committed_thumbnail() {
+        let conn = Connection::open_in_memory().unwrap();
+        let (item_id, cache_key) = setup_db(&conn);
+        let row = q::claim_exotic_tasks(&conn, PID, CAPABILITY, 1, "old", 1000, "mock-1.0.0")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let src = q::exotic_item_source(&conn, item_id).unwrap();
+        let task = ClaimedTask {
+            task_id: row.id,
+            item_id,
+            source_revision: src.source_revision,
+            cache_key,
+            fingerprint: "fp".into(),
+            tier: TIER,
+            attempts: 0,
+            request: RequestBody::Thumbnail {
+                item_id,
+                source_path: src.abs_path,
+                target_long_edge: TIER,
+                input_fingerprint: "fp".into(),
+            },
+        };
+        q::release_exotic_instance_leases(&conn, "old").unwrap();
+        q::claim_exotic_tasks(&conn, PID, CAPABILITY, 1, "new", 2000, "mock-1.0.0").unwrap();
+        let writer = Mutex::new(conn);
+        let limiter = BackgroundHeavyLimiter::new(2);
+        let token = CancellationToken::new();
+        let dir = tempfile::tempdir().unwrap();
+        let d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
+        let current = make_webp(20, 20);
+        assert!(finalize_success(&d, &task, "mock-1.0.0", "new", &current, &[1, 2, 3]).unwrap());
+        assert!(!finalize_success(
+            &d,
+            &task,
+            "mock-1.0.0",
+            "old",
+            &make_webp(10, 10),
+            &[4, 5, 6]
+        )
+        .unwrap());
+        assert_eq!(
+            std::fs::read(crate::thumbnail::cache::thumb_path(
+                dir.path(),
+                TIER,
+                cache_key
+            ))
+            .unwrap(),
+            current
+        );
+        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 2);
     }
 }

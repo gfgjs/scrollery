@@ -96,14 +96,23 @@ pub fn batch_update_ai_status_guarded(
     Ok(n)
 }
 
-/// 获取给定模型的所有嵌入向量（用于内存余弦搜索）。
-pub fn get_all_embeddings(conn: &Connection, model_name: &str) -> Result<Vec<(i64, Vec<u8>)>> {
+/// 逐行借用给定模型的嵌入 BLOB；调用方在当前行内消费，避免物化原始向量全集。
+pub fn for_each_embedding(
+    conn: &Connection,
+    model_name: &str,
+    mut visit: impl FnMut(i64, &[u8]),
+) -> Result<()> {
     let mut stmt =
         conn.prepare("SELECT item_id, embedding FROM ai_embeddings WHERE model_name=?1")?;
-    let rows = stmt.query_map(params![model_name], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    rows.map(|r| r.map_err(AppError::from)).collect()
+    let mut rows = stmt.query(params![model_name])?;
+    while let Some(row) = rows.next()? {
+        let value = row.get_ref(1)?;
+        let blob = value.as_blob().map_err(|_| {
+            rusqlite::Error::InvalidColumnType(1, "embedding".into(), value.data_type())
+        })?;
+        visit(row.get(0)?, blob);
+    }
+    Ok(())
 }
 
 /// 统计某个模型已经写入的向量数量；这是语义搜索真实可用的覆盖数。

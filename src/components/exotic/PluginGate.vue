@@ -12,6 +12,11 @@
     <span class="gate__muted-text">{{ $t('exotic.gateChecking') }}</span>
   </div>
 
+  <div v-else-if="failed" class="gate gate--blocked">
+    <span>{{ $t('official.queryFailed') }}</span>
+    <button class="btn btn-ghost" @click="emit('retry')">{{ $t('official.retry') }}</button>
+  </div>
+
   <!-- 放行 / 已授权：直接渲染被包裹的真实功能。 -->
   <slot v-else-if="mode === 'passthrough' || mode === 'authorized'" />
 
@@ -23,10 +28,6 @@
     <div class="gate__body">
       <div class="gate__title">{{ featureName || $t('exotic.gateTitle') }}</div>
       <p class="gate__desc">{{ featureDesc || $t('exotic.gateDescGeneric') }}</p>
-      <div v-if="sku" class="gate__sku">
-        <span class="gate__sku-label">{{ $t('exotic.gateSku') }}</span>
-        <code class="gate__sku-code">{{ sku }}</code>
-      </div>
 
       <div class="gate__actions">
         <!-- 购买：跳商店页；无链接则禁用并给出说明（不隐藏，保持可预期）。 -->
@@ -63,7 +64,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { AlertTriangle, ExternalLink, KeyRound, Lock } from '@lucide/vue'
-import { open as shellOpen } from '@tauri-apps/plugin-shell'
+import { openPurchase, purchaseUrl } from '../../utils/openPurchase'
 import { useI18n } from 'vue-i18n'
 
 import type { PluginEntitlement } from '../../types/exotic'
@@ -79,6 +80,7 @@ interface Props {
   entitlement: PluginEntitlement | null
   /** 判定尚在拉取中（显示轻量占位）。 */
   loading?: boolean
+  failed?: boolean
   /** 受门控功能的人类可读名称（如「PSD 预览」）；缺省用通用标题。 */
   featureName?: string
   /** 功能说明（缺省用通用文案）。 */
@@ -87,12 +89,13 @@ interface Props {
 
 const props = withDefaults(defineProps<Props>(), {
   loading: false,
+  failed: false,
   featureName: '',
   featureDesc: '',
 })
 
 /** 用户点「已购买 · 激活」——父组件据此打开激活流程。 */
-const emit = defineEmits<{ (e: 'activate'): void }>()
+const emit = defineEmits<{ (e: 'activate'): void; (e: 'retry'): void }>()
 
 const { t } = useI18n()
 const toast = useToastStore()
@@ -100,8 +103,7 @@ const toast = useToastStore()
 // 渲染分支：复用 composable 的纯分类函数（单一事实源）。
 const mode = computed(() => gateModeFor(props.entitlement))
 
-const sku = computed(() => props.entitlement?.sku ?? null)
-const storeUrl = computed(() => props.entitlement?.storeUrl ?? null)
+const storeUrl = computed(() => purchaseUrl(props.entitlement?.storeUrl ?? null))
 
 // 购买按钮文案随可用态微调：未安装→获取；已装未授权→购买授权；过期→续订。
 const buyLabel = computed(() => {
@@ -143,9 +145,9 @@ async function openStore() {
   if (!url || openingStore.value) return
   openingStore.value = true
   try {
-    await shellOpen(url)
-  } catch (e) {
-    toast.addToast('error', t('exotic.gateOpenStoreFailed', { error: e }))
+    await openPurchase(url)
+  } catch {
+    toast.addToast('error', t('official.openFailed'))
   } finally {
     openingStore.value = false
   }

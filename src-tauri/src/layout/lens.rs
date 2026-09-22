@@ -549,6 +549,24 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(total, (36.0 + 0.0 + 100.0 + 0.0) * 2.0);
+        // 模式、宽度与行高不进入顺序键；两种打包必须保留同一镜头的完整成员序。
+        let narrow = LayoutParams {
+            container_width: 150.0,
+            target_row_height: 60.0,
+            ..params
+        };
+        let (justified, _) = compute_lens_layout_justified(&slices, &narrow, Some(1.0));
+        let flatten = |rows: &[LayoutRow]| -> Vec<i64> {
+            rows.iter()
+                .filter_map(|row| match row {
+                    LayoutRow::Normal { items, .. } => Some(items.iter().map(|item| item.id)),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        assert_eq!(flatten(&rows), vec![4, 3, 2, 1]);
+        assert_eq!(flatten(&justified), flatten(&rows));
     }
     /// S-P5 基准(非门禁,--release + --ignored 手动跑;方案 §15 性能预算由 100K/1M 合成库
     /// 与真实库共同校准——此处为纯函数层下界,不含 SQL 取数段)。用法:

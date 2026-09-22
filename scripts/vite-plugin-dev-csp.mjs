@@ -12,15 +12,30 @@
 //
 // 单一事实源:dev CSP 由 prod CSP(tauri.conf.json `app.security.csp`)派生,而非另写一份
 // —— 避免两份 CSP 字符串各改各的、悄悄漂移出不一致的放行范围。**唯一**的追加放行是
-// connect-src 的 `ws:`(Vite HMR 走 WebSocket;AGENTS.md 已明确许可
-// 「development may allow ws://」),不放宽 script-src 等其它指令。
+// connect-src 的开发服务器 HMR WebSocket 来源(Vite HMR 走 WebSocket),不放宽 script-src 等其它指令。
+//
+// 来源收窄(F14):只放行开发服务器**实际**的 HMR 地址,不放行裸 `ws:`(那等于放行任意
+// 主机的 WebSocket)。地址取自 Vite 已解析的 server 配置,不再另维护一份:默认取 server.host/port
+// (本项目 127.0.0.1:1420),显式 `TAURI_DEV_HOST` 时取 hmr.host/hmr.port(本项目 host:1421)。
+
+/**
+ * 从 Vite resolved server 配置取 HMR WebSocket 来源(纯函数,便于核对)。
+ * @param {{host?:string,port?:number,https?:unknown,hmr?:{protocol?:string,host?:string,port?:number}}} server
+ * @returns {string} 形如 `ws://127.0.0.1:1420` 的来源
+ */
+export function hmrWsOrigin(server) {
+  const hmr = server.hmr && typeof server.hmr === 'object' ? server.hmr : undefined
+  const protocol = hmr?.protocol || (server.https ? 'wss' : 'ws')
+  return `${protocol}://${hmr?.host || server.host}:${hmr?.port || server.port}`
+}
 
 /**
  * 从生产 CSP 派生开发态 CSP(纯函数,不碰 fs/Vite,便于单测)。
  * @param {string} prodCsp tauri.conf.json 的 app.security.csp 原始字符串
+ * @param {string} wsOrigin HMR WebSocket 来源(由 {@link hmrWsOrigin} 从 resolved 配置得到)
  * @returns {string}
  */
-export function deriveDevCsp(prodCsp) {
+export function deriveDevCsp(prodCsp, wsOrigin) {
   const directives = prodCsp
     .split(';')
     .map((d) => d.trim())
@@ -32,10 +47,10 @@ export function deriveDevCsp(prodCsp) {
 
   const connectSrc = directives.find((d) => d.name === 'connect-src')
   if (connectSrc) {
-    if (!connectSrc.values.includes('ws:')) connectSrc.values.push('ws:')
+    if (!connectSrc.values.includes(wsOrigin)) connectSrc.values.push(wsOrigin)
   } else {
     // prod CSP 目前恒有 connect-src,这支只是防御性兜底,避免上游改了配置就悄悄失去 HMR 放行。
-    directives.push({ name: 'connect-src', values: ["'self'", 'ws:'] })
+    directives.push({ name: 'connect-src', values: ["'self'", wsOrigin] })
   }
 
   return directives.map((d) => [d.name, ...d.values].join(' ')).join('; ')
@@ -52,7 +67,7 @@ export default function devCsp(tauriConfPath) {
   return {
     name: 'scrollery:dev-csp',
     apply: 'serve',
-    async transformIndexHtml() {
+    async transformIndexHtml(_html, ctx) {
       const { readFileSync } = await import('node:fs')
       const { fileURLToPath } = await import('node:url')
       const { dirname, resolve } = await import('node:path')
@@ -73,10 +88,14 @@ export default function devCsp(tauriConfPath) {
         return
       }
 
+      const wsOrigin = hmrWsOrigin(ctx.server.config.server)
       return [
         {
           tag: 'meta',
-          attrs: { 'http-equiv': 'Content-Security-Policy', content: deriveDevCsp(prodCsp) },
+          attrs: {
+            'http-equiv': 'Content-Security-Policy',
+            content: deriveDevCsp(prodCsp, wsOrigin),
+          },
           injectTo: 'head-prepend',
         },
       ]

@@ -126,6 +126,8 @@ export interface LayoutSummary {
   totalRows: number
   totalHeight: number
   layoutVersion: number
+  /** 成员及顺序身份；纯几何重排沿用，供全集 ID 与邻接缓存复用。 */
+  orderVersion: number
   totalItems: number
   /// date 分组：每日一项（label=日期串，count=该日项数）；folder 分组：每文件夹一项（count=文件数）。
   /// epochDay = 该日 UTC 天数（date 分组），folder/none 分组为 null；P3 时间比例坐标据此线性

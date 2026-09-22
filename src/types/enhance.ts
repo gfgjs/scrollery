@@ -18,6 +18,9 @@ export type { ModelDownloadProgress }
 /** 增强任务种类——模型列表口径（enhance_status → EnhanceModelDto.task，serde camelCase）。 */
 export type EnhanceModelTask = 'denoise' | 'dejpegArtifact' | 'upscale'
 
+/** 后端统一能力判定，优先显示阻断下载/购买的发行前提。 */
+export type EnhanceReadiness = 'ready' | 'workerMissing' | 'manifestUnready' | 'unlicensed' | 'modelMissing'
+
 /**
  * 增强任务种类——协议 step 口径（EnhanceStep.task = exotic_protocol::EnhanceTask，serde snake_case）。
  * 去伪影这里是 'dejpeg_artifact'（下划线），与 EnhanceModelTask 的 'dejpegArtifact' 不同。
@@ -36,13 +39,16 @@ export interface EnhanceModelInfo {
   installed: boolean
   /** 该档下载清单是否就绪（URL 待回填时为 false）。 */
   manifestReady: boolean
+  readiness: EnhanceReadiness
+  canDownload: boolean
 }
 
 /** enhance_status 返回（EnhanceStatusDto，serde camelCase）。 */
 export interface EnhanceStatus {
   availability: Availability
   storeUrl: string | null
-  /** 当前推理执行提供器回声（worker 会话未起时为 null）。 */
+  workerReady: boolean
+  /** 增强协议尚未回传提供器，当前为 null。 */
   provider: string | null
   models: EnhanceModelInfo[]
 }
@@ -90,7 +96,7 @@ export interface EnhanceJob {
 
 /**
  * 前后对比预览结果（enhance_preview 实现后返回 { beforePath, afterPath }）。
- * P0 后端返回 enhance_not_implemented 占位码，本类型供 4.5 批实现后接线。
+ * 只有授权、worker 与模型都可用时才会执行预览。
  */
 export interface EnhancePreviewResult {
   beforePath: string
@@ -117,6 +123,9 @@ export type EnhanceErrorCode =
   | 'enhance_unlicensed'
   | 'enhance_input_unsupported'
   | 'enhance_model_missing'
+  | 'enhance_worker_missing'
+  | 'enhance_manifest_unready'
+  | 'enhance_status_unavailable'
   | 'enhance_busy'
   | 'enhance_download_failed'
   | 'enhance_io'

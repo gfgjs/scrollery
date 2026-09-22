@@ -10,6 +10,8 @@ defineProps<{
   modelValue: boolean
   /** 禁用:落到原生 input 的 disabled,阻断交互。 */
   disabled?: boolean
+  /** 原生开关的可访问名称。 */
+  label?: string
 }>()
 
 const emit = defineEmits<{ 'update:modelValue': [boolean] }>()
@@ -24,6 +26,7 @@ function onChange(e: Event) {
   <label class="toggle">
     <input
       type="checkbox"
+      :aria-label="label"
       :checked="modelValue"
       :disabled="disabled"
       @change="onChange"

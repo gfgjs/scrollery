@@ -309,6 +309,71 @@ mod tests {
         CancellationToken::new()
     }
 
+    #[test]
+    fn adaptive_cancel_discards_batch_and_releases_budget() {
+        run_probe("adaptive_cancel", || {
+            let budget = crate::scanner::hdd_io::test_budget(4);
+            let cancel = cancel_token();
+            let result = run_bounded_header_parse(
+                200,
+                &cancel,
+                Some(&pool(4)),
+                Some(&pool(3)),
+                &PipelineTiming::default(),
+                |index| {
+                    let _permit = budget.acquire_header(&cancel)?;
+                    Ok::<_, AppError>(index)
+                },
+                |_, item| {
+                    let _permit = budget.acquire(&cancel)?;
+                    cancel.cancel();
+                    item
+                },
+            );
+            assert!(matches!(result, Err(AppError::Cancelled)));
+            assert_eq!(Arc::strong_count(&budget), 1);
+            assert!(budget.acquire_header(&cancel_token()).is_ok());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn supplemental_timeout_discards_batch_without_waiting_for_background_read() {
+        run_probe("supplemental_timeout", || {
+            let budget = crate::scanner::hdd_io::test_budget(4);
+            let cancel = cancel_token();
+            let held = std::sync::Mutex::new(None);
+            let timing = PipelineTiming::default();
+            let result = run_bounded_header_parse(
+                200,
+                &cancel,
+                Some(&pool(4)),
+                Some(&pool(3)),
+                &timing,
+                |index| budget.acquire_header(&cancel).map(|_| index),
+                |_, item| -> Result<usize> {
+                    let _ = item?;
+                    let permit = budget.acquire(&cancel)?;
+                    permit.mark_timed_out();
+                    // 模拟后台读取未结束；流水线必须在这个守卫释放之前返回错误。
+                    *held.lock().unwrap() = Some(permit);
+                    Err(AppError::ImageReadTimeout)
+                },
+            )
+            .and_then(|items| items.into_iter().collect::<Result<Vec<_>>>());
+            assert!(matches!(result, Err(AppError::ImageReadTimeout)));
+            assert!(!cancel.is_cancelled());
+            assert_eq!(timing.snapshot().in_flight_chunks, 0);
+            assert!(matches!(
+                budget.acquire_header(&cancel),
+                Err(AppError::ImageReadTimeout)
+            ));
+            drop(held);
+            assert!(budget.acquire_header(&cancel).is_ok());
+        })
+        .unwrap();
+    }
+
     /// 在独立线程里跑流水线并把结果/panic 传回；探针超时只用于把「卡死」变成「失败」——
     /// 重叠与在途上界一律用 barrier/channel 握手判定，不依赖墙钟阈值。
     fn run_probe<T: Send + 'static>(

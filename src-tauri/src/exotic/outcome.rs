@@ -38,6 +38,8 @@ pub enum TaskOutcome {
         height: u32,
         mime: String,
         blob: Vec<u8>,
+        /// 宿主对已验证像素计算，绝不采信 worker 声明。
+        thumbhash: Vec<u8>,
     },
     /// Worker 显式失败（已核对 item/fingerprint）。
     Failure(FailureBody),

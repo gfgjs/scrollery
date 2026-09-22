@@ -928,6 +928,25 @@ mod tests {
         );
         assert!(total_on > total_off);
         assert_eq!(proj_on[&3].bucket, DuplicateBucket::Unique);
+        // folders 两种打包沿用同一成员序；独有项开关另受顺序键约束。
+        let narrow = LayoutParams {
+            container_width: 150.0,
+            target_row_height: 60.0,
+            ..params
+        };
+        for (unique, expected) in [(false, flat), (true, flat_on)] {
+            let (grid, _, _) =
+                compute_lens_folder_layout(&assembly, unique, &narrow, Some(1.0), true);
+            let ids: Vec<i64> = grid
+                .iter()
+                .filter_map(|row| match row {
+                    LayoutRow::Normal { items, .. } => Some(items.iter().map(|item| item.id)),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(ids, expected);
+        }
     }
     /// S-P5 基准(非门禁,--release + --ignored 手动跑;方案 §15)。folders 纯函数层下界:
     /// 250K 组 × 2 成员(500K dup 行)+ 各目录 250 unconf/250 unique ≈ 1M 行域。

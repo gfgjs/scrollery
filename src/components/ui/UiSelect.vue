@@ -8,6 +8,8 @@ import { computed } from 'vue'
 const props = defineProps<{
   modelValue: string
   disabled?: boolean
+  /** 原生选择框的可访问名称。 */
+  label?: string
 }>()
 const emit = defineEmits<{ 'update:modelValue': [string] }>()
 
@@ -20,7 +22,7 @@ const selected = computed<string>({
 
 <template>
   <div class="select-wrap">
-    <select v-model="selected" class="select" :disabled="disabled">
+    <select v-model="selected" class="select" :disabled="disabled" :aria-label="label">
       <slot />
     </select>
   </div>

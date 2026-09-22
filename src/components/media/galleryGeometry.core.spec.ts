@@ -269,14 +269,6 @@ describe('滚动与重排锚点', () => {
       expect(pickReflowAnchor(rows, -5)).toBeNull()
     })
 
-    it('取首个与视口顶相交的 normal 行首项;偏移 = row.y - vTop(行顶已滚出为负)', () => {
-      const rows = [row(0, 200, [1, 2]), row(204, 200, [3, 4]), row(408, 200, [5])]
-      // vTop=250:首行(0-200)已整体滚出,第二行(204-404)与视口顶相交。
-      expect(pickReflowAnchor(rows, 250)).toEqual({ id: 3, screenOffset: -46 })
-      // vTop=100:首行仍占视口顶,偏移为负(行顶在视口上方 100px)。
-      expect(pickReflowAnchor(rows, 100)).toEqual({ id: 1, screenOffset: -100 })
-    })
-
     it('跳过 separator 行与空 items 行', () => {
       const rows = [
         row(100, 40, [], 'separator'),

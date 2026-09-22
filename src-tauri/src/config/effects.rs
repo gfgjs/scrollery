@@ -19,7 +19,8 @@ use crate::error::{AppError, Result};
 use crate::state::AppState;
 
 /// 日志级别热重载句柄(logging 模块在装配 subscriber 时经 config_commands 的再导出写入)。
-pub static LOG_RELOAD: std::sync::OnceLock<Handle<EnvFilter, Registry>> = std::sync::OnceLock::new();
+pub static LOG_RELOAD: std::sync::OnceLock<Handle<EnvFilter, Registry>> =
+    std::sync::OnceLock::new();
 
 /// 本批设置变更的来源。唯一影响的是**派生流水线是否需要被重启**(见 `restart_derivation`):
 /// 用户提交与外部编辑要保持既有功能(新参数要作用到存量待处理项),而恢复默认设置不得把用户
@@ -178,9 +179,7 @@ pub async fn apply_batch(
             }
             Ok(Err(e)) => {
                 // 目录建不出来 = 新缓存目录用不上:值已保存,但如实报告未生效(不吞错、不谎报成功)。
-                tracing::warn!(
-                    "缓存目录无法创建(设置已保存) | creating cache dir failed: {e}"
-                );
+                tracing::warn!("缓存目录无法创建(设置已保存) | creating cache dir failed: {e}");
                 failed.push(key);
             }
             Err(e) => {
@@ -261,9 +260,7 @@ async fn restart_derivation(
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
 
     if origin == ApplyOrigin::Reset && !expected_running {
-        tracing::info!(
-            "[Config] 恢复默认设置:派生流水线未处于期望运行状态,保持停止不自动启动"
-        );
+        tracing::info!("[Config] 恢复默认设置:派生流水线未处于期望运行状态,保持停止不自动启动");
         return Ok(());
     }
 
@@ -279,11 +276,7 @@ async fn restart_derivation(
 
 /// 失效布局与 S1 取数缓存并 bump 数据版本(缩略图复位后视图必须重算)。
 fn invalidate_layout_caches(state: &Arc<AppState>) {
-    *state
-        .layout_cache
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-    crate::layout::items_cache::invalidate(&state.layout_items_cache);
+    state.clear_layout_caches();
     state.bump_data_version();
 }
 

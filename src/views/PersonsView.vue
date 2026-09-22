@@ -1,7 +1,7 @@
 <template>
   <!-- 人物墙（F6）：聚类出的人物簇卡片。点卡片进入该人物的照片；可命名/合并/隐藏。 -->
-  <div class="persons-view">
-    <div class="persons-header">
+  <div ref="scrollEl" class="persons-view">
+    <div ref="headerEl" class="persons-header">
       <div class="persons-header__text">
         <h2 class="persons-title">{{ t('sidebar.persons') }}</h2>
         <p class="persons-subtitle">{{ t('persons.subtitle') }}</p>
@@ -62,7 +62,7 @@
     </div>
 
     <!-- 合并操作条：选中 ≥2 时出现 -->
-    <div v-if="selectedIds.size >= 2" class="merge-bar">
+    <div v-if="selectedIds.size >= 2" ref="mergeBarEl" class="merge-bar">
       <span>{{ t('persons.selectedCount', { count: selectedIds.size }) }}</span>
       <button class="btn btn-primary" @click="mergeSelected">{{ t('persons.mergeIntoOne') }}</button>
       <button class="btn btn-secondary" @click="clearSelection">{{ t('common.cancel') }}</button>
@@ -72,12 +72,30 @@
       {{ t('persons.empty') }}
     </div>
 
-    <div class="persons-grid">
+    <div
+      ref="gridEl"
+      class="persons-grid"
+      :style="{ height: `${virtualizer.getTotalSize()}px` }"
+    >
+      <div
+        v-for="row in virtualRows"
+        :key="row.key as number"
+        :ref="measureRow"
+        :data-index="row.index"
+        class="persons-row"
+        :style="{
+          gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+          transform: `translateY(${row.start - scrollMargin}px)`,
+        }"
+      >
       <article
-        v-for="p in displayPersons"
+        v-for="p in displayPersons.slice(row.index * columns, (row.index + 1) * columns)"
         :key="p.id"
+        :data-person-id="p.id"
         class="person-card"
         :class="{ 'person-card--selected': selectedIds.has(p.id) }"
+        @focusin="focusedId = p.id"
+        @focusout="onCardFocusOut"
       >
         <button
           type="button"
@@ -147,6 +165,7 @@
             v-if="editingId === p.id"
             ref="nameInput"
             v-model="editName"
+            :readonly="submitted"
             class="person-card__input"
             :placeholder="t('persons.namePlaceholder')"
             maxlength="40"
@@ -161,6 +180,7 @@
         </div>
         <div class="person-card__count">{{ t('persons.faceCount', { count: p.faceCount }) }}</div>
       </article>
+      </div>
     </div>
 
     <!-- 批量审批面板（T10）：模态覆盖层，按需打开。 -->
@@ -169,7 +189,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount, watch } from 'vue'
+import { defaultRangeExtractor, useVirtualizer, type Range } from '@tanstack/vue-virtual'
 import { useRouter } from 'vue-router'
 import { ScanFace, Eye, EyeOff, Check, RefreshCw, UserCheck, Ban, RotateCcw } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
@@ -202,6 +223,96 @@ const visiblePersons = computed(() =>
 const displayPersons = computed(() =>
   showIgnored.value ? store.ignoredPersons : visiblePersons.value,
 )
+
+const editingId = ref<number | null>(null)
+const editName = ref('')
+const nameInput = ref<HTMLInputElement | HTMLInputElement[] | null>(null)
+const submitted = ref(false)
+let editGeneration = 0
+
+const scrollEl = ref<HTMLElement | null>(null)
+const headerEl = ref<HTMLElement | null>(null)
+const mergeBarEl = ref<HTMLElement | null>(null)
+const gridEl = ref<HTMLElement | null>(null)
+const columns = ref(1)
+const rowGap = ref(0)
+const scrollMargin = ref(0)
+const focusedId = ref<number | null>(null)
+const pinnedRows = computed(() => {
+  // 离屏编辑保留草稿；焦点前后各保留一行，让 Tab 自然跨越窗口边界。
+  const rows = new Set<number>()
+  for (const id of [editingId.value, focusedId.value]) {
+    const index = id === null ? -1 : displayPersons.value.findIndex((p) => p.id === id)
+    if (index < 0) continue
+    const row = Math.floor(index / columns.value)
+    for (const adjacent of [row - 1, row, row + 1]) {
+      if (adjacent >= 0 && adjacent < Math.ceil(displayPersons.value.length / columns.value)) {
+        rows.add(adjacent)
+      }
+    }
+  }
+  return [...rows]
+})
+const virtualizer = useVirtualizer(computed(() => {
+  const pinned = pinnedRows.value
+  return {
+    count: Math.ceil(displayPersons.value.length / columns.value),
+    getScrollElement: () => scrollEl.value,
+    estimateSize: () => 280,
+    overscan: 2,
+    gap: rowGap.value,
+    scrollMargin: scrollMargin.value,
+    rangeExtractor: (range: Range) =>
+      [...new Set([...defaultRangeExtractor(range), ...pinned])].sort((a, b) => a - b),
+  }
+}))
+const virtualRows = computed(() => virtualizer.value.getVirtualItems())
+
+function measureRow(el: Element | { $el?: Element } | null) {
+  const node = el instanceof Element ? el : el?.$el
+  if (node) virtualizer.value.measureElement(node)
+}
+
+function updateGridGeometry() {
+  const grid = gridEl.value
+  const scroll = scrollEl.value
+  if (!grid || !scroll) return
+  const gap = parseFloat(getComputedStyle(grid).columnGap) || 0
+  columns.value = Math.max(1, Math.floor((grid.clientWidth + gap) / (140 + gap)))
+  rowGap.value = gap
+  scrollMargin.value = grid.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop
+}
+
+function onCardFocusOut(event: FocusEvent) {
+  const target = event.relatedTarget
+  if (!(target instanceof Element) || !target.closest('.person-card')) focusedId.value = null
+}
+
+let gridObserver: ResizeObserver | undefined
+onMounted(() => {
+  gridObserver = new ResizeObserver(updateGridGeometry)
+  for (const el of [scrollEl.value, headerEl.value, gridEl.value]) {
+    if (el) gridObserver.observe(el)
+  }
+  updateGridGeometry()
+})
+watch(mergeBarEl, (el, previous) => {
+  if (previous) gridObserver?.unobserve(previous)
+  if (el) gridObserver?.observe(el)
+  updateGridGeometry()
+}, { flush: 'post' })
+watch(columns, async () => {
+  const input = Array.isArray(nameInput.value) ? nameInput.value[0] : nameInput.value
+  const hadFocus = input === document.activeElement
+  virtualizer.value.measure()
+  await nextTick()
+  // 列数改变可能让编辑卡片迁到另一行；恢复原焦点，不强制滚回离屏编辑项。
+  if (hadFocus) {
+    const current = Array.isArray(nameInput.value) ? nameInput.value[0] : nameInput.value
+    current?.focus({ preventScroll: true })
+  }
+})
+onBeforeUnmount(() => gridObserver?.disconnect())
 
 // 两个管理切换互斥(同时只看一种):开一个即关另一个,并清合并选区(避免对不可见人物合并)。
 function toggleHidden() {
@@ -315,23 +426,31 @@ function onCardClick(p: PersonSummary) {
 }
 
 async function hidePerson(p: PersonSummary) {
-  await store.setHidden(p.id, true)
-  // 撤销无时限：登记进 historyStore（会话内长存 + Ctrl+Z 可达），toast 只是即时入口（round10 #7）。
-  const undoId = history.pushUndoable({
-    undo: () => store.setHidden(p.id, false),
-    redo: () => store.setHidden(p.id, true),
-    undoMessage: t('persons.restoredDone'),
-    redoMessage: t('persons.hiddenDone'),
-  })
-  toast.addToast('success', t('persons.hiddenDone'), 5000, [
-    { label: t('common.undo'), onClick: () => history.undoIfTop(undoId) },
-  ])
+  try {
+    await store.setHidden(p.id, true)
+    // 撤销无时限：登记进 historyStore（会话内长存 + Ctrl+Z 可达），toast 只是即时入口（round10 #7）。
+    const undoId = history.pushUndoable({
+      undo: () => store.setHidden(p.id, false),
+      redo: () => store.setHidden(p.id, true),
+      undoMessage: t('persons.restoredDone'),
+      redoMessage: t('persons.hiddenDone'),
+    })
+    toast.addToast('success', t('persons.hiddenDone'), 5000, [
+      { label: t('common.undo'), onClick: () => history.undoIfTop(undoId) },
+    ])
+  } catch (e) {
+    toast.addToast('error', ipcErrorMessage(e))
+  }
 }
 
 async function restorePerson(p: PersonSummary) {
-  await store.setHidden(p.id, false)
-  if (hiddenCount.value === 0) showHidden.value = false
-  toast.addToast('success', t('persons.restoredDone'))
+  try {
+    await store.setHidden(p.id, false)
+    if (hiddenCount.value === 0) showHidden.value = false
+    toast.addToast('success', t('persons.restoredDone'))
+  } catch (e) {
+    toast.addToast('error', ipcErrorMessage(e))
+  }
 }
 
 // 移出误检桶(ignored 历史管理的恢复通路,镜像 restorePerson):清 is_ignored,人物重新上墙。
@@ -346,15 +465,12 @@ async function restoreIgnored(p: PersonSummary) {
 }
 
 // ── inline 命名 ───────────────────────────────────────────────────────────────
-const editingId = ref<number | null>(null)
-const editName = ref('')
-const nameInput = ref<HTMLInputElement | HTMLInputElement[] | null>(null)
-let submitted = false
 
 function startEdit(p: PersonSummary) {
+  editGeneration++
   editingId.value = p.id
   editName.value = p.name ?? ''
-  submitted = false
+  submitted.value = false
   nextTick(() => {
     const el = Array.isArray(nameInput.value) ? nameInput.value[0] : nameInput.value
     el?.focus()
@@ -363,15 +479,24 @@ function startEdit(p: PersonSummary) {
 }
 
 async function submitEdit(p: PersonSummary) {
-  if (submitted) return
-  submitted = true
+  if (submitted.value || editingId.value !== p.id) return
+  submitted.value = true
+  const generation = editGeneration
   const name = editName.value
-  editingId.value = null
-  await store.rename(p.id, name)
+  try {
+    await store.rename(p.id, name)
+    // 等待写入时可以切换编辑对象；旧请求不能关闭新的输入框。
+    if (generation === editGeneration) editingId.value = null
+  } catch (e) {
+    toast.addToast('error', ipcErrorMessage(e))
+  } finally {
+    if (generation === editGeneration) submitted.value = false
+  }
 }
 
 function cancelEdit() {
-  submitted = true
+  editGeneration++
+  submitted.value = false
   editingId.value = null
 }
 
@@ -407,8 +532,12 @@ async function mergeSelected() {
     cancelText: t('common.cancel'),
   })
   if (!confirmed) return
-  await store.merge(srcIds, dst.id)
-  clearSelection()
+  try {
+    await store.merge(srcIds, dst.id)
+    clearSelection()
+  } catch (e) {
+    toast.addToast('error', ipcErrorMessage(e))
+  }
 }
 </script>
 
@@ -481,8 +610,15 @@ async function mergeSelected() {
   font-size: var(--font-size-sm);
 }
 .persons-grid {
+  position: relative;
+  column-gap: var(--spacing-md);
+}
+.persons-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: var(--spacing-md);
 }
 .person-card {

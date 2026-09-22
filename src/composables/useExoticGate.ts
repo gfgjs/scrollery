@@ -1,5 +1,5 @@
 // src/composables/useExoticGate.ts
-// Exotic 逐项 gate（Part5 T12 增量3）：把某媒体项映射为 PluginGate 可消费的授权态，并封装激活。
+// Exotic 逐项 gate（Part5 T12 增量3）：把某媒体项映射为 PluginGate 可消费的授权态，查询失败单独展示。
 //
 // 前后端职责：本 composable 只向后端取「格式解析 / 逐项状态」并适配为展示 DTO，
 //    **不持任何验签逻辑**——可用态与激活验签全在后端。
@@ -15,7 +15,7 @@ import { invokeIpc } from '../utils/ipc'
 
 // ── Exotic 格式集缓存（模块级单例，跨组件共享）──────────────────────────────
 // Catalog 提供的格式在一次运行内基本静态；缓存一次即可，避免每次开图都拉全量解析。
-// 失败**不写缓存**（返回空集本次放行），下次重试；inflight 去重并发首拉。
+// 失败**不写缓存**（本次展示查询错误），下次重试；inflight 去重并发首拉。
 let exoticFormatsCache: ReadonlySet<string> | null = null
 let inflight: Promise<ReadonlySet<string>> | null = null
 
@@ -27,9 +27,6 @@ async function loadExoticFormats(): Promise<ReadonlySet<string>> {
         const list = await invokeIpc<FormatResolution[]>(IPC.LIST_EXOTIC_FORMAT_RESOLUTIONS)
         exoticFormatsCache = new Set(list.map((r) => r.format.toLowerCase()))
         return exoticFormatsCache
-      } catch {
-        // 拉取失败：本次按「无 exotic 格式」放行（不误拦），不落缓存以便下次重试。
-        return new Set<string>()
       } finally {
         inflight = null
       }
@@ -63,7 +60,7 @@ export function useExoticGate() {
   /** 当前项的 gate 授权态（null = 非 exotic / 未解析 → 触点放行渲染真实内容）。 */
   const entitlement = ref<PluginEntitlement | null>(null)
   const loading = ref(false)
-  const activating = ref(false)
+  const failed = ref(false)
   let resolveGeneration = 0
 
   /**
@@ -74,13 +71,13 @@ export function useExoticGate() {
   async function resolveForItem(itemId: number, fileFormat: string): Promise<boolean> {
     const generation = ++resolveGeneration
     entitlement.value = null
-    loading.value = false
+    loading.value = true
+    failed.value = false
+    try {
     const formats = await loadExoticFormats()
     if (generation !== resolveGeneration) return false
     if (!formats.has(fileFormat.toLowerCase())) return false
 
-    loading.value = true
-    try {
       const st = await invokeIpc<ExoticItemState>(IPC.GET_EXOTIC_ITEM_STATE, { itemId })
       if (generation !== resolveGeneration) return false
       // resolution=null 表示后端也认为非 catalog 格式（与格式集缓存竞态时的兜底）→ 放行。
@@ -89,31 +86,20 @@ export function useExoticGate() {
     } catch {
       if (generation !== resolveGeneration) return false
       entitlement.value = null
+      failed.value = true
       return false
     } finally {
       if (generation === resolveGeneration) loading.value = false
     }
   }
 
-  /**
-   * 激活插件（token → 后端验签存 keyring）。错误**向上抛**（含稳定 code），由调用方（激活对话框）展示。
-   * @param pluginId 取自已解析的 entitlement，非用户任意输入
-   */
-  async function activate(pluginId: string, token: string): Promise<void> {
-    activating.value = true
-    try {
-      await invokeIpc(IPC.ACTIVATE_EXOTIC_PLUGIN, { pluginId, token })
-    } finally {
-      activating.value = false
-    }
-  }
-
   /** 关闭触点时清态。 */
   function reset(): void {
+    failed.value = false
     resolveGeneration++
     entitlement.value = null
     loading.value = false
   }
 
-  return { entitlement, loading, activating, resolveForItem, activate, reset }
+  return { entitlement, loading, failed, resolveForItem, reset }
 }

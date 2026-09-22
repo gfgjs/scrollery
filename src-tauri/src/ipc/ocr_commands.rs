@@ -219,6 +219,7 @@ fn run_ocr_batch(state: &AppState, spec: &OcrSessionSpec, item: OcrItem) -> Resu
 pub async fn ocr_status(state: State<'_, Arc<AppState>>) -> Result<OcrStatusDto> {
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || -> Result<OcrStatusDto> {
+        crate::official::entitlement(state.entitlement_provider().as_ref())?;
         let resolution = state.exotic_host().resolve_format("ocr");
         let models_dir = crate::ai::runtime_config::models_dir(&state);
         let tiers = ocr_profiles()

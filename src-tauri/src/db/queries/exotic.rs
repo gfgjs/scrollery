@@ -107,20 +107,31 @@ pub fn invalidate_exotic_tasks_for_item(conn: &Connection, item_id: i64) -> Resu
     )?)
 }
 
-/// 升级 Worker 后失效：把该插件「已完成但 worker_version 不同」的任务退回 pending（指纹会变）。
-/// 只失效受影响 capability/版本的任务，不动其他插件。返回受影响行数。
+/// Worker 版本变化时重置缩略图及失败预算；旧库失败记录先登记版本基线。
 pub fn invalidate_exotic_tasks_for_plugin_version(
     conn: &Connection,
     plugin_id: &str,
     new_worker_version: &str,
 ) -> Result<usize> {
-    Ok(conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
         "UPDATE exotic_tasks
          SET status=0, input_fingerprint=NULL, claimed_at=NULL, lease_owner=NULL,
+             attempts=0, next_retry_at=NULL, last_error_code=NULL, last_error_message=NULL,
+             output_path=NULL, worker_version=?2,
              updated_at=strftime('%s','now')
-         WHERE plugin_id=?1 AND status=2 AND (worker_version IS NULL OR worker_version<>?2)",
+         WHERE plugin_id=?1 AND capability='thumbnail' AND status IN (2,3,4)
+           AND (worker_version<>?2 OR (status=2 AND worker_version IS NULL))",
         params![plugin_id, new_worker_version],
-    )?)
+    )?;
+    // 缺执行版本不能证明发生升级；只建一次基线，避免每次 Startup 复活坏文件。
+    tx.execute(
+        "UPDATE exotic_tasks SET worker_version=?2
+         WHERE plugin_id=?1 AND capability='thumbnail' AND status IN (3,4) AND worker_version IS NULL",
+        params![plugin_id, new_worker_version],
+    )?;
+    tx.commit()?;
+    Ok(changed)
 }
 
 /// 全量重建 / 清空缩略图语义：把所有 thumbnail exotic 任务退回 pending，清空旧输出/指纹/错误/租约。
@@ -178,6 +189,7 @@ pub fn is_exotic_source_current(
 /// 单条 UPDATE...RETURNING 完成领取，避免 SELECT/UPDATE 之间的竞态窗口（R2）。
 /// 隐藏根排除（V21）：第 5 条生成线与缩略图/AI/人脸/派生同口径——隐藏根下的 exotic 任务
 /// 不领取（留在 pending，不烧解码算力）；取消隐藏后由 `wake_exotic` 踢 Coordinator 重领。
+#[allow(clippy::too_many_arguments)]
 pub fn claim_exotic_tasks(
     conn: &Connection,
     plugin_id: &str,
@@ -185,10 +197,11 @@ pub fn claim_exotic_tasks(
     limit: i64,
     instance_id: &str,
     now: i64,
+    worker_version: &str,
 ) -> Result<Vec<ExoticTaskRow>> {
     let sql = format!(
         "UPDATE exotic_tasks
-         SET status=1, claimed_at=?3, lease_owner=?4, updated_at=strftime('%s','now')
+         SET status=1, claimed_at=?3, lease_owner=?4, worker_version=?6, updated_at=strftime('%s','now')
          WHERE id IN (
              SELECT id FROM exotic_tasks
              WHERE plugin_id=?1 AND capability=?2
@@ -200,7 +213,14 @@ pub fn claim_exotic_tasks(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(
-            params![plugin_id, capability, now, instance_id, limit],
+            params![
+                plugin_id,
+                capability,
+                now,
+                instance_id,
+                limit,
+                worker_version
+            ],
             map_exotic_task,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -263,8 +283,15 @@ pub fn finish_exotic_task(
     Ok(n == 1)
 }
 
-/// 失败任务：retryable 且未超次数 → status=3 + attempts+1 + next_retry_at；否则 terminal(4)。
-/// 条件更新（仍 processing 且租约属本实例）。返回是否本实例成功记录。
+/// 条件失败更新的实际结果，供调度统计使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExoticFailureOutcome {
+    RetryScheduled,
+    Terminal,
+    LeaseLost,
+}
+
+/// 失败任务：返回实际重试/终态/租约丢失，第三次失败不再误计为重试。
 #[allow(clippy::too_many_arguments)]
 pub fn fail_exotic_task(
     conn: &Connection,
@@ -275,26 +302,33 @@ pub fn fail_exotic_task(
     code: &str,
     message: &str,
     next_retry_at: i64,
-) -> Result<bool> {
-    let n = conn.execute(
-        "UPDATE exotic_tasks
+) -> Result<ExoticFailureOutcome> {
+    let retry = conn
+        .query_row(
+            "UPDATE exotic_tasks
          SET attempts = attempts + 1,
              status = CASE WHEN ?3=1 AND attempts+1 < ?4 THEN 3 ELSE 4 END,
              next_retry_at = CASE WHEN ?3=1 AND attempts+1 < ?4 THEN ?7 ELSE NULL END,
              last_error_code=?5, last_error_message=?6,
              claimed_at=NULL, lease_owner=NULL, updated_at=strftime('%s','now')
-         WHERE id=?1 AND status=1 AND lease_owner=?2",
-        params![
-            id,
-            instance_id,
-            retryable as i64,
-            max_attempts,
-            code,
-            message,
-            next_retry_at
-        ],
-    )?;
-    Ok(n == 1)
+         WHERE id=?1 AND status=1 AND lease_owner=?2 RETURNING status",
+            params![
+                id,
+                instance_id,
+                retryable as i64,
+                max_attempts,
+                code,
+                message,
+                next_retry_at
+            ],
+            |row| Ok(row.get::<_, i64>(0)? == 3),
+        )
+        .optional()?;
+    Ok(match retry {
+        Some(true) => ExoticFailureOutcome::RetryScheduled,
+        Some(false) => ExoticFailureOutcome::Terminal,
+        None => ExoticFailureOutcome::LeaseLost,
+    })
 }
 
 /// 列出已安装插件（安装真相投影）。Part1 安装表为空 → 返回空列表。
@@ -533,13 +567,13 @@ pub fn has_ready_exotic_task(
     capability: &str,
     now: i64,
 ) -> Result<bool> {
-    let exists: i64 = conn.query_row(
+    let sql = format!(
         "SELECT EXISTS(SELECT 1 FROM exotic_tasks
             WHERE plugin_id=?1 AND capability=?2
-              AND ( status=0 OR (status=3 AND (next_retry_at IS NULL OR next_retry_at<=?3)) ))",
-        params![plugin_id, capability, now],
-        |r| r.get(0),
-    )?;
+              AND ( status=0 OR (status=3 AND (next_retry_at IS NULL OR next_retry_at<=?3)) )
+              {EXCLUDE_HIDDEN_ROOT_ITEMS})"
+    );
+    let exists: i64 = conn.query_row(&sql, params![plugin_id, capability, now], |r| r.get(0))?;
     Ok(exists != 0)
 }
 
@@ -626,7 +660,7 @@ mod exotic_dao_tests {
     }
 
     fn claim(c: &Connection, limit: i64, owner: &str, now: i64) -> Vec<ExoticTaskRow> {
-        claim_exotic_tasks(c, PID, CAP, limit, owner, now).unwrap()
+        claim_exotic_tasks(c, PID, CAP, limit, owner, now, "1.0.0").unwrap()
     }
 
     fn source_snapshot(c: &Connection, item_id: i64) -> (i64, i64) {
@@ -698,7 +732,12 @@ mod exotic_dao_tests {
         super::super::scan::set_scan_root_hidden(&c, 2, true).unwrap();
         let got: Vec<i64> = claim(&c, 10, "A", 1000).iter().map(|t| t.item_id).collect();
         assert_eq!(got, vec![1], "隐藏根任务不领取");
+        assert!(
+            !has_ready_exotic_task(&c, PID, CAP, 1000).unwrap(),
+            "只剩隐藏任务时调度器不得反复启动空流水线"
+        );
         super::super::scan::set_scan_root_hidden(&c, 2, false).unwrap();
+        assert!(has_ready_exotic_task(&c, PID, CAP, 1000).unwrap());
         let got: Vec<i64> = claim(&c, 10, "A", 1000).iter().map(|t| t.item_id).collect();
         assert_eq!(got, vec![2], "unhide 后 pending 任务原地可领");
     }
@@ -962,7 +1001,10 @@ mod exotic_dao_tests {
         seed(&c, 1);
         let id = claim(&c, 1, "inst-A", 1000)[0].id;
         // 可重试，下次重试时刻 1500，最多 3 次。
-        assert!(fail_exotic_task(&c, id, "inst-A", true, 3, "io_error", "busy", 1500).unwrap());
+        assert_eq!(
+            fail_exotic_task(&c, id, "inst-A", true, 3, "io_error", "busy", 1500).unwrap(),
+            ExoticFailureOutcome::RetryScheduled
+        );
         assert_eq!(claim(&c, 1, "inst-A", 1000).len(), 0); // 未到期
         let due = claim(&c, 1, "inst-A", 1600);
         assert_eq!(due.len(), 1); // 到期可再领
@@ -975,8 +1017,13 @@ mod exotic_dao_tests {
         seed(&c, 1);
         let id = claim(&c, 1, "inst-A", 1000)[0].id;
         // max_attempts=1：attempts+1=1 不 < 1 → 直接 terminal(4)，不再可领。
-        assert!(
-            fail_exotic_task(&c, id, "inst-A", true, 1, "malformed_input", "bad", 1500).unwrap()
+        assert_eq!(
+            fail_exotic_task(&c, id, "inst-A", true, 1, "malformed_input", "bad", 1500).unwrap(),
+            ExoticFailureOutcome::Terminal
+        );
+        assert_eq!(
+            fail_exotic_task(&c, id, "inst-A", true, 1, "malformed_input", "bad", 1500).unwrap(),
+            ExoticFailureOutcome::LeaseLost
         );
         assert_eq!(claim(&c, 1, "inst-A", 9999).len(), 0);
     }
@@ -1087,6 +1134,43 @@ mod exotic_dao_tests {
         assert_eq!(
             invalidate_exotic_tasks_for_plugin_version(&c, PID, "1.1.0").unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn upgrade_resets_failed_generation_once() {
+        let c = mem_db();
+        seed(&c, 1);
+        c.execute(
+            "UPDATE exotic_tasks SET status=4, attempts=3, worker_version='old',
+             last_error_code='internal_error' WHERE item_id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            invalidate_exotic_tasks_for_plugin_version(&c, PID, "new").unwrap(),
+            1
+        );
+        let row = claim(&c, 1, "A", 1000).pop().unwrap();
+        assert_eq!(row.attempts, 0);
+        assert!(row.last_error_code.is_none());
+        // 旧库失败记录没有执行版本时只建立基线，不能每次启动都复活坏文件。
+        c.execute(
+            "UPDATE exotic_tasks SET status=4, worker_version=NULL WHERE id=?1",
+            [row.id],
+        )
+        .unwrap();
+        assert_eq!(
+            invalidate_exotic_tasks_for_plugin_version(&c, PID, "new").unwrap(),
+            0
+        );
+        assert_eq!(
+            invalidate_exotic_tasks_for_plugin_version(&c, PID, "new").unwrap(),
+            0
+        );
+        assert_eq!(
+            invalidate_exotic_tasks_for_plugin_version(&c, PID, "newer").unwrap(),
+            1
         );
     }
 }

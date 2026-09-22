@@ -9,6 +9,8 @@ import { buildLayoutContentKey, useMediaStore } from './mediaStore'
 import type { LayoutSummary } from '../types/layout'
 import type { AppStats, MediaDetail } from '../types/media'
 import { IPC } from '../constants/ipc'
+import { useViewIds } from '../composables/useViewIds'
+import { useSelection } from '../composables/useSelection'
 
 function detail(id: number): MediaDetail {
   return { id } as MediaDetail
@@ -19,6 +21,7 @@ function layoutSummary(version: number): LayoutSummary {
     totalRows: 1,
     totalHeight: 200,
     layoutVersion: version,
+    orderVersion: version,
     totalItems: 1,
     separators: [],
     monthBuckets: [],
@@ -201,21 +204,36 @@ describe('mediaStore 详情请求时序', () => {
     expect(store.isDetailOpen).toBe(false)
   })
 
-  it('openDetail(fromLayout) 在 fetch 完成前即同步清空旧导航上下文', async () => {
+  it('普通导航立即替换旧搜索上下文,同顺序几何重排可续用,换顺序的迟到邻居不得提交', async () => {
+    vi.stubGlobal('window', { devicePixelRatio: 1 })
     invokeIpc.mockReturnValueOnce(Promise.resolve(detail(1)))
     const store = useMediaStore()
     await store.openDetailFromSearch(1, [1, 2, 3])
     expect(store.navContext?.type).toBe('search')
 
+    invokeIpc.mockResolvedValueOnce(layoutSummary(10))
+    await store.computeLayout({ containerWidth: 800, rowHeight: 200 })
+
     const pending = deferred<MediaDetail>()
     invokeIpc.mockReturnValueOnce(pending.promise)
     const opening = store.openDetail(2, true)
-    // fetch 在途:旧搜索上下文必须已清空,方向键不会按旧列表导航。
-    expect(store.navContext).toBeNull()
+    expect(store.navContext).toMatchObject({ type: 'layout', orderVersion: 10 })
     pending.resolve(detail(2))
     await opening
     expect(store.detailItem?.id).toBe(2)
-    expect(store.navContext).toBeNull()
+    const context = store.navContext
+    invokeIpc.mockResolvedValueOnce({ ...layoutSummary(11), orderVersion: 10 })
+    await store.computeLayout({ containerWidth: 900, rowHeight: 200 })
+    expect(store.navContext).toBe(context)
+    const neighbor = deferred<MediaDetail>()
+    invokeIpc.mockReturnValueOnce(neighbor.promise)
+    const navigating = store.navigateDetail(1)
+    expect(invokeIpc).toHaveBeenLastCalledWith(IPC.GET_ADJACENT_MEDIA, { currentId: 2, offset: 1, orderVersion: 10 })
+    store.invalidateViewOrder()
+    neighbor.resolve(detail(3))
+    await navigating
+    expect(store.detailItem?.id).toBe(2)
+    expect(store.isNavContextCurrent(context)).toBe(false)
   })
 
   it('openDetail(fromLayout) IPC 失败也不残留旧导航上下文', async () => {
@@ -246,28 +264,10 @@ describe('mediaStore 详情请求时序', () => {
     expect(store.detailItem?.id).toBe(2)
   })
 
-  it('重叠 navigateDetail:旧响应被丢弃,索引与展示项始终一致', async () => {
-    invokeIpc.mockReturnValueOnce(Promise.resolve(detail(1)))
-    const store = useMediaStore()
-    await store.openDetailFromSearch(1, [1, 2, 3])
-
-    const first = deferred<MediaDetail>()
-    const second = deferred<MediaDetail>()
-    invokeIpc.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
-    const navFirst = store.navigateDetail(1)
-    const navSecond = store.navigateDetail(1)
-    second.resolve(detail(2))
-    await navSecond
-    first.resolve(detail(2))
-    await navFirst
-
-    // 两次都基于同一未推进索引(都指 idx 1),旧响应被 generation 丢弃:落位 idx 1,不跳项。
-    expect(store.detailItem?.id).toBe(2)
-    expect(store.navContext?.currentIndex).toBe(1)
-  })
-
   it('镜头导航按 layoutVersion 请求后端相邻项，边界不回退普通邻接', async () => {
     const store = useMediaStore()
+    store.layoutSummary = layoutSummary(42)
+    store.layoutSemanticKey = 'lens:groups'
     store.detailItem = detail(10)
     store.setLensNavContext(42, 3)
     invokeIpc.mockResolvedValueOnce({ detail: detail(11), index: 1, totalCount: 3 })
@@ -320,16 +320,23 @@ describe('mediaStore 详情请求时序', () => {
 
     const firstCompute = store.computeLayout({ containerWidth: 800 })
     const queuedCompute = store.computeLayout({ containerWidth: 1000 })
+    let queuedFinished = false
+    void queuedCompute.then(() => { queuedFinished = true })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(queuedFinished).toBe(false)
     expect(invokeIpc).toHaveBeenCalledTimes(1)
 
     first.resolve(layoutSummary(11))
-    await first.promise
+    expect(await firstCompute).toBe('superseded')
     expect(invokeIpc).toHaveBeenCalledTimes(2)
     expect(store.layoutSummary?.layoutVersion).toBe(10)
+    expect(queuedFinished).toBe(false)
 
     second.resolve(layoutSummary(12))
     await firstCompute
     await queuedCompute
+    expect(queuedFinished).toBe(true)
     expect(store.layoutSummary?.layoutVersion).toBe(12)
   })
 
@@ -346,6 +353,15 @@ describe('mediaStore 详情请求时序', () => {
     expect(store.layoutSemanticKey).toBe(buildLayoutContentKey({ filters: {} }))
     normal.resolve(layoutSummary(21))
     await resize
+    const viewIds = useViewIds()
+    invokeIpc.mockResolvedValueOnce([1, 2, 3])
+    await viewIds.ensureFresh(store.orderVersion)
+    const selection = useSelection()
+    selection.clearSelection()
+    selection.selectRange(1, 3)
+    expect(selection.materializeIds()).toEqual([1, 2, 3])
+    selection.selectAll()
+    const selectedEpoch = selection.selectionEpoch.value
 
     const groups = deferred<LayoutSummary>()
     invokeIpc.mockReturnValueOnce(groups.promise)
@@ -355,6 +371,18 @@ describe('mediaStore 详情请求时序', () => {
     })
     expect(store.layoutSummary).toBeNull()
     expect(store.layoutSemanticKey).toBeNull()
+    expect(viewIds.allIds()).toEqual([])
+    expect(selection.selectedCount.value).toBe(0)
+    expect(selection.selectionEpoch.value).toBeGreaterThan(selectedEpoch)
+    expect(selection.toBackendDescriptor()).toBeNull()
+    selection.clearSelection()
+    selection.toggleSelect(1)
+    selection.selectRange(1, 3)
+    selection.invertSelection()
+    selection.selectAll()
+    expect(selection.materializeIds()).toEqual([1])
+    selection.clearSelection()
+    expect(selection.materializeIds()).toEqual([])
     groups.resolve(layoutSummary(22))
     await enterGroups
     expect(store.layoutSummary?.layoutVersion).toBe(22)
@@ -378,6 +406,44 @@ describe('mediaStore 详情请求时序', () => {
         duplicateLens: { mode: 'folders', showUniqueItems: false, orderingVersion: 1 },
       }),
     )
+  })
+
+  it('排队请求被替代时明确结束，最新请求失败不提交中间布局且释放槽位', async () => {
+    vi.stubGlobal('window', { devicePixelRatio: 1 })
+    const store = useMediaStore()
+    const first = deferred<LayoutSummary>()
+    invokeIpc.mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error('query failed'))
+    const initial = store.computeLayout({ containerWidth: 800 })
+    const replaced = store.computeLayout({ containerWidth: 900 })
+    const latest = store.computeLayout({ containerWidth: 1000 })
+    expect(await replaced).toBe('superseded')
+    first.resolve(layoutSummary(10))
+    expect(await initial).toBe('superseded')
+    expect(await latest).toBe('failed')
+    expect(store.layoutSummary).toBeNull()
+    expect(store.isComputingLayout).toBe(false)
+    expect(invokeIpc).toHaveBeenCalledTimes(2)
+
+    invokeIpc.mockResolvedValueOnce(layoutSummary(12))
+    expect(await store.computeLayout({ containerWidth: 1100 })).toBe('committed')
+    expect(store.layoutSummary?.layoutVersion).toBe(12)
+  })
+
+  it('新的查询意图尚未发出布局时，旧计算完成也不能重新开放旧全集', async () => {
+    vi.stubGlobal('window', { devicePixelRatio: 1 })
+    const store = useMediaStore()
+    const ids = useViewIds()
+    const response = deferred<LayoutSummary>()
+    invokeIpc.mockReturnValueOnce(response.promise)
+    const pending = store.computeLayout({ containerWidth: 800 })
+    // 模拟语义查询启动/离屏切条件，新条件尚未达到布局入口。
+    store.invalidateViewOrder()
+    response.resolve(layoutSummary(80))
+    await pending
+    invokeIpc.mockResolvedValueOnce([7, 8])
+    await ids.ensureFresh(80)
+    expect(ids.isReady()).toBe(false)
+    expect(invokeIpc).not.toHaveBeenCalledWith(IPC.GET_VIEW_IDS, expect.anything())
   })
 
   it('内容键区分 folders 独有项与普通目录/筛选，并忽略对象键顺序', () => {
@@ -410,6 +476,7 @@ describe('mediaStore 详情请求时序', () => {
     void store.computeLayout({ containerWidth: 900 })
     await vi.advanceTimersByTimeAsync(30000)
     expect(invokeIpc).toHaveBeenCalledTimes(2)
+    expect(await firstCompute).toBe('superseded')
 
     second.resolve(layoutSummary(32))
     await Promise.resolve()

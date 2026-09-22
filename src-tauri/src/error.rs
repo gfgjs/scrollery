@@ -82,6 +82,12 @@ pub enum AppError {
     #[error("Operation cancelled")]
     Cancelled,
 
+    /// 超时后台图片读取仍占用磁盘；本批退出，实际读取结束后才允许重试。
+    #[error(
+        "图片读取超时，后台读取仍未结束 | Image read timed out; background read is still active"
+    )]
+    ImageReadTimeout,
+
     #[error("AI inference error: {0}")]
     Ai(String),
 
@@ -471,6 +477,10 @@ impl Serialize for AppError {
             // message 即卷标签（前端拼「请插入设备 <label>」）——message-passthrough，同 System/Os。
             AppError::VolumeOffline(m) => ("VolumeOffline", m.as_str()),
             AppError::Cancelled => ("Cancelled", "操作已取消 | Operation cancelled"),
+            AppError::ImageReadTimeout => (
+                "ImageReadTimeout",
+                "图片读取超时，后台读取结束后可重试 | Image read timed out; retry after the background read finishes",
+            ),
             AppError::Ai(_) => ("Ai", "AI 推理异常 | AI inference error"),
             AppError::AiModelNotLoaded(m) => ("AiModelNotLoaded", m.as_str()),
             AppError::AnalysisBusy => (

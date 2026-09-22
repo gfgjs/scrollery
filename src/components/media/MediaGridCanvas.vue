@@ -36,7 +36,8 @@
         @contextmenu.prevent="onHoverCardContextMenu"
         @pointerdown="onHoverCardPointerDown"
       >
-        <!-- §8.1 browse-only:browse-only 透传 MediaThumb,镜头态隐藏收藏/评分快捷动作与拖拽手柄。 -->
+        <!-- 悬停卡的生成由 Canvas 可见需求统一管理；卡片卸载不能取消仍可见的同项请求。
+             §8.1 browse-only 透传 MediaThumb,镜头态隐藏收藏/评分快捷动作与拖拽手柄。 -->
         <MediaThumb
           :id="hoverCard.item.id"
           :item="hoverCard.item"
@@ -59,8 +60,7 @@
           :browse-only="lensActive"
           :force-full="!isSelectionMode"
           :cache-dir="cacheDir"
-          @request-thumb="(id: number) => emit('request-thumb', id)"
-          @cancel-thumb="(id: number) => emit('cancel-thumb', id)"
+          @request-thumb="scheduleDraw"
           @regenerate-thumb="(id: number) => emit('regenerate-thumb', id)"
           @favorite="(id: number) => emit('cell-favorite', id)"
           @rate="(id: number, value: number) => emit('cell-rate', id, value)"
@@ -131,6 +131,8 @@ const props = defineProps<{
   spacerHeight: number
   /** 缩略图缓存目录(已规整为正斜杠)。 */
   cacheDir: string
+  /** 返回生成/解析请求的完成信号，供 Canvas 释放有界请求额度。 */
+  requestThumb: (id: number) => Promise<void>
   /** 是否极密(<100px):与 DOM 一致按此 gate 非必要 badges(播放/时长)。 */
   compactCells: boolean
   /** 选中谓词(单格粒度)。 */
@@ -197,7 +199,6 @@ const emit = defineEmits<{
   // onHandle:指针是否落在已选中格的左上拖拽手柄上(Canvas 几何命中);宿主 onCardPointerDown
   // 据此分流「拖到文件夹 vs 反转扫选」——DOM 网格不传此参、走 e.target 兜底判定。
   'cell-pointerdown': [id: number, event: PointerEvent, onHandle: boolean]
-  'request-thumb': [id: number]
   'cancel-thumb': [id: number]
   'regenerate-thumb': [id: number]
   /** 悬停卡交互(T13):收藏/评分/checkbox 上抛宿主(handleFavorite/handleRate/toggleSelect)。 */
@@ -321,7 +322,8 @@ const selAnim = new SelectionAnimTracker()
 // 图像缓存/加载/失败收口 + 视口外预取(idle+draw 尾双通道,原逻辑域 B/E 预取部分)。
 const pipeline = useCanvasThumbPipeline({
   cacheDir: () => props.cacheDir,
-  onRequestThumb: (id) => emit('request-thumb', id),
+  onRequestThumb: (id) => props.requestThumb(id),
+  onCancelThumb: (id) => emit('cancel-thumb', id),
   onRegenerateThumb: (id) => emit('regenerate-thumb', id),
   scheduleDraw,
   viewportW: () => viewW,

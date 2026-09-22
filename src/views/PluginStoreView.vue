@@ -27,6 +27,8 @@
       {{ storeErrorText }}
     </div>
 
+    <OfficialFeaturesPanel ref="featuresPanel" />
+
     <!-- 处理进度：有 exotic 任务时才显（进度条 + 计数 + 控制）。 -->
     <section v-if="proc && procTotal > 0" class="ps-proc">
       <div class="ps-proc__head">
@@ -163,7 +165,6 @@
             <span v-else-if="row.availableVersion">
               {{ $t('exotic.version') }} {{ row.availableVersion }}
             </span>
-            <span v-if="row.sku" class="ps-card__sku"><code>{{ row.sku }}</code></span>
           </div>
         </div>
 
@@ -223,86 +224,10 @@
       </div>
     </div>
 
-    <!-- 内置能力插件（T11：D-OCR-5——无安装包，直接走 license 门控，如 OCR）。 -->
-    <section v-if="store.builtinOfferings.value.length" class="ps-builtin">
-      <h3 class="ps-builtin__title">{{ $t('store.builtinTitle') }}</h3>
-      <div class="ps-list">
-        <div
-          v-for="off in store.builtinOfferings.value"
-          :key="off.format"
-          class="ps-card"
-        >
-          <div class="ps-card__icon"><Puzzle :size="22" /></div>
-          <div class="ps-card__body">
-            <div class="ps-card__title-row">
-              <span class="ps-card__name">{{ off.displayName || off.pluginId }}</span>
-              <span
-                v-if="off.availability === 'authorized'"
-                class="ps-badge ps-badge--installed"
-                >{{ $t('exotic.activated') }}</span
-              >
-            </div>
-            <p v-if="off.availability === 'authorized'" class="ps-builtin__hint">
-              {{ $t('store.builtinNoInstall') }}
-            </p>
-            <!-- 视频格式扩展子系统(design.md §3.4):FFmpeg 是进程边界外的独立可执行文件,不链接
-                 进本应用(全链路无链接,连 LGPL 动态链接义务都不触发),但仍按 LGPL 精神展示声明 +
-                 源码获取渠道。仅本插件卡片显示(硬编 pluginId 判断,数据驱动的 catalog 无 description
-                 字段可扩,见 findings)。 -->
-            <!-- 源码链钉死到具体 release tag(V7 项11),与 tools.rs BTBN_RELEASE_TAG 同步改——
-                 该常量升级时须同时改这里的 href,否则用户点开的源码页与实际内置版本不一致。 -->
-            <p v-if="off.pluginId === 'video-extended'" class="ps-builtin__ffmpeg-notice">
-              {{ $t('store.videoExtendedFfmpegNotice') }}
-              <a
-                class="ps-builtin__ffmpeg-link"
-                href="https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-07-24-13-32"
-                target="_blank"
-                rel="noopener noreferrer"
-                >{{ $t('store.videoExtendedSourceLink') }}</a
-              >
-            </p>
-          </div>
-          <div class="ps-card__actions">
-            <span v-if="off.pluginId ? busy[off.pluginId] : false" class="ps-busy">
-              <RefreshCw :size="14" class="spin-anim" />
-            </span>
-            <template v-else>
-              <span v-if="off.availability === 'authorized'" class="ps-activated">
-                <CheckCircle2 :size="14" /> {{ $t('exotic.activated') }}
-              </span>
-              <template
-                v-else-if="off.availability === 'availableUninstalled' || off.availability === 'licenseExpired'"
-              >
-                <button
-                  v-if="off.pluginId"
-                  class="btn btn-ghost btn-sm"
-                  @click="activateTarget = off.pluginId"
-                >
-                  <KeyRound :size="14" /> {{ $t('exotic.activateAction') }}
-                </button>
-                <a
-                  v-if="off.storeUrl"
-                  class="btn btn-ghost btn-sm"
-                  :href="off.storeUrl"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  {{ $t('exotic.gateBuy') }}
-                </a>
-              </template>
-              <!-- 兜底态(平台不支持/版本不兼容/已禁用等):禁用态徽章,不留空白操作区。 -->
-              <span v-else class="ps-badge ps-badge--disabled">{{ $t('exotic.stateDisabled') }}</span>
-            </template>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <!-- 激活对话框：由某行「激活」触发。 -->
     <ExoticActivateDialog
       :open="activateTarget !== null"
-      :plugin-id="activateTarget ?? ''"
-      :feature-name="activateTarget ?? ''"
+      :feature-name="$t('official.title')"
       @close="activateTarget = null"
       @activated="onActivated"
     />
@@ -331,6 +256,7 @@ import {
 } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
 
+import OfficialFeaturesPanel from '../components/exotic/OfficialFeaturesPanel.vue'
 import ExoticActivateDialog from '../components/exotic/ExoticActivateDialog.vue'
 import { useExoticStore, mergeStorePlugins, type StorePluginRow } from '../composables/useExoticStore'
 import { resetOcrStatusCache } from '../composables/useOcr'
@@ -348,6 +274,7 @@ import { invokeIpc, type IpcError } from '../utils/ipc'
 
 const { t } = useI18n()
 const store = useExoticStore()
+const featuresPanel = ref<InstanceType<typeof OfficialFeaturesPanel> | null>(null)
 const toast = useToastStore()
 const { confirm } = useConfirm()
 
@@ -534,6 +461,7 @@ async function run(pluginId: string, fn: () => Promise<void>, okKey: string) {
   busy[pluginId] = true
   try {
     await fn()
+    void featuresPanel.value?.refresh()
     toast.addToast('success', t(okKey))
   } catch (e) {
     toast.addToast('error', t('exotic.opFailed', { code: (e as IpcError)?.code ?? 'unknown' }))
@@ -550,24 +478,22 @@ function onRepair(pluginId: string) {
 }
 
 async function onUninstall(pluginId: string) {
-  const { confirmed, checkboxValue } = await confirm({
+  const { confirmed } = await confirm({
     title: t('exotic.uninstallTitle'),
     message: t('exotic.uninstallMsg'),
     confirmText: t('exotic.uninstall'),
-    showCheckbox: true,
-    checkboxLabel: t('exotic.uninstallRemoveLicense'),
-    checkboxValue: false,
   })
   if (!confirmed) return
-  void run(pluginId, () => store.uninstall(pluginId, checkboxValue), 'exotic.uninstalledOk')
+  void run(pluginId, () => store.uninstall(pluginId), 'exotic.uninstalledOk')
 }
 
 // 激活成功 → 刷新已装/进度（授权态变化可能解阻处理）+ 内置能力区（T11）；
 // resetOcrStatusCache 清 useOcr 的 60s 状态缓存，激活后立即反映新授权态。
+useTauriListen(EVENTS.OFFICIAL_LICENSE_CHANGED, () => { onActivated() })
+
 function onActivated() {
   void store.loadInstalled()
   void store.loadStatus()
-  void store.loadBuiltin()
   resetOcrStatusCache()
 }
 

@@ -5,6 +5,7 @@
       <div class="batch-size-stack">
         <input
           type="number"
+          :aria-label="$t('settings.aiBatchSize')"
           v-model.number="aiBatchSizeLocal"
           @change="onBatchChange"
           min="0"
@@ -53,12 +54,12 @@
 
     <!-- ── 开关类(注册表 control='toggle',绑定见 toggleBindings)──── -->
     <template v-else-if="spec?.control === 'toggle' && hasToggleBinding">
-      <UiToggle v-model="toggleModel" :class="{ 'compact-toggle': compact }" />
+      <UiToggle v-model="toggleModel" :label="$t(spec.label)" :class="{ 'compact-toggle': compact }" />
     </template>
 
     <!-- ── 下拉类(control='select',选项表来自注册表)────────────── -->
     <template v-else-if="spec?.control === 'select' && hasSelectBinding">
-      <UiSelect v-model="selectModel" :class="{ 'compact-select-wrap': compact }">
+      <UiSelect v-model="selectModel" :label="$t(spec.label)" :class="{ 'compact-select-wrap': compact }">
         <option v-for="opt in spec.options ?? []" :key="opt.value" :value="opt.value">
           {{ opt.labelKey ? $t(opt.labelKey) : opt.label }}
         </option>
@@ -67,15 +68,19 @@
 
     <!-- ── 数字类(control='number',边界来自注册表;本地缓冲,change 时提交)── -->
     <template v-else-if="spec?.control === 'number' && hasNumberBinding">
+      <div class="number-control">
       <input
         type="number"
         v-model.number="numberLocal"
+        :aria-label="[$t(spec.label), spec.unit].filter(Boolean).join(' ')"
         @change="commitNumber"
         :min="spec.min"
         :max="spec.max"
         class="input-number"
         :class="{ 'compact-input': compact }"
       />
+      <span v-if="spec.unit" class="number-control__unit" aria-hidden="true">{{ spec.unit }}</span>
+      </div>
     </template>
 
     <!-- ── 危险清理按钮类(compact 统一 RotateCcw 图标,全尺寸按键取各自图标)── -->
@@ -509,6 +514,15 @@ async function handleOpenLogWindow() {
 </script>
 
 <style scoped>
+.number-control {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+}
+.number-control__unit {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
 /* ── Segmented Control ─────────────────────────────────────────────────── */
 .segmented-control {
   display: inline-flex;

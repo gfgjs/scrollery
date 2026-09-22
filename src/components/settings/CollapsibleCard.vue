@@ -1,32 +1,18 @@
-<!-- 可折叠的设置分组：复用全局设置行契约，标题行点击折叠/展开，状态按 id 持久化。 -->
 <template>
-  <div class="settings-card" :class="{ 'settings-card--collapsed': !open }">
-    <div
-      class="settings-card__header settings-card__header--toggle"
-
-      tabindex="0"
-
-      @click="toggle"
-      @keydown.enter.prevent="toggle"
-      @keydown.space.prevent="toggle"
-    >
-      <ChevronRight :size="14" class="settings-card__chevron" :class="{ expanded: open }" />
-      <span class="settings-card__header-title"
-        ><slot name="title">{{ title }}</slot></span
-      >
-      <!-- 可选右侧操作区；此处点击不触发折叠。 -->
-      <span v-if="$slots.actions" class="settings-card__header-actions" @click.stop
-        ><slot name="actions"
-      /></span>
+  <div class="settings-card" :class="{ 'settings-card--collapsed': !open }" :data-settings-card="id">
+    <div class="settings-card__header">
+      <button type="button" class="settings-card__header-toggle" :aria-expanded="open"
+        :aria-controls="`settings-card-body-${id}`" @click="toggle">
+        <span class="settings-card__heading-text">
+          <span class="settings-card__header-title"><slot name="title">{{ title }}</slot></span>
+          <span v-if="!open && summary" class="settings-card__summary">{{ summary }}</span>
+        </span>
+        <ChevronRight :size="16" class="settings-card__chevron" :class="{ expanded: open }" />
+      </button>
+      <div v-if="$slots.actions" class="settings-card__header-actions"><slot name="actions" /></div>
     </div>
-
-    <!-- 折叠动画：grid 行高 1fr↔0fr，内层裁剪溢出；DOM 常驻不卸载。 -->
-    <!-- Collapse via grid 1fr↔0fr; inner clips overflow; DOM stays mounted. -->
-    <div class="settings-card__body">
-      <div class="settings-card__body-inner">
-        <slot />
-      </div>
-    </div>
+    <!-- 常驻 DOM 保留编辑与任务状态；收起时隐藏，键盘不会进入不可见控件，搜索可立即定位。 -->
+    <div v-show="open" :id="`settings-card-body-${id}`" class="settings-card__body"><slot /></div>
   </div>
 </template>
 
@@ -34,20 +20,16 @@
 import { computed, onMounted, onUnmounted } from 'vue'
 import { ChevronRight } from '@lucide/vue'
 import { useSettingsCards } from '../../composables/useSettingsCards'
-
-const props = defineProps<{
-  /** 持久化展开状态的稳定键 | stable key for persisting expand-state */
+const props = withDefaults(defineProps<{
+  /** 分组展开状态的持久化键，与配置 schema 一致。 */
   id: string
-  /** 标题文本（也可用 #title 插槽覆盖）| header text (or override via #title slot) */
   title?: string
-  /** 首次（无持久化值时）是否展开，默认展开 | default open when no stored value */
+  /** 收起时仍可查看当前参数。 */
+  summary?: string
+  /** 权威快照到达前的默认展开状态。 */
   defaultOpen?: boolean
-}>()
-const emit = defineEmits<{
-  toggle: [open: boolean]
-}>()
-
-// 展开状态交由全局协调器管理，使「一键全部折叠/展开」能跨组件作用。
+}>(), { defaultOpen: true })
+const emit = defineEmits<{ toggle: [open: boolean] }>()
 const cards = useSettingsCards()
 onMounted(() => cards.register(props.id, props.defaultOpen ?? true))
 onUnmounted(() => cards.unregister(props.id))
@@ -59,60 +41,52 @@ function toggle() {
 </script>
 
 <style scoped>
-/* 标题行改为可点击的开合控件（基础样式来自全局 .settings-card__header）。 */
-.settings-card__header--toggle {
+.settings-card__header {
   display: flex;
   align-items: center;
-  gap: var(--spacing-sm);
+  padding: 0;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.settings-card__header-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-md);
+  flex: 1;
+  min-width: 0;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border: 0;
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  text-align: left;
   cursor: pointer;
-  user-select: none;
-  /* 展开时显示分隔线（折叠时透明，避免遗留 1px 线）。 */
-  border-bottom: 1px solid transparent;
-  transition:
-    background var(--transition-fast),
-    color var(--transition-fast),
-    border-color var(--transition-fast);
 }
-.settings-card:not(.settings-card--collapsed) .settings-card__header--toggle {
-  border-bottom-color: var(--color-divider);
-}
-.settings-card__header--toggle:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-secondary);
-}
-.settings-card__header--toggle:focus-visible {
+.settings-card__header-toggle:hover { background: var(--color-bg-hover); }
+.settings-card__header-toggle:focus-visible {
   outline: 2px solid var(--color-accent);
-  outline-offset: -2px;
+  outline-offset: -3px;
+}
+.settings-card__heading-text { display: grid; gap: var(--spacing-xs); min-width: 0; }
+.settings-card__header-title { font-weight: 500; }
+.settings-card__summary {
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
 }
 .settings-card__chevron {
   flex-shrink: 0;
-  transition: transform 0.2s;
+  color: var(--color-text-tertiary);
+  transition: transform var(--transition-fast);
 }
-.settings-card__chevron.expanded {
-  transform: rotate(90deg);
-}
-.settings-card__header-title {
-  flex: 1;
-  min-width: 0;
-}
+.settings-card__chevron.expanded { transform: rotate(90deg); }
 .settings-card__header-actions {
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: var(--spacing-sm);
-  cursor: default;
+  padding-right: var(--spacing-lg);
 }
-
-.settings-card__body {
-  display: grid;
-  grid-template-rows: 1fr;
-  transition: grid-template-rows var(--duration-moderate) var(--ease-in-out);
-}
-.settings-card--collapsed .settings-card__body {
-  grid-template-rows: 0fr;
-}
-.settings-card__body-inner {
-  overflow: hidden;
-  min-width: 0;
-}
+.settings-card__body { border-top: 1px solid var(--color-divider); }
 </style>

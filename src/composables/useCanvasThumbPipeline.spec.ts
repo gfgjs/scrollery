@@ -2,8 +2,8 @@
 // getImage 的 renderSig 失效判定、64 槽全局在途上限背压、cancelAbortableThumbLoads 的
 // abortable/非 abortable 判定。项目无 DOM 测试环境(全 node,不引 jsdom):window/fetch/Image
 // 用最小桩,写法对齐 useThumbLoader.spec.ts(先 vi.stubGlobal 再动态 import,避开模块顶层
-// window.location.search 读取先于桩生效的坑)。源文件零改动——本测试只消费已导出的公开 API
-// (getImage/dispose/thumbState/CanvasThumbPipelineOptions),不触碰 thumbLoads 等私有闭包状态。
+// window.location.search 读取先于桩生效的坑)。同时覆盖视口生成需求的上限、取消与异步归属；
+// 只消费公开 API，不触碰 thumbLoads / thumbRequests 等私有闭包状态。
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import type { LayoutRow, LayoutRowItem } from '../types/layout'
 import type { CanvasThumbPipeline, ThumbSrc } from './useCanvasThumbPipeline'
@@ -78,19 +78,105 @@ function makePipeline(fetchImpl?: (url: string) => Promise<unknown>) {
       throw new Error(`unexpected fetch: ${url}`)
     }),
   )
-  const onRequestThumb = vi.fn()
+  const onRequestThumb = vi.fn<(id: number) => Promise<void>>(() => new Promise(() => {}))
+  const onCancelThumb = vi.fn()
   const onRegenerateThumb = vi.fn()
   const scheduleDraw = vi.fn()
   const pipeline = useCanvasThumbPipeline({
     cacheDir: () => '/cache',
     onRequestThumb,
+    onCancelThumb,
     onRegenerateThumb,
     scheduleDraw,
     viewportW: () => 800,
     viewportH: () => 600,
   })
-  return { pipeline, onRequestThumb, onRegenerateThumb, scheduleDraw }
+  return { pipeline, onRequestThumb, onCancelThumb, onRegenerateThumb, scheduleDraw }
 }
+
+describe('视口生成请求生命周期', () => {
+  it('同签名连续绘制只请求一次，生成状态变化后加载返回的源', () => {
+    const { pipeline, onRequestThumb } = makePipeline(() => new Promise(() => {}))
+    const item = makeItem({ id: 1 })
+    pipeline.getImage(item)
+    pipeline.getImage(item)
+    expect(onRequestThumb).toHaveBeenCalledTimes(1)
+    pipeline.getImage({ ...item, thumbStatus: 1, thumbPath: 'ready.webp' })
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('一屏数千待生成项只提交两批需求，落定后重绘推进下一项', async () => {
+    const done = deferred<void>()
+    const { pipeline, onRequestThumb, scheduleDraw } = makePipeline()
+    onRequestThumb.mockReturnValueOnce(done.promise)
+    const items = Array.from({ length: 3000 }, (_, id) => makeItem({ id }))
+    for (const item of items) pipeline.getImage(item)
+    expect(onRequestThumb).toHaveBeenCalledTimes(48)
+    done.resolve(undefined)
+    await done.promise
+    await Promise.resolve()
+    expect(scheduleDraw).toHaveBeenCalledTimes(1)
+    pipeline.getImage(items[48])
+    expect(onRequestThumb).toHaveBeenLastCalledWith(48)
+  })
+
+  it('离屏取消、重入可重发；旧请求迟到落定不释放新请求', async () => {
+    const old = deferred<void>()
+    const { pipeline, onRequestThumb, onCancelThumb, scheduleDraw } = makePipeline()
+    onRequestThumb.mockReturnValueOnce(old.promise)
+    const item = makeItem({ id: 1 })
+    pipeline.getImage(item)
+    pipeline.prioritizeVisibleThumbLoads([], 0, 0)
+    expect(onCancelThumb).toHaveBeenCalledWith(1)
+    pipeline.getImage(item)
+    old.resolve(undefined)
+    await old.promise
+    await Promise.resolve()
+    expect(scheduleDraw).not.toHaveBeenCalled()
+    pipeline.prioritizeVisibleThumbLoads([], 0, 0)
+    expect(onCancelThumb).toHaveBeenCalledTimes(2)
+    expect(onRequestThumb).toHaveBeenCalledTimes(2)
+  })
+
+  it('已在当前视口的生成请求保留，预取不新增生成或路径解析需求', () => {
+    const { pipeline, onRequestThumb, onCancelThumb } = makePipeline()
+    const item = makeItem({ id: 1 })
+    pipeline.getImage(item)
+    pipeline.prioritizeVisibleThumbLoads(normalRows({ y: 0, items: [item] }), 0, 1)
+    expect(onCancelThumb).not.toHaveBeenCalled()
+    pipeline.getImage(makeItem({ id: 2 }), 'prefetch')
+    pipeline.getImage(makeItem({ id: 3, thumbStatus: 3 }), 'prefetch')
+    expect(onRequestThumb).toHaveBeenCalledTimes(1)
+  })
+
+  it('请求终拒释放额度并补绘，同签名不无限重试', async () => {
+    const { pipeline, onRequestThumb, scheduleDraw } = makePipeline()
+    onRequestThumb.mockRejectedValueOnce(new Error('failed'))
+    const item = makeItem({ id: 1 })
+    pipeline.getImage(item)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(scheduleDraw).toHaveBeenCalledTimes(1)
+    pipeline.getImage(item)
+    expect(onRequestThumb).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['pause', 'dispose'] as const)('%s 撤销生成需求，迟到落定不重绘，恢复后可请求', async (method) => {
+    const done = deferred<void>()
+    const { pipeline, onRequestThumb, onCancelThumb, scheduleDraw } = makePipeline()
+    onRequestThumb.mockReturnValueOnce(done.promise)
+    const item = makeItem({ id: 1 })
+    pipeline.getImage(item)
+    pipeline[method]()
+    expect(onCancelThumb).toHaveBeenCalledWith(1)
+    done.resolve(undefined)
+    await done.promise
+    await Promise.resolve()
+    expect(scheduleDraw).not.toHaveBeenCalled()
+    pipeline.getImage(item)
+    expect(onRequestThumb).toHaveBeenCalledTimes(2)
+  })
+})
 
 describe('getImage renderSig 失效', () => {
   it('规格现行(renderSig 精确匹配)是纯命中:不发起刷新请求;规格过期(w/h 变化)则回退旧位图续画并发起一次刷新', () => {

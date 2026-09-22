@@ -48,6 +48,12 @@ export function enhanceErrorMessageKey(code: string | null | undefined): string 
       return 'enhance.errInputUnsupported'
     case 'enhance_model_missing':
       return 'enhance.errModelMissing'
+    case 'enhance_worker_missing':
+      return 'enhance.errWorkerMissing'
+    case 'enhance_manifest_unready':
+      return 'settings.enhanceManifestUnready'
+    case 'enhance_status_unavailable':
+      return 'enhance.errStatusUnavailable'
     case 'enhance_busy':
       return 'enhance.errBusy'
     case 'enhance_download_failed':
@@ -89,12 +95,19 @@ export const useEnhanceStore = defineStore('enhance', () => {
 
   // ── Actions ───────────────────────────────────────────────────────────────
 
-  /** 拉取门控 + 模型态。失败记 logger 不抛（分节/对话框容错，由调用方判 null）。 */
+  let statusGeneration = 0
+  /** 授权变更后的新查询优先，旧响应不能恢复已被移除的授权展示。 */
   async function fetchStatus(): Promise<EnhanceStatus | null> {
+    const current = ++statusGeneration
+    status.value = null
     try {
-      status.value = await invokeIpc<EnhanceStatus>(IPC.ENHANCE_STATUS)
+      const result = await invokeIpc<EnhanceStatus>(IPC.ENHANCE_STATUS)
+      if (current === statusGeneration) status.value = result
     } catch (e) {
-      logger.error('[Enhance] 拉取状态失败 | fetch status', { error: e })
+      if (current === statusGeneration) {
+        status.value = null
+        logger.error('[Enhance] 拉取状态失败 | fetch status', { error: e })
+      }
     }
     return status.value
   }

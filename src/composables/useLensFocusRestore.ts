@@ -7,15 +7,12 @@
 // 该 id 的卡片；该 id 已不在新布局（如关闭独有项后原聚焦项是独有项）时回顶部并聚焦镜头状态条
 // 主标题（§8.1 明文）。机制按通用写,不假设 P1 只有 groups——P3 folders 排列切换直接生效。
 //
-// 时序契约：恢复挂在宿主布局重算的滚动恢复链上（MediaGrid 把本 composable 的 restoreLensFocus
-// 链在 useReflowAnchor.restoreReflowAnchor 之后,注入 useGalleryTauriSync 的 layoutVersion
-// watcher）——即「reflow 锚点 → 镜头焦点锚点 → scrollCache 回退」的单一顺序。镜头排列切换不会
-// 捕获 reflow 锚点（其 watch 面不含镜头键,且锚点按 viewKey 校验、排列切换即换键）,二者天然互斥；
-// 返回 true 时短路调用方的 scrollCache 回退,保证「回顶部」的明文语义不被旧镜头键缓存覆盖。
-import { nextTick, watch } from 'vue'
+// bucket 换代先解析「reflow 锚点 → 镜头焦点锚点 → scrollCache」,再一次提交目标窗口。
+// 镜头项消失时明确返回顶部目标,确保旧缓存位不会覆盖产品规定的焦点回退。
+import { nextTick, onScopeDispose, watch } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
-import { scrollCache } from '../utils/scrollCache'
+import type { LayoutRestoreTarget } from './useBucketVirtualScroll'
 import { IPC } from '../constants/ipc'
 import { useDuplicateLensStore } from '../stores/duplicateLensStore'
 
@@ -30,7 +27,6 @@ const FOCUS_RETRY_DELAY_MS = 16
 
 export interface LensFocusRestoreDeps {
   gridRef: () => HTMLElement | null
-  scrollToLogicalY: (y: number) => Promise<void>
   getViewKey: () => string
 }
 
@@ -39,6 +35,9 @@ export function useLensFocusRestore(deps: LensFocusRestoreDeps) {
 
   /** 待恢复的聚焦项:null = 无待恢复（非镜头路径恒空,恢复链上零开销直返）。 */
   let pendingFocus: { id: number; screenOffset: number } | null = null
+  let restoreEpoch = 0
+  let disposed = false
+  onScopeDispose(() => { disposed = true; restoreEpoch++ })
 
   /**
    * 捕获:镜头激活期间 mode/showUniqueItems 变化（切换前后 mode 均非空）→ 记下当前聚焦卡片的
@@ -50,6 +49,7 @@ export function useLensFocusRestore(deps: LensFocusRestoreDeps) {
   watch(
     () => [lens.mode, lens.showUniqueItems] as const,
     ([mode], [prevMode]) => {
+      restoreEpoch++
       if (mode === null || prevMode === null) {
         // 镜头退出即弃锚,防陈旧 pending 被无关布局变化消费。
         pendingFocus = null
@@ -71,48 +71,49 @@ export function useLensFocusRestore(deps: LensFocusRestoreDeps) {
     return { id, screenOffset }
   }
 
-  /**
-   * 镜头焦点锚点恢复。返回 true = 本函数已把滚动位安排妥当,调用方跳过 scrollCache 回退;
-   * false = 无待恢复（非镜头路径常态）。焦点落卡是行回填后的后续动作,fire-and-forget 不阻塞恢复链。
-   */
-  async function restoreLensFocus(): Promise<boolean> {
-    if (pendingFocus === null) return false
-    const { id, screenOffset } = pendingFocus
-    pendingFocus = null
+  /** 只解析目标；窗口提交后才恢复焦点，等待虚拟行期间持续核对视图归属。 */
+  async function resolveLensFocus(layoutVersion: number, isCurrent: () => boolean): Promise<LayoutRestoreTarget | null> {
+    if (pendingFocus === null || disposed) return null
+    const focus = pendingFocus
+    const { id, screenOffset } = focus
     const el = deps.gridRef()
-    if (!el) return false
+    if (!el) return null
+    const epoch = ++restoreEpoch
+    const viewKey = deps.getViewKey()
+    const current = () => !disposed && epoch === restoreEpoch && viewKey === deps.getViewKey() && isCurrent()
+    const consume = () => {
+      if (!current()) return false
+      if (pendingFocus === focus) pendingFocus = null
+      return true
+    }
 
     let y: number | null = null
     try {
       // 新布局中该项所在行的逻辑 y（后端布局缓存已随 layoutVersion 换代,查得即新几何）。
-      y = await invokeIpc<number | null>(IPC.GET_ITEM_Y_BY_ID, { itemId: id })
+      y = await invokeIpc<number | null>(IPC.GET_ITEM_Y_BY_ID, { itemId: id, layoutVersion })
     } catch (e) {
       logger.warn('[LensFocus] get_item_y_by_id failed', { error: e })
+      return null
     }
+    if (!current()) return null
 
     if (y === null) {
-      // 焦点项已不在新布局（§8.1）:回顶部 + 聚焦主标题。返回 true 短路 scrollCache 回退——
+      // 焦点项已不在新布局（§8.1）:回顶部 + 聚焦主标题,短路 scrollCache 回退——
       // 旧镜头键可能有历史缓存位,不能让它把「回顶部」顶掉。
-      await deps.scrollToLogicalY(0)
-      scrollCache.set(deps.getViewKey(), 0)
-      void focusTitleFallback()
-      return true
+      return { y: 0, afterRestore: () => { if (consume()) void focusTitleFallback(current) } }
     }
 
     // 滚动位:把该项钉回其切换前的屏幕纵向位置;顺带写入新镜头键的滚动缓存（与重排锚点同惯例）。
-    const targetY = Math.max(0, y - screenOffset)
-    await deps.scrollToLogicalY(targetY)
-    scrollCache.set(deps.getViewKey(), targetY)
-    void focusItemWhenRendered(id)
-    return true
+    return { y: Math.max(0, y - screenOffset), afterRestore: () => { if (consume()) void focusItemWhenRendered(id, current) } }
   }
 
   /** 等虚拟行回填后把焦点移回该 id 的卡片;始终不出现则退而聚焦网格容器,保住键盘滚动能力。 */
-  async function focusItemWhenRendered(id: number): Promise<void> {
+  async function focusItemWhenRendered(id: number, isCurrent: () => boolean): Promise<void> {
     const selector = `[data-item-id="${id}"]`
     for (let i = 0; i < FOCUS_RETRY_LIMIT; i++) {
       // nextTick:让调用方恢复链尾随的 updateVisible → 渲染 flush 先落地。
       await nextTick()
+      if (!isCurrent()) return
       const card = deps.gridRef()?.querySelector(selector) as HTMLElement | null
       if (card) {
         // preventScroll:滚动位已按 item y 精确设定,交浏览器重滚会与虚拟行回填竞态。
@@ -121,15 +122,16 @@ export function useLensFocusRestore(deps: LensFocusRestoreDeps) {
       }
       await new Promise((r) => setTimeout(r, FOCUS_RETRY_DELAY_MS))
     }
-    deps.gridRef()?.focus({ preventScroll: true })
+    if (isCurrent()) deps.gridRef()?.focus({ preventScroll: true })
   }
 
   /** 焦点项已不在新布局的兜底:聚焦镜头状态条主标题（常驻 DOM,非虚拟化）。 */
-  async function focusTitleFallback(): Promise<void> {
+  async function focusTitleFallback(isCurrent: () => boolean): Promise<void> {
     await nextTick()
+    if (!isCurrent()) return
     const title = document.querySelector(LENS_STATUS_TITLE_SELECTOR) as HTMLElement | null
     title?.focus({ preventScroll: true })
   }
 
-  return { restoreLensFocus }
+  return { resolveLensFocus }
 }

@@ -328,6 +328,41 @@ mod tests {
         }
     }
 
+    /// orderVersion 不包含打包参数：两种布局、分隔符和几何变化必须保留完整输入序。
+    #[test]
+    fn geometry_inputs_preserve_full_order_across_packers() {
+        let items = vec![
+            mk_item(8, 160, 90, 86_420),
+            mk_item(3, 90, 160, 86_410),
+            mk_item(7, 100, 100, 20),
+            mk_item(2, 400, 100, 10),
+            mk_item(9, 0, 0, -1),
+        ];
+        let expected: Vec<i64> = items.iter().map(|item| item.id).collect();
+        for group in ["none", "date", "folder"] {
+            for seamless in [false, true] {
+                for (width, height, gap) in [(500.0, 120.0, 8.0), (150.0, 50.0, 0.0)] {
+                    let mut params = grid_params(width, height, gap, group);
+                    params.seamless = seamless;
+                    for rows in [
+                        compute_grid_layout(&items, &params, &HashMap::new()),
+                        compute_justified_layout(&items, &params, &HashMap::new(), None),
+                    ] {
+                        let flat: Vec<i64> = rows
+                            .iter()
+                            .filter_map(as_normal)
+                            .flat_map(|(_, _, row)| row.iter().map(|item| item.id))
+                            .collect();
+                        assert_eq!(
+                            flat, expected,
+                            "group={group}, seamless={seamless}, width={width}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// grid（none 分组）：固定列数、方格单元、撑满宽、x 按列均布、y 逐行推进。
     #[test]
     fn grid_none_packs_uniform_square_rows() {

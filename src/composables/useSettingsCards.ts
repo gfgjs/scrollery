@@ -44,6 +44,11 @@ function toggle(id: string) {
   commit({ ...readOpenMap(), [id]: !isOpen(id) })
 }
 
+/** 搜索定位时只展开目标分组，保留其他分组的用户选择。 */
+function expand(id: string) {
+  if (!isOpen(id)) commit({ ...readOpenMap(), [id]: true })
+}
+
 /** 挂载时登记；缺省只记在本地用于首帧呈现。 */
 function register(id: string, defaultOpen = true) {
   mounted.add(id)
@@ -67,5 +72,5 @@ const allOpen = computed(() => [...mounted].every((id) => isOpen(id)))
 const allClosed = computed(() => mounted.size > 0 && [...mounted].every((id) => !isOpen(id)))
 
 export function useSettingsCards() {
-  return { isOpen, toggle, register, unregister, setAll, allOpen, allClosed }
+  return { isOpen, toggle, expand, register, unregister, setAll, allOpen, allClosed }
 }

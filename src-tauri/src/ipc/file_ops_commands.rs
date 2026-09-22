@@ -13,7 +13,7 @@ use crate::utils::path::{resolve_media_path, resolve_within_root};
 
 /// Drop 守卫：把「布局失效 + bump 数据版本」放到 early-return 跳不过的位置。
 ///
-/// 2026-07-06 审查 P1-6：本文件四个批量命令（move/relocate/copy_db/remove_hard）逐条自动提交，
+/// 2026-07-06 审查 P1-6：本文件三个批量命令（relocate/copy_db/remove_hard）逐条自动提交，
 /// 第 N 项失败时前 N-1 项的删行/改行**已生效**，而原实现把失效放在循环之后——中途 `?` 返回即
 /// 跳过 bump，items 取数缓存继续按旧 data_version 命中，画廊持续端出已删/已移项（点击报
 /// MediaNotFound），直到下次任意写路径 bump 才恢复。守卫在 Drop 时按 `dirty` 决定失效，
@@ -99,138 +99,6 @@ pub async fn create_physical_folder(
     Ok(path_str)
 }
 
-#[tauri::command]
-pub async fn move_media_items(
-    media_ids: Vec<i64>,
-    target_dir: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<i64>> {
-    // span 埋点(W1,D-312 info 档:逐条 fs rename + DB 删行,真实 IO/DB 工作)。
-    let _span = crate::logging::SpanTimer::info("ipc:move_media_items");
-    // R1-3：逐条「读路径(SQL) → rename(fs) → 删行(SQL)」串行交织，且尾部 trash::delete 是
-    // 回收站 syscall，整段下沉一个 blocking 任务（tokio::fs 内部本就逐调用 spawn_blocking，
-    // 合并后反而少跳线程）；顺序与失败语义不变（中途失败即返回，已移动项的删行已生效）。
-    let state = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = InvalidateOnWrite::new(&state);
-        let mut moved_ids = vec![];
-        let mut dirs_to_check = std::collections::HashSet::new();
-
-        for id in media_ids {
-            let src_path = {
-                let pool = state.db_read_pool.get().map_err(AppError::from)?;
-                let (root, rel, name) = q::get_item_path_info(&pool, id)?;
-                resolve_media_path(&root, &rel, &name)
-            };
-
-            let src_file_name = PathBuf::from(&src_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            if src_file_name.is_empty() {
-                continue;
-            }
-
-            let target_path = PathBuf::from(&target_dir).join(&src_file_name);
-
-            if let Some(parent) = target_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| AppError::MoveFile(e.to_string()))?;
-            }
-
-            std::fs::rename(&src_path, &target_path)
-                .map_err(|e| AppError::MoveFile(e.to_string()))?;
-
-            if let Some(parent) = PathBuf::from(&src_path).parent() {
-                dirs_to_check.insert(parent.to_path_buf());
-            }
-
-            {
-                // 硬删走对账封装(2026-07-10 审查 F7):CASCADE 删脸后同事务重算受影响
-                // person 的派生字段,防计数虚高/封面悬挂/幽灵人物。
-                let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-                q::delete_media_item_hard(&conn, id)?;
-            }
-            guard.dirty = true; // 删行已生效——即使后续项失败也必须 bump（P1-6）
-            moved_ids.push(id);
-        }
-
-        // 如果源文件夹为空，则移入系统回收站
-        for dir in dirs_to_check {
-            if let Ok(mut entries) = std::fs::read_dir(&dir) {
-                // 与原 tokio 版语义一致：仅首个 entry 成功读取才算非空（读取出错视作空）。
-                let is_empty = !matches!(entries.next(), Some(Ok(_)));
-                if is_empty {
-                    if let Err(e) = trash::delete(&dir) {
-                        tracing::warn!("Failed to move empty folder to trash: {}", e);
-                    } else {
-                        tracing::info!("Moved empty folder to trash: {:?}", dir);
-                    }
-                }
-            }
-        }
-
-        // S1：移动已逐条删行（DB 成员变化）→ 失效由 guard 在 Drop 统一执行（含报错路径）。
-        Ok(moved_ids)
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-}
-
-#[tauri::command]
-pub async fn copy_media_items(
-    media_ids: Vec<i64>,
-    target_dir: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<i64>> {
-    // span 埋点(W1,D-312 info 档:逐条 fs copy(可达 GB 级),真实 IO 工作)。
-    let _span = crate::logging::SpanTimer::info("ipc:copy_media_items");
-    // R1-3：同 move_media_items——SQL 与 fs 复制（可达 GB 级）交织，整段下沉 blocking。
-    let state = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        // 内层闭包收拢逐条 `?`:无论成功还是中途失败,已复制的文件都落了盘,树快照都要清(R-05)。
-        let result = (|| -> Result<Vec<i64>> {
-            let mut copied_ids = vec![];
-
-            for id in media_ids {
-                let src_path = {
-                    let pool = state.db_read_pool.get().map_err(AppError::from)?;
-                    let (root, rel, name) = q::get_item_path_info(&pool, id)?;
-                    resolve_media_path(&root, &rel, &name)
-                };
-
-                let src_file_name = PathBuf::from(&src_path)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if src_file_name.is_empty() {
-                    continue;
-                }
-
-                let target_path = PathBuf::from(&target_dir).join(&src_file_name);
-
-                if let Some(parent) = target_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| AppError::CopyFile(e.to_string()))?;
-                }
-
-                std::fs::copy(&src_path, &target_path)
-                    .map_err(|e| AppError::CopyFile(e.to_string()))?;
-                copied_ids.push(id);
-            }
-
-            Ok(copied_ids)
-        })();
-        state.tree_snapshots.clear(); // R-05:成功/中途失败都清(部分文件可能已落盘)
-        result
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-}
-
 /// 一次重定位请求：将媒体项 `id` 移动到目录 `target_dir_id`。
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,14 +116,9 @@ pub struct MediaRelocationResult {
     pub target_dir_id: i64,
 }
 
-/// Relocate media items into target directories by reassigning `directory_id` and moving
-/// the file on disk. Unlike `move_media_items` (delete + re-ingest via rescan), this keeps
-/// the SAME item id, so thumbnails and AI embeddings stay valid, and it is REVERSIBLE:
-/// the returned `from_dir_id` lets the caller record an exact inverse for undo (问题5).
-/// 通过重设 `directory_id` 并移动磁盘文件来重定位媒体项。不同于 move_media_items（删行 +
-/// 重扫重导入），本命令保留同一 item id，缩略图与 AI 嵌入向量仍有效，且可逆：返回的
-/// from_dir_id 让调用方记录精确逆操作以撤销（问题5）。传入不同目标目录即可驱动「拖到文件夹」
-/// 与撤销/重做。
+/// 通过重设 `directory_id` 并移动磁盘文件来重定位媒体项。
+/// 保留同一 item id，使缩略图与 AI 嵌入向量仍有效；返回原目录 `from_dir_id`，
+/// 供调用方记录逆操作并执行撤销/重做。
 #[tauri::command]
 pub async fn relocate_media_items(
     moves: Vec<MediaRelocation>,
@@ -263,7 +126,7 @@ pub async fn relocate_media_items(
 ) -> Result<Vec<MediaRelocationResult>> {
     // span 埋点(W1,D-312 info 档:逐条 fs rename + DB 改行,真实 IO/DB 工作)。
     let _span = crate::logging::SpanTimer::info("ipc:relocate_media_items");
-    // R1-3：同 move_media_items——逐条 SQL 与 fs rename 交织，整段下沉 blocking。
+    // R1-3：逐条 SQL 与 fs rename 交织，整段下沉 blocking。
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let mut guard = InvalidateOnWrite::new(&state);
@@ -369,7 +232,7 @@ pub async fn copy_media_items_db(
 ) -> Result<Vec<MediaCopyResult>> {
     // span 埋点(W1,D-312 info 档:逐条 fs copy + DB 插行,真实 IO/DB 工作)。
     let _span = crate::logging::SpanTimer::info("ipc:copy_media_items_db");
-    // R1-3：同 copy_media_items——逐条 SQL 与 fs copy（可达 GB 级）交织，整段下沉 blocking。
+    // R1-3：逐条 SQL 与 fs copy（可达 GB 级）交织，整段下沉 blocking。
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let mut guard = InvalidateOnWrite::new(&state);
@@ -480,7 +343,7 @@ pub async fn remove_media_items_hard(ids: Vec<i64>, state: State<'_, Arc<AppStat
                 }
             }
             {
-                // 硬删走对账封装(2026-07-10 审查 F7),理由同 move_media_items。
+                // 硬删走对账封装：CASCADE 删脸后同事务重算人物派生字段，防止计数与封面悬挂。
                 let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
                 q::delete_media_item_hard(&conn, id)?;
             }

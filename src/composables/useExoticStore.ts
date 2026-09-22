@@ -12,7 +12,6 @@ import type {
   ExoticInstallState,
   ExoticProcessingStatus,
   ExoticRegistryEntry,
-  FormatResolution,
   InstalledExoticPlugin,
   RegistrySummary,
 } from '../types/exotic'
@@ -38,22 +37,6 @@ export interface StorePluginRow {
   registryExpired: boolean
   /** 已装且 registry 有更高 packageSequence → 可升级。 */
   upgradable: boolean
-}
-
-/**
- * 将按格式返回的内置解析结果折叠为插件商店展示行。
- * 同一 offering 声明多个格式时只展示一张卡片；保留首条结果即可，因为同一插件的可用态共享。
- */
-export function dedupeBuiltinOfferings(resolutions: FormatResolution[]): FormatResolution[] {
-  const seenPluginIds = new Set<string>()
-
-  return resolutions.filter((resolution) => {
-    if (!resolution.builtin) return false
-    if (!resolution.pluginId) return true
-    if (seenPluginIds.has(resolution.pluginId)) return false
-    seenPluginIds.add(resolution.pluginId)
-    return true
-  })
 }
 
 /**
@@ -115,8 +98,6 @@ export function useExoticStore() {
   const registry = ref<ExoticRegistryEntry[]>([])
   const installed = ref<InstalledExoticPlugin[]>([])
   const status = ref<ExoticProcessingStatus | null>(null)
-  /** 内置能力插件（builtin offering，如 OCR）：无安装包，单独一区展示（T11）。 */
-  const builtinOfferings = ref<FormatResolution[]>([])
   const loading = ref(false)
   const error = ref<IpcError | null>(null)
 
@@ -135,20 +116,12 @@ export function useExoticStore() {
     status.value = await invokeIpc<ExoticProcessingStatus>(IPC.GET_EXOTIC_PROCESSING_STATUS)
   }
 
-  /**
-   * 列内置能力 offering（过滤非 builtin，并按 pluginId 折叠多格式结果）。
-   */
-  async function loadBuiltin(): Promise<void> {
-    const all = await invokeIpc<FormatResolution[]>(IPC.LIST_EXOTIC_FORMAT_RESOLUTIONS)
-    builtinOfferings.value = dedupeBuiltinOfferings(all)
-  }
-
-  /** 一次性刷新商店三态（列表 + 已装 + 进度 + 内置能力）。失败置 `error` 不抛（列表视图容错）。 */
+  /** 一次性刷新商店三态（列表 + 已装 + 进度）。失败置 `error` 不抛（列表视图容错）。 */
   async function loadAll(): Promise<void> {
     loading.value = true
     error.value = null
     try {
-      await Promise.all([loadRegistry(), loadInstalled(), loadStatus(), loadBuiltin()])
+      await Promise.all([loadRegistry(), loadInstalled(), loadStatus()])
     } catch (e) {
       error.value = e as IpcError
     } finally {
@@ -171,8 +144,8 @@ export function useExoticStore() {
     await loadInstalled()
   }
 
-  async function uninstall(pluginId: string, removeLicense = false): Promise<void> {
-    await invokeIpc(IPC.UNINSTALL_EXOTIC_PLUGIN, { pluginId, removeLicense })
+  async function uninstall(pluginId: string): Promise<void> {
+    await invokeIpc(IPC.UNINSTALL_EXOTIC_PLUGIN, { pluginId })
     await loadInstalled()
   }
 
@@ -184,11 +157,6 @@ export function useExoticStore() {
   async function rollback(pluginId: string): Promise<void> {
     await invokeIpc(IPC.ROLLBACK_EXOTIC_PLUGIN, { pluginId })
     await loadInstalled()
-  }
-
-  /** 移除授权（不影响安装目录）。 */
-  async function deactivate(pluginId: string): Promise<void> {
-    await invokeIpc(IPC.DEACTIVATE_EXOTIC_PLUGIN, { pluginId })
   }
 
   // ── 处理控制（恢复/暂停/停止本次运行/重试失败）；均后随刷新进度 ────────────────
@@ -218,20 +186,17 @@ export function useExoticStore() {
     registry,
     installed,
     status,
-    builtinOfferings,
     loading,
     error,
     loadRegistry,
     loadInstalled,
     loadStatus,
-    loadBuiltin,
     loadAll,
     refreshRegistry,
     install,
     uninstall,
     repair,
     rollback,
-    deactivate,
     startProcessing,
     pauseProcessing,
     stopProcessing,

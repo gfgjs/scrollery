@@ -62,15 +62,31 @@ pub enum CachedOrder {
     },
 }
 
-/// [`derive_order`] folder 轴的排序置换 memo（items 下标序列）。memo 键含 `sort_within`——
-/// 双键统一缓存下同一份 items 会被 folder+datetime 与 folder+filename 两轴各派生一次，
-/// 置换不同，键须区分轴（否则 datetime 的置换会被误当 filename 复用）。
+/// [`derive_order`] **全部实排分支**共用的排序置换 memo（items 下标序列）。
+///
+/// **覆盖范围（T2）**：folder（任意轴/方向）、date+filename（UTC 日桶主键）与跨键
+/// none/date+datetime 三条实排路径共用这**唯一一个最近排列**槽——同一份 items 上，
+/// 几何重排（滑块/窗宽/行高）不改变任何排序键，命中即免 O(N log N) 排序、仅 O(N) 还原引用序。
+/// 不扩为多轴常驻缓存：只留最近一次排列，换轴/换向即替换（内存增量恒为一个 `Vec<u32>`）。
+///
+/// memo 键含 `group_by` 与 `sort_within`——双键统一缓存下同一份 items 会被
+/// folder+datetime 与 folder+filename 两轴各派生一次，置换不同，键须区分轴（否则 datetime
+/// 的置换会被误当 filename 复用）。
 pub struct PermMemo {
     pub group_by: String,
     pub sort_within: String,
     pub sort_order: String,
     /// 派生序 → 基准序下标的置换。
     pub perm: Vec<u32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// **仅测试**的置换 memo 命中计数（生产构建不编译本项，热路径零开销）。
+    /// 定向验证用：证明「相同排序参数下的连续几何重排」确实走命中还原路径，而非重新排序——
+    /// 这是对**排序是否真的省下**的直接判据，不是测试里镜像一遍实现逻辑。
+    /// `thread_local`：并发测试各自独立计数，互不干扰。
+    pub(crate) static PERM_MEMO_HITS: std::cell::Cell<u32> = std::cell::Cell::new(0);
 }
 
 /// 驻留的视图取数缓存体。
@@ -96,13 +112,16 @@ pub struct ItemsCacheData {
     /// 是否可作为 compute_layout 的命中源（S3）。false = 仅作载荷源服务出口拼装：
     /// ①视图敏感写后（成员已变，须重查换代）②ai_search 视图（结果表随每次搜索整表重写）。
     pub reusable: bool,
+    /// 宽高输入就地改变时递增；几何去重不能只看集合的数据代。
+    pub geometry_revision: u64,
     /// 已测量项宽高比中位数的惰性缓存（S3.5）：只依赖项集、不依赖布局参数，justified
     /// 每次重排免 O(N) 重算。就地 patch（尺寸回填）有意不失效——中位数轻微漂移仅影响
     /// 0×0 占位项的形状，容差内；随缓存体整体换代自动重算。
     pub median_aspect: std::sync::OnceLock<f64>,
-    /// folder 轴派生序的置换 memo：同 (group_by, sort_within, sort_order) 的后续派生免排序、O(N) 还原。
+    /// 派生序的**唯一最近排列** memo（T2：folder / date+filename / 跨键 none 三条实排路径共用）：
+    /// 同 (group_by, sort_within, sort_order) 的后续派生免排序、O(N) 还原。
     /// 就地 patch 均不触碰排序键 (dir_id, sort_datetime/filename_rank, id)，故 memo 只需随缓存体
-    /// 整体换代（MISS 重建）自动失效，无需单独失效逻辑。
+    /// 整体换代（MISS 重建）自动失效，无需单独失效逻辑——data_version 换代即新 ItemsCacheData。
     pub perm_memo: Mutex<Option<PermMemo>>,
     /// filename 自然序位次的惰性缓存（双键统一缓存）：`filename_rank[i]` = `items[i]` 的**全局
     /// NATURAL_CMP 位次**（0 起）。仅 datetime 基准（[`CachedOrder::Canonical`]）需要——items 非
@@ -114,6 +133,14 @@ pub struct ItemsCacheData {
 }
 
 pub type ItemsCache = RwLock<Option<ItemsCacheData>>;
+
+/// 单槽保存当前快照句柄；布局保留同一句柄，换集合时旧行不会读到新集合载荷。
+pub type ItemsCacheSlot = RwLock<std::sync::Arc<ItemsCache>>;
+
+/// 创建尚无载荷的当前快照槽。
+pub fn new_items_cache_slot() -> ItemsCacheSlot {
+    RwLock::new(std::sync::Arc::new(new_items_cache()))
+}
 
 pub fn new_items_cache() -> ItemsCache {
     RwLock::new(None)
@@ -318,6 +345,12 @@ pub fn build_dir_rank(dir_labels: &HashMap<i64, DirLabel>) -> HashMap<i64, u32> 
 /// 直接对 `&LayoutItem` 排序时每次比较 = 2 次查秩 + 2 次对 ~200B 大结构体的随机访存，
 /// 1M 项 ≈ 2000 万次比较实测 5-7s；排序键抽进紧凑连续元组后亚秒，置换存入
 /// [`ItemsCacheData::perm_memo`]（键含 `sort_within`），同轴同向的后续交互（滑块/窗宽）免排序。
+///
+/// **T2：memo 覆盖全部实排分支**。除 folder 外，date+filename（UTC 日桶主键）与跨键
+/// none/date+datetime（CanonicalFilename 基准派 datetime 等）同样在实排后写入**同一个**
+/// 最近排列槽，命中即 O(N) 还原引用序。故「相同数据体 + 相同排序参数 + 只改几何」的连续
+/// 重排（宽度/行高/布局模式）一次排序后零重新排序。同键 identity/reverse 快路径本就是 O(N)
+/// 线性遍历，不占用 memo。**只保留一个最近排列**，不引入多视图常驻缓存。
 pub fn derive_order<'a>(
     data: &'a ItemsCacheData,
     group_by: &str,
@@ -348,20 +381,29 @@ pub fn derive_order<'a>(
             it.sort_datetime
         }
     };
+    // 是否走实排分支：folder 恒实排、date+filename 恒实排、none/date 跨键实排。
+    // 其余（none/date 同键）是线性恒等/反转快捷，本就不需要排序，故不占 memo。
+    let real_sort = group_by == "folder" || (group_by == "date" && want_filename) || !same_key;
+    // 次键数据是否真就绪：datetime 基准派 filename 时位次是**惰性**填入的（OnceLock 在缓存体
+    // 存活期间 set），缺位次则次键退化为 i64::MAX 的防御序。该退化序不能进 memo——否则位次
+    // 填入后仍会命中早先的退化置换。生产路径由 HIT 守卫（rank_ready）与 MISS 预填保证此处恒就绪。
+    let memo_ok = real_sort && (!want_filename || baseline_is_filename || fname_rank.is_some());
+    // T2 共享置换 memo 命中（三条实排分支同一槽）：置换只由 (group_by, sort_within, sort_order)
+    // 与基准序决定，而基准序 = 本缓存体自身，故键相符即免排序、按下标 O(N) 还原引用序。
+    // 命中判定在锁内完成并就地物化引用（不 clone 置换）。
+    if memo_ok {
+        let memo = data.perm_memo.lock().unwrap();
+        if let Some(m) = memo.as_ref() {
+            if m.group_by == group_by && m.sort_within == sort_within && m.sort_order == sort_order
+            {
+                #[cfg(test)]
+                PERM_MEMO_HITS.with(|c| c.set(c.get() + 1));
+                return m.perm.iter().map(|&i| &data.items[i as usize]).collect();
+            }
+        }
+    }
     match group_by {
         "folder" => {
-            // 置换 memo 命中：免排序，按下标 O(N) 还原引用序。键含 sort_within（双键区分轴）。
-            {
-                let memo = data.perm_memo.lock().unwrap();
-                if let Some(m) = memo.as_ref() {
-                    if m.group_by == group_by
-                        && m.sort_within == sort_within
-                        && m.sort_order == sort_order
-                    {
-                        return m.perm.iter().map(|&i| &data.items[i as usize]).collect();
-                    }
-                }
-            }
             let rank = |it: &LayoutItem| -> u32 {
                 it.dir_id
                     .and_then(|id| data.dir_rank.get(&id).copied())
@@ -386,14 +428,7 @@ pub fn derive_order<'a>(
                 })
             });
             let perm: Vec<u32> = keys.iter().map(|k| k.3).collect();
-            let refs: Vec<&LayoutItem> = perm.iter().map(|&i| &data.items[i as usize]).collect();
-            *data.perm_memo.lock().unwrap() = Some(PermMemo {
-                group_by: group_by.to_string(),
-                sort_within: sort_within.to_string(),
-                sort_order: sort_order.to_string(),
-                perm,
-            });
-            refs
+            store_perm(data, group_by, sort_within, sort_order, perm, memo_ok)
         }
         // date+filename（B-file-iii / D-018 A′ 全面 UTC 桶）：UTC 日桶主键 + filename 位次次键 +
         // id 末键，整键按方向。桶 = `sort_datetime.div_euclid(86400)`（每项自带，与 run_layout 分组
@@ -424,7 +459,9 @@ pub fn derive_order<'a>(
                     key.reverse()
                 }
             });
-            keys.iter().map(|k| &data.items[k.3 as usize]).collect()
+            // T2：与 folder/跨键分支共用同一最近排列 memo（几何重排免二次排序）。
+            let perm: Vec<u32> = keys.iter().map(|k| k.3).collect();
+            store_perm(data, group_by, sort_within, sort_order, perm, memo_ok)
         }
         // none/date 轴（datetime 任意方向、none+filename；date+filename 已在上面独立分支处理）。
         _ if same_key => {
@@ -457,9 +494,34 @@ pub fn derive_order<'a>(
                     key.reverse()
                 }
             });
-            keys.iter().map(|k| &data.items[k.2 as usize]).collect()
+            // T2：与 folder/date+filename 分支共用同一最近排列 memo（几何重排免二次排序）。
+            let perm: Vec<u32> = keys.iter().map(|k| k.2).collect();
+            store_perm(data, group_by, sort_within, sort_order, perm, memo_ok)
         }
     }
+}
+
+/// 实排结果写入**唯一最近排列** memo 并物化引用序（T2）。folder / date+filename / 跨键
+/// none 三条实排分支共用，避免三处重复写锁与还原代码；置换留在 memo 内（不 clone）。
+/// `store` 为 false（次键未就绪的防御性退化序）时只物化、不落 memo，避免退化序被后续命中。
+fn store_perm<'a>(
+    data: &'a ItemsCacheData,
+    group_by: &str,
+    sort_within: &str,
+    sort_order: &str,
+    perm: Vec<u32>,
+    store: bool,
+) -> Vec<&'a LayoutItem> {
+    let refs: Vec<&LayoutItem> = perm.iter().map(|&i| &data.items[i as usize]).collect();
+    if store {
+        *data.perm_memo.lock().unwrap() = Some(PermMemo {
+            group_by: group_by.to_string(),
+            sort_within: sort_within.to_string(),
+            sort_order: sort_order.to_string(),
+            perm,
+        });
+    }
+    refs
 }
 
 /// 出口拼装①(P1-5,载荷读锁内,**零 IO**):为可视行收集多档选档请求——只读载荷与算几何,
@@ -659,16 +721,21 @@ pub fn set_dimensions(cache: &ItemsCache, dims: &[(i64, i64, i64)]) {
     }
     let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
     let Some(data) = guard.as_mut() else { return };
+    let mut changed = false;
     for &(id, w, h) in dims {
         let Some(&i) = data.id_to_idx.get(&id) else {
             continue;
         };
         if let Some(it) = data.items.get_mut(i as usize) {
-            if it.width <= 0 || it.height <= 0 {
+            if (it.width <= 0 || it.height <= 0) && (it.width != w || it.height != h) {
                 it.width = w;
                 it.height = h;
+                changed = true;
             }
         }
+    }
+    if changed {
+        data.geometry_revision += 1;
     }
 }
 
@@ -765,6 +832,7 @@ mod tests {
             dir_rank,
             filter: MediaFilter::default(),
             reusable: true,
+            geometry_revision: 0,
             median_aspect: std::sync::OnceLock::new(),
             perm_memo: Mutex::new(None),
             filename_rank: std::sync::OnceLock::new(),
@@ -773,6 +841,31 @@ mod tests {
 
     fn ids(refs: &[&LayoutItem]) -> Vec<i64> {
         refs.iter().map(|it| it.id).collect()
+    }
+
+    /// 尺寸回填只改变几何输入；集合、时间序与取数命中资格必须保留。
+    #[test]
+    fn dimensions_patch_preserves_items_and_order() {
+        let cache = new_items_cache();
+        let mut data = canonical_data();
+        data.items[0].width = 0;
+        data.items[0].height = 0;
+        store_items(&cache, data);
+        set_dimensions(&cache, &[(5, 800, 400), (4, 900, 600)]);
+        assert!(is_hit_valid(&cache, "{}", 1, "date", "datetime", "desc"));
+        let guard = cache.read().unwrap();
+        let data = guard.as_ref().unwrap();
+        assert_eq!((data.items[0].width, data.items[0].height), (800, 400));
+        assert_eq!((data.items[1].width, data.items[1].height), (100, 100));
+        assert_eq!(
+            ids(&derive_order(data, "date", "datetime", "desc")),
+            vec![5, 4, 3, 1]
+        );
+        assert_eq!(data.geometry_revision, 1);
+        drop(guard);
+        // 重复回填与不存在的 id 不制造新几何代，避免无意义重排。
+        set_dimensions(&cache, &[(5, 800, 400), (99, 800, 400)]);
+        assert_eq!(cache.read().unwrap().as_ref().unwrap().geometry_revision, 1);
     }
 
     /// 写边界防降级(与 db::queries::update_thumb_result 同语义):失败 patch(2)不得覆盖
@@ -950,6 +1043,177 @@ mod tests {
         assert_eq!(memo.as_ref().unwrap().sort_order, "asc");
     }
 
+    /// **T2 表征（date+filename）**：Canonical 基准下 date+filename 现在也写入共享 memo；
+    /// 相同排序参数的连续几何重排必须走命中还原（命中计数 > 0）、不重新排序，且序不变；
+    /// 换方向 → memo 替换、序按新方向。命中计数是「排序真的省下」的直接判据。
+    #[test]
+    fn date_filename_perm_memo_reused_on_geometry_repeat() {
+        let data = canonical_data();
+        data.filename_rank.set(vec![3, 2, 1, 0]).unwrap();
+        assert!(data.perm_memo.lock().unwrap().is_none());
+
+        let hits = || PERM_MEMO_HITS.with(|c| c.get());
+        let first = ids(&derive_order(&data, "date", "filename", "desc"));
+        assert_eq!(
+            first,
+            vec![5, 4, 3, 1],
+            "date 单桶 desc = filename 位次降序"
+        );
+        assert!(
+            data.perm_memo.lock().unwrap().is_some(),
+            "date+filename 应写共享 memo"
+        );
+
+        // 同参数重复派生（模拟只改宽度/行高的几何重排）：命中 memo，序与首次一致。
+        let before = hits();
+        for _ in 0..5 {
+            assert_eq!(ids(&derive_order(&data, "date", "filename", "desc")), first);
+        }
+        assert_eq!(
+            hits() - before,
+            5,
+            "同参数几何重排必须走 memo 命中(零重新排序)"
+        );
+        assert_eq!(
+            data.perm_memo.lock().unwrap().as_ref().unwrap().group_by,
+            "date"
+        );
+
+        // 换方向 → memo 替换为 asc 置换（不是新增第二个槽）。
+        let asc_before = hits();
+        assert_eq!(
+            ids(&derive_order(&data, "date", "filename", "asc")),
+            vec![1, 3, 4, 5]
+        );
+        assert_eq!(hits(), asc_before, "换方向是重排(memo 未命中)");
+        let memo = data.perm_memo.lock().unwrap();
+        let m = memo.as_ref().unwrap();
+        assert_eq!(
+            (m.group_by.as_str(), m.sort_order.as_str()),
+            ("date", "asc")
+        );
+    }
+
+    /// **T2 表征（none+filename 跨键实排）**：datetime 基准派 filename 是跨键实排，现在同样
+    /// 写入共享 memo；同参数重复派生零重新排序。`filename_rank` 未就绪的防御序不入 memo
+    /// （否则位次填入后仍会命中退化置换）。
+    #[test]
+    fn cross_key_none_filename_perm_memo_reused_and_guarded() {
+        // ① 位次未就绪：防御序只物化、不落 memo，避免退化置换被后续命中。
+        let data = canonical_data();
+        let hits = || PERM_MEMO_HITS.with(|c| c.get());
+        assert_eq!(
+            ids(&derive_order(&data, "none", "filename", "asc")),
+            vec![1, 3, 4, 5],
+            "缺位次 → 次键 i64::MAX 的防御序(全部同键,按 id 决胜)"
+        );
+        assert!(
+            data.perm_memo.lock().unwrap().is_none(),
+            "次键未就绪的退化序不得进 memo"
+        );
+
+        // ② 位次就绪：实排后落 memo，同参数重复派生全命中。
+        data.filename_rank.set(vec![3, 2, 1, 0]).unwrap();
+        let first = ids(&derive_order(&data, "none", "filename", "asc"));
+        assert_eq!(first, vec![1, 3, 4, 5]);
+        assert!(
+            data.perm_memo.lock().unwrap().is_some(),
+            "跨键实排应写共享 memo"
+        );
+        let before = hits();
+        for _ in 0..3 {
+            assert_eq!(ids(&derive_order(&data, "none", "filename", "asc")), first);
+        }
+        assert_eq!(hits() - before, 3, "跨键同参数几何重排必须走 memo 命中");
+    }
+
+    /// **T2 表征（同键快路径不占 memo）**：none/date+datetime 同键是线性恒等/反转，
+    /// 本就不排序，故不写 memo、也不产生命中——避免把线性快路径误报成缓存收益。
+    #[test]
+    fn same_key_fast_paths_do_not_touch_perm_memo() {
+        let data = canonical_data();
+        let hits = || PERM_MEMO_HITS.with(|c| c.get());
+        let before = hits();
+        assert_eq!(
+            ids(&derive_order(&data, "date", "datetime", "desc")),
+            vec![5, 4, 3, 1]
+        );
+        assert_eq!(
+            ids(&derive_order(&data, "none", "datetime", "asc")),
+            vec![1, 3, 4, 5]
+        );
+        assert_eq!(hits(), before, "同键快路径不产生 memo 命中");
+        assert!(
+            data.perm_memo.lock().unwrap().is_none(),
+            "同键快路径不占唯一 memo 槽"
+        );
+    }
+
+    /// **T2 表征（就地 patch 不使顺序 memo 失效）**：尺寸回填只改几何输入（geometry_revision
+    /// 递增），排序键 (sort_datetime/filename_rank/dir_id/id) 未动 → 同一缓存体上的 memo 仍命中，
+    /// 序不变。这正是「data geometry_revision 就地 patch 不失效顺序 memo」的锁定。
+    #[test]
+    fn dimensions_patch_keeps_date_filename_perm_memo_hit() {
+        let cache = new_items_cache();
+        let mut data = canonical_data();
+        data.filename_rank.set(vec![3, 2, 1, 0]).unwrap();
+        data.items[0].width = 0;
+        data.items[0].height = 0;
+        store_items(&cache, data);
+
+        let hits = || PERM_MEMO_HITS.with(|c| c.get());
+        let first = {
+            let guard = cache.read().unwrap();
+            ids(&derive_order(
+                guard.as_ref().unwrap(),
+                "date",
+                "filename",
+                "desc",
+            ))
+        };
+        assert_eq!(first, vec![5, 4, 3, 1]);
+
+        // 就地补尺寸：几何代 +1，排序键未动。
+        set_dimensions(&cache, &[(5, 800, 400)]);
+        {
+            let guard = cache.read().unwrap();
+            let data = guard.as_ref().unwrap();
+            assert_eq!(data.geometry_revision, 1, "尺寸 patch 只推进几何代");
+            let before = hits();
+            assert_eq!(
+                ids(&derive_order(data, "date", "filename", "desc")),
+                first,
+                "尺寸 patch 后序不变"
+            );
+            assert_eq!(hits() - before, 1, "尺寸 patch 不使顺序 memo 失效(仍命中)");
+        }
+
+        // 展示字段 patch（缩略图/收藏/评分/色标）同样不触碰排序键。
+        apply_thumb_results(
+            &cache,
+            &[ThumbResult {
+                item_id: 4,
+                thumb_status: 1,
+                thumb_path: Some("t/4.webp".into()),
+                thumbhash: None,
+                source_revision: 0,
+                cache_key: 0,
+            }],
+        );
+        let guard = cache.read().unwrap();
+        let before = hits();
+        assert_eq!(
+            ids(&derive_order(
+                guard.as_ref().unwrap(),
+                "date",
+                "filename",
+                "desc"
+            )),
+            first
+        );
+        assert_eq!(hits() - before, 1, "缩略图 patch 不使顺序 memo 失效");
+    }
+
     #[test]
     fn same_rel_path_uses_dir_id_tiebreaker_and_stays_contiguous() {
         // 两根同 rel_path "x"，基准序刻意交错两个目录；folder 派生后必须按目录连续成组，
@@ -979,6 +1243,7 @@ mod tests {
             dir_rank,
             filter: MediaFilter::default(),
             reusable: true,
+            geometry_revision: 0,
             median_aspect: std::sync::OnceLock::new(),
             perm_memo: Mutex::new(None),
             filename_rank: std::sync::OnceLock::new(),
@@ -1512,6 +1777,7 @@ mod tests {
                 dir_rank,
                 filter: MediaFilter::default(),
                 reusable: true,
+                geometry_revision: 0,
                 median_aspect: std::sync::OnceLock::new(),
                 perm_memo: std::sync::Mutex::new(None),
                 filename_rank: std::sync::OnceLock::new(),

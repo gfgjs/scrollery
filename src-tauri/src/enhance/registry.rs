@@ -5,22 +5,16 @@
 //! （每档 fp32 + fp16 两件，`{id}-fp32.onnx` / `{id}-fp16.onnx`）——本文件只负责
 //! 「往哪下 + 校验多少」。
 //!
-//! # 资产源未定案（P0）
-//! design.md §C/J-2:模型托管走用户自建公开仓（GitHub Releases / HuggingFace），托管
-//! 自导出 ONNX + LICENSE/NOTICE。仓名定案前 URL 为占位、sha256/字节数留空——下载引擎
-//! 契约「size_bytes=0 / sha256=None → 暂不校验」（`model_download`，plugin-store-map §2）。
+//! 发行资产尚未提供（2026-09-22）：没有获准分发的 ONNX、导出记录、LICENSE/NOTICE
+//! 和固定版本下载地址。空 URL/大小/哈希只表达缺失；下载、执行与安装态均关闭。
 
 use std::path::Path;
 
 use crate::ai::profile::ModelAsset;
 use scrollery_ai_core::enhance_profile::{find_enhance_profile, EnhanceProfile};
 
-/// 占位资产源前缀（design.md §C）。
-// TODO(批6): 用户 HuggingFace/GitHub 仓名定案后回填 URL/sha256/bytes（含 mirror_url）。
-const PENDING_REPO_BASE: &str = "https://huggingface.co/PENDING_USER_REPO/resolve/main";
-
 /// 某增强模型档位的完整下载清单（fp32 + fp16 两件）。
-/// 文件名单源取自 `profile`；URL 暂用占位、sha256/bytes 暂空（清单待批 6 回填）。
+/// 文件名单源取自 `profile`；资产尚未交付，URL/sha256/bytes 留空。
 /// profile_id 不在注册表 → `None`（fail-closed，下载命令据此回 `enhance_model_missing`）。
 pub fn enhance_assets(profile_id: &str) -> Option<Vec<ModelAsset>> {
     find_enhance_profile(profile_id).map(|p| profile_assets(&p))
@@ -51,8 +45,8 @@ fn profile_assets(p: &EnhanceProfile) -> Vec<ModelAsset> {
     [&p.file_fp32, &p.file_fp16]
         .into_iter()
         .map(|file| ModelAsset {
-            // TODO(批6): 占位 URL——仓名定案后回填真实直链 + mirror_url + sha256 + size_bytes。
-            url: format!("{PENDING_REPO_BASE}/{file}"),
+            // 只有核实导出契约、分发许可和实际字节后，才可填写固定版本清单。
+            url: String::new(),
             mirror_url: None,
             dest: file.clone(),
             size_bytes: 0,
@@ -61,17 +55,27 @@ fn profile_assets(p: &EnhanceProfile) -> Vec<ModelAsset> {
         .collect()
 }
 
-/// 档位安装判定：`models_dir` 下 fp32 + fp16 两文件均存在且非空。
-/// sha 深校验留给 worker `EnhanceSessionInit`（此处仅粗判「看起来已下载」，供设置页/门控展示）。
+/// 档位安装判定：发行清单就绪，两个普通文件均位于模型根内且大小匹配。
+/// SHA-256 深校验由 worker 对照发行清单执行，状态查询不反复读取全部模型。
 pub fn enhance_model_installed(models_dir: &Path, profile_id: &str) -> bool {
-    find_enhance_profile(profile_id).is_some_and(|p| {
-        [&p.file_fp32, &p.file_fp16].into_iter().all(|filename| {
-            models_dir
-                .join(filename)
+    enhance_assets(profile_id).is_some_and(|assets| assets_installed(models_dir, &assets))
+}
+
+fn assets_installed(models_dir: &Path, assets: &[ModelAsset]) -> bool {
+    if !manifest_is_ready(assets) {
+        return false;
+    }
+    let Ok(root) = models_dir.canonicalize() else {
+        return false;
+    };
+    assets.iter().all(|asset| {
+        let Ok(path) = models_dir.join(&asset.dest).canonicalize() else {
+            return false;
+        };
+        path.starts_with(&root)
+            && path
                 .metadata()
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        })
+                .is_ok_and(|m| m.is_file() && m.len() == asset.size_bytes)
     })
 }
 
@@ -87,7 +91,7 @@ mod tests {
             let assets = enhance_assets(&p.id).expect("已知 profile 必有清单");
             assert_eq!(assets.len(), 2, "每档恰 fp32 + fp16 两件");
             for a in &assets {
-                assert!(a.url.starts_with("https://"));
+                assert!(a.url.is_empty());
                 // 清单未定案:字节数 0 + sha256 None（下载引擎据此暂不校验）。
                 assert_eq!(a.size_bytes, 0);
                 assert!(a.sha256.is_none());
@@ -142,14 +146,35 @@ mod tests {
     }
 
     #[test]
-    fn model_installed_false_when_missing_true_when_present() {
+    fn unpinned_local_files_do_not_count_as_installed() {
         let p = &enhance_profiles()[0];
         let tmp = tempfile::tempdir().unwrap();
         assert!(!enhance_model_installed(tmp.path(), &p.id));
         for f in [&p.file_fp32, &p.file_fp16] {
             fs::write(tmp.path().join(f), b"x").unwrap();
         }
-        assert!(enhance_model_installed(tmp.path(), &p.id));
+        assert!(!enhance_model_installed(tmp.path(), &p.id));
+    }
+
+    #[test]
+    fn pinned_assets_require_regular_files_of_expected_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let asset = ModelAsset {
+            url: "https://example.invalid/model.onnx".into(),
+            mirror_url: None,
+            dest: "model.onnx".into(),
+            size_bytes: 2,
+            sha256: Some("a".repeat(64)),
+        };
+        let assets = [asset];
+        assert!(!assets_installed(tmp.path(), &assets));
+        fs::create_dir(tmp.path().join("model.onnx")).unwrap();
+        assert!(!assets_installed(tmp.path(), &assets));
+        fs::remove_dir(tmp.path().join("model.onnx")).unwrap();
+        fs::write(tmp.path().join("model.onnx"), b"x").unwrap();
+        assert!(!assets_installed(tmp.path(), &assets));
+        fs::write(tmp.path().join("model.onnx"), b"xx").unwrap();
+        assert!(assets_installed(tmp.path(), &assets));
     }
 
     #[test]

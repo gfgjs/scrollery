@@ -24,9 +24,10 @@ vi.mock('../utils/ipc', () => ({
 }))
 vi.mock('../utils/appEvents', () => ({
   listenAppEvent: async (
-    _event: string,
+    event: string,
     handler: (event: { payload: { requestId: string } }) => void,
   ) => {
+    expect(event).toBe('settings-flush-requested')
     handlers.push(handler)
     return unlistenSpy
   },

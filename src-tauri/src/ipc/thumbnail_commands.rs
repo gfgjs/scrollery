@@ -737,11 +737,7 @@ pub async fn regenerate_missing_thumb(
 
     // 失效三件套（对齐 clear_all_thumbnails / config 档位变更）：items 快照是布局行载荷源，
     // 不清则 HIT 路径仍端出旧 status=1 + 已删路径 → 继续 404 且前端不重取。
-    *state_arc
-        .layout_cache
-        .write()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-    crate::layout::items_cache::invalidate(&state_arc.layout_items_cache);
+    state_arc.clear_layout_caches();
     state_arc.bump_data_version();
 
     // 发 db:media_enriched：① MediaGrid 防抖重算刷新可见行；② useDerivationAutoStart kick
@@ -800,11 +796,7 @@ pub async fn clear_all_thumbnails(state: State<'_, Arc<AppState>>) -> Result<()>
                 // 失效三件套须齐全(2026-07-06 审查 P1-7,对照 clear_database 正例):items 快照是布局行
                 // 载荷源,只清 layout_cache 时 HIT 路径仍按未变的 data_version 端出 thumb_status=1 +
                 // 指向已删文件的 thumb_path → 全屏裂图且前端不会重新请求生成。
-                *state_arc
-                    .layout_cache
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
-                crate::layout::items_cache::invalidate(&state_arc.layout_items_cache);
+                state_arc.clear_layout_caches();
                 state_arc.bump_data_version();
                 Ok(())
             })

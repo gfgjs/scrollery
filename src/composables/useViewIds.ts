@@ -1,111 +1,104 @@
-// src/composables/useViewIds.ts
-// Part5 T4a · 视图布局序全集 id —— 选区脱离 DOM 的第二支柱。
-//
-// range / select-all / invert 的「顺序」与「全集」必须来自**布局序 flat_ids**,不来自可视 DOM。
-// 旧实现用 container.querySelectorAll('[data-item-id]') 只覆盖已渲染节点 → Shift 跨视口失效、
-// Ctrl+A 只选一屏、框选漏掉滚出屏幕的项（Part5 G1 三症状）。本 composable 经后端 get_view_ids
-// 取布局缓存里已物化的 flat_ids（cache.rs:217 直接 clone,O(1) 无 DB），从根上解除对 DOM 的依赖。
-//
-// 设计依据：docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §4。
-
-import { shallowRef, readonly } from 'vue'
+// 当前视图按顺序排列的全集 ID；复制、传输和建索引为 O(N)，仅在顺序换代时支付。
+// 选区范围/反选必须消费此全集，不能用已经渲染的几行代替。
+import { shallowRef, ref, computed } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
 
-// 模块级单例：同一时刻只有一个「当前视图」,与 useSelection 的单例模式一致。
-// 大数组(可达百万)用 shallowRef,避免 Vue 深代理对海量元素的 CPU/内存开销(前端规约)。
-const viewIds = shallowRef<readonly number[]>([])
-// id → 布局序 index 的 O(1) 索引。非 ref:它是随 viewIds 重建的派生查找结构,
-// 消费方对「视图变化」的反应由 viewIds.value 引用变更驱动,index 无需自身响应式。
+const EMPTY_IDS: readonly number[] = []
+const cachedIds = shallowRef<readonly number[]>(EMPTY_IDS)
 let idIndex = new Map<number, number>()
-// 已加载对应的 layout_version;null = 尚未加载 / 已失效清空,供 ensureFresh 判定。
-let loadedVersion: number | null = null
-// in-flight token(2026-07-06 审查 P0-2):refresh 必须是「最后发起者赢」而非「最后落地者赢」。
-// 布局版本快速连跳(缩略图滑块/enrichment 每 2s 重算)时多个 refresh 并发在途,
-// 若无 token,迟到的旧版本应答(尤其 ViewStale 拒绝走 catch)会把刚落地的新版本全集清空,
-// 且无人再触发重取 → Shift 区间选择静默退化为单项 toggle(Part5 G1 症状无声回归)。
-let refreshToken = 0
+const loadedVersion = ref<number | null>(null)
+const expectedVersion = ref<number | null>(null)
+let requestToken = 0
+let inFlight: { version: number; promise: Promise<void> } | null = null
 
-/**
- * 拉取指定布局版本的全集 id 并重建索引。
- * 失败（ViewStale 版本不符 / LayoutNotReady 无布局 / 其它）→ 清空,等下次重取
- * (锚点失效保护:宁可让 range/全选暂时取不到,也不基于过期 flat_ids 误选)。
- * 落地前复核 token:自己已不是最新发起者 → 结果直接丢弃(成功与失败路径同规)。
- */
-async function refresh(layoutVersion: number): Promise<void> {
-  const my = ++refreshToken
-  try {
-    // 后端 layout_version: Option<u64>,IPC 层自动 snake→camel
-    const ids = await invokeIpc<number[]>(IPC.GET_VIEW_IDS, { layoutVersion })
-    if (my !== refreshToken) return // 迟到应答,已有更新的 refresh 在途/落地
-    const idx = new Map<number, number>()
-    for (let i = 0; i < ids.length; i++) idx.set(ids[i], i)
-    viewIds.value = ids
-    idIndex = idx
-    loadedVersion = layoutVersion
-  } catch (err) {
-    if (my !== refreshToken) return // 迟到的拒绝不得清掉新版本数据
-    // ViewStale / LayoutNotReady 属预期路径;其它错误记录便于排查,但同样降级为「清空待重取」。
-    logger.warn('[useViewIds] get_view_ids 失败,清空待重取', { error: err })
-    viewIds.value = []
-    idIndex = new Map()
-    loadedVersion = null
-  }
+/** 当前全集已属于正在展示的成员与顺序。 */
+function isReady(): boolean {
+  return expectedVersion.value !== null && loadedVersion.value === expectedVersion.value
+}
+const viewIds = computed(() => isReady() ? cachedIds.value : EMPTY_IDS)
+
+function clearLoaded() {
+  loadedVersion.value = null
+  cachedIds.value = EMPTY_IDS
+  idIndex = new Map()
 }
 
-/** 仅当版本变化（或未加载）时才重取,避免无谓 IPC。 */
-async function ensureFresh(layoutVersion: number): Promise<void> {
-  if (loadedVersion !== layoutVersion) await refresh(layoutVersion)
+/** 接受后端顺序身份；null 撤销操作资格，同一版本恢复时保留数组与索引。 */
+function setExpectedVersion(version: number | null) {
+  const next = version !== null && version > 0 ? version : null
+  if (next === expectedVersion.value) return
+  expectedVersion.value = next
+  requestToken++
+  inFlight = null
+  if (next !== null && loadedVersion.value !== next) clearLoaded()
 }
 
-/** id 的布局序下标;不在当前视图返回 -1。 */
+/** 同版在途共用一次取数，成功和失败都须仍属于当前顺序。 */
+function refresh(orderVersion: number): Promise<void> {
+  if (orderVersion <= 0 || expectedVersion.value !== orderVersion) return Promise.resolve()
+  if (inFlight?.version === orderVersion) return inFlight.promise
+  clearLoaded()
+  const token = ++requestToken
+  const promise = (async () => {
+    try {
+      const ids = await invokeIpc<number[]>(IPC.GET_VIEW_IDS, { orderVersion })
+      // 先复核资格，再做 O(N) 的索引构建；迟到结果不再占用主线程建立无用 Map。
+      if (token !== requestToken || expectedVersion.value !== orderVersion) return
+      const index = new Map<number, number>()
+      for (let i = 0; i < ids.length; i++) index.set(ids[i], i)
+      idIndex = index
+      cachedIds.value = ids
+      loadedVersion.value = orderVersion
+    } catch (error) {
+      if (token !== requestToken || expectedVersion.value !== orderVersion) return
+      clearLoaded()
+      logger.warn('[useViewIds] get_view_ids 失败，等待下一次有效请求', { error })
+    } finally {
+      if (token === requestToken) inFlight = null
+    }
+  })()
+  inFlight = { version: orderVersion, promise }
+  return promise
+}
+
+/** 几何重排沿用已加载全集；初挂载和布局通知共用同版在途。 */
+function ensureFresh(orderVersion: number): Promise<void> {
+  return isFresh(orderVersion) ? Promise.resolve() : refresh(orderVersion)
+}
+
+/** ID 的当前顺序下标，全集未就绪或 ID 不在集合内时为 -1。 */
 function indexOf(id: number): number {
-  return idIndex.get(id) ?? -1
+  return isReady() ? idIndex.get(id) ?? -1 : -1
 }
 
-/** 当前已加载是否对应给定版本(且非空失效态)。 */
-function isFresh(layoutVersion: number): boolean {
-  return loadedVersion === layoutVersion
+/** 当前可操作的全集是否属于指定顺序。 */
+function isFresh(orderVersion: number): boolean {
+  return isReady() && loadedVersion.value === orderVersion
 }
 
-/**
- * 布局序上的闭区间 [anchor, to]（含端点），与方向无关。
- * 任一端点不在当前视图（如布局已失效尚未重取）→ 返回空数组,由调用侧决定降级行为。
- */
+/** 顺序已提交,即使全集尚未传到前端,后端仍可按该版本做单步导航。 */
+function isExpected(orderVersion: number): boolean {
+  return expectedVersion.value === orderVersion
+}
+
+/** 当前完整顺序上的闭区间；全集未就绪或任一端点不在其中时为空。 */
 function rangeBetween(anchorId: number, toId: number): number[] {
-  const ai = idIndex.get(anchorId)
-  const bi = idIndex.get(toId)
-  if (ai === undefined || bi === undefined) return []
-  const lo = Math.min(ai, bi)
-  const hi = Math.max(ai, bi)
-  return viewIds.value.slice(lo, hi + 1)
+  const a = indexOf(anchorId)
+  const b = indexOf(toId)
+  if (a < 0 || b < 0) return []
+  return cachedIds.value.slice(Math.min(a, b), Math.max(a, b) + 1)
 }
 
-/** 当前视图布局序全集（过渡期物化 all 态、invert 全集运算用）。 */
-function allIds(): readonly number[] {
-  return viewIds.value
-}
+/** 当前可操作的全集；待新集合/顺序提交期间不暴露旧 ID。 */
+function allIds(): readonly number[] { return viewIds.value }
 
-/** 全集元素数（all 态计数基数）。 */
-function totalCount(): number {
-  return viewIds.value.length
-}
+/** 当前可操作全集的大小。 */
+function totalCount(): number { return viewIds.value.length }
 
-/**
- * 视图布局序全集 id 单例。
- * 用法:布局摘要的 layoutVersion 变化时调 ensureFresh(version);
- *      选区策略经 rangeBetween / allIds / totalCount 取序与全集,不再依赖可视 DOM。
- */
+/** 单例全集缓存，布局提交后按 orderVersion 加载。 */
 export function useViewIds() {
-  return {
-    viewIds: readonly(viewIds),
-    refresh,
-    ensureFresh,
-    indexOf,
-    isFresh,
-    rangeBetween,
-    allIds,
-    totalCount,
-  }
+  return { viewIds, setExpectedVersion, isReady, refresh, ensureFresh, indexOf, isFresh, isExpected,
+    rangeBetween, allIds, totalCount }
 }

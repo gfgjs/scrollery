@@ -191,9 +191,6 @@ export const IPC = {
   // 退出前 flush 回报:后端发 SETTINGS_FLUSH_REQUESTED,前端落盘完成后经此回执。
   // ok=false 时后端保留窗口不退出,由前端给出重试/放弃选择。
   SETTINGS_FLUSH_DONE: 'settings_flush_done',
-  // 退出前 flush 请求(设置集中保存):后端发 SETTINGS_FLUSH_REQUESTED 事件,载荷 { requestId };
-  // 前端落盘在途/待保存设置后经 IPC.SETTINGS_FLUSH_DONE 回执,后端收齐再退出。
-  SETTINGS_FLUSH_REQUESTED: 'settings-flush-requested',
   // 启动时一次性取设置快照与内部状态(首启/引导标记),合并为 1 次往返。
   GET_STARTUP_CONFIG: 'get_startup_config',
   // 应用日志目录路径（设置页"打开日志目录"用）。
@@ -327,15 +324,15 @@ export const IPC = {
 
   // ── Exotic 插件平台（Part5 T11/T12，消费 Part6）────────────────────────
   // 某插件的授权判定（gate / 购买引导用）；判定全在后端 EntitlementProvider，前端不持验签逻辑。
+  GET_OFFICIAL_ENTITLEMENT: 'get_official_entitlement',
+  LIST_FEATURE_OFFERINGS: 'list_feature_offerings',
+  ACTIVATE_OFFICIAL_LICENSE: 'activate_official_license',
+  DEACTIVATE_OFFICIAL_LICENSE: 'deactivate_official_license',
   GET_PLUGIN_ENTITLEMENT: 'get_plugin_entitlement',
   // 单个媒体项的 exotic 状态（可用态 + 任务态）；resolution=null 即普通格式，触点据此决定是否 gate。
   GET_EXOTIC_ITEM_STATE: 'get_exotic_item_state',
   // Catalog 全部格式解析（前端据此缓存"哪些格式属 exotic"，避免为普通格式空跑 item-state IPC）。
   LIST_EXOTIC_FORMAT_RESOLUTIONS: 'list_exotic_format_resolutions',
-  // 激活插件：用可信 Catalog 的 sku 验证 token→存 keyring。参数只接受 pluginId+token（后端红线）。
-  ACTIVATE_EXOTIC_PLUGIN: 'activate_exotic_plugin',
-  // 移除授权（卸载时的独立操作，不影响安装目录）。
-  DEACTIVATE_EXOTIC_PLUGIN: 'deactivate_exotic_plugin',
   // ── 插件商店（T11）：registry 浏览 / 安装生命周期 / 处理进度 ──────────────
   // 拉取远程签名 Registry（验签+防回滚+原子写缓存）；返回本次可装条目摘要。
   FETCH_EXOTIC_REGISTRY: 'fetch_exotic_registry',
@@ -399,10 +396,6 @@ export const IPC = {
   RELAUNCH_APP: 'relaunch_app',
 
   // ── 图片简单编辑（方案 C §6/§7）────────────────────────────────
-  /** 查询内建图片编辑高级功能授权态；复用 exotic EntitlementProvider，不走格式插件 catalog。 */
-  GET_EDITING_ENTITLEMENT: 'get_editing_entitlement',
-  /** 激活内建图片编辑高级功能；后端固定 plugin id / SKU，前端只提交 token。 */
-  ACTIVATE_EDITING_FEATURE: 'activate_editing_feature',
   /** 获取 orientation 烤入、sRGB、长边受限的 raw 编辑预览 packet。 */
   GET_EDIT_PREVIEW: 'get_edit_preview',
   /** 保存编辑副本:旋转/翻转/裁剪 + 编码落盘 + 单文件入库,直接返回终态(非 job/事件模型)。 */
@@ -416,9 +409,11 @@ export const IPC = {
 
 // ── Tauri 事件 ──────────────────────────────────────────────────────────
 export const EVENTS = {
+  OFFICIAL_LICENSE_CHANGED: 'official-license-changed',
+  // 退出前 flush 请求，载荷 { requestId }；前端落盘后经 IPC.SETTINGS_FLUSH_DONE 回执。
+  SETTINGS_FLUSH_REQUESTED: 'settings-flush-requested',
   MEDIA_ENRICHED: 'db:media_enriched',
   ENRICHMENT_COMPLETED: 'enrichment:completed',
-  MEDIA_UPDATED: 'db:media_updated',
   /** 卷插拔监听（Part2 T2）：卷在线态变化 → 画廊刷新离线徽标显隐。 */
   VOLUMES_CHANGED: 'volumes:changed',
   /** exotic 处理进度/状态变化（后端 Pipeline 每批进度 + 租约清扫时发）→ 商店进度区实时刷新。 */

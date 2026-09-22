@@ -8,7 +8,6 @@ import { useViewIds } from './useViewIds'
 import { useMediaStore } from '../stores/mediaStore'
 import { useDedupStore } from '../stores/dedupStore'
 import { useUiStore } from '../stores/uiStore'
-import { scrollCache } from '../utils/scrollCache'
 import { EVENTS } from '../constants/ipc'
 import { needsViewportMeta } from '../components/media/mediaGrid.helpers'
 import type { LayoutRow } from '../types/layout'
@@ -17,10 +16,6 @@ export interface GalleryTauriSyncDeps {
   /** 自动重算入口：离屏时登记 deferred，激活后补算当前视图。 */
   requestCompute: () => boolean
   refreshCacheDir: () => Promise<void>
-  restoreReflowAnchor: () => Promise<boolean>
-  gridRef: () => HTMLElement | null
-  scrollToLogicalY: (y: number) => Promise<void>
-  getViewKey: () => string
   /** browse-only 镜头不需要把布局 flat_ids 物化到前端。 */
   shouldLoadViewIds: () => boolean
   isLensActive: () => boolean
@@ -69,7 +64,10 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
   // 组件卸载与(父 composable / effectScope)销毁都会走到这里:监听器解绑由
   // useTauriListen 自己的 onScopeDispose 负责,此处只清尾窗口定时器(与其它
   // 可脱离组件单测的 composable 同款锚点)。
-  onScopeDispose(clearEnrichRefreshTimer)
+  onScopeDispose(() => {
+    clearEnrichRefreshTimer()
+    media.ensureMeta([])
+  })
 
   // 当 totalItems 发生变化（扫描完成 / 清除数据）时，走统一重算闸门。
   watch(
@@ -81,12 +79,12 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
 
   // 当布局被标记为脏时（例如全量缩略图生成完成且网格已挂载），走统一重算闸门。
   watch(
-    () => media.layoutDirty,
-    async (dirty) => {
-      if (!dirty) return
+    () => media.layoutDirtyRevision,
+    async () => {
+      if (!media.layoutDirty) return
       await deps.refreshCacheDir()
-      // 离屏时保留 dirty，激活补算时由 flushIfDeferred 一并消费。
-      if (deps.requestCompute()) media.consumeLayoutDirty()
+      // 缓存目录读取期间可能已有布局完成；仍有未消费的失效才请求，成功后由布局入口消费。
+      if (media.layoutDirty) deps.requestCompute()
       // updateVisible 由下方的 layoutVersion watcher 处理
     },
   )
@@ -106,22 +104,11 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
   // 当布局发生变化时（由于调整大小、文件夹切换、过滤器等原因），刷新可见的行
   watch(
     () => media.layoutVersion,
-    async (v) => {
+    () => {
       // 布局变了 → 普通画廊刷新选区用的布局序全集；镜头 browse-only 由查看器走
       // get_lens_adjacent_media，不把全量 flat_ids 灌入前端。fire-and-forget 不阻塞滚动恢复。
-      if (deps.shouldLoadViewIds()) void viewIds.ensureFresh(v)
-      // 等待 DOM，允许在布局渲染之前设置 scrollTop
-      const el = deps.gridRef()
-      if (el) {
-        // 整体重排(行高/分组/排序/宽度/布局模式):重新锚定到之前浏览的项。无锚的布局
-        // 变化(文件夹/筛选/…)回退到保存的滚动位。
-        const restored = await deps.restoreReflowAnchor()
-        if (!restored) {
-          const saved = scrollCache.get(deps.getViewKey()) || 0
-          await deps.scrollToLogicalY(saved)
-        }
-      }
-      // 段表重建由引擎的 layoutVersion watch 自驱,无需另发取数请求。
+      if (deps.shouldLoadViewIds() && media.orderVersion > 0) void viewIds.ensureFresh(media.orderVersion)
+      // 目标解析、段表与滚动恢复由 bucket 换代统一提交。
     },
   )
 
@@ -133,9 +120,12 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
       // 只有勾了真正消费元数据的元素才按视口拉(S7):此前只看总开关,勾 size/status 这类
       // 纯 item 字段的元素也会每屏拉一遍 EXIF/GPS/路径,拉回来无人渲染。元素列表本身也
       // 须入 watch 源,否则中途勾上 camera 要等到行变化才补拉。
-      if (!ui.showThumbInfo || !needsViewportMeta(ui.thumbInfoElements)) return ''
+      if (!media.layoutSemanticKey || !ui.showThumbInfo || !needsViewportMeta(ui.thumbInfoElements)) return ''
+      const rows = deps.activeRows()
+      // 换代期间显示种子不属于新窗口；等首段就绪再替换窗口,避免几何重排先清空同集合元数据。
+      if (rows.length === 0 && media.totalRows > 0) return null
       const ids: number[] = []
-      for (const row of deps.activeRows()) {
+      for (const row of rows) {
         if (row.rowType === 'normal') {
           for (const it of row.items) ids.push(it.id)
         }
@@ -143,8 +133,8 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
       return ids.join(',')
     },
     (key) => {
-      if (!key) return
-      media.ensureMeta(key.split(',').map(Number))
+      if (key === null) return
+      media.ensureMeta(key ? key.split(',').map(Number) : [])
     },
     { immediate: true },
   )

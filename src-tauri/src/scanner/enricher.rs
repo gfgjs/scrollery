@@ -23,9 +23,9 @@ use crate::db::queries::{
 use crate::error::{AppError, Result};
 use crate::scanner::live_photo::pair_live_photos;
 use crate::scanner::metadata::{
-    apply_orientation_swap, detect_motion_photo_xmp, detect_motion_photo_xmp_buf, parse_exif_meta,
-    parse_exif_meta_buf_detailed_with_file, read_header_buf_for_ext_with_file_size,
-    read_raw_dimensions, read_raw_dimensions_buf, ExifParsePath, HeaderRead,
+    apply_orientation_swap, detect_motion_photo_xmp, detect_motion_photo_xmp_buf,
+    parse_exif_with_context, read_dimensions_with_context, read_header_buf_for_ext_with_file_size,
+    ExifParsePath, HeaderRead, ImageReadContext,
 };
 use crate::state::AppState;
 use crate::utils::path::resolve_media_path;
@@ -219,9 +219,7 @@ fn reserved_core_pool() -> Option<rayon::ThreadPool> {
 /// Windows 下多文件 open/stat/seek 和杀毒软件过滤造成的等待。上限是硬边界，避免把
 /// 「提高并发」变成无界文件句柄和随机 IO 放大。
 fn header_read_pool() -> Option<rayon::ThreadPool> {
-    let n = std::thread::available_parallelism()
-        .map(|c| c.get().saturating_mul(2).clamp(4, 32))
-        .unwrap_or(8);
+    let n = crate::scanner::hdd_io::header_worker_count();
     rayon::ThreadPoolBuilder::new().num_threads(n).build().ok()
 }
 
@@ -257,12 +255,40 @@ fn read_image_header(path: &std::path::Path, file_size: i64) -> ImageHeaderRead 
 ///
 /// 与旧整批路径逐项同语义（同一解析函数、同一方向处理、同一回退选择），只是从内联闭包提取成
 /// 函数：新分块流水线与旧整批路径共用它，表征测试才能逐项对照两条路径的结果。
+#[cfg(test)]
 fn parse_image_item(
     path_info: &ImageEnrichmentPathInfo,
     ext: String,
-    mut header_read: Option<HeaderRead>,
+    header_read: Option<HeaderRead>,
 ) -> ImageParseResult {
+    parse_image_item_measured(
+        path_info,
+        ext,
+        header_read,
+        &mut ImageReadContext::default(),
+        std::time::Duration::ZERO,
+        None,
+    )
+    .unwrap()
+}
+
+fn parse_image_item_measured(
+    path_info: &ImageEnrichmentPathInfo,
+    ext: String,
+    mut header_read: Option<HeaderRead>,
+    context: &mut ImageReadContext,
+    header_elapsed: std::time::Duration,
+    run: Option<(i64, &str)>,
+) -> Result<ImageParseResult> {
     let (id, abs_path, w, h, _sort_dt, _file_size) = path_info;
+    let started = std::time::Instant::now();
+    let header_bytes = header_read
+        .as_ref()
+        .map_or(0, |read| read.header.bytes.len());
+    let container_format = header_read
+        .as_ref()
+        .and_then(|read| image::guess_format(&read.header.bytes).ok());
+    let mut dimensions_elapsed = std::time::Duration::ZERO;
     // panic 伞(2026-07-10 审查 B8,P1-1 同族):kamadak-exif/image 对畸形文件的 panic 会经
     // rayon 传播中止整个 run_enrichment,且该项不落 minimal 行 → 下轮同一文件重新入选再炸,
     // 库级补全永不完成。panic 降级为「EXIF 失败」,与解析失败同路写 minimal 行,保住前进性。
@@ -272,16 +298,12 @@ fn parse_image_item(
         // Windows 下每次 open 伴随 Defender 扫描,是本 pass 的首要 I/O 成本)。阶段5 按扩展名
         // 阶梯读:JPEG 128KB、TIFF/HEIC 系保持 256KB、其余 64KB；截断时先做格式级判断,
         // 只有不能确认“无 EXIF”时才回退整文件路径。open 失败走原 per-fn 路径,同语义报错。
-        let (meta, exif_path) = match header_read.as_mut() {
-            Some(read) => {
-                parse_exif_meta_buf_detailed_with_file(path, &read.header, &mut read.file)
-            }
-            None => (parse_exif_meta(path), ExifParsePath::DirectFile),
-        };
+        let (meta, exif_path) = parse_exif_with_context(path, header_read.as_mut(), context);
         let (is_live, has_embedded) = if matches!(ext.as_str(), "jpg" | "jpeg") {
             match header_read.as_ref() {
                 Some(read) => detect_motion_photo_xmp_buf(&read.header),
-                None => detect_motion_photo_xmp(path),
+                None if context.ensure_file_access().is_ok() => detect_motion_photo_xmp(path),
+                None => (false, false),
             }
         } else {
             (false, false)
@@ -289,10 +311,14 @@ fn parse_image_item(
         // 仅对占位项读取尺寸 — 保持首屏即时尺寸（及其方向）不变（不双重翻转）。
         // 复用上面刚解析出的方向（meta），而不是为读 Orientation 再开一次 JPEG。
         let dims = if *w == 0 || *h == 0 {
-            let raw = match header_read.as_ref() {
-                Some(read) => read_raw_dimensions_buf(path, ext.as_str(), &read.header),
-                None => read_raw_dimensions(path, ext.as_str()),
-            };
+            let dimension_started = std::time::Instant::now();
+            let raw = read_dimensions_with_context(
+                path,
+                ext.as_str(),
+                header_read.as_ref().map(|read| &read.header),
+                context,
+            );
+            dimensions_elapsed = dimension_started.elapsed();
             if raw.0 > 0 && raw.1 > 0 {
                 let oriented = if matches!(ext.as_str(), "jpg" | "jpeg") {
                     let orientation = meta.as_ref().map(|m| m.orientation as u32).unwrap_or(1);
@@ -309,13 +335,31 @@ fn parse_image_item(
         };
         Ok((meta, is_live, has_embedded, dims, exif_path))
     });
-    match guarded {
+    let result = match guarded {
         Ok((meta, is_live, has_embedded, dims, exif_path)) => {
             (*id, meta, is_live, has_embedded, dims, exif_path)
         }
         // panic → 与 EXIF 解析失败同路(meta=Err),下游写 minimal 行。
         Err(e) => (*id, Err(e), false, false, None, ExifParsePath::Failed),
+    };
+    let parse_elapsed = started.elapsed();
+    if let Some((root_id, run_id)) = run {
+        if header_elapsed + parse_elapsed >= std::time::Duration::from_millis(500) {
+            info!(root_id, run_id, item_id = id, format = %ext, container_format = ?container_format,
+                header_ms = header_elapsed.as_secs_f64() * 1000.0,
+                parse_ms = parse_elapsed.as_secs_f64() * 1000.0,
+                exif_memory_ms = context.exif_memory.as_secs_f64() * 1000.0,
+                exif_probe_ms = context.exif_probe.as_secs_f64() * 1000.0,
+                exif_fallback_ms = context.exif_fallback.as_secs_f64() * 1000.0,
+                dimensions_ms = dimensions_elapsed.as_secs_f64() * 1000.0,
+                dimensions_file = context.dimensions_file,
+                file_access_wait_ms = context.file_access_wait.as_secs_f64() * 1000.0, header_bytes,
+                exif_path = ?result.5, exif_ok = result.1.is_ok(), dimensions = ?result.4,
+                "Slow image enrichment item");
+        }
     }
+    context.check_io_error()?;
+    Ok(result)
 }
 
 // ── IPC 事件负载 ────────────────────────────────────────────────────────
@@ -575,6 +619,7 @@ fn run_enrichment_inner(
     let mut enriched_total: i64 = 0;
     let mut enriched_bytes: i64 = 0;
     let mut exif_header_total: i64 = 0;
+    let mut exif_chunk_total: i64 = 0;
     let mut exif_fallback_total: i64 = 0;
     let mut exif_no_metadata_total: i64 = 0;
     let mut exif_unsupported_total: i64 = 0;
@@ -591,6 +636,24 @@ fn run_enrichment_inner(
     // T13（§3.7.2）：图片段并行 EXIF/尺寸提取也跑在**保留核**的池上（与视频/音频段一致），
     // 为前台 `compute_layout` 留一个核——否则海量图片导入会把全局 rayon 池占满、与「2s 自动重排」
     // 反馈循环互相饿死。一次性建池、整段复用；`None`（建池失败）→ 回退全局池。
+    let root_path: Option<String> = {
+        let conn = writer.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT path FROM scan_roots WHERE id=?1",
+            [root_id],
+            |row| row.get(0),
+        )
+        .optional()?
+    };
+    // 设备查询不能占着数据库 writer；同盘多个根从进程级注册表取得同一预算。
+    let disk_budget = root_path
+        .as_deref()
+        .and_then(crate::scanner::hdd_io::for_root);
+    let image_io_mode = if disk_budget.is_some() {
+        "hdd_adaptive"
+    } else {
+        "header_pipeline"
+    };
     let img_pool = reserved_core_pool();
     let header_pool = header_read_pool();
     // 批内流水线的累计分段计时与在途块峰值。口径是单根：多根同时富化时各自独立统计，
@@ -605,6 +668,10 @@ fn run_enrichment_inner(
         .map(rayon::ThreadPool::current_num_threads)
         .unwrap_or_else(rayon::current_num_threads);
     info!(
+        root_id, run_id, image_io_mode,
+        disk = ?disk_budget.as_ref().map(|budget| budget.disk),
+        header_limit = ?disk_budget.as_ref().map(|budget| budget.header_limit),
+        supplemental_limit = ?disk_budget.as_ref().map(|_| 1),
         "Image enrichment pipeline: batch={IMAGE_ENRICHMENT_BATCH}, header_chunk={HEADER_CHUNK_ITEMS}, max_inflight_header_chunks={MAX_INFLIGHT_HEADER_CHUNKS}, header_workers={header_workers}, parse_workers={parse_workers}"
     );
 
@@ -746,12 +813,32 @@ fn run_enrichment_inner(
             header_pool.as_ref(),
             img_pool.as_ref(),
             &pipeline_timing,
-            |index| {
+            |index| -> Result<_> {
                 let (_, abs_path, _, _, _, file_size) = &path_infos[index];
-                read_image_header(std::path::Path::new(abs_path), *file_size)
+                let started = std::time::Instant::now();
+                // 守卫只覆盖头读；随缓冲进入队列会与消费侧的独占补读互相等待。
+                let _permit = disk_budget
+                    .as_ref()
+                    .map(|budget| budget.acquire_header(cancel))
+                    .transpose()?;
+                let header = read_image_header(std::path::Path::new(abs_path), *file_size);
+                Ok((header, started.elapsed()))
             },
-            |index, (ext, header_read)| parse_image_item(&path_infos[index], ext, header_read),
-        )?;
+            |index, header| -> Result<_> {
+                let ((ext, header_read), elapsed) = header?;
+                let mut context = ImageReadContext::with_disk_budget(disk_budget.clone(), cancel);
+                parse_image_item_measured(
+                    &path_infos[index],
+                    ext,
+                    header_read,
+                    &mut context,
+                    elapsed,
+                    Some((root_id, run_id)),
+                )
+            },
+        )?
+        .into_iter()
+        .collect::<Result<_>>()?;
         let pipeline_wall_ns = image_pipeline::duration_ns(pipeline_started.elapsed());
         pipeline_wall_ns_total += pipeline_wall_ns;
 
@@ -845,6 +932,7 @@ fn run_enrichment_inner(
         for (_, _, _, _, _, exif_path) in &parsed {
             match exif_path {
                 ExifParsePath::HeaderBuffer => exif_header_total += 1,
+                ExifParsePath::ContainerChunk => exif_chunk_total += 1,
                 ExifParsePath::FullFileFallback => exif_fallback_total += 1,
                 ExifParsePath::NoMetadata => exif_no_metadata_total += 1,
                 ExifParsePath::Unsupported => exif_unsupported_total += 1,
@@ -868,6 +956,7 @@ fn run_enrichment_inner(
         debug!(
             run_id,
             root_id,
+            image_io_mode,
             items = parsed.len(),
             select_ns,
             pipeline_wall_ns,
@@ -946,7 +1035,9 @@ fn run_enrichment_inner(
     info!(
         run_id,
         root_id,
+        image_io_mode,
         exif_header = exif_header_total,
+        exif_container_chunk = exif_chunk_total,
         exif_full_file_fallback = exif_fallback_total,
         exif_no_metadata = exif_no_metadata_total,
         exif_unsupported = exif_unsupported_total,
@@ -1442,6 +1533,25 @@ fn enrichment_order_clause(group_by: &str, sort_within_group: &str, sort_order: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timed_out_disk_is_a_batch_error_instead_of_minimal_metadata() {
+        let budget = crate::scanner::hdd_io::test_budget(1);
+        let cancel = CancellationToken::new();
+        let permit = budget.acquire(&cancel).unwrap();
+        permit.mark_timed_out();
+        let mut context = ImageReadContext::with_disk_budget(Some(budget), &cancel);
+        let path_info = (1, String::from("missing.jpg"), 0, 0, 0, 0);
+        let result = parse_image_item_measured(
+            &path_info,
+            String::from("jpg"),
+            None,
+            &mut context,
+            std::time::Duration::ZERO,
+            None,
+        );
+        assert!(matches!(result, Err(AppError::ImageReadTimeout)));
+    }
 
     fn video_info(width: u32, height: u32) -> crate::video::VideoInfo {
         crate::video::VideoInfo {
@@ -2034,6 +2144,37 @@ mod tests {
             parse_fingerprints(&bulk),
             "流水线与整批路径必须逐项等价"
         );
+
+        // 自动调度复用同组真实文件，逐项核对元数据、尺寸和失败路径。
+        let budget = crate::scanner::hdd_io::test_budget(4);
+        let adaptive = run_bounded_header_parse(
+            path_infos.len(),
+            &cancel,
+            Some(&header_pool),
+            Some(&parse_pool),
+            &PipelineTiming::default(),
+            |index| {
+                let _permit = budget.acquire_header(&cancel).unwrap();
+                let (_, path, _, _, _, file_size) = &path_infos[index];
+                read_image_header(std::path::Path::new(path), *file_size)
+            },
+            |index, (ext, header)| {
+                let mut context = ImageReadContext::with_disk_budget(Some(budget.clone()), &cancel);
+                parse_image_item_measured(
+                    &path_infos[index],
+                    ext,
+                    header,
+                    &mut context,
+                    std::time::Duration::ZERO,
+                    None,
+                )
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        assert_eq!(parse_fingerprints(&adaptive), parse_fingerprints(&bulk));
 
         // 有效样本确实被解析出 EXIF：JPEG(EXIF APP1)方向为 6。
         let jpeg_parsed = piped
