@@ -775,6 +775,8 @@ export default {
     neutral: 'Neutral',
     warmPaper: 'Warm Paper',
     coldNight: 'Cold Night',
+    mint: 'Fresh Mint',
+    forest: 'Animal Forest',
   },
   // 阅读专属主题名(R3;注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
   readerThemes: {
@@ -804,7 +806,7 @@ export default {
     unpinFromSidebar: 'Unpin from sidebar',
     viewerIccProfiles: 'Imported profiles ({count})',
     cacheBreakdown: 'View cache breakdown',
-    themeCustomize: 'Customize colors and window material',
+    themeCustomize: 'Customize colors, style, and window material',
     titlebarSummary: 'Place gallery tools in the title bar to save vertical space.',
     selectionBarSummary: 'Show selection actions in the bottom status bar.',
     selectionAlignSummary: 'Changing alignment resets the manually dragged position.',
@@ -875,7 +877,11 @@ export default {
     themePreviewButton: 'Button',
     themePreviewThisMode: 'Preview this mode',
     themePreviewing: 'Previewing',
-    themeResetMode: 'Reset',
+    themeResetMode: 'Reset this palette',
+    themeVisualStyle: 'Visual style',
+    themeVisualStandard: 'Standard',
+    themeVisualMint: 'Fresh Mint',
+    themeVisualForest: 'Animal Forest',
     themeApply: 'Apply',
     themeSaveAs: 'Save as theme',
     themeSaveAndApply: 'Save and apply',
@@ -908,7 +914,7 @@ export default {
     windowMaterialNone: 'Solid',
     windowOpacity: 'Window opacity',
     windowMaterialDraftHint:
-      'Changes preview the interface fill only; the native window material and opacity apply when you click Apply.',
+      'Native material affects the shell only. Preview cannot reproduce the system backdrop; native material and opacity apply when you click Apply.',
     reading: 'Reading themes',
     readerThemeHint:
       'Day and night themes follow the app appearance. Adjust text size and layout in the reader.',

@@ -1,7 +1,13 @@
 <template>
   <!-- data-theme 单源在 documentElement(uiStore.applyAppearance 唯一写点);此处
        不得再绑一份——双源曾导致 system 模式规则不匹配(Part5 F1)与主题切换脱同步。 -->
-  <div class="app-shell">
+  <div
+    class="app-shell"
+    :class="{
+      'app-shell--maximized': isMaximized,
+      'app-shell--flat': viewerRoute || viewer.isImmersive || isFullscreen,
+    }"
+  >
     <!-- 自绘标题栏：只承载品牌、窗口三键、拖拽区与当前视图的 navigation 命令。 -->
     <slot name="titlebar" />
 
@@ -16,7 +22,7 @@
            移出焦点序(同 titlebar-host 沉浸收起手法)。 -->
       <aside
         ref="sidebarRef"
-        class="app-sidebar"
+        class="app-sidebar theme-shell-surface"
         :style="{
           width: ui.sidebarWidth + 'px',
           marginLeft: sidebarVisible ? '0' : `-${ui.sidebarWidth}px`,
@@ -126,7 +132,7 @@ import { useUiStore } from '../../stores/uiStore'
 import { useViewerStore } from '../../stores/viewerStore'
 import { useSidebarResize } from '../../composables/useSidebarResize'
 import { useFullscreenExitGuard } from '../../composables/useFullscreenExitGuard'
-import { initWindowMode, toggleFullscreen } from '../../composables/useWindowMode'
+import { initWindowMode, toggleFullscreen, isFullscreen, isMaximized } from '../../composables/useWindowMode'
 import {
   chromeAutoHidden,
   topRevealed,
@@ -303,7 +309,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-  background-color: var(--color-bg-primary);
+  background-color: var(--color-shell-bg-primary, var(--color-bg-primary));
   color: var(--color-text-primary);
 }
 
@@ -397,6 +403,42 @@ onBeforeUnmount(() => {
      避开侧栏(本元素起点即侧栏右缘),不像 fixed 那样会铺到侧栏底下。overflow:hidden(上一行,原有)
      顺带把收起态平移出去的两条裁掉。 */
   position: relative;
+  margin: var(--theme-main-inset-top) var(--theme-main-inset-right)
+    var(--theme-main-inset-bottom) var(--theme-main-inset-left);
+  border: var(--theme-main-border-width) solid var(--theme-main-border-color);
+  border-radius: var(--theme-main-radius);
+  box-shadow: var(--theme-main-shadow);
+  background: transparent;
+}
+
+:global(html[data-visual-style]) .app-main {
+  background: var(--color-bg-primary);
+}
+
+.app-shell--maximized:not(.app-shell--flat) {
+  --theme-main-inset-top: 3px;
+  --theme-main-inset-right: 4px;
+  --theme-main-inset-bottom: 4px;
+  --theme-main-inset-left: 3px;
+}
+
+@media (max-width: 760px) {
+  .app-shell--maximized:not(.app-shell--flat) {
+    --theme-main-inset-top: 0px;
+    --theme-main-inset-right: 0px;
+    --theme-main-inset-bottom: 0px;
+    --theme-main-inset-left: 0px;
+  }
+}
+
+.app-shell--flat {
+  --theme-main-inset-top: 0px;
+  --theme-main-inset-right: 0px;
+  --theme-main-inset-bottom: 0px;
+  --theme-main-inset-left: 0px;
+  --theme-main-radius: 0px;
+  --theme-main-border-width: 0px;
+  --theme-main-shadow: none;
 }
 
 .app-toolbar {

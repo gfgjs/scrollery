@@ -5,7 +5,7 @@
        未越阈值即松手 → 按钮/控件照常响应点击。整行任意处(含按钮)可拖,原生表单控件(行高滑块/搜索框/
        下拉)与窗口三键(data-no-window-drag)排除。双击裸露标题面最大化/还原由 useWindowDrag 复刻。
        平台分叉:mac 用系统红绿灯(不渲染三键),非 mac 自绘三键。 -->
-  <div ref="rootRef" class="window-chrome" :class="{ 'is-mac': isMac }">
+  <div ref="rootRef" class="window-chrome theme-shell-surface" :class="{ 'is-mac': isMac }">
     <!-- 内容区:P1 为空(仅拖拽);P3 换 ContextualToolbar。mac 左侧 padding 避让红绿灯。
          data-window-drag-surface:内容区本体(槽位内容之间的空隙/padding)是「纯空隙拖拽面」——命中它
          本体即 pointerdown 即时移窗(VSCode 级,useWindowDrag 路径 B);槽内后代按钮/可点 div 靠 matches

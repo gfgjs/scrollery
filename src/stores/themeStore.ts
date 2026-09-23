@@ -24,7 +24,7 @@ import {
   writeSettings,
 } from './settingsPersistence'
 import { generateTheme } from '../themes/generate'
-import { applyMaterial, applyPalette } from '../themes/apply'
+import { applyMaterial, applyPalette, applyVisualStyle } from '../themes/apply'
 import { buildThemeCache, writeThemeCache } from '../themes/snapshot'
 import { DEFAULT_THEME_DEFINITION } from '../themes/presets'
 // 主题配置的键名与结构转换集中在 themes/config.ts(config.toml 结构的唯一转写点),本 store 只做
@@ -44,6 +44,7 @@ import type {
   ThemeMode,
   ThemePalette,
   ThemeSeed,
+  ThemeVisualStyle,
 } from '../themes/types'
 
 const APPEARANCE_MODES: readonly AppearanceMode[] = ['light', 'dark', 'system']
@@ -74,6 +75,7 @@ function cloneDefinition(definition: ThemeDefinition): ThemeDefinition {
     dark: { ...definition.dark },
     material: definition.material,
     opacity: definition.opacity,
+    visualStyle: definition.visualStyle,
   }
 }
 
@@ -84,6 +86,7 @@ function definitionFrom(values: Record<string, string>): ThemeDefinition {
     darkPalette: values[THEME_SETTING_KEYS.darkPalette] ?? null,
     windowMaterial: values[THEME_SETTING_KEYS.windowMaterial] ?? null,
     windowOpacity: values[THEME_SETTING_KEYS.windowOpacity] ?? null,
+    visualStyle: values[THEME_SETTING_KEYS.visualStyle] ?? null,
   })
 }
 
@@ -106,7 +109,7 @@ function appearanceFrom(values: Record<string, string>): AppearanceMode {
  * 「我的主题」列表变化不算主题变化——重命名/删除个人主题不得打断正在进行的草稿。
  */
 function signatureOf(definition: ThemeDefinition): string {
-  return JSON.stringify([definition.light, definition.dark, definition.material, definition.opacity])
+  return JSON.stringify([definition.light, definition.dark, definition.material, definition.opacity, definition.visualStyle])
 }
 
 /** 稳定 ID:crypto.randomUUID 不可用时退回时间戳 + 计数(仍需唯一且不含颜色/名称信息)。 */
@@ -182,7 +185,7 @@ export const useThemeStore = defineStore('theme', () => {
   // 只是取值,不会各自触发 generateTheme,故 DOM 与 Canvas 必定拿到同一帧的同一份结果;
   // 「最多每帧一次」也由这一处保证(拖动只排队,不逐事件重算)。
   const currentPalette = shallowRef<ThemePalette>(
-    generateTheme(DEFAULT_THEME_DEFINITION[effectiveMode.value], effectiveMode.value),
+    generateTheme(DEFAULT_THEME_DEFINITION[effectiveMode.value], effectiveMode.value, DEFAULT_THEME_DEFINITION.visualStyle),
   )
   const currentMaterial = shallowRef<ThemeMaterial>(DEFAULT_THEME_DEFINITION.material)
   const currentOpacity = shallowRef(DEFAULT_THEME_DEFINITION.opacity)
@@ -190,12 +193,13 @@ export const useThemeStore = defineStore('theme', () => {
   function publishNow(): void {
     const definition = currentDefinition.value
     const mode = effectiveMode.value
-    const palette = generateTheme(definition[mode], mode)
+    const palette = generateTheme(definition[mode], mode, definition.visualStyle)
+    applyVisualStyle(definition.visualStyle)
+    applyPalette(palette)
+    applyMaterial(definition.material, definition.opacity, { windows: isWindows })
     currentPalette.value = palette
     currentMaterial.value = definition.material
     currentOpacity.value = definition.opacity
-    applyPalette(palette)
-    applyMaterial(definition.material, definition.opacity, { windows: isWindows })
   }
 
   let framePending = false
@@ -262,10 +266,11 @@ export const useThemeStore = defineStore('theme', () => {
     writeThemeCache(
       buildThemeCache(
         confirmedAppearance.value,
-        generateTheme(definition.light, 'light'),
-        generateTheme(definition.dark, 'dark'),
+        generateTheme(definition.light, 'light', definition.visualStyle),
+        generateTheme(definition.dark, 'dark', definition.visualStyle),
         definition.material,
         definition.opacity,
+        definition.visualStyle,
       ),
     )
   }
@@ -358,6 +363,13 @@ export const useThemeStore = defineStore('theme', () => {
     const current = ensureDraft()
     ensurePreview()
     draft.value = { ...current, opacity: parseOpacity(pct) }
+    schedulePublish()
+  }
+
+  function updateVisualStyle(visualStyle: ThemeVisualStyle): void {
+    const current = ensureDraft()
+    ensurePreview()
+    draft.value = { ...current, visualStyle }
     schedulePublish()
   }
 
@@ -567,6 +579,7 @@ export const useThemeStore = defineStore('theme', () => {
     updateSeed,
     updateMaterial,
     updateOpacity,
+    updateVisualStyle,
     loadDefinition,
     loadSavedTheme,
     resetSeedToDefault,

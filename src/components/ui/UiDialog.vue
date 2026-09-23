@@ -110,7 +110,7 @@ useFocusTrap(overlayEl, () => props.open)
   background-color: var(--color-bg-elevated);
   border-color: var(--color-border-strong);
   border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--theme-dialog-shadow);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   animation: ui-dialog-slide var(--duration-normal) var(--ease-out);
@@ -193,7 +193,7 @@ useFocusTrap(overlayEl, () => props.open)
 .dialog-content--float {
   background-color: var(--color-bg-elevated);
   border-color: var(--color-border-strong);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--theme-dialog-shadow);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }

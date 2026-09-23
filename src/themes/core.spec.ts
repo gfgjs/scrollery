@@ -73,7 +73,7 @@ describe('主题可读性', () => {
     it('正文与辅助文字在全部承载面上 ≥4.5', () => {
       for (const mode of MODES) {
         for (const preset of BUILTIN_PRESETS) {
-          const p = generateTheme(preset.definition[mode], mode)
+          const p = generateTheme(preset.definition[mode], mode, preset.definition.visualStyle)
           const label = preset.id + ' ' + mode
           for (const base of [p.background, p.surface, p.elevated]) {
             expect(
@@ -92,7 +92,7 @@ describe('主题可读性', () => {
     it('有含义的控件边界与控件轨道 ≥3;装饰性分隔线不套该门槛', () => {
       for (const mode of MODES) {
         for (const preset of BUILTIN_PRESETS) {
-          const p = generateTheme(preset.definition[mode], mode)
+          const p = generateTheme(preset.definition[mode], mode, preset.definition.visualStyle)
           const label = preset.id + ' ' + mode
           const bases = controlBases(p)
           expect(minContrast(p.controlBorder, bases), label + ' 控件边界').toBeGreaterThanOrEqual(
@@ -109,7 +109,7 @@ describe('主题可读性', () => {
     it('强调色文字 ≥4.5,强调填充文字在填充与其悬停色上 ≥4.5', () => {
       for (const mode of MODES) {
         for (const preset of BUILTIN_PRESETS) {
-          const p = generateTheme(preset.definition[mode], mode)
+          const p = generateTheme(preset.definition[mode], mode, preset.definition.visualStyle)
           const label = preset.id + ' ' + mode
           expect(
             minContrast(p.accentText, [p.background, p.surface, p.selection]),
@@ -135,7 +135,7 @@ describe('主题可读性', () => {
       } as const
       for (const mode of MODES) {
         for (const preset of BUILTIN_PRESETS) {
-          const p = generateTheme(preset.definition[mode], mode)
+          const p = generateTheme(preset.definition[mode], mode, preset.definition.visualStyle)
           const label = preset.id + ' ' + mode
           for (const key of ['success', 'warning', 'error', 'info'] as const) {
             expect(contrastRatio(p[onKeys[key]], p[key]), label + ' ' + key).toBeGreaterThanOrEqual(
@@ -204,7 +204,7 @@ describe('首帧恢复', () => {
 
   function cacheText(overrides: Record<string, unknown> = {}): string {
     return JSON.stringify({
-      ...buildThemeCache('system', lightPalette, darkPalette, 'none', 90),
+      ...buildThemeCache('system', lightPalette, darkPalette, 'none', 90, 'standard'),
       ...overrides,
     })
   }
@@ -272,6 +272,7 @@ describe('主题持久化', () => {
     dark: { ...DEFAULT_DARK_SEED, gallery: '#101820' },
     material: 'acrylic',
     opacity: 85,
+    visualStyle: 'forest',
   }
 
   describe('当前主题的应用参数', () => {
@@ -298,6 +299,7 @@ describe('主题持久化', () => {
           darkPalette: patch[THEME_SETTING_KEYS.darkPalette],
           windowMaterial: patch[THEME_SETTING_KEYS.windowMaterial],
           windowOpacity: patch[THEME_SETTING_KEYS.windowOpacity],
+          visualStyle: patch[THEME_SETTING_KEYS.visualStyle],
         }),
       ).toEqual(definition)
     })

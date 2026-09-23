@@ -37,7 +37,7 @@
               v-for="mode in THEME_MODES"
               :key="mode"
               class="theme-tile__preview"
-              :seed="preset.definition[mode]"
+              :definition="preset.definition"
               :mode="mode"
             />
           </span>
@@ -64,7 +64,7 @@
                 v-for="mode in THEME_MODES"
                 :key="mode"
                 class="theme-saved__preview"
-                :seed="saved[mode]"
+                :definition="saved"
                 :mode="mode"
               />
             </span>
@@ -91,12 +91,25 @@
         :key="mode"
         :mode="mode"
         :seed="editable[mode]"
+        :definition="editable"
         :previewing="theme.previewMode === mode"
         @update="onSeedUpdate(mode, $event)"
         @preview="onPreviewMode(mode)"
         @reset="theme.resetSeedToDefault(mode)"
       />
     </div>
+
+    <section class="theme-settings__group">
+      <h4 class="theme-settings__group-title">{{ t('settings.themeVisualStyle') }}</h4>
+      <UiSelect
+        :model-value="editable.visualStyle"
+        @update:model-value="theme.updateVisualStyle($event as ThemeVisualStyle)"
+      >
+        <option v-for="style in THEME_VISUAL_STYLES" :key="style" :value="style">
+          {{ t(VISUAL_STYLE_LABEL_KEYS[style]) }}
+        </option>
+      </UiSelect>
+    </section>
 
 <!-- 窗口材质:草稿即时预览界面填充,窗口原生材质在应用后生效。 -->
     <section class="theme-settings__group">
@@ -209,6 +222,7 @@ import { useThemeStore } from '../../stores/themeStore'
 import { useToastStore } from '../../stores/toastStore'
 import { logger } from '../../utils/logger'
 import { BUILTIN_PRESETS, definitionEquals } from '../../themes/presets'
+import { THEME_VISUAL_STYLES } from '../../themes/visualStyles'
 import { MIN_TEXT_CONTRAST } from '../../themes/generate'
 import { contrastRatio } from '../../themes/colors'
 import {
@@ -219,6 +233,7 @@ import {
   type ThemeMaterial,
   type ThemeMode,
   type ThemeSeed,
+  type ThemeVisualStyle,
 } from '../../themes/types'
 import type { AppearanceMode } from '../../types/ui'
 
@@ -236,6 +251,12 @@ const MATERIAL_LABEL_KEYS: Record<ThemeMaterial, string> = {
   none: 'settings.windowMaterialNone',
   mica: 'settings.windowMaterialMica',
   acrylic: 'settings.windowMaterialAcrylic',
+}
+
+const VISUAL_STYLE_LABEL_KEYS: Record<ThemeVisualStyle, string> = {
+  standard: 'settings.themeVisualStandard',
+  mint: 'settings.themeVisualMint',
+  forest: 'settings.themeVisualForest',
 }
 
 /** 可编辑参数:草稿优先,未进编辑时即已应用值(store 不再单列 editableDefinition)。 */

@@ -52,6 +52,7 @@
         </UiEmptyState>
         <UiEmptyState
           v-else-if="!lensActive && media.totalRows === 0 && !media.isComputingLayout"
+          decorative
           :title="emptyTitle"
           :description="emptyDescription"
         >
@@ -810,7 +811,7 @@ const galleryAuto = computed(
   () => theme.currentDefinition[theme.effectiveMode].gallery === GALLERY_AUTO,
 )
 const galleryTransparent = computed(
-  () => isWindows && theme.currentMaterial !== 'none' && galleryAuto.value,
+  () => isWindows && theme.currentMaterial !== 'none' && galleryAuto.value && theme.currentDefinition.visualStyle === 'standard',
 )
 // 全局性能面板只持有稳定 getter；失活时注销，避免在查看器路由误跑画廊基准。
 // (与 onActivated/onDeactivated 同属 KeepAlive 胶水,故留根组件。)

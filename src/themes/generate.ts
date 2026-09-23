@@ -9,8 +9,9 @@
 // (正文/辅助文字、有含义的控件边界、强调色文字)不写死系数,而是按门槛反推混色量:固定系数
 // 在任意用户配色上都无法保证达标。
 
-import type { ThemeMode, ThemePalette, ThemeSeed } from './types'
+import type { ThemeMode, ThemePalette, ThemeSeed, ThemeVisualStyle } from './types'
 import { GALLERY_AUTO } from './types'
+import { shellBackgroundFor } from './visualStyles'
 import {
   ensureContrast,
   isLightColor,
@@ -130,54 +131,89 @@ function controlBases(background: string, surface: string, elevated: string): st
   return [background, surface, elevated]
 }
 
-/**
- * 生成一份完整色板。
- *
- * seed 的三个颜色为规范 #rrggbb、gallery 为 auto 或规范 #rrggbb——校验发生在输入/设置
- * 边界(见 config.ts),此处不再逐字段复核;坏值由 colors.ts 的降级行为兜底。
- */
-export function generateTheme(seed: ThemeSeed, mode: ThemeMode): ThemePalette {
-  const c = clampContrast(seed.contrast) / 100
-  const light = mode === 'light'
-  const { background, foreground, accent } = seed
-
+/** 主内容与外壳按同一表面公式派生，边线按各自实际承载面校正。 */
+function deriveSurfaceColors(
+  background: string,
+  foreground: string,
+  accent: string,
+  c: number,
+  light: boolean,
+  includeInputBg = false,
+) {
   const surface = light
     ? mix(background, WHITE, THEME_CONSTANTS.lightPanel)
     : mix(background, foreground, THEME_COEFFICIENTS.darkPanel(c))
   const elevated = light
     ? mix(background, WHITE, THEME_CONSTANTS.lightFloat)
     : mix(background, foreground, THEME_COEFFICIENTS.darkFloat(c))
-  const inset = light
-    ? mix(background, foreground, THEME_COEFFICIENTS.inset(c))
-    : mix(background, BLACK, THEME_CONSTANTS.darkInset)
-
-  // 有含义的控件边界:按门槛反推混色量,且必须在一组承载面上全部达标。装饰性分隔线只用固定
-  // 系数,不套控件门槛。
+  const inputBg = mix(background, foreground, THEME_COEFFICIENTS.inputBg(c))
   const bases = controlBases(background, surface, elevated)
-  const controlBorder = mixUntilContrast(
-    background,
-    foreground,
-    bases,
-    MIN_CONTROL_CONTRAST,
-    THEME_CONSTANTS.controlFloor,
-  )
-  const controlTrack = mixUntilContrast(
-    background,
-    foreground,
-    bases,
-    MIN_CONTROL_CONTRAST + THEME_CONSTANTS.controlTrackExtra,
-    THEME_CONSTANTS.controlFloor,
-  )
+  if (includeInputBg) bases.push(inputBg)
+  return {
+    surface,
+    elevated,
+    inset: light
+      ? mix(background, foreground, THEME_COEFFICIENTS.inset(c))
+      : mix(background, BLACK, THEME_CONSTANTS.darkInset),
+    hover: mix(background, foreground, THEME_COEFFICIENTS.hover(c)),
+    selection: mix(background, accent, THEME_COEFFICIENTS.selection(c)),
+    textSecondary: mix(background, foreground, THEME_COEFFICIENTS.textSecondary(c)),
+    textTertiary: mix(background, foreground, THEME_COEFFICIENTS.textTertiary(c)),
+    border: mix(background, foreground, THEME_COEFFICIENTS.border(c)),
+    borderStrong: mix(background, foreground, THEME_COEFFICIENTS.borderStrong(c)),
+    borderSubtle: mix(background, foreground, THEME_COEFFICIENTS.borderSubtle(c)),
+    divider: mix(background, foreground, THEME_COEFFICIENTS.divider(c)),
+    inputBg,
+    controlBorder: mixUntilContrast(
+      background, foreground, bases, MIN_CONTROL_CONTRAST, THEME_CONSTANTS.controlFloor,
+    ),
+    controlTrack: mixUntilContrast(
+      background, foreground, bases,
+      MIN_CONTROL_CONTRAST + THEME_CONSTANTS.controlTrackExtra,
+      THEME_CONSTANTS.controlFloor,
+    ),
+  }
+}
 
-  const textSecondary = mix(background, foreground, THEME_COEFFICIENTS.textSecondary(c))
-  const textTertiary = mix(background, foreground, THEME_COEFFICIENTS.textTertiary(c))
+/**
+ * 生成一份完整色板。
+ *
+ * seed 的三个颜色为规范 #rrggbb、gallery 为 auto 或规范 #rrggbb——校验发生在输入/设置
+ * 边界(见 config.ts),此处不再逐字段复核;坏值由 colors.ts 的降级行为兜底。
+ */
+export function generateTheme(
+  seed: ThemeSeed,
+  mode: ThemeMode,
+  visualStyle: ThemeVisualStyle = 'standard',
+): ThemePalette {
+  const c = clampContrast(seed.contrast) / 100
+  const light = mode === 'light'
+  const { background, foreground, accent } = seed
+
+  const main = deriveSurfaceColors(background, foreground, accent, c, light)
+  const { surface, elevated, inset, controlBorder, controlTrack, textSecondary, textTertiary } = main
 
   // 选中浅背景与强调色悬停:两者都与强调色相关,先算出来供强调色文字一并判定。
-  const selection = mix(background, accent, THEME_COEFFICIENTS.selection(c))
+  const selection = main.selection
   const accentHover = mix(accent, light ? BLACK : WHITE, THEME_CONSTANTS.accentHover)
   // 强调色文字以 accent 为起点,必要时向黑/白调整;它读在基础底面、面板与强调色浅底(选中态)
   // 三种底上,任一处不可读都算不达标。
   const accentText = ensureContrast(accent, [background, surface, selection], MIN_TEXT_CONTRAST)
+
+  const shellBackground = shellBackgroundFor(background, accent, mode, visualStyle)
+  const shell = visualStyle === 'standard'
+    ? main
+    : deriveSurfaceColors(shellBackground, foreground, accent, c, light, true)
+  const shellBases = [shellBackground, shell.surface, shell.elevated]
+  const shellTextPrimary = visualStyle === 'standard'
+    ? foreground
+    : ensureContrast(foreground, shellBases, MIN_TEXT_CONTRAST)
+  const shellTextSecondary = visualStyle === 'standard'
+    ? textSecondary
+    : ensureContrast(shell.textSecondary, shellBases, MIN_TEXT_CONTRAST)
+  const shellTextTertiary = visualStyle === 'standard'
+    ? textTertiary
+    : ensureContrast(shell.textTertiary, shellBases, MIN_TEXT_CONTRAST)
 
   // 画廊/纸面从**实际**画廊底色派生:指定了 gallery 的区间不能被错误地按窗口底色计算。
   const canvas = seed.gallery === GALLERY_AUTO ? background : seed.gallery
@@ -205,10 +241,34 @@ export function generateTheme(seed: ThemeSeed, mode: ThemeMode): ThemePalette {
     surface,
     elevated,
     inset,
-    hover: mix(background, foreground, THEME_COEFFICIENTS.hover(c)),
+    hover: main.hover,
     selection,
     // 遮罩叠在照片/内容之上,确需透明(方案 §4.2 保留 alpha 的用途之一)。
     overlay: light ? withAlpha(foreground, 0.45) : withAlpha(BLACK, 0.6),
+
+    shellBackground,
+    shellSurface: shell.surface,
+    shellElevated: shell.elevated,
+    shellInset: shell.inset,
+    shellHover: shell.hover,
+    shellSelection: shell.selection,
+    shellTextPrimary,
+    shellTextSecondary,
+    shellTextTertiary,
+    shellTextPlaceholder: shellTextTertiary,
+    shellAccentText: visualStyle === 'standard'
+      ? accentText
+      : ensureContrast(accent, [shellBackground, shell.surface, shell.selection], MIN_TEXT_CONTRAST),
+    shellBorder: shell.border,
+    shellBorderStrong: shell.borderStrong,
+    shellBorderSubtle: shell.borderSubtle,
+    shellDivider: shell.divider,
+    shellInputBg: shell.inputBg,
+    shellControlBorder: shell.controlBorder,
+    shellControlTrack: shell.controlTrack,
+    shellToggleThumb: light ? WHITE : shellBackground,
+    shellScrollbarThumb: withAlpha(visualStyle === 'standard' ? foreground : shellTextPrimary, 0.16),
+    shellScrollbarThumbHover: withAlpha(visualStyle === 'standard' ? foreground : shellTextPrimary, 0.28),
 
     textPrimary: foreground,
     textSecondary,
@@ -223,14 +283,14 @@ export function generateTheme(seed: ThemeSeed, mode: ThemeMode): ThemePalette {
     accentText,
     textOnAccent: pickReadableText(accent),
 
-    border: mix(background, foreground, THEME_COEFFICIENTS.border(c)),
-    borderStrong: mix(background, foreground, THEME_COEFFICIENTS.borderStrong(c)),
-    borderSubtle: mix(background, foreground, THEME_COEFFICIENTS.borderSubtle(c)),
-    divider: mix(background, foreground, THEME_COEFFICIENTS.divider(c)),
+    border: main.border,
+    borderStrong: main.borderStrong,
+    borderSubtle: main.borderSubtle,
+    divider: main.divider,
     controlBorder,
     controlTrack,
     focusRing: withAlpha(accent, 0.45),
-    inputBg: mix(background, foreground, THEME_COEFFICIENTS.inputBg(c)),
+    inputBg: main.inputBg,
     toggleThumb: light ? WHITE : background,
 
     canvas,
@@ -290,6 +350,27 @@ export const PALETTE_CSS_VARS: Readonly<Record<keyof ThemePalette, readonly stri
   hover: ['--color-bg-hover', '--color-sidebar-hover-bg'],
   selection: ['--color-bg-active', '--color-accent-subtle', '--color-sidebar-active-bg'],
   overlay: ['--color-bg-overlay'],
+  shellBackground: ['--color-shell-bg-primary', '--color-shell-bg-secondary'],
+  shellSurface: ['--color-shell-bg-surface'],
+  shellElevated: ['--color-shell-bg-elevated'],
+  shellInset: ['--color-shell-bg-inset'],
+  shellHover: ['--color-shell-bg-hover', '--color-shell-sidebar-hover-bg'],
+  shellSelection: ['--color-shell-bg-active', '--color-shell-accent-subtle', '--color-shell-sidebar-active-bg'],
+  shellTextPrimary: ['--color-shell-text-primary'],
+  shellTextSecondary: ['--color-shell-text-secondary'],
+  shellTextTertiary: ['--color-shell-text-tertiary'],
+  shellTextPlaceholder: ['--color-shell-text-placeholder'],
+  shellAccentText: ['--color-shell-accent-text', '--color-shell-sidebar-active-text'],
+  shellBorder: ['--color-shell-border'],
+  shellBorderStrong: ['--color-shell-border-strong'],
+  shellBorderSubtle: ['--color-shell-border-subtle'],
+  shellDivider: ['--color-shell-divider'],
+  shellInputBg: ['--color-shell-input-bg'],
+  shellControlBorder: ['--color-shell-input-border'],
+  shellControlTrack: ['--color-shell-toggle-bg'],
+  shellToggleThumb: ['--color-shell-toggle-thumb'],
+  shellScrollbarThumb: ['--color-shell-scrollbar-thumb'],
+  shellScrollbarThumbHover: ['--color-shell-scrollbar-thumb-hover'],
   textPrimary: ['--color-text-primary'],
   textSecondary: ['--color-text-secondary'],
   textTertiary: ['--color-text-tertiary'],

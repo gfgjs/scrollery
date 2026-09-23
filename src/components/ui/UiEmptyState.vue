@@ -9,11 +9,14 @@ defineProps<{
   title: string
   /** 可选说明文字(缺省不渲染说明行)。 */
   description?: string
+  /** 普通空态可显示主题静态装饰；加载、错误与重复分析保持关闭。 */
+  decorative?: boolean
 }>()
 </script>
 
 <template>
-  <div class="empty-state">
+  <div class="empty-state" :class="{ 'empty-state--decorative': decorative }">
+    <div v-if="decorative" class="empty-state__decorative" aria-hidden="true" />
     <div v-if="$slots.icon" class="empty-state__icon"><slot name="icon" /></div>
     <div class="empty-state__title">{{ title }}</div>
     <div v-if="description" class="empty-state__desc">{{ description }}</div>
@@ -25,9 +28,20 @@ defineProps<{
 <style scoped>
 /* 空状态是内容区基座，不套卡片；只收敛密度与文字层级到共享 token。 */
 .empty-state {
+  position: relative;
   gap: var(--spacing-md);
   padding: var(--spacing-xl);
   color: var(--color-text-secondary);
+}
+
+.empty-state__decorative {
+  position: absolute;
+  top: -48px;
+  left: 50%;
+  width: 120px;
+  height: 60px;
+  transform: translateX(-50%);
+  pointer-events: none;
 }
 
 .empty-state__icon {

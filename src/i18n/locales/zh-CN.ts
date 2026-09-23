@@ -753,6 +753,8 @@ export default {
     neutral: '中性',
     warmPaper: '暖纸',
     coldNight: '冷夜',
+    mint: '清新薄荷',
+    forest: '动物森林',
   },
   // 阅读专属主题名(R3;注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
   readerThemes: {
@@ -782,7 +784,7 @@ export default {
     unpinFromSidebar: '取消固定到侧栏',
     viewerIccProfiles: '已导入配置文件（{count}）',
     cacheBreakdown: '查看缓存明细',
-    themeCustomize: '自定义配色与窗口材质',
+    themeCustomize: '自定义配色、外观与窗口材质',
     titlebarSummary: '将图库工具放入标题栏，节省纵向空间。',
     selectionBarSummary: '多选操作显示在底部状态栏。',
     selectionAlignSummary: '切换对齐方式会清除手动拖动的位置。',
@@ -852,7 +854,11 @@ export default {
     themePreviewButton: '按钮',
     themePreviewThisMode: '预览此模式',
     themePreviewing: '预览中',
-    themeResetMode: '恢复默认',
+    themeResetMode: '恢复本档默认配色',
+    themeVisualStyle: '外观样式',
+    themeVisualStandard: '标准',
+    themeVisualMint: '清新薄荷',
+    themeVisualForest: '动物森林',
     themeApply: '应用',
     themeSaveAs: '保存为主题',
     themeSaveAndApply: '保存并应用',
@@ -882,7 +888,7 @@ export default {
     windowMaterialNone: '纯色',
     windowOpacity: '窗口不透明度',
     windowMaterialDraftHint:
-      '调整只即时预览界面填充；窗口原生材质与不透明度在点「应用」后生效。',
+      '原生材质仅影响外壳，预览无法复现系统背板；窗口原生材质与不透明度在点「应用」后生效。',
     reading: '阅读主题',
     readerThemeHint:
       '日间与夜间主题随应用明暗切换。字号和排版可在阅读器中调整。',
