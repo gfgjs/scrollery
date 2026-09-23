@@ -11,6 +11,10 @@ import coldNightDark from './presets/cold-night-dark.json'
 import coldNightLight from './presets/cold-night-light.json'
 import defaultDark from './presets/default-dark.json'
 import defaultLight from './presets/default-light.json'
+import forestDark from './presets/forest-dark.json'
+import forestLight from './presets/forest-light.json'
+import mintDark from './presets/mint-dark.json'
+import mintLight from './presets/mint-light.json'
 import warmPaperDark from './presets/warm-paper-dark.json'
 import warmPaperLight from './presets/warm-paper-light.json'
 import {
@@ -32,11 +36,14 @@ export const DEFAULT_THEME_DEFINITION: ThemeDefinition = {
   dark: DEFAULT_DARK_SEED,
   material: 'none',
   opacity: DEFAULT_WINDOW_OPACITY,
+  visualStyle: 'standard',
 }
 
 export const PRESET_NEUTRAL = 'neutral'
 export const PRESET_WARM_PAPER = 'warm-paper'
 export const PRESET_COLD_NIGHT = 'cold-night'
+export const PRESET_MINT = 'mint'
+export const PRESET_FOREST = 'forest'
 
 /**
  * 内置三套预设:中性、暖纸、冷夜。顺序即设置页展示顺序,中性即默认(与
@@ -52,6 +59,7 @@ export const BUILTIN_PRESETS: readonly ThemePreset[] = [
       dark: { ...warmPaperDark },
       material: 'mica',
       opacity: 92,
+      visualStyle: 'standard',
     },
   },
   {
@@ -62,6 +70,29 @@ export const BUILTIN_PRESETS: readonly ThemePreset[] = [
       dark: { ...coldNightDark },
       material: 'acrylic',
       opacity: 88,
+      visualStyle: 'standard',
+    },
+  },
+  {
+    id: PRESET_MINT,
+    nameKey: 'themes.mint',
+    definition: {
+      light: { ...mintLight },
+      dark: { ...mintDark },
+      material: 'none',
+      opacity: DEFAULT_WINDOW_OPACITY,
+      visualStyle: 'mint',
+    },
+  },
+  {
+    id: PRESET_FOREST,
+    nameKey: 'themes.forest',
+    definition: {
+      light: { ...forestLight },
+      dark: { ...forestDark },
+      material: 'none',
+      opacity: DEFAULT_WINDOW_OPACITY,
+      visualStyle: 'forest',
     },
   },
 ]
@@ -82,7 +113,8 @@ export function definitionEquals(a: ThemeDefinition, b: ThemeDefinition): boolea
     seedEquals(a.light, b.light) &&
     seedEquals(a.dark, b.dark) &&
     a.material === b.material &&
-    a.opacity === b.opacity
+    a.opacity === b.opacity &&
+    a.visualStyle === b.visualStyle
   )
 }
 

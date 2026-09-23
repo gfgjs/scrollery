@@ -420,6 +420,10 @@ pub const SAVED_THEME_FIELDS: &[FieldDef] = &[
         name: "opacity",
         ty: FieldType::Int { min: 0, max: 100 },
     },
+    FieldDef {
+        name: "visual_style",
+        ty: FieldType::Enum(&["standard", "mint", "forest"]),
+    },
 ];
 pub static SAVED_THEME: StructDef = StructDef {
     fields: SAVED_THEME_FIELDS,
@@ -527,6 +531,14 @@ src/themes/presets/default-light.json)。",
         default: DEFAULT_DARK_SEED_JSON,
         comment_zh: "深色模式的配色种子(字段与取值范围同上)。默认取中性预设深色种子(见 \
 src/themes/presets/default-dark.json)。",
+        hot: true,
+    },
+    SettingDef {
+        section: "ui",
+        key: "theme_visual_style",
+        kind: SettingKind::Enum(&["standard", "mint", "forest"]),
+        default: "standard",
+        comment_zh: "主题外观样式。可选:standard(标准) / mint(清新薄荷) / forest(动物森林)。默认 standard。",
         hot: true,
     },
     SettingDef {

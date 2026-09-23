@@ -6,6 +6,7 @@
 @import '@fontsource-variable/inter/opsz.css';
 
 @import './variables.css';
+@import './theme-visual.css';
 /* 主题颜色不再由静态 CSS 提供:默认色板由 vite-plugin-theme-default-css 注入(与运行时同一份
    generateTheme 结果),运行时色板由 apply.ts 写入 html 内联变量。此处只留非颜色基础层。 */
 /* 窗口玻璃模式覆写层:消费主题生成的 --color-* 与唯一窗口不透明度 --window-opacity,

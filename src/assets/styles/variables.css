@@ -139,7 +139,43 @@
 }
 
 /* 暗色档阴影:同一四档加厚(数值沿用原深色主题的声明)。 */
-html[data-color-scheme='dark'] {
+html[data-color-scheme='dark'],
+[data-theme-scope][data-color-scheme='dark'] {
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.24);
+  --shadow-md: 0 4px 14px -2px rgb(0 0 0 / 0.48), 0 2px 6px -1px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 12px 32px -4px rgb(0 0 0 / 0.58), 0 4px 12px -2px rgb(0 0 0 / 0.38);
+  --shadow-xl: 0 20px 48px -6px rgb(0 0 0 / 0.7), 0 8px 20px -3px rgb(0 0 0 / 0.48);
+}
+
+/* 局部预览必须拥有自己的标准基线，不继承根上的森林/薄荷造型。 */
+[data-theme-scope] {
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05), 0 1px 1px rgb(0 0 0 / 0.025);
+  --shadow-md: 0 4px 12px -2px rgb(0 0 0 / 0.07), 0 2px 5px -1px rgb(0 0 0 / 0.035);
+  --shadow-lg: 0 10px 28px -4px rgb(0 0 0 / 0.1), 0 4px 10px -2px rgb(0 0 0 / 0.045);
+  --shadow-xl: 0 20px 40px -6px rgb(0 0 0 / 0.14), 0 8px 16px -3px rgb(0 0 0 / 0.06);
+}
+
+:root,
+[data-theme-scope] {
+  --theme-main-inset-top: 6px;
+  --theme-main-inset-right: 8px;
+  --theme-main-inset-bottom: 8px;
+  --theme-main-inset-left: 6px;
+  --theme-main-radius: 0px;
+  --theme-main-border-width: 0px;
+  --theme-main-border-color: transparent;
+  --theme-main-shadow: none;
+  --theme-button-depth: 0px;
+  --theme-dialog-shadow: var(--shadow-lg);
+  --theme-section-rule-style: solid;
+}
+
+[data-theme-scope][data-color-scheme='dark'] {
   --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.24);
   --shadow-md: 0 4px 14px -2px rgb(0 0 0 / 0.48), 0 2px 6px -1px rgb(0 0 0 / 0.3);
   --shadow-lg: 0 12px 32px -4px rgb(0 0 0 / 0.58), 0 4px 12px -2px rgb(0 0 0 / 0.38);

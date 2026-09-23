@@ -11,6 +11,9 @@ export type ThemeMode = 'light' | 'dark'
 /** 窗口材质。none 为纯色(新默认);mica / acrylic 仅 Windows 生效。 */
 export type ThemeMaterial = 'none' | 'mica' | 'acrylic'
 
+/** 有限外观配方；颜色种子与窗口材质仍独立保存。 */
+export type ThemeVisualStyle = 'standard' | 'mint' | 'forest'
+
 /** 画廊底色跟随界面底面的取值。 */
 export const GALLERY_AUTO = 'auto'
 
@@ -47,6 +50,7 @@ export interface ThemeDefinition {
   material: ThemeMaterial
   /** 窗口不透明度,0–100 整数。 */
   opacity: number
+  visualStyle: ThemeVisualStyle
 }
 
 /** 用户命名的主题快照:保存后继续调色不自动更新它。 */
@@ -89,6 +93,29 @@ export interface ThemePalette {
   selection: string
   /** 遮罩:确实需要透明的用途保留 alpha。 */
   overlay: string
+
+  /* ── 外壳色域：侧栏与标题栏消费，standard 与主色域逐项相同 ─────────── */
+  shellBackground: string
+  shellSurface: string
+  shellElevated: string
+  shellInset: string
+  shellHover: string
+  shellSelection: string
+  shellTextPrimary: string
+  shellTextSecondary: string
+  shellTextTertiary: string
+  shellTextPlaceholder: string
+  shellAccentText: string
+  shellBorder: string
+  shellBorderStrong: string
+  shellBorderSubtle: string
+  shellDivider: string
+  shellInputBg: string
+  shellControlBorder: string
+  shellControlTrack: string
+  shellToggleThumb: string
+  shellScrollbarThumb: string
+  shellScrollbarThumbHover: string
 
   /* ── 文字 ─────────────────────────────────────────────────────────────── */
   /** 正文。 */

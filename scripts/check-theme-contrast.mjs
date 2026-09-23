@@ -83,7 +83,7 @@ function palettes() {
   const seen = new Set()
   for (const preset of BUILTIN_PRESETS) {
     for (const mode of ['light', 'dark']) {
-      const palette = generateTheme(preset.definition[mode], mode)
+      const palette = generateTheme(preset.definition[mode], mode, preset.definition.visualStyle)
       const key = `${preset.id}-${mode}`
       if (seen.has(key)) continue
       seen.add(key)
@@ -105,7 +105,7 @@ function palettes() {
 
 console.log('主题对比度门(生成的色板,非 CSS 字面量)')
 
-for (const { label, palette: p } of palettes()) {
+for (const { label, preset, palette: p } of palettes()) {
   console.log(`\n═══ ${label} ═══`)
 
   for (const base of ['background', 'surface', 'elevated', 'inset', 'canvas']) {
@@ -113,6 +113,18 @@ for (const { label, palette: p } of palettes()) {
   }
   for (const base of ['background', 'surface', 'elevated']) {
     gate(`textSecondary × ${base}`, p.textSecondary, p[base], MIN_TEXT_CONTRAST)
+  }
+  if (preset.definition?.visualStyle !== undefined && preset.definition.visualStyle !== 'standard') {
+    for (const base of ['shellBackground', 'shellSurface', 'shellElevated']) {
+      gate(`shellTextPrimary × ${base}`, p.shellTextPrimary, p[base], MIN_TEXT_CONTRAST)
+      gate(`shellTextSecondary × ${base}`, p.shellTextSecondary, p[base], MIN_TEXT_CONTRAST)
+    }
+    gate('shellAccentText × shellSelection', p.shellAccentText, p.shellSelection, MIN_TEXT_CONTRAST)
+    for (const key of ['shellControlBorder', 'shellControlTrack']) {
+      for (const base of ['shellBackground', 'shellSurface', 'shellElevated', 'shellInputBg']) {
+        gate(`${key} × ${base}`, p[key], p[base], MIN_CONTROL_CONTRAST)
+      }
+    }
   }
   for (const base of ['background', 'surface']) {
     gate(`textTertiary × ${base}`, p.textTertiary, p[base], 3)

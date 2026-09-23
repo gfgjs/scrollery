@@ -14,7 +14,7 @@
       </span>
     </header>
 
-    <ThemePreview :seed="seed" :mode="mode" />
+    <ThemePreview :definition="definition" :mode="mode" />
 
     <div class="palette-card__colors">
       <ThemeColorPicker
@@ -74,11 +74,12 @@ import { useI18n } from 'vue-i18n'
 import UiButton from '../ui/UiButton.vue'
 import ThemeColorPicker from './ThemeColorPicker.vue'
 import ThemePreview from './ThemePreview.vue'
-import { GALLERY_AUTO, type ThemeMode, type ThemeSeed } from '../../themes/types'
+import { GALLERY_AUTO, type ThemeDefinition, type ThemeMode, type ThemeSeed } from '../../themes/types'
 
 const props = defineProps<{
   mode: ThemeMode
   seed: ThemeSeed
+  definition: ThemeDefinition
   /** 该模式是否正被临时预览(界面外观偏好不因此改变)。 */
   previewing: boolean
 }>()

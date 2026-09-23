@@ -1,0 +1,132 @@
+/* 有限造型配方；所有外观覆写只作用于根或独立预览 scope。 */
+:is(:root, [data-theme-scope])[data-visual-style='mint'] {
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-xl: 18px;
+  --theme-main-radius: 18px;
+  --theme-main-border-width: 1px;
+  --theme-main-border-color: var(--color-border-subtle);
+  --theme-main-shadow: 0 2px 10px rgb(25 63 46 / 0.06);
+  --theme-dialog-shadow: 0 8px 24px rgb(25 63 46 / 0.12);
+}
+
+:is(:root, [data-theme-scope])[data-visual-style='forest'] {
+  --radius-xs: 4px;
+  --radius-sm: 10px;
+  --radius-md: 12px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --theme-main-radius: 16px;
+  --theme-main-border-width: 1px;
+  --theme-main-border-color: var(--color-border);
+  --theme-main-shadow: 0 2px 8px rgb(77 65 41 / 0.08);
+  --theme-dialog-shadow: 0 8px 24px rgb(77 65 41 / 0.14);
+  --theme-button-depth: 2px;
+  --theme-section-rule-style: dashed;
+}
+
+:is(:root, [data-theme-scope])[data-color-scheme='dark'][data-visual-style='mint'] {
+  --theme-main-shadow: 0 2px 10px rgb(0 0 0 / 0.2);
+  --theme-dialog-shadow: 0 8px 24px rgb(0 0 0 / 0.32);
+}
+
+:is(:root, [data-theme-scope])[data-color-scheme='dark'][data-visual-style='forest'] {
+  --theme-main-shadow: 0 2px 8px rgb(0 0 0 / 0.24);
+  --theme-dialog-shadow: 0 8px 24px rgb(0 0 0 / 0.36);
+}
+
+/* chrome 子树复用原语语义变量；内容区与 body 弹层继续用主色域。 */
+.theme-shell-surface {
+  --color-bg-primary: var(--color-shell-bg-primary);
+  --color-bg-secondary: var(--color-shell-bg-secondary);
+  --color-bg-surface: var(--color-shell-bg-surface);
+  --color-bg-elevated: var(--color-shell-bg-elevated);
+  --color-bg-inset: var(--color-shell-bg-inset);
+  --color-bg-hover: var(--color-shell-bg-hover);
+  --color-bg-active: var(--color-shell-bg-active);
+  --color-accent-subtle: var(--color-shell-accent-subtle);
+  --color-sidebar-hover-bg: var(--color-shell-sidebar-hover-bg);
+  --color-sidebar-active-bg: var(--color-shell-sidebar-active-bg);
+  --color-text-primary: var(--color-shell-text-primary);
+  --color-text-secondary: var(--color-shell-text-secondary);
+  --color-text-tertiary: var(--color-shell-text-tertiary);
+  --color-text-placeholder: var(--color-shell-text-placeholder);
+  --color-accent-text: var(--color-shell-accent-text);
+  --color-sidebar-active-text: var(--color-shell-sidebar-active-text);
+  --color-border: var(--color-shell-border);
+  --color-border-strong: var(--color-shell-border-strong);
+  --color-border-subtle: var(--color-shell-border-subtle);
+  --color-divider: var(--color-shell-divider);
+  --color-input-bg: var(--color-shell-input-bg);
+  --color-input-border: var(--color-shell-input-border);
+  --color-toggle-bg: var(--color-shell-toggle-bg);
+  --color-toggle-thumb: var(--color-shell-toggle-thumb);
+  --color-scrollbar-thumb: var(--color-shell-scrollbar-thumb);
+  --color-scrollbar-thumb-hover: var(--color-shell-scrollbar-thumb-hover);
+}
+
+@media (max-width: 760px) {
+  :is(:root, [data-theme-scope])[data-visual-style],
+  :is(:root, [data-theme-scope]):not([data-visual-style]) {
+    --theme-main-inset-top: 0px;
+    --theme-main-inset-right: 0px;
+    --theme-main-inset-bottom: 0px;
+    --theme-main-inset-left: 0px;
+  }
+}
+
+html[data-visual-style='mint'] .empty-state--decorative .empty-state__decorative {
+  background: url('../themes/mint-empty.svg') center / contain no-repeat;
+}
+
+html[data-color-scheme='dark'][data-visual-style='mint'] .empty-state__decorative {
+  opacity: 0.65;
+}
+
+html[data-visual-style='forest'] .app-sidebar .acc-header:not(.acc-header--first) {
+  border-top-style: dashed;
+}
+
+html[data-visual-style='forest'] .empty-state--decorative .empty-state__decorative {
+  top: -56px;
+  width: 140px;
+  height: 70px;
+  background: url('../themes/forest-empty.svg') center / contain no-repeat;
+}
+
+html[data-color-scheme='dark'][data-visual-style='forest'] .empty-state__decorative {
+  opacity: 0.75;
+}
+
+/* 有树项时主动隐藏侧栏小景，避免背景轮廓压在密集列表文字下。 */
+html:not([data-glass])[data-visual-style='forest'] .app-shell:not(.app-shell--flat) .app-sidebar:not(:has(.tree-item))::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 42px;
+  left: 0;
+  height: 160px;
+  background: url('../themes/forest-shell.svg') bottom center / 320px 160px no-repeat;
+  opacity: 0.06;
+  pointer-events: none;
+}
+
+.theme-preview[data-visual-style='forest'] .theme-preview__sidebar::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 42px;
+  height: 22px;
+  background: url('../themes/forest-shell.svg') bottom center / cover no-repeat;
+  opacity: 0.12;
+  pointer-events: none;
+}
+
+@media (max-width: 760px) {
+  html[data-visual-style='forest'] .app-sidebar::after {
+    display: none;
+  }
+}

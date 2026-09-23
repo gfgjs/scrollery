@@ -39,6 +39,7 @@ export function buildBootstrapScript(): string {
   var CONCRETE_COLOR = /^(#[0-9a-f]{6}|rgba?[(][0-9., ]+[)]|transparent)$/
   var APPEARANCES = ['system', 'light', 'dark']
   var MATERIALS = ['none', 'mica', 'acrylic']
+  var VISUAL_STYLES = ['standard', 'mint', 'forest']
 
   function has(object, name) {
     return Object.prototype.hasOwnProperty.call(object, name)
@@ -72,6 +73,7 @@ export function buildBootstrapScript(): string {
     if (parsed.v !== ${THEME_CACHE_VERSION}) return null
     if (APPEARANCES.indexOf(parsed.appearance) < 0) return null
     if (MATERIALS.indexOf(parsed.material) < 0) return null
+    if (VISUAL_STYLES.indexOf(parsed.visualStyle) < 0) return null
     if (!isCompleteVars(parsed.light) || !isCompleteVars(parsed.dark)) return null
     if (typeof parsed.opacity !== 'number' || parsed.opacity !== Math.round(parsed.opacity)) return null
     if (parsed.opacity < 0 || parsed.opacity > 100) return null
@@ -102,6 +104,8 @@ export function buildBootstrapScript(): string {
   var root = document.documentElement
   root.setAttribute('data-color-scheme', dark ? 'dark' : 'light')
   if (!cache) return
+
+  if (cache.visualStyle !== 'standard') root.setAttribute('data-visual-style', cache.visualStyle)
 
   var vars = dark ? cache.dark : cache.light
   for (var index = 0; index < EXPECTED_KEYS.length; index += 1) {

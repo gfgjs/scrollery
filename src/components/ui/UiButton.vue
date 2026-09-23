@@ -67,14 +67,42 @@ withDefaults(
   transform: none;
 }
 
+.btn-primary {
+  --theme-button-edge: var(--color-accent-hover);
+}
+
+.btn-secondary {
+  --theme-button-edge: var(--color-border-strong);
+}
+
+.btn-primary,
+.btn-secondary {
+  box-shadow: 0 var(--theme-button-depth) 0 var(--theme-button-edge);
+}
+
+.btn-primary:active,
+.btn-secondary:active {
+  box-shadow: 0 calc(var(--theme-button-depth) * 0.5) 0 var(--theme-button-edge);
+}
+
 .btn:focus-visible {
   outline: none;
   box-shadow: var(--control-focus-ring);
 }
 
+.btn-primary:focus-visible,
+.btn-secondary:focus-visible {
+  box-shadow: var(--control-focus-ring), 0 var(--theme-button-depth) 0 var(--theme-button-edge);
+}
+
 .btn:disabled {
   cursor: not-allowed;
   opacity: var(--opacity-disabled);
+}
+
+.btn-primary:disabled,
+.btn-secondary:disabled {
+  box-shadow: none;
 }
 
 /* 加载指示器：currentColor 描边环,随按钮文字色自适应各变体/主题。 */

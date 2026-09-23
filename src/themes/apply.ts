@@ -8,7 +8,7 @@
 // 浏览器与 vite 配置插件(Node 侧)共用同一实现,平台差异由调用方以参数传入。
 
 import { THEME_PALETTE_VARS, generateTheme, paletteToCssVars } from './generate'
-import type { ThemeDefinition, ThemeMaterial, ThemePalette } from './types'
+import type { ThemeDefinition, ThemeMaterial, ThemePalette, ThemeVisualStyle } from './types'
 
 /** 材质开启时写入窗口根的不透明度变量(百分比文本,glass.css 消费;bootstrap 同名写入)。 */
 export const WINDOW_OPACITY_VAR = '--window-opacity'
@@ -17,6 +17,14 @@ export const WINDOW_OPACITY_VAR = '--window-opacity'
 export const COLOR_SCHEME_ATTR = 'data-color-scheme'
 /** 原生玻璃背板属性:仅 Windows 且材质非 none 时存在(glass.css 唯一入口)。 */
 export const GLASS_ATTR = 'data-glass'
+export const VISUAL_STYLE_ATTR = 'data-visual-style'
+
+/** standard 清属性，使默认选择器与旧主题完全相同。 */
+export function applyVisualStyle(style: ThemeVisualStyle, root?: HTMLElement): void {
+  const target = root ?? document.documentElement
+  if (style === 'standard') target.removeAttribute(VISUAL_STYLE_ATTR)
+  else target.setAttribute(VISUAL_STYLE_ATTR, style)
+}
 
 /** 上一次写入的变量与根元素:同一份值不重复 setProperty,避免无谓的样式失效。 */
 let appliedRoot: HTMLElement | null = null
@@ -78,7 +86,7 @@ function cssDeclarations(palette: ThemePalette): string {
 export function themeDefaultCss(definition: ThemeDefinition): string {
   return [
     '/* 由 src/themes/apply.ts themeDefaultCss 生成:默认主题色板,勿手改(改种子/presets) */',
-    `:root{${cssDeclarations(generateTheme(definition.light, 'light'))}}`,
-    `html[${COLOR_SCHEME_ATTR}='dark']{${cssDeclarations(generateTheme(definition.dark, 'dark'))}}`,
+    `:root{${cssDeclarations(generateTheme(definition.light, 'light', definition.visualStyle))}}`,
+    `html[${COLOR_SCHEME_ATTR}='dark']{${cssDeclarations(generateTheme(definition.dark, 'dark', definition.visualStyle))}}`,
   ].join('\n')
 }

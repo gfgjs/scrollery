@@ -26,11 +26,13 @@ import {
   THEME_MATERIALS,
   WINDOW_OPACITY_MAX,
   WINDOW_OPACITY_MIN,
+  type ThemeVisualStyle,
   type SavedTheme,
   type ThemeDefinition,
   type ThemeMaterial,
   type ThemeSeed,
 } from './types'
+import { THEME_VISUAL_STYLES } from './visualStyles'
 
 /** 主题域消费的设置键(与 Rust schema 的键名一一对应)。 */
 export const THEME_SETTING_KEYS = {
@@ -40,6 +42,7 @@ export const THEME_SETTING_KEYS = {
   savedThemes: 'theme_saved_themes',
   windowMaterial: 'window_material',
   windowOpacity: 'window_opacity',
+  visualStyle: 'theme_visual_style',
 } as const
 
 /** 命名主题的持久化条目:固定扁平字段,与运行期 SavedTheme 一一对应。 */
@@ -58,6 +61,14 @@ export interface SavedThemeFlatEntry {
   dark_gallery: string
   material: ThemeMaterial
   opacity: number
+  visual_style: ThemeVisualStyle
+}
+
+/** 未知外观只在读取边界回落，写入由 Rust 枚举约束。 */
+export function parseVisualStyle(raw: unknown): ThemeVisualStyle {
+  return THEME_VISUAL_STYLES.includes(raw as ThemeVisualStyle)
+    ? raw as ThemeVisualStyle
+    : 'standard'
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -156,6 +167,7 @@ export interface ThemeDefinitionTexts {
   darkPalette?: string | null
   windowMaterial?: string | null
   windowOpacity?: string | null
+  visualStyle?: string | null
 }
 
 /** 当代前主题的应用参数:两套配色 + 材质。 */
@@ -168,6 +180,7 @@ export function parseThemeDefinition(
     dark: parseThemeSeedText(texts.darkPalette, fallback.dark),
     material: parseMaterial(texts.windowMaterial, fallback.material),
     opacity: parseOpacity(texts.windowOpacity, fallback.opacity),
+    visualStyle: parseVisualStyle(texts.visualStyle),
   }
 }
 
@@ -180,6 +193,7 @@ export function toThemeDefinitionPatch(
     [THEME_SETTING_KEYS.darkPalette]: serializeThemeSeed(definition.dark),
     [THEME_SETTING_KEYS.windowMaterial]: definition.material,
     [THEME_SETTING_KEYS.windowOpacity]: String(parseOpacity(definition.opacity)),
+    [THEME_SETTING_KEYS.visualStyle]: definition.visualStyle,
   }
 }
 
@@ -202,6 +216,7 @@ export function toFlatSavedTheme(theme: SavedTheme): SavedThemeFlatEntry {
     dark_gallery: dark.gallery,
     material: parseMaterial(theme.material),
     opacity: parseOpacity(theme.opacity),
+    visual_style: parseVisualStyle(theme.visualStyle),
   }
 }
 
@@ -237,6 +252,7 @@ export function fromFlatSavedTheme(entry: unknown): SavedTheme | null {
     ),
     material: parseMaterial(typeof flat.material === 'string' ? flat.material : undefined),
     opacity: parseOpacity(flat.opacity as string | number | null | undefined),
+    visualStyle: parseVisualStyle(flat.visual_style),
   }
 }
 

@@ -1036,7 +1036,7 @@ mod tests {
 \"light_background\":\"#ffffff\",\"light_foreground\":\"#202024\",\"light_accent\":\"#087f5b\",\
 \"light_contrast\":45,\"light_gallery\":\"auto\",\"dark_background\":\"#181818\",\
 \"dark_foreground\":\"#f4f4f5\",\"dark_accent\":\"#34d399\",\"dark_contrast\":60,\
-\"dark_gallery\":\"#101010\",\"material\":\"mica\",\"opacity\":90}";
+\"dark_gallery\":\"#101010\",\"material\":\"mica\",\"opacity\":90,\"visual_style\":\"forest\"}";
 
     /// 配色种子的合法/非法边界:规范 #rrggbb 通过;gallery 另接受 auto;非规范写法、越界对比度、
     /// 缺字段、多字段一律拒绝(提交是整批拒绝口径,不做「猜用户意图」的补默认值)。
@@ -1141,6 +1141,14 @@ mod tests {
         assert_eq!(back.text, canonical);
         assert!(back.ignored.is_empty(), "{:?}", back.ignored);
 
+        // 旧条目缺外观字段按枚举首项 standard 补齐，并保留原 ID。
+        let old = parse_item(&literal.replace(", \"visual_style\" = \"forest\"", ""));
+        let old_back = item_to_canonical(key, &old).unwrap();
+        assert!(old_back.text.contains("\"id\":\"t1\""));
+        assert!(old_back.text.contains("\"visual_style\":\"standard\""));
+        assert!(!old_back.ignored.is_empty());
+        assert!(text_to_canonical(key, &format!("[{}]", SAVED_THEME_JSON.replace("forest", "unknown"))).is_err());
+
         // 磁盘上两条同名:第一条生效,第二条被丢弃并回报一条说明。
         // 注意这里必须是 **TOML** 字面量(文件本身就是 TOML),不能拿上面的 JSON 常量硬拼。
         let inner = &literal[1..literal.len() - 1];
@@ -1162,6 +1170,7 @@ mod tests {
         assert_eq!(def("theme_saved_themes").default, "[]");
         assert_eq!(def("window_opacity").default, "90");
         assert_eq!(def("window_material").default, "none");
+        assert_eq!(def("theme_visual_style").default, "standard");
         assert!(matches!(
             def("theme_light_palette").kind,
             SettingKind::Struct(_)

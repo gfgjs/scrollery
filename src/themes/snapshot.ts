@@ -9,12 +9,13 @@
 
 import type { AppearanceMode } from '../types/ui'
 import { THEME_PALETTE_VARS, paletteToCssVars } from './generate'
-import type { ThemeMaterial, ThemePalette } from './types'
+import type { ThemeMaterial, ThemePalette, ThemeVisualStyle } from './types'
+import { THEME_VISUAL_STYLES } from './visualStyles'
 
 /** 缓存键(与旧 scrollery.themeSnapshot.v1 无关;bootstrap 内是同一字面量,由契约测试钉住)。 */
-export const THEME_CACHE_KEY = 'scrollery.themeCache.v2'
+export const THEME_CACHE_KEY = 'scrollery.themeCache.v3'
 /** 缓存结构版本;读写双方都只接受这一版,不向前兼容。 */
-export const THEME_CACHE_VERSION = 2
+export const THEME_CACHE_VERSION = 3
 
 export interface ThemeCache {
   v: number
@@ -24,6 +25,7 @@ export interface ThemeCache {
   light: Record<string, string>
   dark: Record<string, string>
   material: ThemeMaterial
+  visualStyle: ThemeVisualStyle
   /** 窗口不透明度,0–100 整数。 */
   opacity: number
 }
@@ -59,6 +61,7 @@ export function buildThemeCache(
   dark: ThemePalette,
   material: ThemeMaterial,
   opacity: number,
+  visualStyle: ThemeVisualStyle,
 ): ThemeCache {
   return {
     v: THEME_CACHE_VERSION,
@@ -66,6 +69,7 @@ export function buildThemeCache(
     light: paletteToCssVars(light),
     dark: paletteToCssVars(dark),
     material,
+    visualStyle,
     opacity,
   }
 }
@@ -84,6 +88,7 @@ export function parseThemeCache(raw: string | null): ThemeCache | null {
   if (cache.v !== THEME_CACHE_VERSION) return null
   if (!APPEARANCE_MODES.includes(cache.appearance as AppearanceMode)) return null
   if (!MATERIALS.includes(cache.material as ThemeMaterial)) return null
+  if (!THEME_VISUAL_STYLES.includes(cache.visualStyle as ThemeVisualStyle)) return null
   if (!isCompleteVars(cache.light) || !isCompleteVars(cache.dark)) return null
   // 越界/非整数一律丢弃整份缓存,不做夹取:夹取会把「不是当前格式」的输入修饰成看似合法的缓存。
   if (
@@ -100,6 +105,7 @@ export function parseThemeCache(raw: string | null): ThemeCache | null {
     light: cache.light,
     dark: cache.dark,
     material: cache.material as ThemeMaterial,
+    visualStyle: cache.visualStyle as ThemeVisualStyle,
     opacity: cache.opacity,
   }
 }
