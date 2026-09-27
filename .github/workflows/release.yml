@@ -85,6 +85,10 @@ jobs:
           cat release-notes.md
 
       # ── 构建(tauri CLI 在 windows runner 自动拉取 NSIS/WiX 工具链)────────────
+      # native worker 的 VPL bridge 依赖固定版本 dispatcher，干净 runner 没有本机预置产物。
+      - name: 准备固定版本 VPL dispatcher
+        run: node scripts/build-vpl-dispatcher.mjs
+
       # 前端只构建一次:dist 由本步 beforeBuildCommand(prepare:legal + vite build + 四个 worker
       # 构建)产出,即安装包真正打包的那份;不再另跑一次 npm run build,避免两套产物分叉。
       - name: tauri build(免费版,含 MSI + NSIS 安装包)

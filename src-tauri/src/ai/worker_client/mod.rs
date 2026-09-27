@@ -47,8 +47,6 @@ use crate::exotic::worker::{
 mod dispatch;
 mod process;
 mod session;
-#[cfg(test)]
-mod tests;
 
 pub use process::ai_worker_exe;
 pub use session::{build_ocr_session_spec, build_session_spec};

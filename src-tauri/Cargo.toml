@@ -209,8 +209,10 @@ notify = "8"
 # PROPVARIANT(PropVariantToInt64);Win32_Storage_FileSystem:卷 GUID + 盘类型(C5 Piece A);
 # Win32_System_ProcessStatus:GetProcessMemoryInfo(方案 C §5 图片编辑内存基准探针
 # `examples/edit_memory_probe.rs` 用,自报 PeakWorkingSetSize,不进正式命令路径)。
+# Win32_UI_WindowsAndMessaging:GetForegroundWindow + GetWindowThreadProcessId(窗口焦点事件
+# 边界的应用前台判定,见 lifecycle.rs;Tauri 焦点事件由 WebView2 合成,不能与 Tao 窗口缓存混用)。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["implement", "Win32_Graphics_Imaging", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_UI_Shell"] }
+windows = { version = "0.58", features = ["implement", "Win32_Graphics_Imaging", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_DXCore", "Win32_System_LibraryLoader", "Win32_Graphics_Dxgi_Common", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_JobObjects", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # `#[implement]` 宏(media_foundation.rs 的 IMFSourceReaderCallback 异步回调)展开出 `::windows_core`
 # 绝对路径,需 windows-core 作为直接依赖在 crate 根可见(版本随 windows 0.58 锁到同一 0.58.0)。
 windows-core = "0.58"
@@ -243,6 +245,7 @@ name = "logging"
 harness = false
 
 [features]
+native-vpl = [] # Windows x64 worker 链接显式准备的官方 VPL 与本项目薄桥。
 # Lite 为默认变体（极致轻量，零大体积 native 捆绑）。custom-protocol 为 Tauri 生产构建所需。
 # 见 docs/archive/feature_expansion_plan_v1.md §1.4：包体积由编译期决定 → 主开关必须是 Cargo feature。
 default = ["custom-protocol", "lite"]

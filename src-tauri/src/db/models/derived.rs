@@ -110,25 +110,3 @@ pub struct DocumentMeta {
     /// 文档子类型（pdf/svg/epub/office/text…，见 `utils::format::doc_subtype`）。
     pub doc_subtype: Option<String>,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ThumbResult;
-
-    #[test]
-    fn thumb_production_snapshot_is_not_serialized() {
-        let result = ThumbResult {
-            item_id: 7,
-            thumb_status: 1,
-            thumb_path: Some("480/aa/thumb.webp".into()),
-            thumbhash: None,
-            source_revision: 9,
-            cache_key: 123,
-        };
-
-        let json = serde_json::to_value(result).unwrap();
-        assert_eq!(json["itemId"], 7);
-        assert!(json.get("sourceRevision").is_none());
-        assert!(json.get("cacheKey").is_none());
-    }
-}

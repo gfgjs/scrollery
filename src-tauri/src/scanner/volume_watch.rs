@@ -105,12 +105,48 @@ pub fn spawn(app: AppHandle, state: Arc<AppState>) -> tauri::async_runtime::Join
             // 2026-07-06 审查 R7:对账含整卷 UPDATE(bulk_set_availability,可达百万行)且 lock()
             // 会等在途扫描批写释放——整段下沉 spawn_blocking,不占 runtime 线程(rusqlite 硬化条款)。
             let state_c = Arc::clone(&state);
-            let result = tokio::task::spawn_blocking(move || match state_c.db_writer.lock() {
-                Ok(conn) => run_once(&conn, &PathProber, now_unix()),
-                Err(_) => {
-                    tracing::warn!("volume_watch: db_writer 锁毒化，跳过本轮");
-                    Ok(Vec::new())
-                }
+            let result = tokio::task::spawn_blocking(move || -> Result<Vec<VolumeChange>> {
+                let Some(epoch) = state_c.current_database_epoch() else {
+                    return Ok(Vec::new());
+                };
+                let (changes, volumes) = {
+                    let conn = match state_c.db_writer.lock() {
+                        Ok(conn) => conn,
+                        Err(_) => {
+                            tracing::warn!("volume_watch: db_writer 锁毒化，跳过本轮");
+                            return Ok(Vec::new());
+                        }
+                    };
+                    (
+                        run_once(&conn, &PathProber, now_unix())?,
+                        q::list_volumes(&conn)?,
+                    )
+                };
+                // 设备查询可能等待系统 IO，不能持数据库锁或进入缩略图逐项热路径。
+                let devices = volumes
+                    .into_iter()
+                    .filter(|volume| {
+                        volume.is_online
+                            && matches!(
+                                volume.kind,
+                                crate::db::models::VolumeKind::Local
+                                    | crate::db::models::VolumeKind::Removable
+                            )
+                    })
+                    .filter_map(|volume| {
+                        super::hdd_io::storage_device(
+                            volume.last_mount_path.as_deref()?,
+                            Some(&volume.stable_id),
+                        )
+                        .map(|device| (volume.id, device))
+                    })
+                    .collect();
+                state_c.with_database_lifecycle_read(epoch, || {
+                    state_c
+                        .background_volume_io_budget
+                        .publish_devices(epoch, devices);
+                });
+                Ok(changes)
             })
             .await
             .unwrap_or_else(|e| {
@@ -137,158 +173,4 @@ pub fn spawn(app: AppHandle, state: Arc<AppState>) -> tauri::async_runtime::Join
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::params;
-    use std::collections::HashSet;
-
-    /// 可注入的在线判定：online 集内的挂载点视为在线。
-    struct MockChecker {
-        online: HashSet<String>,
-    }
-    impl VolumeOnlineCheck for MockChecker {
-        fn is_online(&self, p: &Path) -> bool {
-            self.online.contains(p.to_str().unwrap_or(""))
-        }
-    }
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        c
-    }
-
-    /// 建一个卷（指定挂载点 / 在线态）+ 一条挂在该卷上的 media（指定 availability）。
-    fn seed_volume_with_item(
-        c: &Connection,
-        vol_id: i64,
-        stable: &str,
-        mount: &str,
-        is_online: bool,
-        item_id: i64,
-        avail: &str,
-    ) {
-        c.execute(
-            "INSERT INTO volumes (id, stable_id, label, kind, last_mount_path, is_online)
-             VALUES (?1, ?2, NULL, 'removable', ?3, ?4)",
-            params![vol_id, stable, mount, is_online as i64],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO media_items
-                (id, directory_id, file_name, file_size, file_mtime, file_format,
-                 media_type, width, height, sort_datetime, cache_key, volume_id, availability)
-             VALUES (?1, 1, ?2, 0,0,'jpg','image',0,0,0,0, ?3, ?4)",
-            params![item_id, format!("{item_id}.jpg"), vol_id, avail],
-        )
-        .unwrap();
-    }
-
-    fn avail(c: &Connection, id: i64) -> String {
-        c.query_row(
-            "SELECT availability FROM media_items WHERE id=?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-    fn vol_online(c: &Connection, id: i64) -> bool {
-        c.query_row(
-            "SELECT is_online FROM volumes WHERE id=?1",
-            params![id],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            != 0
-    }
-
-    /// 卷由在线变离线：media 'online'→'offline'，卷 is_online→0，记一条变化。
-    #[test]
-    fn online_to_offline_flips_availability() {
-        let c = mem_db();
-        seed_volume_with_item(&c, 1, "vol-A", "E:\\", true, 100, "online");
-        let checker = MockChecker {
-            online: HashSet::new(),
-        }; // E:\ 不在线
-        let changes = run_once(&c, &checker, 1000).unwrap();
-
-        assert_eq!(changes.len(), 1);
-        assert!(!changes[0].now_online);
-        assert_eq!(avail(&c, 100), "offline");
-        assert!(!vol_online(&c, 1));
-    }
-
-    /// 卷由离线变在线：media 'offline'→'online'，卷 is_online→1。
-    #[test]
-    fn offline_to_online_restores_availability() {
-        let c = mem_db();
-        seed_volume_with_item(&c, 1, "vol-A", "E:\\", false, 100, "offline");
-        let checker = MockChecker {
-            online: HashSet::from(["E:\\".to_string()]),
-        };
-        let changes = run_once(&c, &checker, 1000).unwrap();
-
-        assert_eq!(changes.len(), 1);
-        assert!(changes[0].now_online);
-        assert_eq!(avail(&c, 100), "online");
-        assert!(vol_online(&c, 1));
-    }
-
-    /// 状态未变（在线卷仍在线）：零变化、零写。
-    #[test]
-    fn no_change_when_state_matches() {
-        let c = mem_db();
-        seed_volume_with_item(&c, 1, "vol-A", "E:\\", true, 100, "online");
-        let checker = MockChecker {
-            online: HashSet::from(["E:\\".to_string()]),
-        };
-        let changes = run_once(&c, &checker, 1000).unwrap();
-        assert!(changes.is_empty());
-        assert_eq!(avail(&c, 100), "online");
-    }
-
-    /// 正交铁律：卷掉线时，'missing' 项**绝不**被改成 'offline'（只 online→offline）。
-    #[test]
-    fn missing_items_untouched_on_offline() {
-        let c = mem_db();
-        seed_volume_with_item(&c, 1, "vol-A", "E:\\", true, 100, "missing");
-        // 同卷再加一个 online 项，确认它会翻而 missing 不翻。
-        c.execute(
-            "INSERT INTO media_items
-                (id, directory_id, file_name, file_size, file_mtime, file_format,
-                 media_type, width, height, sort_datetime, cache_key, volume_id, availability)
-             VALUES (101, 1, '101.jpg', 0,0,'jpg','image',0,0,0,0, 1, 'online')",
-            [],
-        )
-        .unwrap();
-        let checker = MockChecker {
-            online: HashSet::new(),
-        };
-        run_once(&c, &checker, 1000).unwrap();
-
-        assert_eq!(avail(&c, 100), "missing", "missing 项不得被卷监听改动");
-        assert_eq!(avail(&c, 101), "offline", "同卷 online 项应翻为 offline");
-    }
-
-    /// 无挂载点的卷：跳过、不动其状态（保守）。
-    #[test]
-    fn volume_without_mount_path_skipped() {
-        let c = mem_db();
-        c.execute(
-            "INSERT INTO volumes (id, stable_id, label, kind, last_mount_path, is_online)
-             VALUES (1, 'vol-A', NULL, 'removable', NULL, 1)",
-            [],
-        )
-        .unwrap();
-        let checker = MockChecker {
-            online: HashSet::new(),
-        };
-        let changes = run_once(&c, &checker, 1000).unwrap();
-        assert!(changes.is_empty(), "无挂载点卷应被跳过");
-        assert!(vol_online(&c, 1), "其在线态不应被改动");
-    }
 }

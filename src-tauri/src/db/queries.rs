@@ -19,6 +19,7 @@ mod move_journal;
 mod scan;
 mod storage;
 mod thumbnail;
+mod thumbnail_tasks;
 
 pub use ai::*;
 pub use collections::*;
@@ -36,3 +37,4 @@ pub use move_journal::*;
 pub use scan::*;
 pub use storage::*;
 pub use thumbnail::*;
+pub use thumbnail_tasks::*;

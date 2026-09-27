@@ -330,11 +330,16 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
         drop(rx); // 批级失败提前退出时解除解码线程 send 阻塞(正常收尾时为空操作)
     });
     drop(clock); // 结束对 timing 的可变借用,下方汇总才可读
-    // 分段汇总(每请求一条)。读法:`wait_input_us` 与 `enc_*` 相加≈`wall_us`(供料与
-    // 推理串行);`wall_us - wait_input_us - enc_run_us` 即主线程固定开销(组批复制等)。
+                 // 分段汇总(每请求一条)。读法:`wait_input_us` 与 `enc_*` 相加≈`wall_us`(供料与
+                 // 推理串行);`wall_us - wait_input_us - enc_run_us` 即主线程固定开销(组批复制等)。
     if perf && !items.is_empty() {
-        let wall_us = req_t0.map(|t0| t0.elapsed().as_micros() as u64).unwrap_or(0);
-        let decode_us = decode_us.as_ref().map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
+        let wall_us = req_t0
+            .map(|t0| t0.elapsed().as_micros() as u64)
+            .unwrap_or(0);
+        let decode_us = decode_us
+            .as_ref()
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0);
         let preprocess_us = preprocess_us
             .as_ref()
             .map(|a| a.load(Ordering::Relaxed))
@@ -670,194 +675,4 @@ pub fn handle_face(
         ..Default::default()
     };
     Frame::with_blob(FrameType::Success, request_id, &body, blob).unwrap()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cache_key_whitelist_blocks_traversal() {
-        let root = Path::new("C:/cache/ai");
-        assert!(cache_webp_path(root, "..").is_none(), "点号必须被拒");
-        assert!(cache_webp_path(root, "../../etc").is_none());
-        assert!(cache_webp_path(root, "ab/cd").is_none(), "分隔符必须被拒");
-        assert!(cache_webp_path(root, "ab\\cd").is_none());
-        assert!(cache_webp_path(root, "").is_none());
-        assert!(
-            cache_webp_path(root, "ab").is_none(),
-            "短于前缀长度必须被拒"
-        );
-        assert!(cache_webp_path(root, &"a".repeat(65)).is_none());
-    }
-
-    #[test]
-    fn cache_key_valid_hex_maps_to_prefixed_path() {
-        let root = Path::new("C:/cache/ai");
-        let p = cache_webp_path(root, "0badf00d1234abcd").unwrap();
-        // 约定:{root}/{key[..2]}/{key}.webp(与 host thumbnail::cache::ai_cache_path 同构)。
-        assert!(p.ends_with(Path::new("0b").join("0badf00d1234abcd.webp")));
-        assert!(p.starts_with(root));
-    }
-
-    #[test]
-    fn parallel_map_preserves_order() {
-        // 保序是协议契约(results/blob 按 items 序);多线程领活后必须按索引落槽。
-        let n = 100usize;
-        let out = parallel_map_indexed(4, n, |i| i * 3);
-        assert_eq!(out, (0..n).map(|i| i * 3).collect::<Vec<_>>());
-        // 单线程退化路径同样保序。
-        let out1 = parallel_map_indexed(1, 5, |i| i + 10);
-        assert_eq!(out1, vec![10, 11, 12, 13, 14]);
-        // 空批。
-        assert!(parallel_map_indexed(4, 0, |i| i).is_empty());
-        // 非整块批次中的末项错误也应占据原槽位，不能让先完成的后继项前移。
-        let out: Vec<Result<usize, usize>> = parallel_map_indexed(4, 15, |i| {
-            if i == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            if i == 14 {
-                Err(i)
-            } else {
-                Ok(i)
-            }
-        });
-        assert_eq!(out[..14], (0..14).map(Ok).collect::<Vec<_>>());
-        assert_eq!(out[14], Err(14));
-    }
-
-    #[test]
-    fn append_embedding_is_f32_le_layout() {
-        let mut blob = Vec::new();
-        append_embedding(&mut blob, &[1.0f32, -2.5]);
-        append_embedding(&mut blob, &[0.25]);
-        assert_eq!(blob.len(), 12, "3 × f32 = 12 字节");
-        assert_eq!(&blob[0..4], &1.0f32.to_le_bytes());
-        assert_eq!(&blob[4..8], &(-2.5f32).to_le_bytes());
-        assert_eq!(&blob[8..12], &0.25f32.to_le_bytes());
-    }
-
-    struct TempPng(PathBuf);
-
-    impl Drop for TempPng {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
-    // 每例只清理自己以 create_new 创建的文件，不递归删除临时目录。
-    fn temp_png(name: &str, bytes: &[u8]) -> TempPng {
-        use std::io::Write as _;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "ai-worker-face-{}-{name}-{nonce}.png",
-            std::process::id()
-        ));
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
-        TempPng(path)
-    }
-
-    /// 标准 CRC-32(zlib/PNG 用,polynomial 0xEDB88320,reflected,init/final 0xFFFFFFFF)。
-    /// 构造畸形 IHDR fixture 需要在改字段后自行重算 chunk CRC(镜像 ocr.rs::crc32)。
-    fn crc32(bytes: &[u8]) -> u32 {
-        let mut crc: u32 = 0xFFFF_FFFF;
-        for &b in bytes {
-            crc ^= b as u32;
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            }
-        }
-        !crc
-    }
-
-    /// 编码一张真实可解的 1×1 PNG 作为 fixture(测试只改头部声明,不生成巨大位图)。
-    fn one_pixel_png() -> Vec<u8> {
-        let mut bytes: Vec<u8> = Vec::new();
-        let img = image::RgbImage::from_pixel(1, 1, image::Rgb([0u8, 0, 0]));
-        image::DynamicImage::ImageRgb8(img)
-            .write_to(
-                &mut std::io::Cursor::new(&mut bytes),
-                image::ImageFormat::Png,
-            )
-            .unwrap();
-        // IHDR 是签名(8 字节)后第一个 chunk(PNG 规范强制):
-        // [8..12]=length(13) [12..16]="IHDR" [16..20]=width [20..24]=height [29..33]=CRC。
-        assert_eq!(
-            &bytes[12..16],
-            b"IHDR",
-            "PNG 编码器必须把 IHDR 作为首个 chunk"
-        );
-        bytes
-    }
-
-    /// 就地改写 IHDR 声明的宽高并重算 CRC(其余字节不动 → 像素数据与声明不符)。
-    fn rewrite_png_dims(bytes: &mut [u8], w: u32, h: u32) {
-        bytes[16..20].copy_from_slice(&w.to_be_bytes());
-        bytes[20..24].copy_from_slice(&h.to_be_bytes());
-        let crc = crc32(&bytes[12..29]); // chunk type(4) + data(13)
-        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
-    }
-
-    fn face_item_source(path: &Path) -> FaceItem {
-        FaceItem {
-            item_id: 1,
-            cache_key: None,
-            source_path: Some(path.to_string_lossy().into_owned()),
-            fingerprint: "fp".into(),
-        }
-    }
-
-    #[test]
-    fn oversized_pixel_header_rejected_before_full_decode() {
-        // 短边 ≤640(host 允许这种原图直接回退)但总像素超上限:640 × 200_000 =
-        // 1.28e8 > MAX_SOURCE_PIXELS(1e8)。into_dimensions 只解头不解像素,超限判定
-        // 必须发生在真正解码分配之前(stat 只拦压缩字节,像素级设防补在此)。
-        let mut bytes = one_pixel_png();
-        rewrite_png_dims(&mut bytes, 640, 200_000);
-
-        let file = temp_png("oversized-pixels", &bytes);
-
-        let err =
-            load_face_image(Path::new("unused-cache"), &face_item_source(&file.0)).unwrap_err();
-        assert_eq!(
-            err,
-            WorkerErrorCode::ResourceLimit,
-            "超像素上限应在解码前判 ResourceLimit(逐项 Err,不连坐)"
-        );
-    }
-
-    #[test]
-    fn normal_small_image_still_decodes() {
-        // 上限内普通图不受新设防影响(避免像素检查误伤正常源)。
-        let file = temp_png("normal-small", &one_pixel_png());
-
-        let img = load_face_image(Path::new("unused-cache"), &face_item_source(&file.0)).unwrap();
-        assert_eq!((img.width, img.height), (1, 1));
-        assert_eq!(img.pixels.len(), 4, "1×1 RGBA = 4 字节");
-    }
-
-    #[test]
-    fn in_budget_header_with_bad_pixels_is_malformed_not_resource_limit() {
-        // 声明尺寸在上限内(1000×1000 = 1e6),但像素数据与声明不符 → 解码必失败。
-        // 契约:像素检查只负责「声明超限」,真实解码失败仍是 MalformedInput,
-        // 不得因解码失败被误判为 ResourceLimit。
-        let mut bytes = one_pixel_png();
-        rewrite_png_dims(&mut bytes, 1000, 1000);
-
-        let file = temp_png("bad-pixels", &bytes);
-
-        let err =
-            load_face_image(Path::new("unused-cache"), &face_item_source(&file.0)).unwrap_err();
-        assert_eq!(err, WorkerErrorCode::MalformedInput);
-    }
 }

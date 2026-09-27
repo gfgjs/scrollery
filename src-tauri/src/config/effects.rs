@@ -94,7 +94,6 @@ pub async fn apply_batch(
                     cfg.strategy = value.clone();
                     direct_reset_keys.push(key.clone());
                 }
-                "gpu_engine" => cfg.gpu_engine = value.clone(),
                 "ai_hq_cache_enabled" => cfg.ai_hq_cache = value == "true",
                 "ai_cache_short_edge" => {
                     // 同 thumb_webp_quality 惯例,运行时即时生效:下一次 AI 高清缓存路径的解码/
@@ -302,6 +301,8 @@ async fn reset_completed_thumbnail_rows(state: &Arc<AppState>) -> Result<(usize,
                  WHERE status = 2 AND kind IN ('video_cover','audio_cover','doc_thumb')",
                 [],
             )?;
+            crate::db::queries::reset_image_thumbnail_leases(&tx)?;
+            crate::db::queries::reset_native_video_cover_leases(&tx)?;
             tx.commit()?;
             Ok((items, covers))
         })
@@ -320,11 +321,7 @@ async fn reset_direct_thumbnail_rows(state: &Arc<AppState>) -> Result<usize> {
                 .db_writer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            Ok(conn.execute(
-                "UPDATE media_items SET thumb_status = 0, thumb_path = NULL, thumbhash = NULL \
-                 WHERE thumb_status = 3 AND is_deleted = 0",
-                [],
-            )?)
+            crate::db::queries::reset_direct_thumbnail_rows_for_config(&conn)
         })
     })
     .await

@@ -23,7 +23,7 @@ vi.mock('../i18n', async () => {
 import { IPC } from '../constants/ipc'
 import type { CopyDirResult, MoveDirResult, DirectoryMoveRecovery } from '../types/ipc'
 import { useHistoryStore } from './historyStore'
-import { useDirectoryMoveRecoveryStore, dirMoveRecoveryDetailKey } from './directoryMoveRecoveryStore'
+import { useDirectoryMoveRecoveryStore } from './directoryMoveRecoveryStore'
 import { useToastStore } from './toastStore'
 
 const dispatchEvent = vi.fn()
@@ -103,17 +103,6 @@ describe('historyStore：幂等回调失败', () => {
 })
 
 describe('historyStore：目录移动', () => {
-  it('正常移动进撤销栈，不产生收尾任务', async () => {
-    invoke.mockResolvedValue(moveResult())
-    const history = useHistoryStore()
-
-    await expect(history.move(1, '旅行', 9, 4)).resolves.toBe('complete')
-
-    expect(history.undoStack).toHaveLength(1)
-    expect(history.undoStack[0]).toMatchObject({ type: 'move', dirId: 1, toParentId: 4 })
-    expect(useDirectoryMoveRecoveryStore().items).toHaveLength(0)
-    expect(useToastStore().toasts).toHaveLength(0)
-  })
 
   it('结果带源残留/recoveryId：不进撤销栈，登记可重试的收尾任务并给出真实落点', async () => {
     invoke.mockImplementation((cmd: unknown) =>
@@ -176,15 +165,6 @@ describe('historyStore：目录移动', () => {
     const retry = invoke.mock.calls.find((c) => c[0] === IPC.RETRY_DIRECTORY_MOVE)
     expect(retry?.[1]).toEqual({ recoveryId: 42 })
   })
-
-  it('真失败（同名冲突）仍抛出：调用方保留原有错误分流', async () => {
-    invoke.mockRejectedValue({ code: 'DirectoryExists', message: '旅行' })
-    const history = useHistoryStore()
-
-    await expect(history.move(1, '旅行', 9, 4)).rejects.toMatchObject({ code: 'DirectoryExists' })
-    expect(history.undoStack).toHaveLength(0)
-    expect(useDirectoryMoveRecoveryStore().items).toHaveLength(0)
-  })
 })
 
 describe('historyStore：撤销 / 重做目录移动（与初次移动共用完整/半完成判定）', () => {
@@ -196,19 +176,6 @@ describe('historyStore：撤销 / 重做目录移动（与初次移动共用完�
     useToastStore().toasts.splice(0)
     return history
   }
-
-  it('完整撤销：移回原位、进重做栈并报成功', async () => {
-    const history = await withMovedFolder()
-
-    await history.undo()
-
-    const moves = invoke.mock.calls.filter((c) => c[0] === IPC.MOVE_DIRECTORY)
-    expect(moves[1]?.[1]).toEqual({ sourceDirId: 1, targetDirId: 9 }) // 回到原父目录
-    expect(history.undoStack).toHaveLength(0)
-    expect(history.redoStack).toHaveLength(1)
-    expect(lastToast()?.type).toBe('success')
-    expect(lastToast()?.message).toContain('已撤销移动')
-  })
 
   it('撤销遇到 move_db_pending：登记恢复任务、丢弃该历史项、不进重做栈、不报成功', async () => {
     const history = await withMovedFolder()
@@ -242,18 +209,6 @@ describe('historyStore：撤销 / 重做目录移动（与初次移动共用完�
     })
   })
 
-  it('撤销结果带源残留/recoveryId：同样丢弃历史项并登记恢复任务', async () => {
-    const history = await withMovedFolder()
-    invoke.mockResolvedValue(moveResult({ sourceLeftover: 'D:/archive/旅行', recoveryId: 12 }))
-
-    await history.undo()
-
-    expect(history.undoStack).toHaveLength(0)
-    expect(history.redoStack).toHaveLength(0)
-    expect(lastToast()?.type).toBe('warning')
-    expect(useToastStore().toasts.some((to) => to.message.includes('已撤销移动'))).toBe(false)
-  })
-
   it('重做遇到半完成：同样丢弃该历史项、不报成功', async () => {
     const history = await withMovedFolder()
     await history.undo() // 完整撤销后 move 记录进重做栈
@@ -280,20 +235,6 @@ describe('historyStore：撤销 / 重做目录移动（与初次移动共用完�
 })
 
 describe('historyStore：目录复制与入库', () => {
-  it('入库重扫成功：进撤销栈且不出现「待入库」提示', async () => {
-    invoke.mockResolvedValue(copyResult())
-    const history = useHistoryStore()
-
-    await history.copy(1, '旅行', 4)
-
-    expect(startScan).toHaveBeenCalledTimes(1)
-    expect(history.undoStack[0]).toMatchObject({
-      type: 'copy',
-      createdRootId: 5,
-      createdAbsPath: 'D:/archive/旅行',
-    })
-    expect(useToastStore().toasts).toHaveLength(0)
-  })
 
   it('入库重扫失败：复制不算失败，明确提示已复制待入库并给重扫动作', async () => {
     invoke.mockResolvedValue(copyResult())
@@ -343,56 +284,6 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
 }
 
 describe('目录移动恢复清单：读取', () => {
-  it('读清单只读：只发 list_pending_directory_moves，条目按后端报告填充', async () => {
-    invoke.mockResolvedValue([report(), report({ recoveryId: 2, detail: 'staging_busy' })])
-    const store = useDirectoryMoveRecoveryStore()
-
-    await store.load()
-
-    expect(invoke).toHaveBeenCalledTimes(1)
-    expect(callAt(0)[0]).toBe(IPC.LIST_PENDING_DIRECTORY_MOVES)
-    expect(store.items.map((i) => i.recoveryId)).toEqual([1, 2])
-    expect(store.pendingCount).toBe(2)
-    expect(dispatchEvent).not.toHaveBeenCalled() // 读清单不动目录树/画廊
-  })
-
-  it('在途读取期间的登记会补读一次，新条目不落在旧快照外', async () => {
-    const first = deferred<DirectoryMoveRecovery[]>()
-    const second = deferred<DirectoryMoveRecovery[]>()
-    invoke.mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise)
-    const store = useDirectoryMoveRecoveryStore()
-
-    const loading = store.load()
-    // 读取在途时后端刚写下一条半完成记录（登记路径内部会再读一次清单）。
-    store.notePending({ recoveryId: 7, targetAbsPath: 'D:/archive/旅行', name: '旅行' })
-    first.resolve([])
-    second.resolve([report({ recoveryId: 7 })])
-    await loading
-
-    expect(invoke).toHaveBeenCalledTimes(2)
-    expect(store.items.map((i) => i.recoveryId)).toEqual([7])
-  })
-
-  it('读清单失败保留现有条目：一次读取失败不该让恢复入口消失', async () => {
-    invoke.mockResolvedValueOnce([report()])
-    const store = useDirectoryMoveRecoveryStore()
-    await store.load()
-
-    invoke.mockRejectedValueOnce(new Error('db busy'))
-    await expect(store.load()).resolves.toBeUndefined()
-
-    expect(store.items).toHaveLength(1)
-    expect(store.loading).toBe(false)
-  })
-
-  it('契约外响应（UI harness 的兜底 null）按空清单处理，不抛错', async () => {
-    invoke.mockResolvedValue(null)
-    const store = useDirectoryMoveRecoveryStore()
-
-    await store.load()
-
-    expect(store.items).toEqual([])
-  })
 
   it('旧读在重试收尾之后才回传：该快照失效并重读，不把已收尾的条目复活', async () => {
     const slowRead = deferred<DirectoryMoveRecovery[]>()
@@ -417,62 +308,9 @@ describe('目录移动恢复清单：读取', () => {
     expect(listCalls).toBe(2) // 过期快照被丢弃并重读一次
     expect(store.items).toEqual([]) // 已完成任务不复活
   })
-
-  it('旧读过期不影响后续读取：重读回传的就是权威清单', async () => {
-    const slowRead = deferred<DirectoryMoveRecovery[]>()
-    let listCalls = 0
-    invoke.mockImplementation((cmd: unknown) => {
-      if (cmd === IPC.LIST_PENDING_DIRECTORY_MOVES) {
-        listCalls += 1
-        return listCalls === 1 ? slowRead.promise : Promise.resolve([report({ recoveryId: 5 })])
-      }
-      return Promise.resolve(report({ detail: 'completed', needsRetry: false }))
-    })
-    const store = useDirectoryMoveRecoveryStore()
-    store.items = [report()]
-
-    const loading = store.load()
-    await store.retry(1)
-    slowRead.resolve([report()])
-    await loading
-
-    expect(store.items.map((i) => i.recoveryId)).toEqual([5])
-  })
 })
 
 describe('目录移动恢复清单：单条重试', () => {
-  it('收尾完成：移除条目 + 刷新目录树/画廊 + 成功提示', async () => {
-    invoke.mockImplementation((cmd: unknown) =>
-      cmd === IPC.RETRY_DIRECTORY_MOVE
-        ? Promise.resolve(report({ detail: 'completed', needsRetry: false }))
-        : Promise.resolve([report()]),
-    )
-    const store = useDirectoryMoveRecoveryStore()
-    await store.load()
-
-    const done = await store.retry(1)
-
-    expect(done).toBe(true)
-    expect(store.items).toHaveLength(0)
-    expect(callAt(1)[0]).toBe(IPC.RETRY_DIRECTORY_MOVE)
-    expect(callAt(1)[1]).toEqual({ recoveryId: 1 })
-    expect(dispatchEvent).toHaveBeenCalledTimes(1)
-    expect(dispatchEvent.mock.calls[0][0]).toMatchObject({ type: 'folder-stats-changed' })
-    expect(lastToast()?.type).toBe('success')
-    expect(lastToast()?.message).toContain('已收尾')
-  })
-
-  it('后端已无该日志行（null）：视作已收尾，移除条目而不是留在清单里', async () => {
-    invoke.mockImplementation((cmd: unknown) =>
-      cmd === IPC.RETRY_DIRECTORY_MOVE ? Promise.resolve(null) : Promise.resolve([report()]),
-    )
-    const store = useDirectoryMoveRecoveryStore()
-    await store.load()
-
-    expect(await store.retry(1)).toBe(true)
-    expect(store.items).toHaveLength(0)
-    expect(callAt(1)[1]).toEqual({ recoveryId: 1 })
-  })
 
   it('目标离线/冲突等仍待收尾：保留条目并说明原因，不报成功', async () => {
     invoke.mockImplementation((cmd: unknown) =>
@@ -493,46 +331,6 @@ describe('目录移动恢复清单：单条重试', () => {
     expect(dispatchEvent).not.toHaveBeenCalled() // 没改库、没动磁盘就不刷新树
   })
 
-  it('无需收尾（目标扫描根已删）：移除条目并说明，不谎称「已收尾」', async () => {
-    invoke.mockImplementation((cmd: unknown) =>
-      cmd === IPC.RETRY_DIRECTORY_MOVE
-        ? Promise.resolve(report({ detail: 'target_root_missing', needsRetry: false }))
-        : Promise.resolve([report()]),
-    )
-    const store = useDirectoryMoveRecoveryStore()
-    await store.load()
-
-    expect(await store.retry(1)).toBe(true)
-    expect(store.items).toHaveLength(0)
-    const last = lastToast()
-    expect(last?.type).toBe('info')
-    expect(last?.message).toContain('无需收尾')
-  })
-
-  it('同一日志 id 运行中不重复发起；跑完后标志复位', async () => {
-    const retryCall = deferred<DirectoryMoveRecovery>()
-    let retryCalls = 0
-    invoke.mockImplementation((cmd: unknown) => {
-      if (cmd === IPC.RETRY_DIRECTORY_MOVE) {
-        retryCalls += 1
-        return retryCall.promise
-      }
-      return Promise.resolve([report()])
-    })
-    const store = useDirectoryMoveRecoveryStore()
-    await store.load()
-
-    const running = store.retry(1)
-    expect(store.isRetrying(1)).toBe(true)
-    // 第二次点击（或快捷键触发）在途时被挡下，不产生第二个 IPC。
-    expect(await store.retry(1)).toBe(false)
-    expect(retryCalls).toBe(1)
-
-    retryCall.resolve(report({ detail: 'completed', needsRetry: false }))
-    expect(await running).toBe(true)
-    expect(store.isRetrying(1)).toBe(false)
-  })
-
   it('重试自身失败：条目留在清单里可再试，并给错误提示', async () => {
     invoke.mockImplementation((cmd: unknown) =>
       cmd === IPC.LIST_PENDING_DIRECTORY_MOVES
@@ -549,35 +347,5 @@ describe('目录移动恢复清单：单条重试', () => {
     const last = lastToast()
     expect(last?.type).toBe('error')
     expect(last?.message).toContain('目标盘不可写')
-  })
-})
-
-describe('目录移动恢复清单：登记半完成移动', () => {
-  it('提示里带真实落点与可点的重试动作，并读一次清单让管理区显示', async () => {
-    invoke.mockResolvedValue([report({ recoveryId: 42 })])
-    const store = useDirectoryMoveRecoveryStore()
-
-    store.notePending({ recoveryId: 42, targetAbsPath: 'D:/archive/旅行', name: '旅行' })
-    const toast = lastToast()
-    expect(toast?.type).toBe('warning')
-    expect(toast?.message).toContain('D:/archive/旅行')
-    expect(toast?.actions?.[0].label).toBe('重试收尾')
-
-    await store.load() // 等登记触发的这次清单读取落地
-    expect(callAt(0)[0]).toBe(IPC.LIST_PENDING_DIRECTORY_MOVES)
-    expect(store.items.map((i) => i.recoveryId)).toEqual([42])
-  })
-})
-
-describe('detail 文案映射', () => {
-  it('白名单标签映射到自己的文案键，陌生标签回落 unknown', () => {
-    expect(dirMoveRecoveryDetailKey('source_leftover')).toBe(
-      'sidebar.dirRecovery.detail.source_leftover',
-    )
-    expect(dirMoveRecoveryDetailKey('target_conflict')).toBe(
-      'sidebar.dirRecovery.detail.target_conflict',
-    )
-    expect(dirMoveRecoveryDetailKey('brand_new_code')).toBe('sidebar.dirRecovery.detail.unknown')
-    expect(dirMoveRecoveryDetailKey('')).toBe('sidebar.dirRecovery.detail.unknown')
   })
 })

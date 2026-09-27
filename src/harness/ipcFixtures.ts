@@ -842,6 +842,7 @@ export async function invokeHarness<T>(
     case IPC.LOG_FRONTEND_EVENTS:
     case IPC.ENSURE_DOC_THUMB_QUEUE:
     case IPC.REGENERATE_MISSING_THUMB:
+    case IPC.CANCEL_VIEWPORT_THUMBNAIL_REQUEST:
     case IPC.START_BACKUP:
     case IPC.STOP_BACKUP:
     case IPC.RESTORE_ARM:
@@ -850,18 +851,17 @@ export async function invokeHarness<T>(
       return undefined as T
     case IPC.BATCH_REQUEST_THUMBNAILS: {
       // 「未生成冷库首览」基准场景的模拟生成器(&thumbStatus=0):逐项延迟经 Channel 送达
-      // 结果(状态 3 + favicon 走原图管线,与极密性能场景同源),全部送达后再 resolve invoke——
-      // 若先 resolve,useRequestQueue 的 finally 兜底会按「批内缺结果」拒绝并触发有界重试,
-      // 造成同批重复生成。harness 无真实 worker,这里以 30ms/项 的节流近似生成吞吐。
+      // 结果(状态 3 + favicon 走原图管线,与极密性能场景同源)。invoke 仅确认受理；
+      // harness 无真实 worker,这里以 30ms/项 的节流近似生成吞吐。
       const a = args as
-        | { itemIds?: number[]; onResult?: { onmessage: (r: ThumbResult) => void } }
+        | { itemIds?: number[]; onResult?: { onmessage: (r: ThumbResult & { pending: boolean }) => void } }
         | undefined
       const ids = Array.isArray(a?.itemIds) ? (a!.itemIds as number[]) : []
       const ch = a?.onResult
       if (!ch || ids.length === 0) return undefined as T
       ids.forEach((id, i) => {
         setTimeout(
-          () => ch.onmessage({ itemId: id, thumbStatus: 3, thumbPath: '/favicon.png', thumbhash: null }),
+          () => ch.onmessage({ itemId: id, thumbStatus: 3, thumbPath: '/favicon.png', thumbhash: null, pending: false }),
           30 * (i + 1),
         )
       })

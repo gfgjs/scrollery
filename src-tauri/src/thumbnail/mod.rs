@@ -1,9 +1,16 @@
 // src-tauri/src/thumbnail/mod.rs
 pub mod cache;
+pub mod coordinator;
 pub mod exif_thumb;
 pub mod generator;
+#[cfg(windows)]
+mod native_adapter;
+pub mod native_protocol;
+#[cfg(windows)]
+pub mod native_worker;
 pub mod qos;
 pub mod router;
+pub mod scheduler;
 pub mod serve;
 pub mod thumbhash;
 

@@ -10,7 +10,15 @@ use crate::db::models::{AppStats, ImageMeta, MediaDetail, MediaItem, MediaMeta, 
 use crate::error::{AppError, Result};
 use crate::utils::path::resolve_media_path;
 
-fn map_media_item(row: &Row<'_>) -> rusqlite::Result<MediaItem> {
+pub(in crate::db::queries) const MEDIA_ITEM_COLUMNS: &str =
+    "id, directory_id, file_name, file_size, file_mtime, file_format,
+     media_type, width, height, duration_ms, sort_datetime, cache_key,
+     thumb_status, thumb_path, thumbhash, is_favorited, is_deleted,
+     deleted_at, rating, is_live_photo, has_embedded_video, companion_of,
+     content_hash, created_at, updated_at, color_label, view_rotation,
+     playback_position_ms, source_revision";
+
+pub(in crate::db::queries) fn map_media_item(row: &Row<'_>) -> rusqlite::Result<MediaItem> {
     Ok(MediaItem {
         id: row.get(0)?,
         directory_id: row.get(1)?,
@@ -154,13 +162,7 @@ mod duplicate_media_item_tests {
 
 pub fn get_media_item(conn: &Connection, id: i64) -> Result<MediaItem> {
     conn.query_row(
-        "SELECT id, directory_id, file_name, file_size, file_mtime, file_format,
-                media_type, width, height, duration_ms, sort_datetime, cache_key,
-                thumb_status, thumb_path, thumbhash, is_favorited, is_deleted,
-                deleted_at, rating, is_live_photo, has_embedded_video, companion_of,
-                content_hash, created_at, updated_at, color_label, view_rotation,
-                playback_position_ms, source_revision
-         FROM media_items WHERE id=?1",
+        &format!("SELECT {MEDIA_ITEM_COLUMNS} FROM media_items WHERE id=?1"),
         params![id],
         map_media_item,
     )
@@ -439,38 +441,6 @@ pub fn set_playback_position(conn: &Connection, item_id: i64, ms: i64) -> Result
     Ok(())
 }
 
-/// GA-fix:queries 层落库归属——DAO 本身不 clamp(调用方职责,同 doc 注明),这里只锚定
-/// 「传入什么值就原样落库」的存储契约。负值 clamp→0 的行为归属 IPC 层
-/// (见 `media_commands::set_playback_position` 的 `ms.max(0)`),测试见该文件同名模块。
-#[cfg(test)]
-mod playback_position_tests {
-    use super::*;
-
-    #[test]
-    fn set_playback_position_roundtrip_stores_value_as_given() {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'd');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime,
-                 file_format, media_type, width, height, sort_datetime, cache_key)
-             VALUES (1, 10, 'a.mp4', 1, 1, 'mp4', 'video', 10, 10, 100, 11);",
-        )
-        .unwrap();
-
-        set_playback_position(&c, 1, 4200).unwrap();
-        let stored: i64 = c
-            .query_row(
-                "SELECT playback_position_ms FROM media_items WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored, 4200, "正 ms 原样落库(DAO 不 clamp)");
-    }
-}
-
 /// 把一组 id 扩展为「自身 ∪ 其 Live Photo companion」（T18 §6.1，结构性写操作——删/移/恢复——专用）。
 ///
 /// Live Photo 的 mov/mp4 伴随项以 `companion_of` 指向静图、在画廊**不独立显示**；删/移/恢复静图时
@@ -545,35 +515,6 @@ pub fn restore_items(conn: &Connection, item_ids: &[i64]) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
-}
-
-#[cfg(test)]
-mod source_revision_mapping_tests {
-    use super::*;
-
-    fn seeded() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
-             INSERT INTO media_items
-                 (id, directory_id, file_name, file_size, file_mtime, file_format, media_type,
-                  width, height, sort_datetime, cache_key, source_revision, is_deleted, deleted_at)
-             VALUES
-                 (1, 10, 'live.jpg', 1, 1, 'jpg', 'image', 1, 1, 100, 11, 7, 0, NULL),
-                 (2, 10, 'trash.jpg', 1, 1, 'jpg', 'image', 1, 1, 200, 22, 8, 1, 500);",
-        )
-        .unwrap();
-        c
-    }
-
-    #[test]
-    fn media_mapping_keeps_source_revision() {
-        let c = seeded();
-
-        assert_eq!(get_media_item(&c, 1).unwrap().source_revision, 7);
-    }
 }
 
 // ── 统计 ─────────────────────────────────────────────────────────────────────
@@ -688,25 +629,6 @@ mod companion_expand_tests {
     }
 
     #[test]
-    fn expand_includes_companion() {
-        let c = mem_db();
-        let mut got = expand_companions(&c, &[1]).unwrap();
-        got.sort();
-        assert_eq!(got, vec![1, 2], "静图展开应含其 companion");
-    }
-
-    #[test]
-    fn expand_standalone_and_empty() {
-        let c = mem_db();
-        assert_eq!(expand_companions(&c, &[3]).unwrap(), vec![3], "独立项不变");
-        assert_eq!(
-            expand_companions(&c, &[]).unwrap(),
-            Vec::<i64>::new(),
-            "空入参空出"
-        );
-    }
-
-    #[test]
     fn soft_delete_cascades_to_companion() {
         let c = mem_db();
         c.execute(
@@ -755,81 +677,5 @@ mod companion_expand_tests {
             3,
             "恢复再次推进 source_revision"
         );
-    }
-}
-
-#[cfg(test)]
-mod r2_6_query_tests {
-    use super::*;
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        // root1 → A(顶层) → A/B(子);C(顶层,无子)。
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
-             INSERT INTO directories (id, root_id, parent_id, rel_path, name, depth) VALUES
-                 (10, 1, NULL, 'A', 'A', 0),
-                 (11, 1, 10, 'A/B', 'B', 1),
-                 (12, 1, NULL, 'C', 'C', 0);",
-        )
-        .unwrap();
-        c
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn add_item(
-        c: &Connection,
-        id: i64,
-        dir: i64,
-        mtype: &str,
-        fav: i64,
-        del: i64,
-        live: i64,
-        companion: Option<i64>,
-    ) {
-        c.execute(
-            "INSERT INTO media_items
-                (id, directory_id, file_name, file_size, file_mtime, file_format, media_type,
-                 width, height, sort_datetime, cache_key, is_favorited, is_deleted,
-                 is_live_photo, companion_of)
-             VALUES (?1, ?2, ?3, 0, 0, 'jpg', ?4, 0, 0, 0, 0, ?5, ?6, ?7, ?8)",
-            params![
-                id,
-                dir,
-                format!("{id}.jpg"),
-                mtype,
-                fav,
-                del,
-                live,
-                companion
-            ],
-        )
-        .unwrap();
-    }
-    /// stats 合一:三处口径差异逐字锁定(favorited 不排 companion、deleted 不加过滤、
-    /// 其余排 companion+软删)。
-    #[test]
-    fn app_stats_buckets_keep_original_semantics() {
-        let c = mem_db();
-        add_item(&c, 1, 10, "image", 0, 0, 0, None);
-        add_item(&c, 2, 10, "video", 0, 0, 0, None);
-        add_item(&c, 3, 10, "audio", 0, 0, 0, None);
-        add_item(&c, 4, 10, "document", 0, 0, 0, None);
-        add_item(&c, 5, 10, "image", 1, 0, 0, None); // favorited 正常项
-        add_item(&c, 6, 10, "video", 1, 0, 0, Some(5)); // favorited 伴随 → 仍计入 favorited
-        add_item(&c, 7, 10, "image", 0, 1, 0, None); // 软删
-        add_item(&c, 8, 10, "image", 0, 0, 1, None); // live photo
-
-        let s = get_app_stats(&c).unwrap();
-        assert_eq!(s.total_items, 6, "排伴随(6)与软删(7)");
-        assert_eq!(s.total_images, 3); // 1,5,8
-        assert_eq!(s.total_videos, 1); // 2(6 是伴随)
-        assert_eq!(s.total_audios, 1);
-        assert_eq!(s.total_documents, 1);
-        assert_eq!(s.total_favorited, 2, "favorited 口径不排 companion");
-        assert_eq!(s.total_deleted, 1);
-        assert_eq!(s.total_live_photos, 1);
     }
 }

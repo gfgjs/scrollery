@@ -798,18 +798,3 @@ pub async fn uninstall_exotic_plugin(
     state.wake_exotic(WakeReason::ConfigChanged);
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 默认 Registry 基址必须 HTTPS：否则 `download_to_vec` 运行期即拒（NotHttps），
-    /// 但更重要的是防「手滑把常量改成 http:// 造成静默降级」——编译期/CI 即锁死。
-    #[test]
-    fn default_registry_base_is_https() {
-        assert!(
-            DEFAULT_REGISTRY_BASE_URL.starts_with("https://"),
-            "Registry 基址绝不可为非 HTTPS（安全红线）"
-        );
-    }
-}

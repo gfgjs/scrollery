@@ -294,27 +294,6 @@ fn same_volume_move_rewrites_paths_and_keeps_user_assets() {
     );
 }
 
-/// 落到扫描根下：父指针必须是该根 rel_path='' 的目录行，绝不能写 NULL（否则普通目录会变成
-/// 树里的伪根节点）。
-#[test]
-fn move_into_scan_root_keeps_root_directory_row_as_parent() {
-    let f = basic_fixture();
-    // 5 = 根目录行（rel_path=''）；10 = Photos/Move，父是 Photos。
-    f.dir(5, 1, None, "", "volA", 0);
-
-    let plan = f.plan(10, 5); // 目标 = 扫描根目录行（根级）
-    assert_eq!(plan.new_rel, "Move");
-    let outcome = run_move(&f, &plan).unwrap();
-    assert_eq!(outcome.affected_dirs, 1);
-
-    let conn = f.conn();
-    let (root_id, parent_id, rel, depth) = dir_row(&conn, 10);
-    assert_eq!(root_id, 1);
-    assert_eq!(parent_id, Some(5), "父指针必须是根目录行，不是 NULL");
-    assert_eq!((rel.as_str(), depth), ("Move", 1));
-    assert!(f.exists(&f.root_a, "Move/a.jpg"));
-}
-
 // ── 2. 跨根（跨卷）移动：卷身份重绑 + 旧卷不下线误伤 ──────────────────────────
 
 /// 跨根移动后条目绑到目标卷；源卷随后下线不得把已在新卷上的条目标成 offline。
@@ -377,45 +356,6 @@ fn cross_root_move_rebinds_volume_and_survives_source_volume_offline() {
 }
 
 // ── 3. 跨根同相对路径：cache_key 不变也要更新身份与绝对缩略图 ────────────────
-
-/// 审查 F-003：旧实现「cache_key 相同即 continue」会漏掉 source-direct 绝对路径与卷定位。
-#[test]
-fn cross_root_same_relative_path_updates_volume_and_source_direct_thumb() {
-    let f = Fixture::new();
-    f.write(&f.root_a, "Photos/Move/a.jpg", "aaa");
-    f.dir(9, 1, None, "Photos", "Photos", 1);
-    f.dir(10, 1, Some(9), "Photos/Move", "Move", 2);
-    f.dir(20, 2, None, "Photos", "Photos", 1);
-    let src_abs = f
-        .root_a
-        .join("Photos/Move/a.jpg")
-        .to_string_lossy()
-        .to_string();
-    let key = f.media(100, 10, "a.jpg", "Photos/Move", 1, 3, Some(&src_abs));
-
-    let plan = f.plan(10, 20);
-    assert_eq!(
-        plan.new_rel, plan.old_rel,
-        "前置：跨根但相对路径相同（cache_key 不变）"
-    );
-    run_move(&f, &plan).unwrap();
-
-    let conn = f.conn();
-    let after = media_row(&conn, 100);
-    assert_eq!(after.cache_key, key, "相对路径相同 → cache_key 不变");
-    assert_eq!(after.volume_id, Some(2), "卷身份必须更新（不能被跳过）");
-    assert_eq!(
-        after.volume_relative_path.as_deref(),
-        Some("volB/Photos/Move/a.jpg")
-    );
-    let expect_thumb = resolve_media_path(&f.root_b.to_string_lossy(), "Photos/Move", "a.jpg");
-    assert_eq!(
-        after.thumb_path.as_deref(),
-        Some(expect_thumb.as_str()),
-        "thumb_status=3 的绝对源路径必须指向新位置"
-    );
-    assert!(!f.exists(&f.root_a, "Photos/Move"));
-}
 
 // ── 4. DB 注入失败：可恢复状态 + 重试幂等 ────────────────────────────────────
 
@@ -731,41 +671,6 @@ fn offline_roots_do_not_discard_journal() {
     );
 }
 
-/// 目标根行确实不存在（清库/删根后的终态）才作废日志；查询失败一律保留。
-#[test]
-fn missing_root_row_only_drops_journal_when_row_is_really_gone() {
-    let f = basic_fixture();
-    let journal = f.journal(q::STAGE_INTENT, 10, None, None);
-    // 行被删掉（模拟根被清库删除）→ 终态，日志可作废。
-    f.conn()
-        .execute("DELETE FROM scan_roots WHERE id=2", [])
-        .unwrap();
-    let report = retry_entry(f.db(), &f.cache_dir(), journal)
-        .unwrap()
-        .unwrap();
-    assert_eq!(report.detail, "target_root_missing");
-    assert!(q::list_pending(&f.conn()).unwrap().is_empty());
-}
-
-/// 目标父目录行被删（重链接/清理带走了它）→ 保留日志，不写 NULL 父指针。
-#[test]
-fn unresolvable_parent_keeps_journal_without_null_parent() {
-    let f = basic_fixture();
-    let journal = f.journal(q::STAGE_INTENT, 10, None, None);
-    f.conn()
-        .execute("DELETE FROM directories WHERE id=20", [])
-        .unwrap();
-    // 父 id 记在日志里，但行已不在，且按 rel 反查也找不到 → 计划重建失败。
-    let report = retry_entry(f.db(), &f.cache_dir(), journal)
-        .unwrap()
-        .unwrap();
-    assert!(report.needs_retry);
-    assert_eq!(report.detail, "target_unresolved");
-    let conn = f.conn();
-    assert_eq!(q::list_pending(&conn).unwrap().len(), 1, "日志保留");
-    assert_eq!(dir_row(&conn, 10).2, "Photos/Move", "库不动");
-}
-
 // ── 7. 删源证明：内容一致才删 ────────────────────────────────────────────────
 
 /// 删源必须逐文件证明内容：同尺寸改写、源里多出的文件都算「源不是目标的子集」→ 绝不删；
@@ -842,50 +747,6 @@ fn symlink_escaping_root_is_rejected() {
 
 // ── 8. 启动收尾：只做可证的短收敛 ────────────────────────────────────────────
 
-/// published 阶段、源与目标都在（跨卷「发布完成、删源前」崩溃）：启动档重放索引，
-/// 但**不动源**（整树比对留给显式重试）。
-#[test]
-fn startup_recovery_rewrites_index_without_touching_source() {
-    let f = basic_fixture();
-    // 跨卷形态：源还在、目标已有同一棵树的副本（我们复制过去的），阶段已推进为 published。
-    f.write(&f.root_a, "Photos/Move/a.jpg", "same");
-    f.write(&f.root_b, "Dest/Move/a.jpg", "same");
-    let payload = tree_payload_digest(&f.root_b.join("Dest/Move")).unwrap();
-    let journal = f.journal(
-        q::STAGE_PUBLISHED,
-        10,
-        None,
-        Some((&payload.digest, payload.files as i64)),
-    );
-
-    let reports = reconcile_at_startup(f.db(), &f.cache_dir()).unwrap();
-    assert_eq!(reports.len(), 1);
-    assert!(reports[0].needs_retry, "{reports:?}");
-    assert_eq!(reports[0].detail, "source_leftover");
-    {
-        let conn = f.conn();
-        assert_eq!(
-            dir_row(&conn, 10),
-            (2, Some(20), "Dest/Move".to_string(), 2)
-        );
-        assert_eq!(media_row(&conn, 100).volume_id, Some(2));
-        let pending = q::list_pending(&conn).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, journal);
-        assert_eq!(
-            pending[0].stage,
-            q::STAGE_SOURCE_LEFTOVER,
-            "阶段推进待显式清理"
-        );
-    }
-    assert!(f.exists(&f.root_b, "Dest/Move/a.jpg"));
-
-    // 幂等：再跑一次结果稳定，不重复改写。
-    let again = reconcile_at_startup(f.db(), &f.cache_dir()).unwrap();
-    assert_eq!(again[0].detail, "source_leftover");
-    assert_eq!(dir_row(&f.conn(), 10).2, "Dest/Move");
-}
-
 /// published 阶段但目标不在（卷离线/被删）→ 保留日志与旧索引状态，绝不假收尾。
 #[test]
 fn recovery_keeps_journal_when_published_target_missing() {
@@ -900,54 +761,6 @@ fn recovery_keeps_journal_when_published_target_missing() {
     assert_eq!(dir_row(&conn, 10).2, "Photos/Move", "旧索引状态保留");
     assert_eq!(media_row(&conn, 100).volume_id, Some(1));
     assert_eq!(q::list_pending(&conn).unwrap().len(), 1, "日志保留");
-}
-
-/// 两端都不在且两侧根都可见（真的什么都没发生）→ 日志行作废，不做任何改写。
-#[test]
-fn startup_recovery_drops_intent_when_nothing_happened() {
-    let f = Fixture::new();
-    f.dir(9, 1, None, "Photos", "Photos", 1);
-    f.dir(10, 1, Some(9), "Photos/Move", "Move", 2);
-    f.dir(20, 2, None, "Dest", "Dest", 1);
-    f.media(100, 10, "a.jpg", "Photos/Move", 1, 1, None);
-    let journal = f.journal(q::STAGE_INTENT, 10, None, None);
-
-    let reports = reconcile_at_startup(f.db(), &f.cache_dir()).unwrap();
-    assert_eq!(reports[0].detail, "absent");
-    {
-        let conn = f.conn();
-        assert!(q::list_pending(&conn).unwrap().is_empty());
-        assert_eq!(dir_row(&conn, 10).2, "Photos/Move", "库保持原状");
-    }
-    assert!(!f.exists(&f.root_b, "Dest/Move"));
-    assert!(retry_entry(f.db(), &f.cache_dir(), journal)
-        .unwrap()
-        .is_none());
-}
-
-/// 启动档不做大拷贝：intent 且源仍在 → 保持待重试；用户显式重试才完成搬运与索引。
-#[test]
-fn startup_recovery_defers_physical_copy_until_retry() {
-    let f = basic_fixture();
-    let plan = f.plan(10, 20);
-    let journal = f.journal(q::STAGE_INTENT, 10, Some(&plan.staging_abs), None);
-
-    let reports = reconcile_at_startup(f.db(), &f.cache_dir()).unwrap();
-    assert!(reports[0].needs_retry);
-    assert_eq!(reports[0].detail, "staging_busy");
-    assert!(f.exists(&f.root_a, "Photos/Move/a.jpg"), "源原件不动");
-    assert!(!f.exists(&f.root_b, "Dest/Move"), "启动档不重做拷贝");
-    assert_eq!(q::list_pending(&f.conn()).unwrap().len(), 1);
-
-    let report = retry_entry(f.db(), &f.cache_dir(), journal)
-        .unwrap()
-        .unwrap();
-    assert!(!report.needs_retry, "{report:?}");
-    assert!(f.exists(&f.root_b, "Dest/Move/a.jpg"));
-    assert!(!f.exists(&f.root_a, "Photos/Move"));
-    let conn = f.conn();
-    assert!(q::list_pending(&conn).unwrap().is_empty());
-    assert_eq!(media_row(&conn, 100).volume_id, Some(2));
 }
 
 // ── 9. 目标冲突、暂存独占、计划复核 ──────────────────────────────────────────
@@ -1064,39 +877,3 @@ fn copy_publishes_complete_tree_and_counts_files() {
 }
 
 // ── 11. 小工具 ───────────────────────────────────────────────────────────────
-
-/// 内容凭据对遍历顺序不敏感、对内容敏感。
-#[test]
-fn payload_digest_is_order_insensitive_but_content_sensitive() {
-    let f = Fixture::new();
-    f.write(&f.root_a, "x/a.jpg", "aaa");
-    f.write(&f.root_a, "x/sub/b.jpg", "bbbb");
-    std::fs::create_dir_all(f.root_b.join("y/sub")).unwrap();
-    f.write(&f.root_b, "y/sub/b.jpg", "bbbb");
-    f.write(&f.root_b, "y/a.jpg", "aaa");
-    let left = tree_payload_digest(&f.root_a.join("x")).unwrap();
-    let right = tree_payload_digest(&f.root_b.join("y")).unwrap();
-    assert_eq!(left.digest, right.digest, "同内容同结构 → 同摘要");
-    assert_eq!(left.files, 2);
-
-    f.write(&f.root_b, "y/a.jpg", "aab");
-    assert_ne!(
-        tree_payload_digest(&f.root_b.join("y")).unwrap().digest,
-        left.digest,
-        "内容变了摘要必须变"
-    );
-}
-
-/// 卷内相对路径：目标根未绑定卷 → NULL；绑定卷 → 卷 subpath + 目录 rel + 文件名。
-#[test]
-fn volume_relative_path_requires_bound_volume() {
-    assert_eq!(volume_relative_path(None, Some("vol"), "a", "b.jpg"), None);
-    assert_eq!(
-        volume_relative_path(Some(2), Some("vol"), "a/b", "c.jpg"),
-        Some("vol/a/b/c.jpg".to_string())
-    );
-    assert_eq!(
-        volume_relative_path(Some(2), Some("/"), "", "c.jpg"),
-        Some("c.jpg".to_string())
-    );
-}

@@ -91,6 +91,7 @@ export const IPC = {
 
   // ── 缩略图 ─────────────────────────────────────────────────────────
   BATCH_REQUEST_THUMBNAILS: 'batch_request_thumbnails',
+  CANCEL_VIEWPORT_THUMBNAIL_REQUEST: 'cancel_viewport_thumbnail_request',
   START_FULL_THUMBNAIL_GENERATION: 'start_full_thumbnail_generation',
   // 增量生成:只补 thumb_status=0(缺失/被复位)的项,不做全表重置;与全量共用停止命令与进度通道。
   START_INCREMENTAL_THUMBNAIL_GENERATION: 'start_incremental_thumbnail_generation',

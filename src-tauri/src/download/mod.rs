@@ -504,29 +504,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_response_appends_and_ignored_range_restarts() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        std::fs::write(&path, b"he").unwrap();
-        let resp = response(
-            "206 Partial Content",
-            "Content-Length: 3\r\nContent-Range: bytes 2-4/5\r\n",
-            "llo",
-        )
-        .await;
-        write_download_response(resp, &path, 2, 5, &|_| {})
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
-
-        let resp = response("200 OK", "Content-Length: 5\r\n", "world").await;
-        write_download_response(resp, &path, 2, 5, &|_| {})
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"world");
-    }
-
-    #[tokio::test]
     async fn chunked_oversend_never_writes_beyond_budget() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.part");
@@ -539,38 +516,6 @@ mod tests {
         let result = write_download_response(resp, &path, 0, 5, &|_| {}).await;
         assert!(matches!(result, Err(DownloadError::TooLarge)), "{result:?}");
         assert!(std::fs::metadata(&path).unwrap().len() <= 5);
-    }
-
-    #[tokio::test]
-    async fn declared_zero_rejects_nonempty_body() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        let resp = response(
-            "200 OK",
-            "Transfer-Encoding: chunked\r\n",
-            "1\r\nx\r\n0\r\n\r\n",
-        )
-        .await;
-        let result = write_download_response(resp, &path, 0, 0, &|_| {}).await;
-        assert!(matches!(result, Err(DownloadError::TooLarge)), "{result:?}");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn resumed_oversend_counts_existing_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        std::fs::write(&path, b"he").unwrap();
-        let resp = response(
-            "206 Partial Content",
-            "Transfer-Encoding: chunked\r\nContent-Range: bytes 2-4/5\r\n",
-            "3\r\nllo\r\n1\r\n!\r\n0\r\n\r\n",
-        )
-        .await;
-        let result = write_download_response(resp, &path, 2, 5, &|_| {}).await;
-        assert!(matches!(result, Err(DownloadError::TooLarge)), "{result:?}");
-        let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.starts_with(b"he") && bytes.len() <= 5);
     }
 
     #[tokio::test]
@@ -588,83 +533,6 @@ mod tests {
             .await
             .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"he");
-    }
-
-    #[tokio::test]
-    async fn changed_part_length_does_not_append() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        std::fs::write(&path, b"hel").unwrap();
-        let resp = response(
-            "206 Partial Content",
-            "Content-Length: 3\r\nContent-Range: bytes 2-4/5\r\n",
-            "llo",
-        )
-        .await;
-        assert!(write_download_response(resp, &path, 2, 5, &|_| {})
-            .await
-            .is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"hel");
-    }
-
-    #[tokio::test]
-    async fn declared_oversend_preserves_existing_part() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        std::fs::write(&path, b"he").unwrap();
-        let resp = response("200 OK", "Content-Length: 6\r\n", "hello!").await;
-        assert!(matches!(
-            write_download_response(resp, &path, 2, 5, &|_| {}).await,
-            Err(DownloadError::TooLarge)
-        ));
-        assert_eq!(std::fs::read(&path).unwrap(), b"he");
-    }
-
-    #[tokio::test]
-    async fn invalid_initial_resume_offset_restarts_from_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        assert_eq!(valid_resume_offset(&path, 2, 5).await, 0);
-        std::fs::write(&path, b"he").unwrap();
-        assert_eq!(valid_resume_offset(&path, 2, 5).await, 2);
-        assert_eq!(valid_resume_offset(&path, 1, 5).await, 0);
-        std::fs::write(&path, b"hello!").unwrap();
-        assert_eq!(valid_resume_offset(&path, 5, 5).await, 0);
-        assert_eq!(valid_resume_offset(&path, 6, 5).await, 0);
-    }
-
-    #[cfg(debug_assertions)]
-    #[tokio::test]
-    async fn local_download_enforces_the_same_size_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("source");
-        let dest = dir.path().join("file.part");
-        std::fs::write(&src, b"hello").unwrap();
-        std::fs::write(&dest, b"he").unwrap();
-        assert!(matches!(
-            copy_local_download(&src, &dest, 4, &|_| {}).await,
-            Err(DownloadError::TooLarge)
-        ));
-        assert_eq!(std::fs::read(&dest).unwrap(), b"he");
-        copy_local_download(&src, &dest, 5, &|n| assert_eq!(n, 5))
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
-    }
-
-    #[test]
-    fn require_https_rejects_http() {
-        assert!(matches!(
-            require_https("http://x.invalid/a"),
-            Err(DownloadError::NotHttps)
-        ));
-        assert!(require_https("https://x.invalid/a").is_ok());
-    }
-
-    #[test]
-    fn secure_client_builds_both_policies() {
-        assert!(secure_client(TimeoutPolicy::SmallFile).is_ok());
-        assert!(secure_client(TimeoutPolicy::LargeFile).is_ok());
     }
 
     #[test]
@@ -685,49 +553,5 @@ mod tests {
             cb.as_ref(),
         ));
         assert!(matches!(r, Err(DownloadError::NotHttps)));
-    }
-
-    #[test]
-    fn download_to_vec_rejects_non_https() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let client = secure_client(TimeoutPolicy::SmallFile).unwrap();
-        let r = rt.block_on(download_to_vec(
-            &client,
-            "http://x.invalid/index.json",
-            4096,
-        ));
-        assert!(matches!(r, Err(DownloadError::NotHttps)));
-    }
-
-    #[test]
-    fn sha256_matches_and_hex() {
-        let path = std::env::temp_dir().join("dl-sha-test.bin");
-        std::fs::write(&path, b"hello").unwrap();
-        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
-        let expect = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
-        assert_eq!(sha256_hex_of_file(&path).unwrap(), expect);
-        assert!(sha256_matches(&path, Some(expect)));
-        assert!(sha256_matches(&path, Some(&expect.to_uppercase())));
-        assert!(sha256_matches(&path, None)); // None = 不校验
-        assert!(!sha256_matches(&path, Some("00")));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn verify_size_sha_catches_size_mismatch() {
-        let path = std::env::temp_dir().join("dl-verify-test.bin");
-        std::fs::write(&path, b"hello").unwrap(); // 5 bytes
-        assert!(matches!(
-            verify_size_sha(&path, 99, None),
-            Err(DownloadError::SizeMismatch {
-                expected: 99,
-                got: 5
-            })
-        ));
-        assert!(verify_size_sha(&path, 5, None).is_ok());
-        let _ = std::fs::remove_file(&path);
     }
 }

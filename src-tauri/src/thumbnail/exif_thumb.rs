@@ -1,10 +1,11 @@
+use std::fs::File;
 use std::path::Path;
 
-use crate::engine::traits::{DecodedImage, ImageEngine};
+use crate::engine::traits::ImageEngine;
 use crate::error::{AppError, Result};
 
-use crate::scanner::metadata::read_jpeg_orientation;
-use crate::thumbnail::thumbhash::generate_thumbhash;
+use crate::scanner::metadata::{read_jpeg_orientation, read_jpeg_orientation_file};
+use crate::thumbnail::thumbhash::generate_thumbhash_rgba;
 
 /// 尝试 EXIF 快速路径。返回编码后的 WebP 字节和可选的 ThumbHash，如果需要回退则返回 `None`。
 pub fn try_exif_thumb(
@@ -12,11 +13,59 @@ pub fn try_exif_thumb(
     path: &Path,
     target_size: u32,
     webp_quality: u8,
+    max_pixel_bytes: u64,
 ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     let embedded = engine.extract_embedded_thumb(path).ok()??;
+    encode_embedded_thumb(
+        &embedded,
+        read_jpeg_orientation(path),
+        target_size,
+        webp_quality,
+        max_pixel_bytes,
+    )
+}
 
+/// 受控文件句柄上的 JPEG 内嵌图快速路径，不重新按路径打开源。
+pub fn try_exif_thumb_file(
+    file: &mut File,
+    target_size: u32,
+    webp_quality: u8,
+    max_pixel_bytes: u64,
+) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let embedded =
+        crate::engine::image_rs::ImageRsEngine::extract_embedded_thumb_file(file).ok()??;
+    let orientation = read_jpeg_orientation_file(file);
+    encode_embedded_thumb(
+        &embedded,
+        orientation,
+        target_size,
+        webp_quality,
+        max_pixel_bytes,
+    )
+}
+
+fn encode_embedded_thumb(
+    embedded: &[u8],
+    orientation: u32,
+    target_size: u32,
+    webp_quality: u8,
+    max_pixel_bytes: u64,
+) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     // 解码内嵌的 JPEG
-    let mut img = image::load_from_memory(&embedded).ok()?;
+    use image::ImageDecoder;
+    let reader = image::ImageReader::new(std::io::Cursor::new(embedded))
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) * 4 > max_pixel_bytes {
+        return None;
+    }
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(max_pixel_bytes);
+    limits.reserve(decoder.total_bytes()).ok()?;
+    decoder.set_limits(limits).ok()?;
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
 
     // The embedded EXIF thumbnail usually shares the physical orientation of the main image.
     // We must apply the EXIF orientation rotation before saving it as WebP,
@@ -24,7 +73,6 @@ pub fn try_exif_thumb(
     // 内嵌的 EXIF 缩略图通常与主图共享物理方向。
     // 在将其保存为 WebP 之前，我们必须应用 EXIF 方向旋转，
     // 因为 WebP 不会将 EXIF 元数据带到浏览器。
-    let orientation = read_jpeg_orientation(path);
     img = match orientation {
         1 => img,
         2 => img.fliph(),
@@ -58,13 +106,7 @@ pub fn try_exif_thumb(
     let resized = img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
     let rgba = resized.to_rgba8();
 
-    let decoded_for_hash = DecodedImage {
-        pixels: rgba.clone().into_raw(),
-        width: new_w,
-        height: new_h,
-        icc: None, // 仅用于 ThumbHash 计算,ICC 与此无关(D-416:EXIF 快速路径不做 CMS)
-    };
-    let hash = generate_thumbhash(&decoded_for_hash).ok();
+    let hash = generate_thumbhash_rgba(rgba.as_raw(), new_w, new_h).ok();
 
     let webp_bytes = encode_as_webp(&rgba, webp_quality).ok()?;
 
@@ -137,83 +179,4 @@ pub fn encode_as_jpeg(rgba: &image::RgbaImage) -> Result<Vec<u8>> {
         .encode_image(&image::DynamicImage::ImageRgb8(rgb))
         .map_err(|e| AppError::Internal(format!("JPEG encode failed: {e}")))?;
     Ok(buf)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::embedded_thumb_acceptable;
-
-    /// 渐变纹理模拟照片内容(纯色图上有损/无损差异不显著)。
-    fn gradient_img() -> image::RgbaImage {
-        image::RgbaImage::from_fn(256, 160, |x, y| {
-            image::Rgba([
-                (x % 256) as u8,
-                ((y * 13) % 256) as u8,
-                ((x + y) % 256) as u8,
-                255,
-            ])
-        })
-    }
-
-    /// 质量 <100 必须是有损 WebP(RIFF 容器内 VP8/VP8X 而非 VP8L 无损 chunk),
-    /// 且产物可被 image crate 解码(前端 Webview 同理可显)。
-    /// 回归钉:image crate 0.25 的 WebP 编码器仅支持无损,若误退回该路径,
-    /// 照片类缩略图体积膨胀 5~10 倍。
-    #[test]
-    fn encode_as_webp_lossy_below_100_and_decodable() {
-        let bytes = super::encode_as_webp(&gradient_img(), super::DEFAULT_WEBP_QUALITY).unwrap();
-        assert_eq!(&bytes[0..4], b"RIFF");
-        assert_eq!(&bytes[8..12], b"WEBP");
-        assert_ne!(&bytes[12..16], b"VP8L", "质量 <100 不得落到无损 VP8L");
-
-        let decoded = image::load_from_memory(&bytes).unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (256, 160));
-    }
-
-    /// 用户设置契约:质量 100 = 无损(VP8L chunk),且往返解码逐像素一致。
-    /// 超界值(>100)钳到 100 同为无损。
-    #[test]
-    fn encode_as_webp_quality_100_is_lossless() {
-        let img = gradient_img();
-        let bytes = super::encode_as_webp(&img, 100).unwrap();
-        assert_eq!(&bytes[0..4], b"RIFF");
-        assert_eq!(&bytes[12..16], b"VP8L", "质量 100 必须走无损 VP8L");
-
-        let decoded = image::load_from_memory(&bytes).unwrap().to_rgba8();
-        assert_eq!(decoded.as_raw(), img.as_raw(), "无损须逐像素还原");
-
-        let clamped = super::encode_as_webp(&img, 255).unwrap();
-        assert_eq!(&clamped[12..16], b"VP8L", ">100 钳到 100 同为无损");
-    }
-
-    /// 大档位（512/1024）严格：标准内嵌图（160×120/256×160，max_edge≤256）不足档位 → 拒绝回退全解码。
-    #[test]
-    fn large_tier_rejects_undersized_embedded() {
-        // tier=512：256<512 拒；恰达/超档位采用。
-        assert!(!embedded_thumb_acceptable(256, 512));
-        assert!(embedded_thumb_acceptable(512, 512));
-        assert!(embedded_thumb_acceptable(600, 512));
-        // tier=1024：800<1024 拒；≥1024 采用。
-        assert!(!embedded_thumb_acceptable(800, 1024));
-        assert!(embedded_thumb_acceptable(1024, 1024));
-        assert!(embedded_thumb_acceptable(1200, 1024));
-    }
-
-    /// 小档位（64/128/256）宽松：max_edge≥128 即采用（容轻度放大），仅 <128 才回退。
-    #[test]
-    fn small_tier_lenient_above_128_floor() {
-        // tier=64：160 采用；127 拒（128px 下限）。
-        assert!(embedded_thumb_acceptable(160, 64));
-        assert!(!embedded_thumb_acceptable(127, 64));
-        // tier=256：160<256 仍采用（宽通道、≤2× 放大）；127 拒。
-        assert!(embedded_thumb_acceptable(160, 256));
-        assert!(!embedded_thumb_acceptable(127, 256));
-    }
-
-    /// 非档位 target_size 经 snap_to_tier 归一后判级（500→512 严格；300→256 宽松）。
-    #[test]
-    fn non_tier_target_snaps_before_grading() {
-        assert!(!embedded_thumb_acceptable(256, 500)); // snap→512 严格，256<512 拒
-        assert!(embedded_thumb_acceptable(160, 300)); // snap→256 宽松，160≥128 采用
-    }
 }

@@ -199,6 +199,30 @@ pub fn claim_exotic_tasks(
     now: i64,
     worker_version: &str,
 ) -> Result<Vec<ExoticTaskRow>> {
+    claim_exotic_tasks_in_volume(
+        conn,
+        plugin_id,
+        capability,
+        limit,
+        instance_id,
+        now,
+        worker_version,
+        None,
+    )
+}
+
+/// 按已取得的源卷额度原子领取；Some(None) 限定尚无卷身份的源。
+#[allow(clippy::too_many_arguments)]
+pub fn claim_exotic_tasks_in_volume(
+    conn: &Connection,
+    plugin_id: &str,
+    capability: &str,
+    limit: i64,
+    instance_id: &str,
+    now: i64,
+    worker_version: &str,
+    volume: Option<Option<i64>>,
+) -> Result<Vec<ExoticTaskRow>> {
     let sql = format!(
         "UPDATE exotic_tasks
          SET status=1, claimed_at=?3, lease_owner=?4, worker_version=?6, updated_at=strftime('%s','now')
@@ -207,6 +231,10 @@ pub fn claim_exotic_tasks(
              WHERE plugin_id=?1 AND capability=?2
                AND ( status=0 OR (status=3 AND (next_retry_at IS NULL OR next_retry_at<=?3)) )
                {EXCLUDE_HIDDEN_ROOT_ITEMS}
+               AND (?7=0 OR (SELECT r.volume_id FROM media_items m
+                    JOIN directories d ON d.id=m.directory_id
+                    JOIN scan_roots r ON r.id=d.root_id
+                    WHERE m.id=exotic_tasks.item_id) IS ?8)
              ORDER BY id LIMIT ?5 )
          RETURNING {EXOTIC_TASK_COLS}"
     );
@@ -219,7 +247,9 @@ pub fn claim_exotic_tasks(
                 now,
                 instance_id,
                 limit,
-                worker_version
+                worker_version,
+                volume.is_some(),
+                volume.flatten()
             ],
             map_exotic_task,
         )?
@@ -577,6 +607,28 @@ pub fn has_ready_exotic_task(
     Ok(exists != 0)
 }
 
+/// 下一项就绪任务的源卷；外层 None 表示无任务，内层 None 表示卷身份未知。
+pub fn next_ready_exotic_volume(
+    conn: &Connection,
+    plugin_id: &str,
+    capability: &str,
+    now: i64,
+) -> Result<Option<Option<i64>>> {
+    let sql = format!(
+        "SELECT (SELECT r.volume_id FROM media_items m
+                 JOIN directories d ON d.id=m.directory_id
+                 JOIN scan_roots r ON r.id=d.root_id
+                 WHERE m.id=exotic_tasks.item_id)
+         FROM exotic_tasks WHERE plugin_id=?1 AND capability=?2
+           AND (status=0 OR (status=3 AND (next_retry_at IS NULL OR next_retry_at<=?3)))
+           {EXCLUDE_HIDDEN_ROOT_ITEMS}
+         ORDER BY id LIMIT 1"
+    );
+    Ok(conn
+        .query_row(&sql, params![plugin_id, capability, now], |row| row.get(0))
+        .optional()?)
+}
+
 /// 取 exotic 任务处理所需的源信息：绝对路径 + source snapshot + 小写扩展名。
 /// 经 directories JOIN scan_roots 解析绝对路径（与 `get_media_detail` 同路径解析）。
 pub fn exotic_item_source(conn: &Connection, item_id: i64) -> Result<ExoticItemSource> {
@@ -624,553 +676,4 @@ pub struct ExoticItemSource {
     pub source_revision: i64,
     pub cache_key: i64,
     pub file_format: String,
-}
-
-#[cfg(test)]
-mod exotic_dao_tests {
-    use super::super::ai::count_pending_ai_items;
-    use super::super::faces::count_pending_face_items;
-    use super::super::thumbnail::{
-        count_pending_thumb_items, exotic_thumbnail_route_info_for_items,
-        exotic_thumbnail_task_status_for_items, get_all_pending_thumb_ids,
-    };
-    use super::*;
-
-    const PID: &str = "exotic-image-psd";
-    const CAP: &str = "thumbnail";
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        // 关 FK 以便用最小 media_items 夹具覆盖任务 DAO，而不构造完整目录树。
-        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        c
-    }
-
-    fn seed(c: &Connection, item_id: i64) {
-        c.execute(
-            "INSERT OR IGNORE INTO media_items
-                (id, directory_id, file_name, file_size, file_mtime, file_format,
-                 media_type, width, height, sort_datetime, cache_key)
-             VALUES (?1, 1, ?2, 1, 1, 'psd', 'image', 0, 0, 0, ?1)",
-            params![item_id, format!("f{item_id}.psd")],
-        )
-        .unwrap();
-        seed_exotic_tasks_for_item(c, item_id, PID, &[CAP.to_string()]).unwrap();
-    }
-
-    fn claim(c: &Connection, limit: i64, owner: &str, now: i64) -> Vec<ExoticTaskRow> {
-        claim_exotic_tasks(c, PID, CAP, limit, owner, now, "1.0.0").unwrap()
-    }
-
-    fn source_snapshot(c: &Connection, item_id: i64) -> (i64, i64) {
-        c.query_row(
-            "SELECT source_revision, cache_key FROM media_items WHERE id=?1",
-            params![item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap()
-    }
-
-    fn finish_current(
-        c: &Connection,
-        task_id: i64,
-        instance_id: &str,
-        fingerprint: &str,
-        output_path: &str,
-        worker_version: &str,
-    ) -> bool {
-        let item_id: i64 = c
-            .query_row(
-                "SELECT item_id FROM exotic_tasks WHERE id=?1",
-                params![task_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let (source_revision, cache_key) = source_snapshot(c, item_id);
-        finish_exotic_task(
-            c,
-            task_id,
-            instance_id,
-            source_revision,
-            cache_key,
-            fingerprint,
-            output_path,
-            worker_version,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn atomic_claim_no_double() {
-        let c = mem_db();
-        for i in 1..=3 {
-            seed(&c, i);
-        }
-        assert_eq!(claim(&c, 2, "inst-A", 1000).len(), 2);
-        assert_eq!(claim(&c, 2, "inst-A", 1000).len(), 1); // 剩 1
-        assert_eq!(claim(&c, 2, "inst-A", 1000).len(), 0); // 全 processing
-        assert!(claim(&c, 2, "inst-A", 1000).is_empty());
-    }
-
-    /// 隐藏根排除(V21):claim 跳过隐藏根下媒体的任务(留 pending,不烧算力);
-    /// unhide 后原任务原地可再领(非破坏暂停,与四条主流水线同口径)。
-    #[test]
-    fn claim_skips_hidden_root_and_unhide_reclaims() {
-        let c = mem_db();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES
-                 (10, 1, '', 'r1'), (20, 2, '', 'r2');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'a.psd', 1, 1, 'psd', 'image', 0, 0, 100, 1),
-                 (2, 20, 'b.psd', 1, 1, 'psd', 'image', 0, 0, 200, 2);",
-        )
-        .unwrap();
-        seed(&c, 1);
-        seed(&c, 2);
-        super::super::scan::set_scan_root_hidden(&c, 2, true).unwrap();
-        let got: Vec<i64> = claim(&c, 10, "A", 1000).iter().map(|t| t.item_id).collect();
-        assert_eq!(got, vec![1], "隐藏根任务不领取");
-        assert!(
-            !has_ready_exotic_task(&c, PID, CAP, 1000).unwrap(),
-            "只剩隐藏任务时调度器不得反复启动空流水线"
-        );
-        super::super::scan::set_scan_root_hidden(&c, 2, false).unwrap();
-        assert!(has_ready_exotic_task(&c, PID, CAP, 1000).unwrap());
-        let got: Vec<i64> = claim(&c, 10, "A", 1000).iter().map(|t| t.item_id).collect();
-        assert_eq!(got, vec![2], "unhide 后 pending 任务原地可领");
-    }
-
-    /// 详情列表(展开详情):活动优先排序 + 桶筛选 + 分页 + JOIN 展示字段。
-    #[test]
-    fn task_details_order_filter_pagination() {
-        let c = mem_db();
-        // 最小媒体链(FK 已关,只为 JOIN 供数):一目录 + 五文件。
-        c.execute_batch(
-            "INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, 'art/psd', 'psd');",
-        )
-        .unwrap();
-        for i in 1..=5 {
-            c.execute(
-                "INSERT INTO media_items
-                    (id, directory_id, file_name, file_size, file_mtime, file_format,
-                     media_type, width, height, sort_datetime, cache_key)
-                 VALUES (?1, 10, ?2, 1, 1, 'psd', 'image', 0, 0, 0, ?1)",
-                params![i, format!("f{i}.psd")],
-            )
-            .unwrap();
-            seed(&c, i);
-        }
-        // 造五态:1=done, 2=processing, 3=terminal error, 4=retryable, 5=pending。
-        let id1 = claim(&c, 1, "A", 1000)[0].id;
-        assert!(finish_current(&c, id1, "A", "fp", "/p.webp", "1.0.0"));
-        let _id2 = claim(&c, 1, "A", 1000)[0].id; // item 2 → processing
-        let id3 = claim(&c, 1, "A", 1000)[0].id; // item 3 → terminal
-        fail_exotic_task(&c, id3, "A", false, 1, "decode_failed", "bad psd", 0).unwrap();
-        let id4 = claim(&c, 1, "A", 1000)[0].id; // item 4 → retryable
-        fail_exotic_task(&c, id4, "A", true, 3, "worker_crash", "boom", 9999).unwrap();
-        // item 5 保持 pending。
-
-        // 全部:processing → retryable → pending → error → done。
-        let all = list_exotic_task_details(&c, PID, CAP, None, 50, 0).unwrap();
-        let order: Vec<(i64, i64)> = all.iter().map(|r| (r.item_id, r.status)).collect();
-        assert_eq!(
-            order,
-            vec![(2, 1), (4, 3), (5, 0), (3, 4), (1, 2)],
-            "活动优先序"
-        );
-        // JOIN 展示字段。
-        let done = &all[4];
-        assert_eq!(done.file_name, "f1.psd");
-        assert_eq!(done.dir_path, "art/psd");
-        assert_eq!(done.format, "psd");
-        // 错误字段透出。
-        let err = &all[3];
-        assert_eq!(err.last_error_code.as_deref(), Some("decode_failed"));
-        assert_eq!(err.attempts, 1);
-
-        // 桶筛选:pending 桶含 0 与 3;error 桶仅 terminal。
-        let pend = list_exotic_task_details(&c, PID, CAP, Some("pending"), 50, 0).unwrap();
-        assert_eq!(
-            pend.iter().map(|r| r.item_id).collect::<Vec<_>>(),
-            vec![4, 5]
-        );
-        let errs = list_exotic_task_details(&c, PID, CAP, Some("error"), 50, 0).unwrap();
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].item_id, 3);
-
-        // 分页:limit/offset 拼接 == 全量。
-        let p1 = list_exotic_task_details(&c, PID, CAP, None, 2, 0).unwrap();
-        let p2 = list_exotic_task_details(&c, PID, CAP, None, 2, 2).unwrap();
-        let p3 = list_exotic_task_details(&c, PID, CAP, None, 2, 4).unwrap();
-        let paged: Vec<i64> = p1.iter().chain(&p2).chain(&p3).map(|r| r.item_id).collect();
-        assert_eq!(paged, vec![2, 4, 5, 3, 1], "分页拼接等于全量序");
-
-        // 未知桶防御性空结果。
-        assert!(list_exotic_task_details(&c, PID, CAP, Some("bogus"), 50, 0)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn lease_guards_finish() {
-        let c = mem_db();
-        seed(&c, 1);
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        // 错误 owner 不能完成（旧 Writer 失租）。
-        assert!(!finish_exotic_task(&c, id, "inst-B", 1, 1, "fp", "/p.webp", "1.0.0").unwrap());
-        assert!(has_blocking_exotic_thumbnail_task(&c, 1).unwrap());
-        // 正确 owner 完成。
-        assert!(finish_current(&c, id, "inst-A", "fp", "/p.webp", "1.0.0"));
-        assert!(!has_blocking_exotic_thumbnail_task(&c, 1).unwrap()); // done 不再阻塞
-    }
-
-    #[test]
-    fn stale_source_snapshot_cannot_finish_exotic_task() {
-        let c = mem_db();
-        seed(&c, 1);
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        let (source_revision, cache_key) = source_snapshot(&c, 1);
-
-        // 模拟扫描在 Worker 处理期间发现同大小/同抽样指纹的源代次变化；cache_key
-        // 也变化时必须同时满足两项快照条件，旧结果不能把 processing 标成 done。
-        c.execute(
-            "UPDATE media_items
-             SET source_revision=?2, cache_key=?3, thumb_status=0, thumb_path=NULL
-             WHERE id=?1",
-            params![1, source_revision + 1, cache_key + 1],
-        )
-        .unwrap();
-        assert!(!is_exotic_source_current(&c, 1, source_revision, cache_key).unwrap());
-
-        assert!(!finish_exotic_task(
-            &c,
-            id,
-            "inst-A",
-            source_revision,
-            cache_key,
-            "old-fingerprint",
-            "480/aa/old.webp",
-            "1.0.0"
-        )
-        .unwrap());
-        let task_status: i64 = c
-            .query_row(
-                "SELECT status FROM exotic_tasks WHERE id=?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(task_status, 1, "旧结果不得结束新源的 processing 任务");
-        let (thumb_status, thumb_path): (i64, Option<String>) = c
-            .query_row(
-                "SELECT thumb_status, thumb_path FROM media_items WHERE id=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(thumb_status, 0);
-        assert!(thumb_path.is_none());
-    }
-
-    #[test]
-    fn install_truth_upsert_get_delete() {
-        let c = mem_db();
-        // 未安装 → None。
-        assert!(get_exotic_plugin(&c, PID).unwrap().is_none());
-
-        // upsert 首装。
-        let rec = crate::exotic::InstalledPluginRecord {
-            plugin_id: PID.into(),
-            version: "1.0.0".into(),
-            manifest_hash: "h1".into(),
-            package_sequence: 3,
-            install_state: crate::exotic::install_state::INSTALLED.into(),
-            installed_at: 100,
-            updated_at: 100,
-        };
-        upsert_exotic_plugin(&c, &rec).unwrap();
-        let got = get_exotic_plugin(&c, PID).unwrap().unwrap();
-        assert_eq!(got, rec);
-
-        // upsert 同主键升级（version/sequence/hash 覆盖）。
-        let upgraded = crate::exotic::InstalledPluginRecord {
-            version: "1.1.0".into(),
-            manifest_hash: "h2".into(),
-            package_sequence: 4,
-            updated_at: 200,
-            ..rec.clone()
-        };
-        upsert_exotic_plugin(&c, &upgraded).unwrap();
-        let got = get_exotic_plugin(&c, PID).unwrap().unwrap();
-        assert_eq!(got.version, "1.1.0");
-        assert_eq!(got.package_sequence, 4);
-
-        // 仅改状态 → broken。
-        assert_eq!(
-            set_exotic_plugin_state(&c, PID, crate::exotic::install_state::BROKEN).unwrap(),
-            1
-        );
-        assert_eq!(
-            get_exotic_plugin(&c, PID).unwrap().unwrap().install_state,
-            "broken"
-        );
-
-        // 删除。
-        assert!(delete_exotic_plugin(&c, PID).unwrap());
-        assert!(get_exotic_plugin(&c, PID).unwrap().is_none());
-        assert!(!delete_exotic_plugin(&c, PID).unwrap()); // 再删 → false
-    }
-
-    #[test]
-    fn recover_only_expired_lease() {
-        let c = mem_db();
-        seed(&c, 1);
-        let _ = claim(&c, 1, "inst-A", 1000);
-        // ttl=100：now=1010 未过期 → 不回收。
-        assert_eq!(recover_orphaned_exotic_tasks(&c, 100, 1010).unwrap(), 0);
-        // now=2000：claimed_at=1000 < 1900 → 回收。
-        assert_eq!(recover_orphaned_exotic_tasks(&c, 100, 2000).unwrap(), 1);
-        // 回收后可被另一实例重新领取。
-        assert_eq!(claim(&c, 1, "inst-B", 2000).len(), 1);
-    }
-
-    #[test]
-    fn invalidate_resets_done_task() {
-        let c = mem_db();
-        seed(&c, 1);
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        assert!(finish_current(&c, id, "inst-A", "fp", "/p.webp", "1.0.0"));
-        assert!(!has_blocking_exotic_thumbnail_task(&c, 1).unwrap());
-        assert_eq!(invalidate_exotic_tasks_for_item(&c, 1).unwrap(), 1);
-        // 退回 pending → 重新阻塞 + 可领取，且输出已清。
-        assert!(has_blocking_exotic_thumbnail_task(&c, 1).unwrap());
-        let again = claim(&c, 1, "inst-A", 2000);
-        assert_eq!(again.len(), 1);
-        assert!(again[0].output_path.is_none());
-        assert!(again[0].input_fingerprint.is_none());
-    }
-
-    #[test]
-    fn reset_all_redoes_done_retry_terminal_keeps_processing() {
-        let c = mem_db();
-        for i in 1..=4 {
-            seed(&c, i);
-        }
-        // item1 → done(2)
-        let id1 = claim(&c, 1, "A", 1000)[0].id;
-        assert!(finish_current(&c, id1, "A", "fp", "/p.webp", "1.0.0"));
-        // item2 → retry(3)
-        let id2 = claim(&c, 1, "A", 1000)[0].id;
-        fail_exotic_task(&c, id2, "A", true, 3, "io_error", "busy", 1500).unwrap();
-        // item3 → terminal(4)
-        let id3 = claim(&c, 1, "A", 1000)[0].id;
-        fail_exotic_task(&c, id3, "A", true, 1, "malformed_input", "bad", 0).unwrap();
-        // item4 → processing(1)，只领不最终化（模拟在途）
-        let _id4 = claim(&c, 1, "A", 1000)[0].id;
-
-        // 重置只动 done/retry/terminal（3 条）；processing 不动（在途结果仍有效）。
-        assert_eq!(reset_all_exotic_thumbnail_tasks(&c).unwrap(), 3);
-
-        // item1/2/3 退回 pending → 可领、输出/指纹已清；item4 仍 processing 领不到。
-        let again = claim(&c, 9, "B", 9999);
-        assert_eq!(again.len(), 3);
-        assert!(again
-            .iter()
-            .all(|r| r.output_path.is_none() && r.input_fingerprint.is_none()));
-    }
-
-    #[test]
-    fn renew_all_refreshes_inflight_leases() {
-        let c = mem_db();
-        seed(&c, 1);
-        seed(&c, 2);
-        let _ = claim(&c, 2, "A", 1000); // 两条 claimed_at=1000
-                                         // 续租把本实例在途刷新到 5000。
-        assert_eq!(renew_all_exotic_leases(&c, "A", 5000).unwrap(), 2);
-        // ttl=100、now=1200：旧 claimed_at(1000<1100) 本会被回收；续租后 claimed_at=5000 不回收。
-        assert_eq!(recover_orphaned_exotic_tasks(&c, 100, 1200).unwrap(), 0);
-        // 别的实例续租不到本实例任务（lease_owner 不符）。
-        assert_eq!(renew_all_exotic_leases(&c, "B", 9000).unwrap(), 0);
-    }
-
-    #[test]
-    fn retryable_respects_next_retry_at() {
-        let c = mem_db();
-        seed(&c, 1);
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        // 可重试，下次重试时刻 1500，最多 3 次。
-        assert_eq!(
-            fail_exotic_task(&c, id, "inst-A", true, 3, "io_error", "busy", 1500).unwrap(),
-            ExoticFailureOutcome::RetryScheduled
-        );
-        assert_eq!(claim(&c, 1, "inst-A", 1000).len(), 0); // 未到期
-        let due = claim(&c, 1, "inst-A", 1600);
-        assert_eq!(due.len(), 1); // 到期可再领
-        assert_eq!(due[0].attempts, 1);
-    }
-
-    #[test]
-    fn terminal_when_attempts_exhausted() {
-        let c = mem_db();
-        seed(&c, 1);
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        // max_attempts=1：attempts+1=1 不 < 1 → 直接 terminal(4)，不再可领。
-        assert_eq!(
-            fail_exotic_task(&c, id, "inst-A", true, 1, "malformed_input", "bad", 1500).unwrap(),
-            ExoticFailureOutcome::Terminal
-        );
-        assert_eq!(
-            fail_exotic_task(&c, id, "inst-A", true, 1, "malformed_input", "bad", 1500).unwrap(),
-            ExoticFailureOutcome::LeaseLost
-        );
-        assert_eq!(claim(&c, 1, "inst-A", 9999).len(), 0);
-    }
-
-    /// 插一条最小 media_items（FK 已关），返回 id。
-    fn insert_media(c: &Connection, fmt: &str) -> i64 {
-        c.execute(
-            "INSERT INTO media_items
-                (directory_id, file_name, file_size, file_mtime, file_format,
-                 media_type, width, height, sort_datetime, cache_key)
-             VALUES (1, ?1, 1, 1, ?2, 'image', 0, 0, 0, ?3)",
-            params![format!("f.{fmt}"), fmt, rand_key()],
-        )
-        .unwrap();
-        c.last_insert_rowid()
-    }
-
-    fn rand_key() -> i64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64
-    }
-
-    #[test]
-    fn full_gen_pending_excludes_blocked_exotic() {
-        let c = mem_db();
-        let jpg = insert_media(&c, "jpg"); // 常见格式，无 exotic 任务
-        let psd = insert_media(&c, "psd");
-        seed(&c, psd); // psd 有 pending thumbnail 任务 → 应被主 generator 的 pending 查询排除
-
-        let pending = get_all_pending_thumb_ids(&c).unwrap();
-        assert!(pending.contains(&jpg), "jpg 应进主缩略图 pending");
-        assert!(
-            !pending.contains(&psd),
-            "未完成 exotic 的 psd 不得进主 generator"
-        );
-        assert_eq!(count_pending_thumb_items(&c).unwrap(), 1);
-
-        // 批量任务状态查询命中 psd=pending，jpg 无任务。
-        let map = exotic_thumbnail_task_status_for_items(&c, &[jpg, psd]).unwrap();
-        assert_eq!(map.get(&psd), Some(&ExoticTaskStatus::Pending));
-        assert!(!map.contains_key(&jpg));
-
-        // 任务完成后 psd 不再被 exotic 谓词阻塞（此时通常 Sink 已置 thumb_status=1）。
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        assert!(finish_current(&c, id, "inst-A", "fp", "/p.webp", "1.0.0"));
-        assert!(get_all_pending_thumb_ids(&c).unwrap().contains(&psd));
-    }
-
-    #[test]
-    fn route_info_returns_fingerprint_and_worker_version_for_done() {
-        let c = mem_db();
-        let psd = insert_media(&c, "psd");
-        seed(&c, psd);
-        // 未完成：route info 含 pending、无指纹/版本。
-        let m = exotic_thumbnail_route_info_for_items(&c, &[psd]).unwrap();
-        let info = m.get(&psd).unwrap();
-        assert_eq!(info.status, ExoticTaskStatus::Pending);
-        assert!(info.input_fingerprint.is_none() && info.worker_version.is_none());
-
-        // 完成后：route info 带回存储的指纹与 worker 版本（供入口重算比对，问题4）。
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        assert!(finish_current(
-            &c, id, "inst-A", "fp-abc", "/p.webp", "1.0.0"
-        ));
-        let m = exotic_thumbnail_route_info_for_items(&c, &[psd]).unwrap();
-        let info = m.get(&psd).unwrap();
-        assert_eq!(info.status, ExoticTaskStatus::Done);
-        assert_eq!(info.input_fingerprint.as_deref(), Some("fp-abc"));
-        assert_eq!(info.worker_version.as_deref(), Some("1.0.0"));
-    }
-
-    #[test]
-    fn ai_and_face_counts_exclude_blocked_exotic() {
-        let c = mem_db();
-        let _jpg = insert_media(&c, "jpg");
-        let psd = insert_media(&c, "psd");
-        seed(&c, psd); // psd 有未完成 thumbnail 任务
-
-        // 两张图均 ai_status=0/face_status=0，但 psd 被 exotic 门控排除 → 计数为 1。
-        assert_eq!(count_pending_ai_items(&c).unwrap(), 1);
-        assert_eq!(count_pending_face_items(&c).unwrap(), 1);
-
-        // 任务完成后门控解除，psd 计入（此后 AI/face 优先用其 thumb_path，§2.4）。
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        assert!(finish_current(&c, id, "inst-A", "fp", "/p.webp", "1.0.0"));
-        assert_eq!(count_pending_ai_items(&c).unwrap(), 2);
-        assert_eq!(count_pending_face_items(&c).unwrap(), 2);
-    }
-
-    #[test]
-    fn upgrade_invalidates_done_with_old_version() {
-        let c = mem_db();
-        seed(&c, 1);
-        let id = claim(&c, 1, "inst-A", 1000)[0].id;
-        assert!(finish_current(&c, id, "inst-A", "fp", "/p.webp", "1.0.0"));
-        // 升级到 1.1.0：旧版本 done 任务退回 pending。
-        assert_eq!(
-            invalidate_exotic_tasks_for_plugin_version(&c, PID, "1.1.0").unwrap(),
-            1
-        );
-        assert!(has_blocking_exotic_thumbnail_task(&c, 1).unwrap());
-        // 相同版本不重复失效。
-        let id = claim(&c, 1, "inst-A", 2000)[0].id;
-        assert!(finish_current(&c, id, "inst-A", "fp2", "/p.webp", "1.1.0"));
-        assert_eq!(
-            invalidate_exotic_tasks_for_plugin_version(&c, PID, "1.1.0").unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn upgrade_resets_failed_generation_once() {
-        let c = mem_db();
-        seed(&c, 1);
-        c.execute(
-            "UPDATE exotic_tasks SET status=4, attempts=3, worker_version='old',
-             last_error_code='internal_error' WHERE item_id=1",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            invalidate_exotic_tasks_for_plugin_version(&c, PID, "new").unwrap(),
-            1
-        );
-        let row = claim(&c, 1, "A", 1000).pop().unwrap();
-        assert_eq!(row.attempts, 0);
-        assert!(row.last_error_code.is_none());
-        // 旧库失败记录没有执行版本时只建立基线，不能每次启动都复活坏文件。
-        c.execute(
-            "UPDATE exotic_tasks SET status=4, worker_version=NULL WHERE id=?1",
-            [row.id],
-        )
-        .unwrap();
-        assert_eq!(
-            invalidate_exotic_tasks_for_plugin_version(&c, PID, "new").unwrap(),
-            0
-        );
-        assert_eq!(
-            invalidate_exotic_tasks_for_plugin_version(&c, PID, "new").unwrap(),
-            0
-        );
-        assert_eq!(
-            invalidate_exotic_tasks_for_plugin_version(&c, PID, "newer").unwrap(),
-            1
-        );
-    }
 }

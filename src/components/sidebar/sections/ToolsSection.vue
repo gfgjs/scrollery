@@ -67,8 +67,13 @@
             </div>
             <div class="tool__progress-meta">
               <span>{{ scan.thumbGenProgress.generated }} / {{ scan.thumbGenProgress.total }}</span>
+              <span v-if="scan.thumbGenProgress.isRunning && scan.thumbGenPhaseLabel">{{ scan.thumbGenPhaseLabel }}</span>
               <span v-if="thumbElapsedStr" class="mono">{{ thumbElapsedStr }}</span>
             </div>
+            <div v-if="scan.thumbGenResultsLabel" class="tool__progress-meta">
+              {{ scan.thumbGenResultsLabel }}
+            </div>
+            <ThumbExecutionSummary />
           </div>
         </div>
 
@@ -329,6 +334,7 @@
 </template>
 
 <script setup lang="ts">
+import ThumbExecutionSummary from '../../common/ThumbExecutionSummary.vue'
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {

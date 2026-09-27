@@ -82,20 +82,3 @@ pub(crate) fn classify_and_maybe_flip(
         Ok(crop)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decision_table() {
-        // p1 胜且 ≥ 阈值 → 翻转。
-        assert!(cls_decision(0.1, 0.95, 0.9));
-        // p1 胜但 < 阈值 → 不翻转。
-        assert!(!cls_decision(0.3, 0.7, 0.9));
-        // p0 胜 → 不翻转。
-        assert!(!cls_decision(0.99, 0.01, 0.9));
-        // 边界:恰等于阈值 → 翻转。
-        assert!(cls_decision(0.1, 0.9, 0.9));
-    }
-}

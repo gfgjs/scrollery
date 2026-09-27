@@ -39,8 +39,6 @@ import {
 
 /** 缩略图解码策略候选(与后端 schema 枚举同值)。 */
 const THUMB_STRATEGIES = ['cpu', 'gpu', 'direct'] as const
-/** GPU 引擎候选。 */
-const GPU_ENGINES = ['wic'] as const
 /** AI 硬件策略候选。 */
 const AI_PROVIDER_OVERRIDES = ['auto', 'cpu'] as const
 /** AI 模型下载源候选。 */
@@ -73,7 +71,6 @@ export const useConfigStore = defineStore('config', () => {
   const enableHoverScale = computed(() => readSettingBool('enable_thumb_hover_scale', true))
   const logLevel = computed(() => readSettingEnum('log_level', LOG_LEVELS, 'info'))
   const thumbStrategy = computed(() => readSettingEnum('thumb_strategy', THUMB_STRATEGIES, 'cpu'))
-  const gpuEngine = computed(() => readSettingEnum('gpu_engine', GPU_ENGINES, 'wic'))
   const aiProviderOverride = computed(() =>
     readSettingEnum('ai_provider_override', AI_PROVIDER_OVERRIDES, 'auto'),
   )
@@ -215,9 +212,6 @@ export const useConfigStore = defineStore('config', () => {
   function setThumbStrategy(val: string) {
     return writeSettings({ thumb_strategy: val })
   }
-  function setGpuEngine(val: string) {
-    return writeSettings({ gpu_engine: val })
-  }
   function setAiProviderOverride(val: string) {
     return writeSettings({ ai_provider_override: val })
   }
@@ -261,7 +255,6 @@ export const useConfigStore = defineStore('config', () => {
     enableHoverScale,
     logLevel,
     thumbStrategy,
-    gpuEngine,
     aiProviderOverride,
     aiBatchSize,
     aiDownloadSource,
@@ -288,7 +281,6 @@ export const useConfigStore = defineStore('config', () => {
     setEnableHoverScale,
     setLogLevel,
     setThumbStrategy,
-    setGpuEngine,
     setAiProviderOverride,
     setAiBatchSize,
     setAiDownloadSource,

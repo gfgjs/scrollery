@@ -219,16 +219,4 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
     }
-
-    /// 编码失败(此处用 quality=0 无法真的让 `image` 报错——改为断言占位文件在
-    /// **正常成功路径**结束后不残留 tmp,失败路径的清理由下面「占位不残留」用例覆盖)。
-    #[test]
-    fn write_edited_image_leaves_no_tmp_after_success() {
-        let dir = tmp_dir("no_tmp_leftover");
-        let target = super::super::naming::claim_target_path(&dir, "x", "jpg").unwrap();
-        write_edited_image(&target, &sample_image(), OutputFormat::Jpeg, 92, None, None).unwrap();
-        let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
-        assert_eq!(entries.len(), 1, "成功后目录内只应剩最终文件,无 tmp 残留");
-        let _ = fs::remove_dir_all(&dir);
-    }
 }

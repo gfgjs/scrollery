@@ -41,7 +41,11 @@ pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
     // 时间戳选择（min(1s, 时长 10%)，黑帧规避）已内聚到后端的同一解码会话内 —— 此处不再
     // 先 probe(旧实现为选时间戳独立 probe,每视频多开一次 reader)。长边直接按缩略图 tier
     // 请求,MF 侧由 XVP 缩好,encode_media_step 的 resize 成为直通。
-    let decoded = backend.cover(&ctx.abs_path, snap_to_tier(ctx.thumb_size))?;
+    let decoded = backend.cover_bounded(
+        &ctx.abs_path,
+        snap_to_tier(ctx.thumb_size),
+        ctx.max_pixel_bytes,
+    )?;
 
     // 复用缩略图编码器：缩放 → WebP → 写入缩略图缓存（按 cache_key）→ thumbhash。
     let cfg = ThumbConfig {
@@ -49,10 +53,10 @@ pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
         size: snap_to_tier(ctx.thumb_size),
         skip_max_bytes: 0,
         strategy: String::new(),
-        gpu_engine: String::new(),
         ai_hq_cache: false, // 视频封面非 CLIP 分析对象，不产 AI 缓存
         webp_quality: ctx.webp_quality,
         ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
+        output_fingerprint: None,
     };
     let res = encode_media_step_with_snapshot(
         ctx.item_id,
@@ -74,7 +78,12 @@ pub fn run_keyframes(ctx: &DerivationContext) -> Result<DerivationOutput> {
     let backend = backend_for(&ctx.file_format)
         .ok_or_else(|| AppError::UnsupportedFormat(ctx.file_format.clone()))?;
 
-    let frames = backend.keyframes(&ctx.abs_path, ctx.keyframe_count, ctx.sprite_cell_height)?;
+    let frames = backend.keyframes_bounded(
+        &ctx.abs_path,
+        ctx.keyframe_count,
+        ctx.sprite_cell_height,
+        ctx.max_pixel_bytes,
+    )?;
     if frames.is_empty() {
         return Err(AppError::Internal("no keyframes | 无关键帧".into()));
     }
@@ -83,17 +92,19 @@ pub fn run_keyframes(ctx: &DerivationContext) -> Result<DerivationOutput> {
     let cell_w = frames[0].width;
     let cell_h = frames[0].height;
     let cols = frames.len() as u32;
-    let sprite_w = cell_w * cols;
+    crate::video::check_frame_collection_budget(cell_w, cell_h, frames.len(), ctx.max_pixel_bytes)?;
+    let sprite_w = cell_w
+        .checked_mul(cols)
+        .ok_or_else(|| AppError::Internal("sprite width overflow".into()))?;
     let sprite_h = cell_h;
 
     let mut sprite = image::RgbaImage::new(sprite_w, sprite_h);
-    for (i, f) in frames.iter().enumerate() {
+    for (i, f) in frames.into_iter().enumerate() {
         // 跳过尺寸漂移的帧（防御性 —— 后端按统一尺寸缩放）。
         if f.width != cell_w || f.height != cell_h {
             continue;
         }
-        let Some(frame_img) = image::RgbaImage::from_raw(f.width, f.height, f.pixels.clone())
-        else {
+        let Some(frame_img) = image::RgbaImage::from_raw(f.width, f.height, f.pixels) else {
             continue;
         };
         let x0 = i as u32 * cell_w;

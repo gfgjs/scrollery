@@ -173,7 +173,7 @@ jobs:
       - name: vue-tsc 类型检查
         run: npm run typecheck
 
-      - name: Vitest 展开用例预算（含 each 和跳过项）
+      - name: 测试预算（Vitest 100 / Rust 200，含跳过项）
         run: npm run check:tests -- --selftest
 
       - name: vitest 单元测试
@@ -226,6 +226,10 @@ jobs:
       - name: tag 与版本锚一致性
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/sync-version.mjs --check-tag "$GITHUB_REF_NAME"
+
+      # 显式准备固定版本 dispatcher，避免冒烟构建依赖自托管 runner 的历史产物。
+      - name: 准备固定版本 VPL dispatcher
+        run: node scripts/build-vpl-dispatcher.mjs
 
       - name: tauri build --no-bundle(release exe)
         run: npx tauri build --no-bundle

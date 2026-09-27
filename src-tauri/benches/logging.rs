@@ -153,7 +153,6 @@ fn bench_pipeline_thumbnail_batch(
         size: 256,
         skip_max_bytes: 0,
         strategy: "cpu".to_string(),
-        gpu_engine: "wic".to_string(),
         ai_hq_cache: false,
         webp_quality: 80,
         ai_cache_short_edge: 336,

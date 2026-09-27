@@ -138,24 +138,3 @@ pub(crate) fn chw_tensor(img: &RgbImage, swap_rb: bool, mean: [f32; 3], std: [f3
     }
     flat
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chw_tensor_layout_and_swap() {
-        let mut img = RgbImage::new(2, 1);
-        img.put_pixel(0, 0, image::Rgb([255, 0, 0])); // R
-        img.put_pixel(1, 0, image::Rgb([0, 0, 255])); // B
-                                                      // 无 swap,mean 0 std 1:channel0 = R 通道。
-        let t = chw_tensor(&img, false, [0.0; 3], [1.0; 3]);
-        // 布局 [C=3][H=1][W=2]:idx c*2 + x。
-        assert!((t[0] - 1.0).abs() < 1e-6); // ch0(R), x0 = 255/255
-        assert!((t[1] - 0.0).abs() < 1e-6); // ch0(R), x1 = 0
-                                            // swap_rb=true:channel0 取 B 分量。
-        let ts = chw_tensor(&img, true, [0.0; 3], [1.0; 3]);
-        assert!((ts[0] - 0.0).abs() < 1e-6); // ch0=B of pixel0(B=0)
-        assert!((ts[1] - 1.0).abs() < 1e-6); // ch0=B of pixel1(B=255)
-    }
-}

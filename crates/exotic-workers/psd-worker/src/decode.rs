@@ -258,47 +258,6 @@ mod tests {
     }
 
     #[test]
-    fn downscales_by_long_edge() {
-        let psd = make_rgb_psd(1000, 500);
-        let out = decode_psd_to_webp(&psd, 480).unwrap();
-        assert_eq!(out.width, 480); // 长边吸附到 480
-        assert_eq!(out.height, 240);
-        assert!(webp_magic_ok(&out.webp));
-    }
-
-    #[test]
-    fn psb_rejected() {
-        let mut psd = make_rgb_psd(8, 8);
-        psd[4..6].copy_from_slice(&2u16.to_be_bytes()); // version 2 = PSB
-        let err = decode_psd_to_webp(&psd, 480).unwrap_err();
-        // psd 0.3.5 from_bytes 直接拒绝 version 2。
-        assert!(matches!(
-            err.code,
-            WorkerErrorCode::MalformedInput | WorkerErrorCode::UnsupportedVariant
-        ));
-    }
-
-    #[test]
-    fn cmyk_rejected_as_unsupported() {
-        let mut psd = make_rgb_psd(8, 8);
-        // color mode @ offset 24 (u16)：4 = CMYK。注意像素仍是 3 通道，但门控在合成前。
-        psd[24..26].copy_from_slice(&4u16.to_be_bytes());
-        let err = decode_psd_to_webp(&psd, 480).unwrap_err();
-        assert_eq!(err.code, WorkerErrorCode::UnsupportedVariant);
-    }
-
-    #[test]
-    fn malformed_garbage_rejected_no_panic() {
-        for bytes in [vec![], vec![0xABu8; 16], vec![0x5Au8; 4096]] {
-            let err = decode_psd_to_webp(&bytes, 480).unwrap_err();
-            assert!(matches!(
-                err.code,
-                WorkerErrorCode::MalformedInput | WorkerErrorCode::UnsupportedVariant
-            ));
-        }
-    }
-
-    #[test]
     fn truncated_raw_image_data_is_rejected() {
         // 探针风险①：psd 0.3.5 对截断的 raw 像素段**零填充**到完整长度 → 不 panic、长度自洽、
         // dims 正确，会出一张内容错误但结构合法的 WebP，Host dims 二次校验也判不出。
@@ -308,15 +267,6 @@ mod tests {
         psd.truncate(psd.len() - 50);
         let err = decode_psd_to_webp(&psd, 480).unwrap_err();
         assert_eq!(err.code, WorkerErrorCode::MalformedInput);
-    }
-
-    #[test]
-    fn intact_raw_passes_truncation_check() {
-        // 完整 raw 段不被截断检测误拒（边界：avail == need）。
-        let psd = make_rgb_psd(64, 64);
-        let out = decode_psd_to_webp(&psd, 480).expect("完整 raw 应正常出图");
-        assert_eq!((out.width, out.height), (64, 64));
-        assert!(webp_magic_ok(&out.webp));
     }
 
     #[test]

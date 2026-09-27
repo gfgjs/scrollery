@@ -2,7 +2,7 @@
 // 批量缩略图请求队列 (§8.3)。收集项目 ID 并以 THUMB_BATCH_SIZE 为批次进行刷新。
 
 import { Channel } from '@tauri-apps/api/core'
-import { invokeIpc } from '../utils/ipc'
+import { generateOperationId, invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import type { ThumbResult } from '../types/media'
 import { IPC } from '../constants/ipc'
@@ -32,6 +32,7 @@ function getOptimalThumbTier(rowHeight: number): number {
 }
 
 type Resolver = (result: ThumbResult) => void
+type ViewportThumbResult = ThumbResult & { pending: boolean }
 
 interface RequestWaiter {
   resolve: Resolver
@@ -44,6 +45,7 @@ interface RequestSlot {
   waiters: RequestWaiter[]
   retryCount: number
   retryTimer: ReturnType<typeof setTimeout> | null
+  cancelInFlight: (() => void) | null
 }
 
 /** 拒绝原因分类:cancelled=调用方主动放弃,不重试;stalled/incomplete=可按上限退避重试。 */
@@ -65,8 +67,6 @@ export function useRequestQueue() {
   const inFlight = new Set<RequestSlot>()
   const activeSlots = new Map<number, RequestSlot>()
 
-  let isFlushing = false
-
   function syncStats() {
     const scan = useScanStore()
     scan.autoThumbQueueSize = queue.length
@@ -75,6 +75,7 @@ export function useRequestQueue() {
 
   function detachSlot(slot: RequestSlot) {
     inFlight.delete(slot)
+    slot.cancelInFlight = null
     if (activeSlots.get(slot.id) === slot) {
       activeSlots.delete(slot.id)
     }
@@ -116,13 +117,14 @@ export function useRequestQueue() {
 
   function flush() {
     flushTimer = null
-    if (queue.length === 0) return
+    const capacity = DEFAULTS.THUMB_BATCH_SIZE - inFlight.size
+    if (queue.length === 0 || capacity <= 0) return
 
-    isFlushing = true
-    const batch = queue.splice(0, DEFAULTS.THUMB_BATCH_SIZE)
+    const batch = queue.splice(0, capacity)
     const batchIds = batch.map((slot) => slot.id)
     const batchSlots = new Map<number, RequestSlot>(batch.map((slot) => [slot.id, slot] as const))
     const pending = new Set(batch)
+    const requestId = generateOperationId().replace(/-/g, '')
     batch.forEach((slot) => {
       slot.state = 'inFlight'
       inFlight.add(slot)
@@ -137,6 +139,25 @@ export function useRequestQueue() {
     // `released` 让 {停滞, finally} 中先到者生效，避免迟到的卡死 invoke 冲掉后续新批。
     let released = false
     let stallTimer: ReturnType<typeof setTimeout> | null = null
+    let accepted = false
+    const cancelledIds = new Set<number>()
+    let cancelTimer: ReturnType<typeof setTimeout> | null = null
+
+    const flushUnsubscribes = () => {
+      cancelTimer = null
+      if (!accepted || cancelledIds.size === 0) return
+      const itemIds = Array.from(cancelledIds)
+      cancelledIds.clear()
+      void invokeIpc(IPC.CANCEL_VIEWPORT_THUMBNAIL_REQUEST, { requestId, itemIds }).catch((err) => {
+        logger.warn(`[useRequestQueue] backend unsubscribe failed: ${err}`)
+      })
+    }
+
+    const unsubscribe = (itemId: number) => {
+      // 取消可早于 IPC 受理；等受理确认后再发，保证后端登记已存在。
+      cancelledIds.add(itemId)
+      if (accepted && cancelTimer === null) cancelTimer = setTimeout(flushUnsubscribes, 0)
+    }
 
     const releaseBatch = (reason: string, rejectErr?: unknown) => {
       if (released) return
@@ -148,16 +169,30 @@ export function useRequestQueue() {
       if (rejectErr !== undefined) {
         for (const slot of Array.from(pending)) {
           pending.delete(slot)
+          unsubscribe(slot.id)
           retryOrRejectSlot(slot, rejectErr)
         }
         logger.warn(`[useRequestQueue] ${reason}`)
       } else {
         logger.debug(`[useRequestQueue] ${reason}`)
       }
-      isFlushing = false
       syncStats()
       if (queue.length > 0) scheduleFlush()
     }
+
+    batch.forEach((slot) => {
+      slot.cancelInFlight = () => {
+        if (!pending.delete(slot)) return
+        unsubscribe(slot.id)
+        rejectSlot(slot, new ThumbRequestError('cancelled', 'cancelled'))
+        syncStats()
+        if (pending.size === 0) {
+          releaseBatch('batch cancelled by requesters')
+        } else if (queue.length > 0) {
+          scheduleFlush()
+        }
+      }
+    })
 
     const armStall = () => {
       if (released) return
@@ -170,7 +205,7 @@ export function useRequestQueue() {
       }, STALL_MS)
     }
 
-    const onResult = new Channel<ThumbResult>()
+    const onResult = new Channel<ViewportThumbResult>()
     onResult.onmessage = (r) => {
       const slot = batchSlots.get(r.itemId)
       if (!slot || !pending.has(slot)) return
@@ -179,8 +214,13 @@ export function useRequestQueue() {
       // 关键点：按本批次的 slot 收尾，而不是按 id 清全局 Map。
       // 这样同一 id 在旧批次结果返回后重新排队时，新 Promise 不会被旧批次误删或误拒绝。
       pending.delete(slot)
-      resolveSlot(slot, r)
+      if (r.pending) {
+        retryOrRejectSlot(slot, new ThumbRequestError('incomplete', 'thumb result pending'))
+      } else {
+        resolveSlot(slot, r)
+      }
       syncStats()
+      if (queue.length > 0) scheduleFlush()
       if (pending.size === 0) {
         releaseBatch('batch drained by item results')
       }
@@ -194,19 +234,25 @@ export function useRequestQueue() {
     const targetSize = getOptimalThumbTier(ui.gridRowHeight * dpr)
     armStall()
 
-    invokeIpc(IPC.BATCH_REQUEST_THUMBNAILS, { itemIds: batchIds, targetSize, onResult })
-      .catch((err) => {
+    // IPC 的成功返回只确认后台已受理；Channel 持续传送最终结果。
+    // 无结果项由后端显式回 pending 并按有限预算重试；通道失联由停滞看门狗重试。
+    void invokeIpc(IPC.BATCH_REQUEST_THUMBNAILS, { itemIds: batchIds, targetSize, requestId, onResult }).then(
+      () => {
+        accepted = true
+        if (cancelledIds.size > 0 && cancelTimer === null) {
+          cancelTimer = setTimeout(flushUnsubscribes, 0)
+        }
+      },
+      (err) => {
         logger.error(`[useRequestQueue] batch failed: ${err}`, { batchIds })
-      })
-      .finally(() => {
-        // 正常完成：关掉看门狗并释放仍挂起的项（如后端跳过的 id）。若停滞看门狗已触发则空操作。
-        releaseBatch('batch finished', new ThumbRequestError('incomplete', 'Batch finished without result'))
-      })
+        releaseBatch('batch invoke failed', new ThumbRequestError('incomplete', 'Batch invoke failed'))
+      },
+    )
   }
 
   function scheduleFlush() {
     if (flushTimer !== null) return
-    if (isFlushing) return
+    if (inFlight.size >= DEFAULTS.THUMB_BATCH_SIZE) return
     flushTimer = setTimeout(flush, 50)
   }
 
@@ -230,6 +276,7 @@ export function useRequestQueue() {
       waiters: [{ resolve, reject }],
       retryCount: 0,
       retryTimer: null,
+      cancelInFlight: null,
     }
     activeSlots.set(id, slot)
     queue.push(slot)
@@ -249,11 +296,8 @@ export function useRequestQueue() {
       rejectSlot(slot, new ThumbRequestError('cancelled', 'cancelled'))
       syncStats()
     } else {
-      // in-flight 请求不能安全地按 id 取消：同一 id 很可能马上重新进入视口。
-      // 这里只取消当前前端等待者，保留后端 single-flight；新 Promise 会挂回同一 slot 并随结果 resolve。
-      slot.waiters.splice(0).forEach((cb) => cb.reject(new ThumbRequestError('cancelled', 'cancelled')))
-      // 原逻辑请求已取消,后来重新加入在途工作的等待者从新的重试预算开始。
-      slot.retryCount = 0
+      // 撤销本批订阅并立即释放前端名额；后台任务由 DB lease 去重，其他请求方不受影响。
+      slot.cancelInFlight?.()
     }
   }
 

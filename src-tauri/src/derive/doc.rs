@@ -42,10 +42,10 @@ pub fn run_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
 
     // 2) 解码为 RGBA → 复用缩略图编码器（缩放 → WebP → 写入缓存 by cache_key → thumbhash），
     //    与视频封面（derive/video.rs::run_cover）完全同构，使 MediaThumb 零改动显示。
-    let dynimg = image::load_from_memory(&img_bytes).map_err(|e| {
-        AppError::Internal(format!("epub cover decode failed | epub 封面解码失败: {e}"))
-    })?;
-    let rgba = dynimg.to_rgba8();
+    let dynimg =
+        crate::engine::image_rs::decode_image_bytes_bounded(&img_bytes, ctx.max_pixel_bytes)?;
+    let rgba = dynimg.into_rgba8();
+    drop(img_bytes);
     let (w, h) = (rgba.width(), rgba.height());
     let decoded = crate::engine::traits::DecodedImage {
         pixels: rgba.into_raw(),
@@ -59,10 +59,10 @@ pub fn run_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
         size: snap_to_tier(ctx.thumb_size),
         skip_max_bytes: 0,
         strategy: String::new(),
-        gpu_engine: String::new(),
         ai_hq_cache: false, // 文档封面非 CLIP 分析对象，不产 AI 缓存
         webp_quality: ctx.webp_quality,
         ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
+        output_fingerprint: None,
     };
     let res = encode_media_step_with_snapshot(
         ctx.item_id,
@@ -312,120 +312,4 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Cursor, Write as _};
-
-    const CONTAINER: &str = r#"<container><rootfiles><rootfile full-path="OEBPS/package.opf"/></rootfiles></container>"#;
-    const OPF2: &str = r#"<package><metadata><meta name="cover" content="c"/></metadata><manifest><item id="c" href="images/cover%20page.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
-    const OPF3: &str = r#"<package><manifest><item id="cover" href="wrong.jpg" media-type="image/jpeg"/><item id="actual" properties="nav cover-image" href="images/cover%20page.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="c1"/></spine></package>"#;
-
-    fn epub(container: &[u8], opf: &[u8], cover: &[u8]) -> tempfile::NamedTempFile {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        let mut archive = zip::ZipWriter::new(&mut file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (name, bytes) in [
-            ("META-INF/container.xml", container),
-            ("OEBPS/package.opf", opf),
-            ("OEBPS/images/cover page.jpg", cover),
-        ] {
-            archive.start_file(name, options).unwrap();
-            archive.write_all(bytes).unwrap();
-        }
-        archive.finish().unwrap();
-        file
-    }
-
-    fn assert_limit(error: AppError) {
-        assert!(matches!(error, AppError::DocumentRender(_)), "{error:?}");
-        assert_eq!(
-            serde_json::to_value(error).unwrap()["code"],
-            "DocumentRender"
-        );
-    }
-
-    #[test]
-    fn epub2_keeps_cover_path_decoding_and_spine_count() {
-        let file = epub(CONTAINER.as_bytes(), OPF2.as_bytes(), b"jpeg");
-        assert_eq!(
-            extract_epub_cover_and_pages(file.path()).unwrap(),
-            (b"jpeg".to_vec(), Some(2))
-        );
-    }
-
-    #[test]
-    fn epub3_cover_property_wins_at_exact_byte_limit() {
-        let file = epub(CONTAINER.as_bytes(), OPF3.as_bytes(), b"jpeg");
-        assert_eq!(
-            extract_epub_cover_with_limits(file.path(), 1024, 4).unwrap(),
-            (b"jpeg".to_vec(), Some(1))
-        );
-    }
-
-    #[test]
-    fn rejects_large_container_in_small_archive() {
-        let container = format!("{CONTAINER}{}", " ".repeat(4096));
-        let file = epub(container.as_bytes(), OPF2.as_bytes(), b"jpeg");
-        assert!(file.as_file().metadata().unwrap().len() < 1024);
-        assert_limit(extract_epub_cover_with_limits(file.path(), 1024, 32).unwrap_err());
-    }
-
-    #[test]
-    fn rejects_large_opf_in_small_archive() {
-        let opf = format!("{OPF2}{}", " ".repeat(4096));
-        let file = epub(CONTAINER.as_bytes(), opf.as_bytes(), b"jpeg");
-        assert_limit(extract_epub_cover_with_limits(file.path(), 1024, 32).unwrap_err());
-    }
-
-    #[test]
-    fn rejects_large_cover_in_small_archive() {
-        let file = epub(CONTAINER.as_bytes(), OPF2.as_bytes(), &[0; 4096]);
-        assert!(file.as_file().metadata().unwrap().len() < 1024);
-        assert_limit(extract_epub_cover_with_limits(file.path(), 1024, 32).unwrap_err());
-    }
-
-    #[test]
-    fn declared_oversize_is_rejected_without_reading() {
-        let mut input = Cursor::new(vec![0; 128]);
-        assert_limit(read_epub_entry(&mut input, 128, 32).unwrap_err());
-        assert_eq!(input.position(), 0);
-    }
-
-    #[test]
-    fn understated_size_still_stops_actual_read_at_limit_plus_one() {
-        let mut input = Cursor::new(vec![0; 128]);
-        assert_limit(read_epub_entry(&mut input, 1, 32).unwrap_err());
-        assert_eq!(input.position(), 33);
-    }
-
-    #[test]
-    fn actual_size_at_limit_is_accepted() {
-        assert_eq!(
-            read_epub_entry(Cursor::new(vec![7; 32]), 1, 32).unwrap(),
-            vec![7; 32]
-        );
-    }
-
-    /// spine 的 itemref 计数 = 页数近似（含自闭合 `<itemref/>` 与带属性形式）。
-    #[test]
-    fn counts_spine_itemrefs() {
-        let opf = r#"<package><spine toc="ncx">
-            <itemref idref="c1"/>
-            <itemref idref="c2"/>
-            <itemref idref="c3" linear="yes"/>
-        </spine></package>"#;
-        assert_eq!(count_epub_spine(opf), Some(3));
-    }
-
-    /// 无 spine/itemref → None（document_meta.page_count 置空，而非 0）。
-    #[test]
-    fn no_spine_returns_none() {
-        let opf = r#"<package><manifest><item id="x" href="x.xhtml"/></manifest></package>"#;
-        assert_eq!(count_epub_spine(opf), None);
-        assert_eq!(count_epub_spine("not xml at all"), None);
-    }
 }

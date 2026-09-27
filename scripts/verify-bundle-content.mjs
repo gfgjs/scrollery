@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 发货闭包内容断言(2026-08-11 起):AI/RAW/video/enhance worker 及其运行时必须随安装包分发。
+// 发货闭包内容断言:AI/RAW/video/enhance/native-thumbnail worker 及其运行时必须随安装包分发。
 // 本脚本防回潮——一旦 externalBin/resources 断链即红。
 //
 // 三层校验:
@@ -36,6 +36,7 @@ const REQUIRED_PAYLOAD = [
   'raw_worker.exe',
   'video_worker.exe',
   'enhance_worker.exe',
+  'native_thumbnail_worker.exe',
 ];
 
 // AGPL-3.0-only 要求随包提供许可证全文与对应源码入口(§4/§6)。
@@ -68,6 +69,8 @@ const REQUIRED_BUNDLE_LEGAL = [
   'legal/graphviz/graphviz-2.40.1-license.txt',
   'legal/graphviz/viz.js-2.1.2-license.txt',
   'legal/lute/lute-1.7.6-license.txt',
+  'legal/libvpl/license',
+  'legal/libvpl/third-party-programs.txt',
   'legal/manifest.json',
 ];
 
@@ -129,6 +132,9 @@ export function checkStaged(binariesDir) {
   if (!names.some((n) => /^video-worker-.+\.exe$/.test(n))) {
     v.push('staging 缺 video-worker-<triple>.exe(跑 npm run build:video-worker)');
   }
+  if (!names.some((n) => /^native-thumbnail-worker-.+\.exe$/.test(n))) {
+    v.push('staging 缺 native-thumbnail-worker-<triple>.exe(跑 npm run build:native-thumbnail-worker)');
+  }
   for (const dll of ['onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']) {
     if (!names.includes(dll)) v.push(`staging 缺 ${dll}(跑 npm run build:ai-worker)`);
   }
@@ -150,6 +156,9 @@ export function checkConfig(conf) {
   }
   if (!ext.includes('binaries/video-worker')) {
     v.push('tauri.conf.json externalBin 缺 binaries/video-worker');
+  }
+  if (!ext.includes('binaries/native-thumbnail-worker')) {
+    v.push('tauri.conf.json externalBin 缺 binaries/native-thumbnail-worker');
   }
   const res = conf?.bundle?.resources ?? {};
   for (const dll of ['onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']) {
@@ -294,16 +303,17 @@ function selftest() {
   expect(normalizeEntryName('ai-worker.exe') === 'ai_worker.exe', '归一化漏转连字符');
   expect(normalizeEntryName('ONNXRUNTIME.DLL') === 'onnxruntime.dll', '归一化漏小写');
   expect(
-    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
+    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
     '载荷检查器对完整载荷误报'
   );
   const missing = checkPayloadEntries(['Bin_raw_worker.exe', 'onnxruntime.dll']);
   expect(missing.includes('ai_worker.exe') && missing.includes('dxil.dll'), '载荷检查器漏检缺项');
   expect(missing.includes('video_worker.exe'), '载荷检查器漏检 video-worker');
   expect(missing.includes('enhance_worker.exe'), '载荷检查器漏检 enhance-worker');
-  expect(missing.length === 6, '载荷检查器缺项计数错误');
+  expect(missing.includes('native_thumbnail_worker.exe'), '载荷检查器漏检 native-thumbnail-worker');
+  expect(missing.length === 7, '载荷检查器缺项计数错误');
   expect(
-    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
+    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
     '载荷检查器对 MSI Bin_ 前缀完整载荷误报'
   );
 
@@ -316,7 +326,7 @@ function selftest() {
   };
   expect(
     checkPayloadEntriesMs(
-      ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe',
+      ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe',
         'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d', 'PathFile_I09b10b5e'],
       [50161992, 49535488, 6523904, 9287261, 25355576, 17986400, 18527544, 1508664],
       msiStaged,
@@ -324,25 +334,25 @@ function selftest() {
     'MSI 匿名化载荷检查器对完整样本(PathFile_+Bin_)误报'
   );
   const msiMissing = checkPayloadEntriesMs(
-    ['app.cab', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe',
+    ['app.cab', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe',
       'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d'],
     [50161992, 6523904, 9287261, 25355576, 17986400, 18527544],
     msiStaged,
   );
   expect(msiMissing.length === 1 && msiMissing[0] === 'dxil.dll', 'MSI 匿名化载荷检查器漏检缺项');
   const msiTruncated = checkPayloadEntriesMs(
-    ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe',
+    ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe',
       'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d', 'PathFile_I09b10b5e'],
     [50161992, 49535488, 6523904, 9287261, 25355576, 17986400, 18527544, 1500000],
     msiStaged,
   );
   expect(msiTruncated.length === 1 && msiTruncated[0] === 'dxil.dll', 'MSI 匿名化载荷检查器漏检截断(尺寸不符)');
 
-  const confOk = { bundle: { externalBin: ['binaries/raw-worker', 'binaries/ai-worker', 'binaries/video-worker', 'binaries/enhance-worker'], resources: { 'binaries/onnxruntime.dll': 'onnxruntime.dll', 'binaries/DirectML.dll': 'DirectML.dll', 'binaries/dxcompiler.dll': 'dxcompiler.dll', 'binaries/dxil.dll': 'dxil.dll', '../LICENSE': 'LICENSE', '../NOTICE.md': 'NOTICE.md', '../SOURCE.md': 'SOURCE.md', '../COMMERCIAL.md': 'COMMERCIAL.md', '../ADDITIONAL-PERMISSION.md': 'ADDITIONAL-PERMISSION.md', '../target/legal': 'legal' } } };
+  const confOk = { bundle: { externalBin: ['binaries/raw-worker', 'binaries/ai-worker', 'binaries/video-worker', 'binaries/enhance-worker', 'binaries/native-thumbnail-worker'], resources: { 'binaries/onnxruntime.dll': 'onnxruntime.dll', 'binaries/DirectML.dll': 'DirectML.dll', 'binaries/dxcompiler.dll': 'dxcompiler.dll', 'binaries/dxil.dll': 'dxil.dll', '../LICENSE': 'LICENSE', '../NOTICE.md': 'NOTICE.md', '../SOURCE.md': 'SOURCE.md', '../COMMERCIAL.md': 'COMMERCIAL.md', '../ADDITIONAL-PERMISSION.md': 'ADDITIONAL-PERMISSION.md', '../target/legal': 'legal' } } };
   expect(checkConfig(confOk).length === 0, 'conf 检查器对完整接线误报');
-  expect(checkConfig({ bundle: { externalBin: ['binaries/raw-worker'], resources: {} } }).length === 13, 'conf 检查器漏检断链');
-  expect(checkLegalEntries(['LICENSE', 'NOTICE.md', 'SOURCE.md', 'COMMERCIAL.md', 'ADDITIONAL-PERMISSION.md', 'legal/foliate-js/LICENSE', 'legal/LibRaw/COPYRIGHT', 'legal/LibRaw/LICENSE.CDDL', 'legal/LibRaw/LICENSE.LGPL', 'legal/onnxruntime/LICENSE', 'legal/onnxruntime/ThirdPartyNotices.txt', 'legal/ffmpeg/LICENSE.md', 'legal/ffmpeg/COPYING.LGPLv2.1', 'legal/ffmpeg/BtbN-LICENSE', 'legal/graphviz/Graphviz-2.40.1-LICENSE.txt', 'legal/graphviz/Viz.js-2.1.2-LICENSE.txt', 'legal/lute/Lute-1.7.6-LICENSE.txt', 'legal/MANIFEST.json']).length === 0, '法律资源归档检查器误报');
-  expect(checkLegalEntries(['LICENSE', 'NOTICE.md']).length === 16, '法律资源归档检查器漏检缺项');
+  expect(checkConfig({ bundle: { externalBin: ['binaries/raw-worker'], resources: {} } }).length === 14, 'conf 检查器漏检断链');
+  expect(checkLegalEntries(['LICENSE', 'NOTICE.md', 'SOURCE.md', 'COMMERCIAL.md', 'ADDITIONAL-PERMISSION.md', 'legal/foliate-js/license', 'legal/libraw/copyright', 'legal/libraw/license.cddl', 'legal/libraw/license.lgpl', 'legal/onnxruntime/license', 'legal/onnxruntime/thirdpartynotices.txt', 'legal/ffmpeg/license.md', 'legal/ffmpeg/copying.lgplv2.1', 'legal/ffmpeg/btbn-license', 'legal/graphviz/graphviz-2.40.1-license.txt', 'legal/graphviz/viz.js-2.1.2-license.txt', 'legal/lute/lute-1.7.6-license.txt', 'legal/libvpl/license', 'legal/libvpl/third-party-programs.txt', 'legal/manifest.json']).length === 0, '法律资源归档检查器误报');
+  expect(checkLegalEntries(['LICENSE', 'NOTICE.md']).length === 18, '法律资源归档检查器漏检缺项');
   expect(checkLegalEntriesMs([10, 20, 30], [{ name: 'LICENSE', size: 10 }, { name: 'NOTICE.md', size: 30 }]).length === 0, 'MSI 法律资源尺寸检查器误报');
   expect(checkLegalEntriesMs([10], [{ name: 'LICENSE', size: 10 }, { name: 'NOTICE.md', size: 30 }]).length === 1, 'MSI 法律资源尺寸检查器漏检');
 

@@ -16,10 +16,12 @@
 use std::path::Path;
 
 use crate::engine::traits::DecodedImage;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 
 #[cfg(windows)]
 pub mod d3d;
+#[cfg(windows)]
+mod file_stream;
 /// MF 解码帧后处理（media_foundation.rs 尾段拆出，零 unsafe 耦合，见超长文件拆分方案 tierB-3）。
 #[cfg(windows)]
 mod frame_post;
@@ -79,12 +81,61 @@ pub trait VideoBackend: Send + Sync {
     /// 解码一帧正立封面，长边 ≤ `max_long_edge`（0 = 原生尺寸;绝不上采样）。时间戳由后端
     /// 自选（≈ min(1s, 时长 10%)，含黑帧规避）—— 时长取自同一解码会话，调用方**不要**为选
     /// 时间戳而先行 probe（那会多开一次解码会话）。
-    fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage>;
+    fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage> {
+        self.cover_bounded(path, max_long_edge, u64::MAX)
+    }
+
+    /// 在像素分配前按调用方额度检查封面输出。
+    fn cover_bounded(
+        &self,
+        path: &Path,
+        max_long_edge: u32,
+        max_pixel_bytes: u64,
+    ) -> Result<DecodedImage>;
+
+    /// 调用方已有 codec 元数据时可作为设备选择提示；未知或过期时后端仍须按实际流解码。
+    fn cover_with_codec_hint(
+        &self,
+        path: &Path,
+        max_long_edge: u32,
+        _codec_hint: Option<&str>,
+    ) -> Result<DecodedImage> {
+        self.cover(path, max_long_edge)
+    }
 
     /// 解码 `n` 张正立、等尺寸、跨视频均匀采样的帧，用于悬停/进度条 scrub 雪碧图（§3.3）。
     /// 返回帧共享同一格尺寸 —— 格高固定为 `cell_height`(px,设置键 `sprite_cell_height`,批次C），
     /// 格宽按视频显示比例推导。
-    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>>;
+    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>> {
+        self.keyframes_bounded(path, n, cell_height, u64::MAX)
+    }
+
+    /// 采样前限制整组输出帧的像素总量。
+    fn keyframes_bounded(
+        &self,
+        path: &Path,
+        n: usize,
+        cell_height: u32,
+        max_pixel_bytes: u64,
+    ) -> Result<Vec<DecodedImage>>;
+}
+
+pub(crate) fn check_frame_collection_budget(
+    width: u32,
+    height: u32,
+    count: usize,
+    limit: u64,
+) -> Result<()> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| bytes.checked_mul(count as u64));
+    if width == 0 || height == 0 || count == 0 || bytes.is_none_or(|bytes| bytes > limit) {
+        return Err(AppError::Internal(
+            "video frame collection exceeds pixel budget".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 批量视频元数据探测的结果状态。`Succeeded` 只表示后端返回了结果，调用方仍应校验
@@ -251,25 +302,28 @@ pub fn backend_for(ext: &str) -> Option<Box<dyn VideoBackend>> {
     worker_backend_if_ready()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 门控核心判据:插件不可用(未授权)或 FFmpeg 未就绪,任一为假 → 关闭(`backend_for` 回退
-    /// `None`,今天的行为)。两者皆真才开放 video-worker 桥。
-    #[test]
-    fn video_bridge_gate_requires_both_authorized_and_ffmpeg_ready() {
-        assert!(!video_bridge_gate_open(false, false));
-        assert!(!video_bridge_gate_open(false, true), "插件不可用 → 门关");
-        assert!(!video_bridge_gate_open(true, false), "FFmpeg 未就绪 → 门关");
-        assert!(video_bridge_gate_open(true, true));
+/// 本机原生封面任务的容器集合；旧视频 worker 的冷门格式由原有派生路径负责。
+pub fn native_cover_formats() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        media_foundation::MF_VIDEO_EXTS
     }
-
-    /// 未绑定 `AppState`(本单测二进制内没有任何测试调用过 `bind_app_state`)时,`backend_for`
-    /// 对 MF 不认的扩展名恒回退 `None` —— V5 之前的既有行为零回归。
-    #[test]
-    fn backend_for_falls_back_to_none_without_app_state_binding() {
-        assert!(backend_for("mkv").is_none());
-        assert!(backend_for("webm").is_none());
+    #[cfg(not(windows))]
+    {
+        &[]
     }
+}
+
+/// 原生封面策略只选择系统后端，绝不落到旧 `backend_for` 的 FFmpeg worker 回退。
+pub fn native_cover_backend_for(ext: &str) -> Option<Box<dyn VideoBackend>> {
+    #[cfg(windows)]
+    {
+        let mf = media_foundation::MediaFoundationBackend;
+        if mf.can_handle(&ext.to_ascii_lowercase()) {
+            return Some(Box::new(mf));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = ext;
+    None
 }

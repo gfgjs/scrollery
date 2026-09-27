@@ -5,15 +5,15 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import puppeteer from 'puppeteer-core'
-import { findBrowser, inspectPage, inspectSourceLinks } from './checks.mjs'
+import { launchGuideBrowser, inspectPage, inspectSourceLinks } from './checks.mjs'
 
 const root = fileURLToPath(new URL('../../', import.meta.url))
 const output = path.join(root, 'docs/architecture/index.html')
 const sampleSource = 'src-tauri/tauri.conf.json'
 const screenshots = path.join(root, '.screenshots/architecture-guide')
 fs.mkdirSync(screenshots, { recursive: true })
-const browser = await puppeteer.launch({ executablePath: findBrowser(), headless: true })
+const session = await launchGuideBrowser()
+const { browser } = session
 const server = http.createServer((request, response) => {
   const files = new Map([
     ['/docs/architecture/index.html', { file: output, type: 'text/html' }],
@@ -139,6 +139,6 @@ try {
   report.runtime = { errors, subresources }
   console.log(JSON.stringify(report, null, 2))
 } finally {
-  await browser.close()
+  await session.close()
   await new Promise((resolve) => server.close(resolve))
 }

@@ -221,8 +221,7 @@ export const useUiStore = defineStore('ui', () => {
     guideSeen.value = val === 'true'
   }
 
-  // 注：thumbStrategy / gpuEngine 此前在此双持（configStore 也持有并镜像至此），但 uiStore 这份
-  // 只被写、从不被读——已删，单一来源归 configStore（S5/T19 去重）。
+  // 缩略图策略由 configStore 持有；uiStore 不再保留同步副本。
 
   // ── 侧边栏 ────────────────────────────────────────────────────────────
   // 侧栏宽度:拖拽期是高频预览(每帧改),故用本地 ref 跟手,松手才经中央服务提交;

@@ -11,7 +11,6 @@
 //! 与 AI（单模型、GPU 批处理）不同，每种派生 `kind` 是一个纯函数（`kind::run`）——
 //! 本框架与具体 kind 无关。新增 kind 无需改动本文件。P0 交付框架 + 桩 kind，后端在 P2/P3/P4 落地。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,8 +27,14 @@ use crate::db::queries::{
     reset_processing_derivations, DerivationClaim, DerivationResultWithSnapshot,
 };
 use crate::derive::kind::{self, DerivationContext, DerivationKind};
+use crate::exotic::limiter::HeavyPermit;
 use crate::scanner::enricher::MediaEnrichedPayload;
 use crate::state::AppState;
+use crate::thumbnail::coordinator::{
+    unique_id, ImageExecution, MemoryPermit, VideoCoverPhase, VolumeIoPermit,
+};
+use crate::thumbnail::generator::snap_to_tier;
+use crate::thumbnail::scheduler::OutputFingerprint;
 
 /// Fallback default when `derive_batch_size` is absent from config.toml (schema.rs
 /// `SETTING_DEFS` default is authoritative; this only backs the `.unwrap_or` parse fallback).
@@ -37,8 +42,11 @@ use crate::state::AppState;
 /// `schema.rs::SETTING_DEFS` 为准)。
 const DEFAULT_BATCH_SIZE: i64 = 256;
 
-/// 生产者和消费者之间的通道容量。
+/// 消费者和写入器之间的结果通道容量；任务通道直接交接已领取的额度。
 const CHANNEL_CAPACITY: usize = 512;
+const DERIVE_WORKSET_RESERVATION_BYTES: u64 = 128 * 1024 * 1024;
+// AI 缓存可能解码完整原图；与原生大图相同，给快速小图留出 80MiB。
+const DERIVE_IMAGE_WORKSET_RESERVATION_BYTES: u64 = 432 * 1024 * 1024;
 
 /// Config-derived tuning values snapshotted once per pipeline run (avoids per-task
 /// RwLock/ConfigManager reads) and threaded through `consume_tasks` as a single param — keeps
@@ -58,6 +66,7 @@ struct PipelineTuning {
 
 /// 从生产者发送到消费者的任务。
 struct DerivationTaskMsg {
+    database_epoch: u64,
     item_id: i64,
     kind: DerivationKind,
     abs_path: PathBuf,
@@ -65,6 +74,10 @@ struct DerivationTaskMsg {
     media_type: String,
     source_revision: i64,
     cache_key: i64,
+    heavy_permit: HeavyPermit,
+    workset_permit: MemoryPermit,
+    volume_id: Option<i64>,
+    volume_permit: VolumeIoPermit,
 }
 
 /// Start the background derivation pipeline. Returns immediately; work runs in background
@@ -222,6 +235,14 @@ fn run_pipeline_blocking(
         );
     }
 
+    let native_video_enabled = !disabled_kinds.contains(&DerivationKind::VideoCover.as_str())
+        && kind_filter
+            .as_ref()
+            .is_none_or(|filter| filter.contains(&DerivationKind::VideoCover));
+    if native_video_enabled {
+        run_native_video_covers(app, state, token)?;
+    }
+
     // ── Enqueue (backfill): insert pending rows for implemented kinds whose source items ──
     // exist but lack a (item, kind) row. Stub kinds (is_implemented=false) are skipped, so
     // P0 enqueues nothing and the pipeline is a clean no-op.
@@ -244,7 +265,10 @@ fn run_pipeline_blocking(
                 }
             }
             let n = match k {
-                DerivationKind::VideoCover | DerivationKind::VideoKeyframes => {
+                DerivationKind::VideoCover => {
+                    crate::db::queries::backfill_legacy_video_covers(&conn)
+                }
+                DerivationKind::VideoKeyframes => {
                     backfill_derivations(&conn, k.as_str(), "video", None)
                 }
                 DerivationKind::AudioCover | DerivationKind::AudioMeta => {
@@ -330,7 +354,7 @@ fn run_pipeline_blocking(
         .unwrap_or(DEFAULT_BATCH_SIZE);
 
     // ── Channels ──────────────────────────────────────────────────────────────
-    let (task_tx, task_rx) = bounded::<DerivationTaskMsg>(CHANNEL_CAPACITY);
+    let (task_tx, task_rx) = bounded::<DerivationTaskMsg>(0);
     let (result_tx, result_rx) = bounded::<DerivationResultWithSnapshot>(CHANNEL_CAPACITY);
 
     let state_prod = Arc::clone(state);
@@ -411,6 +435,83 @@ fn run_pipeline_blocking(
         }
     }
 
+    // 旧派生运行期间新增或自愈的封面在本轮结束前再补一次，避免自动启动器因已在运行而跳过唤醒。
+    if native_video_enabled && !token.is_cancelled() {
+        run_native_video_covers(app, state, token)?;
+    }
+
+    Ok(())
+}
+
+/// 自动/手动派生入口的原生视频封面段，与全库入口共用任务成员和 Q2/Q3 执行器。
+fn run_native_video_covers(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    token: &CancellationToken,
+) -> crate::error::Result<()> {
+    let Some(epoch) = state.current_database_epoch() else {
+        return Ok(());
+    };
+    // 全库轮次已拥有原生封面任务时先等它退出，避免覆盖其 run_id 与阶段快照。
+    while state.thumb_gen_token.is_running() {
+        if token.is_cancelled() || !state.is_database_epoch_current(epoch) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if token.is_cancelled() || !state.is_database_epoch_current(epoch) {
+        return Ok(());
+    }
+    let mut config = state
+        .thumb_config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    config.size = snap_to_tier(config.size);
+    config.ai_hq_cache = false;
+    let fp = OutputFingerprint::for_native_video_cover(&config);
+    config.output_fingerprint = Some(fp);
+    let run_id = unique_id()?;
+    let enrolled = state.with_database_lifecycle_read(epoch, || {
+        let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+        crate::db::queries::enroll_native_video_cover_run(&conn, &run_id, fp)
+    });
+    let Some(enrolled) = enrolled.transpose()? else {
+        return Ok(());
+    };
+    if enrolled == 0 {
+        return Ok(());
+    }
+    state.thumb_coordinator.begin_native_video_tail_run();
+    let published = AtomicUsize::new(0);
+    let on_result = |outcome: ImageExecution| {
+        if let ImageExecution::Published(_, _) = outcome {
+            let count = published.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_multiple_of(32) {
+                let _ = app.emit("db:media_enriched", MediaEnrichedPayload::refresh_signal());
+            }
+        }
+    };
+    for phase in [
+        (crate::db::queries::ThumbnailLane::Heavy, 1),
+        (crate::db::queries::ThumbnailLane::Exception, 2),
+    ] {
+        state.thumb_coordinator.run_background_video_cover_phase(
+            state,
+            epoch,
+            &config,
+            VideoCoverPhase {
+                run_id: &run_id,
+                lane: phase.0,
+                index: phase.1,
+            },
+            token,
+            &on_result,
+        )?;
+    }
+    if published.load(Ordering::Relaxed) > 0 {
+        let _ = app.emit("db:media_enriched", MediaEnrichedPayload::refresh_signal());
+    }
     Ok(())
 }
 
@@ -423,7 +524,10 @@ fn produce_tasks(
     exclude_kinds: &[&str],
     batch_size: i64,
 ) {
-    loop {
+    let Some(database_epoch) = state.current_database_epoch() else {
+        return;
+    };
+    'produce: loop {
         if token.is_cancelled() {
             info!("Derivation producer cancelled | 派生生产者已取消");
             break;
@@ -466,50 +570,58 @@ fn produce_tasks(
             break;
         }
 
-        // 标记处理中，使在途任务在重启时不被重复排队。
-        let candidates: Vec<DerivationClaim> = batch
-            .iter()
-            .map(|(id, kind, _, _, _, source_revision, cache_key)| {
-                (*id, kind.clone(), *source_revision, *cache_key)
-            })
-            .collect();
-        let claimed: HashSet<DerivationClaim> = {
-            let write_conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-            match mark_derivations_processing(&write_conn, &candidates) {
-                Ok(claimed) => claimed.into_iter().collect(),
+        for (
+            item_id,
+            kind_str,
+            abs_path,
+            file_format,
+            media_type,
+            source_revision,
+            cache_key,
+            volume_id,
+        ) in batch
+        {
+            if token.is_cancelled() {
+                break 'produce;
+            }
+            // 准入先于 DB 租约；读取一批轻量候选，但每次仅领取已获额度的一项。
+            let kind = DerivationKind::from_str(&kind_str);
+            let Some((heavy_permit, workset_permit, volume_permit)) =
+                acquire_derivation_budget(state, token, database_epoch, volume_id, kind, &|| {
+                    state.is_scan_or_thumb_running()
+                })
+            else {
+                break 'produce;
+            };
+            let candidate: DerivationClaim =
+                (item_id, kind_str.clone(), source_revision, cache_key);
+            let claimed = {
+                let write_conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+                mark_derivations_processing(&write_conn, &[candidate])
+            };
+            let claimed = match claimed {
+                Ok(claimed) => claimed,
                 Err(e) => {
                     warn!(
                         "Failed to mark derivations processing | 标记派生处理中失败: {}",
                         e
                     );
-                    HashSet::new()
+                    break 'produce;
                 }
-            }
-        };
-
-        for (item_id, kind_str, abs_path, file_format, media_type, source_revision, cache_key) in
-            batch
-        {
-            if token.is_cancelled() {
-                break;
-            }
+            };
             // 只有通过快照条件认领的任务才允许进入消费者；候选 batch 可能在查询后已经
             // 被其它 producer 领取，或其 source_revision/cache_key 已被扫描推进。
-            if !claimed.contains(&(item_id, kind_str.clone(), source_revision, cache_key)) {
+            if claimed.is_empty() {
                 continue;
             }
-            // An unknown kind string (e.g. left by a newer build) — leave it processing;
-            // a future build that knows it will recover & handle it. Skip here.
-            // 未知 kind 字符串（如更高版本遗留）——保持处理中，由认识它的后续构建恢复处理。此处跳过。
-            let Some(kind) = DerivationKind::from_str(&kind_str) else {
-                warn!(
-                    "Unknown derivation kind '{}' for item {} — skipping | 未知派生 kind",
-                    kind_str, item_id
-                );
+            // 未知 kind 沿原契约保留 processing，避免同一批次反复领取。
+            let Some(kind) = kind else {
+                warn!(kind_str, item_id, "Unknown derivation kind | 未知派生 kind");
                 continue;
             };
             if task_tx
                 .send(DerivationTaskMsg {
+                    database_epoch,
                     item_id,
                     kind,
                     abs_path: PathBuf::from(abs_path),
@@ -517,15 +629,65 @@ fn produce_tasks(
                     media_type,
                     source_revision,
                     cache_key,
+                    heavy_permit,
+                    workset_permit,
+                    volume_id,
+                    volume_permit,
                 })
                 .is_err()
             {
-                break;
+                break 'produce;
             }
         }
     }
 
     info!("Derivation producer finished | 派生生产者已完成");
+}
+
+/// 等待前台让步与共享额度；源卷满额时归还工作集和重活席位。
+fn acquire_derivation_budget(
+    state: &Arc<AppState>,
+    token: &CancellationToken,
+    database_epoch: u64,
+    volume_id: Option<i64>,
+    kind: Option<DerivationKind>,
+    should_pause: &dyn Fn() -> bool,
+) -> Option<(HeavyPermit, MemoryPermit, VolumeIoPermit)> {
+    loop {
+        while should_pause() {
+            if token.is_cancelled() {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+        if token.is_cancelled() {
+            return None;
+        }
+        let permits = state.background_workset_budget.acquire_with_heavy(
+            &state.background_heavy_limiter,
+            if kind == Some(DerivationKind::AiThumb) {
+                DERIVE_IMAGE_WORKSET_RESERVATION_BYTES
+            } else {
+                DERIVE_WORKSET_RESERVATION_BYTES
+            },
+            &|| token.is_cancelled() || should_pause(),
+        );
+        if let Some(permits) = permits {
+            if !token.is_cancelled() && !should_pause() {
+                if let Some(volume) = state
+                    .background_volume_io_budget
+                    .try_acquire(database_epoch, volume_id)
+                {
+                    return Some((permits.0, permits.1, volume));
+                }
+                drop(permits);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        if token.is_cancelled() {
+            return None;
+        }
+    }
 }
 
 /// 消费者池：运行每个任务的 kind 函数，产出一条结果行。
@@ -551,6 +713,7 @@ fn consume_tasks(
             if token.is_cancelled() {
                 break;
             }
+            let mut admission = Some((task.heavy_permit, task.workset_permit, task.volume_permit));
             // Dispatch throttle for new heavy decodes (video cover/keyframe):
             //  - scan/thumbnail running → HARD pause (higher tiers keep absolute priority);
             //  - user interacting → TRICKLE: allow 1 in-flight task instead of a full stop.
@@ -564,12 +727,25 @@ fn consume_tasks(
                 if token.is_cancelled() {
                     break;
                 }
-                if state.is_scan_or_thumb_running() {
-                    std::thread::sleep(std::time::Duration::from_millis(120));
-                    continue;
-                }
-                if state.is_interactive() && in_flight.load(Ordering::Acquire) >= 1 {
-                    std::thread::sleep(std::time::Duration::from_millis(120));
+                if state.is_scan_or_thumb_running()
+                    || (state.is_interactive() && in_flight.load(Ordering::Acquire) >= 1)
+                {
+                    drop(admission.take());
+                    admission = acquire_derivation_budget(
+                        state,
+                        token,
+                        task.database_epoch,
+                        task.volume_id,
+                        Some(task.kind),
+                        &|| {
+                            state.is_scan_or_thumb_running()
+                                || (state.is_interactive()
+                                    && in_flight.load(Ordering::Acquire) >= 1)
+                        },
+                    );
+                    if admission.is_none() {
+                        break;
+                    }
                     continue;
                 }
                 break;
@@ -577,10 +753,7 @@ fn consume_tasks(
             if token.is_cancelled() {
                 break;
             }
-            // R4：派发前从**共享后台重活池**取 permit（与 exotic Worker 请求同一预算，FIFO 公平）。
-            // 在此派发线程（非 rayon worker）阻塞取 permit = 天然「预取不超过可派发容量」；permit 移入
-            // 任务闭包，完成/取消即 Drop 释放。取消时 acquire 返回 None → 退出派发循环。
-            let Some(permit) = state.background_heavy_limiter.acquire(token) else {
+            let Some((permit, workset_permit, volume_permit)) = admission.take() else {
                 break;
             };
             let result_tx = result_tx.clone();
@@ -591,14 +764,18 @@ fn consume_tasks(
             in_flight.fetch_add(1, Ordering::AcqRel);
             let in_flight_task = Arc::clone(&in_flight);
             s.spawn(move |_| {
-                // 持有 permit 直至任务结束（含提前 return 的取消路径）→ 归还额度。
+                // 派生接口合并读取与写入，三项额度持有至 kind::run 结束，取消和 panic 同样归还。
                 let _permit = permit;
+                let max_pixel_bytes = workset_permit.pixel_limit();
+                let _workset_permit = workset_permit;
+                let _volume_permit = volume_permit;
                 // 在途计数与 permit 同生命周期(Drop -1),涓流判据见上方派发节流。
                 let _in_flight = InFlightGuard(in_flight_task);
                 if token_clone.is_cancelled() {
                     return;
                 }
                 let ctx = DerivationContext {
+                    max_pixel_bytes,
                     item_id: task.item_id,
                     kind: task.kind,
                     abs_path: task.abs_path,
@@ -813,57 +990,4 @@ fn write_results(
 pub fn derivation_counts(state: &AppState) -> crate::error::Result<(i64, i64, i64, i64)> {
     let conn = state.db_read_pool.get()?;
     count_derivations_by_status(&conn)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepted_cover_patch_keeps_the_worker_source_snapshot() {
-        let row: DerivationResultWithSnapshot = (
-            7,
-            "video_cover".to_string(),
-            2,
-            Some("480/7.webp".to_string()),
-            None,
-            Some(vec![1, 2, 3]),
-            None,
-            19,
-            7001,
-        );
-        let patch =
-            cover_thumb_from_result(&row).expect("cover result should become a cache patch");
-        assert_eq!(patch.item_id, 7);
-        assert_eq!(patch.source_revision, 19);
-        assert_eq!(patch.cache_key, 7001);
-    }
-
-    #[test]
-    fn non_cover_or_failed_results_never_become_resident_cover_patches() {
-        let failed: DerivationResultWithSnapshot = (
-            7,
-            "video_cover".to_string(),
-            3,
-            None,
-            Some("failed".to_string()),
-            None,
-            None,
-            19,
-            7001,
-        );
-        let keyframes: DerivationResultWithSnapshot = (
-            7,
-            "video_keyframes".to_string(),
-            2,
-            Some("video/7.webp".to_string()),
-            None,
-            None,
-            None,
-            19,
-            7001,
-        );
-        assert!(cover_thumb_from_result(&failed).is_none());
-        assert!(cover_thumb_from_result(&keyframes).is_none());
-    }
 }

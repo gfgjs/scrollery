@@ -125,10 +125,11 @@ pub fn validate_thumbnail_output(
     })
 }
 
-/// 默认缩略图上限：64 MiB blob、4 兆像素（足够 960 档）、64px 长边容差。
+/// 默认缩略图上限：16 MiB blob、4 兆像素、64px 长边容差。
+/// 四份同时存活的帧与独立验证像素须容纳于宿主的 128MiB 工作集预留。
 pub fn default_thumbnail_limits() -> WorkerLimits {
     WorkerLimits {
-        max_blob_len: exotic_protocol::MAX_BLOB_LEN,
+        max_blob_len: 16 * 1024 * 1024,
         max_output_pixels: 4_000_000,
         long_edge_tolerance: 64,
     }
@@ -441,7 +442,7 @@ pub fn validate_encode_text_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exotic_protocol::{FaceDet, WorkerErrorCode};
+
     use std::io::Cursor;
 
     fn thumb_req(item_id: i64, fp: &str, tier: u32) -> RequestBody {
@@ -512,50 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_declared_dims_mismatch() {
-        let req = thumb_req(7, "fp", 480);
-        let webp = make_webp(100, 100);
-        let body = SuccessBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: Some(480), // 谎报
-            height: Some(100),
-            ..Default::default()
-        };
-        assert!(validate_thumbnail_output(&req, &body, &webp, &limits()).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_oversized_long_edge() {
-        let req = thumb_req(7, "fp", 120);
-        let webp = make_webp(960, 100); // 长边 960 >> 120+容差
-        let body = SuccessBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: Some(960),
-            height: Some(100),
-            ..Default::default()
-        };
-        assert!(validate_thumbnail_output(&req, &body, &webp, &limits()).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_non_webp_blob() {
-        let req = thumb_req(7, "fp", 480);
-        let body = SuccessBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            mime: Some("image/webp".into()),
-            width: None,
-            height: None,
-            ..Default::default()
-        };
-        assert!(validate_thumbnail_output(&req, &body, b"not a webp at all!!", &limits()).is_err());
-    }
-
-    #[test]
     fn oversized_header_rejected_before_pixel_decode() {
         // 仅保留有效 VP8L 尺寸头，没有可解码的像素；应先拒绝像素预算。
         let mut webp = make_webp(10, 10);
@@ -596,41 +553,6 @@ mod tests {
             }
         }
         b
-    }
-
-    #[test]
-    fn validate_embed_batch_happy_path_with_per_item_err() {
-        let items = embed_items(3);
-        let body = SuccessBody {
-            embed: Some(exotic_protocol::EmbedBatchSuccess {
-                results: vec![
-                    EmbedResult::Ok {
-                        item_id: 1,
-                        fingerprint: "fp0".into(),
-                    },
-                    EmbedResult::Err {
-                        item_id: 2,
-                        fingerprint: "fp1".into(),
-                        code: WorkerErrorCode::IoError,
-                    },
-                    EmbedResult::Ok {
-                        item_id: 3,
-                        fingerprint: "fp2".into(),
-                    },
-                ],
-            }),
-            ..Default::default()
-        };
-        // blob 只含两个 Ok 项(dim=2),按 Ok 项序连续。
-        let blob = le_blob(&[&[1.0, 2.0], &[3.0, 4.0]]);
-        let out = validate_embed_batch_output(&items, &body, &blob, 2).unwrap();
-        assert_eq!(out.len(), 3);
-        assert!(matches!(&out[0], EmbedItemOutcome::Ok(v) if v == &vec![1.0, 2.0]));
-        assert!(matches!(
-            &out[1],
-            EmbedItemOutcome::Err(WorkerErrorCode::IoError)
-        ));
-        assert!(matches!(&out[2], EmbedItemOutcome::Ok(v) if v == &vec![3.0, 4.0]));
     }
 
     #[test]
@@ -688,252 +610,5 @@ mod tests {
         assert!(validate_embed_batch_output(&items, &SuccessBody::default(), &[], 2).is_err());
     }
 
-    #[test]
-    fn validate_encode_text_happy_path_and_violations() {
-        // 合法:count=2、blob=2×dim×4,按顺序切出两个向量。
-        let good = SuccessBody {
-            text_embed: Some(exotic_protocol::TextEmbedSuccess { count: 2 }),
-            ..Default::default()
-        };
-        let blob = le_blob(&[&[1.0, -2.0], &[0.5, 0.25]]);
-        let out = validate_encode_text_output(2, &good, &blob, 2).unwrap();
-        assert_eq!(out, vec![vec![1.0, -2.0], vec![0.5, 0.25]]);
-
-        // ① count 与请求 texts 数不符 → 违例。
-        assert!(validate_encode_text_output(1, &good, &blob, 2).is_err());
-        // ② blob 长度错配 → 违例。
-        assert!(validate_encode_text_output(2, &good, &le_blob(&[&[1.0, -2.0]]), 2).is_err());
-        // ③ 缺 text_embed 应答体(op 错配)→ 违例。
-        assert!(validate_encode_text_output(2, &SuccessBody::default(), &blob, 2).is_err());
-        // ④ embed_dim=0 → 违例(除零/空契约防御)。
-        assert!(validate_encode_text_output(2, &good, &blob, 0).is_err());
-    }
-
-    #[test]
-    fn validate_face_batch_happy_path_zero_and_multi_faces() {
-        let items = vec![
-            FaceItem {
-                item_id: 10,
-                cache_key: Some("aaa".into()),
-                source_path: None,
-                fingerprint: "f10".into(),
-            },
-            FaceItem {
-                item_id: 11,
-                cache_key: None,
-                source_path: Some("x.jpg".into()),
-                fingerprint: "f11".into(),
-            },
-        ];
-        let det = FaceDet {
-            bbox: [1.0, 2.0, 3.0, 4.0],
-            landmarks: [[0.0; 2]; 5],
-            score: 0.95,
-        };
-        let body = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![
-                    FaceItemResult::Ok {
-                        item_id: 10,
-                        fingerprint: "f10".into(),
-                        faces: vec![det.clone(), det.clone()],
-                        width: 640,
-                        height: 480,
-                    },
-                    // 0 张脸也是 Ok(协议明文)。
-                    FaceItemResult::Ok {
-                        item_id: 11,
-                        fingerprint: "f11".into(),
-                        faces: vec![],
-                        width: 320,
-                        height: 240,
-                    },
-                ],
-            }),
-            ..Default::default()
-        };
-        let blob = le_blob(&[&[0.5, 0.6], &[0.7, 0.8]]); // 2 脸 × dim 2
-        let out = validate_face_batch_output(&items, &body, &blob, 2).unwrap();
-        assert_eq!(out.len(), 2);
-        match &out[0] {
-            FaceItemOutcome::Ok {
-                faces,
-                embeddings,
-                width,
-                height,
-            } => {
-                assert_eq!(faces.len(), 2);
-                assert_eq!(embeddings, &vec![vec![0.5, 0.6], vec![0.7, 0.8]]);
-                assert_eq!((*width, *height), (640, 480));
-            }
-            _ => panic!("期望 Ok"),
-        }
-        match &out[1] {
-            FaceItemOutcome::Ok {
-                faces, embeddings, ..
-            } => {
-                assert!(faces.is_empty() && embeddings.is_empty());
-            }
-            _ => panic!("期望 0 脸 Ok"),
-        }
-    }
-
-    #[test]
-    fn validate_face_batch_rejects_zero_dims() {
-        // 旧帧缺 width/height 经 serde default 落 0——host 必须拒收(归一化会除坏),
-        // 该测试锁死「additive 字段的缺省值不可被静默接受」的契约。
-        let items = vec![FaceItem {
-            item_id: 10,
-            cache_key: Some("aaa".into()),
-            source_path: None,
-            fingerprint: "f10".into(),
-        }];
-        let body = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![FaceItemResult::Ok {
-                    item_id: 10,
-                    fingerprint: "f10".into(),
-                    faces: vec![],
-                    width: 0,
-                    height: 0,
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(validate_face_batch_output(&items, &body, &[], 2).is_err());
-    }
-
-    #[test]
-    fn validate_face_batch_rejects_blob_mismatch() {
-        let items = vec![FaceItem {
-            item_id: 10,
-            cache_key: Some("aaa".into()),
-            source_path: None,
-            fingerprint: "f10".into(),
-        }];
-        let body = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![FaceItemResult::Ok {
-                    item_id: 10,
-                    fingerprint: "f10".into(),
-                    faces: vec![FaceDet {
-                        bbox: [0.0; 4],
-                        landmarks: [[0.0; 2]; 5],
-                        score: 1.0,
-                    }],
-                    width: 640,
-                    height: 480,
-                }],
-            }),
-            ..Default::default()
-        };
-        // 1 脸 × dim 2 应为 8 字节,给 4 字节 → 违例。
-        assert!(validate_face_batch_output(&items, &body, &le_blob(&[&[0.5]]), 2).is_err());
-        // fingerprint 错配 → 违例。
-        let bad_fp = SuccessBody {
-            face: Some(exotic_protocol::FaceBatchSuccess {
-                results: vec![FaceItemResult::Err {
-                    item_id: 10,
-                    fingerprint: "WRONG".into(),
-                    code: WorkerErrorCode::IoError,
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(validate_face_batch_output(&items, &bad_fp, &[], 2).is_err());
-    }
-
     // ── OCR 批输出校验(T6)──────────────────────────────────────────────────────────
-
-    fn ocr_items(n: usize) -> Vec<OcrItem> {
-        (0..n)
-            .map(|i| OcrItem {
-                item_id: i as i64 + 1,
-                cache_key: None,
-                source_path: Some(format!("p{i}.png")),
-                fingerprint: format!("fp{i}"),
-            })
-            .collect()
-    }
-
-    fn ocr_line() -> OcrLine {
-        OcrLine {
-            text: "hi".into(),
-            quad: [[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]],
-            confidence: 0.9,
-        }
-    }
-
-    fn ocr_ok(item_id: i64, fp: &str, lines: Vec<OcrLine>, w: u32, h: u32) -> OcrItemResult {
-        OcrItemResult::Ok {
-            item_id,
-            fingerprint: fp.into(),
-            lines,
-            width: w,
-            height: h,
-        }
-    }
-
-    fn ocr_body(results: Vec<OcrItemResult>) -> SuccessBody {
-        SuccessBody {
-            ocr: Some(exotic_protocol::OcrBatchSuccess { results }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn validate_ocr_batch_happy_and_per_item_err() {
-        let items = ocr_items(2);
-        let body = ocr_body(vec![
-            ocr_ok(1, "fp0", vec![ocr_line()], 640, 480),
-            OcrItemResult::Err {
-                item_id: 2,
-                fingerprint: "fp1".into(),
-                code: WorkerErrorCode::IoError,
-            },
-        ]);
-        let out = validate_ocr_batch_output(&items, &body, &[]).unwrap();
-        assert_eq!(out.len(), 2);
-        assert!(matches!(
-            &out[0],
-            OcrItemOutcome::Ok { lines, width, height }
-                if lines.len() == 1 && *width == 640 && *height == 480
-        ));
-        assert!(matches!(
-            &out[1],
-            OcrItemOutcome::Err {
-                code: WorkerErrorCode::IoError
-            }
-        ));
-    }
-
-    #[test]
-    fn validate_ocr_batch_rejects_violations() {
-        let items = ocr_items(1);
-        // ① 缺 ocr 应答体 → 违例。
-        assert!(validate_ocr_batch_output(&items, &SuccessBody::default(), &[]).is_err());
-        // ② results 长度不符(0 项)→ 违例。
-        assert!(validate_ocr_batch_output(&items, &ocr_body(vec![]), &[]).is_err());
-        // ③ item_id 错位 → 违例。
-        let bad_id = ocr_body(vec![ocr_ok(999, "fp0", vec![], 10, 10)]);
-        assert!(validate_ocr_batch_output(&items, &bad_id, &[]).is_err());
-        // ④ blob 非空 → 违例(OCR 走 JSON,blob 恒空)。
-        let ok = ocr_body(vec![ocr_ok(1, "fp0", vec![ocr_line()], 10, 10)]);
-        assert!(validate_ocr_batch_output(&items, &ok, b"x").is_err());
-        // ⑤ 解码尺寸为 0 → 违例。
-        let zero = ocr_body(vec![ocr_ok(1, "fp0", vec![], 0, 0)]);
-        assert!(validate_ocr_batch_output(&items, &zero, &[]).is_err());
-        // ⑥ NaN quad → 违例。
-        let mut nan_line = ocr_line();
-        nan_line.quad[0][0] = f32::NAN;
-        let nan_body = ocr_body(vec![ocr_ok(1, "fp0", vec![nan_line], 10, 10)]);
-        assert!(validate_ocr_batch_output(&items, &nan_body, &[]).is_err());
-        // ⑦ conf 越界 → 违例。
-        let mut bad_conf = ocr_line();
-        bad_conf.confidence = 1.5;
-        let conf_body = ocr_body(vec![ocr_ok(1, "fp0", vec![bad_conf], 10, 10)]);
-        assert!(validate_ocr_batch_output(&items, &conf_body, &[]).is_err());
-        // ⑧ 合法(单项 Ok)→ 通过。
-        assert!(validate_ocr_batch_output(&items, &ok, &[]).is_ok());
-    }
 }

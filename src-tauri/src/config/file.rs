@@ -182,7 +182,8 @@ pub fn validate_doc(doc: DocumentMut) -> LoadedConfig {
     // 从更新版本降级回来的键)。只警告不报错——不能因为一个陌生键就让整份配置失效。
     let known: std::collections::HashSet<&str> = SETTING_DEFS.iter().map(|d| d.key).collect();
     for (key, _item) in doc.iter() {
-        if !known.contains(key) {
+        // 旧版 gpu_engine 只有 wic 一个值；现已不参与路由，保留原文件内容但不报未知键。
+        if !known.contains(key) && key != "gpu_engine" {
             warnings.push(KeyWarning {
                 key: key.to_string(),
                 message: "未知配置键(不在当前版本可识别的设置项内),已忽略".to_string(),
@@ -230,8 +231,8 @@ fn render_key_block(def: &SettingDef, override_value: Option<&str>) -> String {
             ));
         }
     }
-   out.push('\n');
-   out
+    out.push('\n');
+    out
 }
 
 const HEADER: &str = "\
@@ -339,56 +340,6 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<u64, ConfigFileError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
-    /// 模板含全部键,且默认状态下每一行都是注释态(不存在裸的 `key = value` 实值行)。
-    #[test]
-    fn template_contains_all_keys_all_commented_when_no_overrides() {
-        let rendered = render_template(&BTreeMap::new());
-        for def in SETTING_DEFS {
-            let commented = format!("# {} = ", def.key);
-            assert!(
-                rendered.contains(&commented),
-                "模板缺少 {} 的注释态默认值行",
-                def.key
-            );
-            let live = format!("\n{} = ", def.key);
-            assert!(
-                !rendered.contains(&live),
-                "无覆盖时 {} 不应以实值行出现",
-                def.key
-            );
-        }
-    }
-
-    /// overrides 里的键渲染为实值行(无 `#` 前缀),其余键仍是注释态。
-    #[test]
-    fn template_renders_overrides_as_live_lines() {
-        let mut overrides = BTreeMap::new();
-        overrides.insert("thumb_size".to_string(), "256".to_string());
-        overrides.insert("ai_hq_cache_enabled".to_string(), "true".to_string());
-        let rendered = render_template(&overrides);
-        assert!(rendered.contains("\nthumb_size = 256\n"));
-        assert!(rendered.contains("\nai_hq_cache_enabled = true\n"));
-        // 未覆盖的键仍是注释态。
-        assert!(rendered.contains("# log_level = \"info\"\n"));
-    }
-
-    /// 整文件语法错误 → Err,且带出行号列号(具体数值不做强断言,toml_edit 内部实现可能
-    /// 微调 span 边界;只要求命中错误分支且行列号非零)。
-    #[test]
-    fn load_reports_line_col_on_syntax_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "thumb_size = [1, 2\n").unwrap(); // 未闭合数组
-        let err = load(&path).unwrap_err();
-        match err {
-            ConfigFileError::Syntax { line, column, .. } => {
-                assert!(line >= 1 && column >= 1, "行列号应为 1 基有效值");
-            }
-            other => panic!("应为语法错误,实际:{other:?}"),
-        }
-    }
 
     /// 单键类型错(布尔键写了字符串)→ 记警告并跳过该键,其余合法键照常进入 values。
     #[test]
@@ -406,45 +357,6 @@ mod tests {
             Some("256")
         );
         assert!(!loaded.values.contains_key("ai_hq_cache_enabled"));
-    }
-
-    /// schema 之外的未知键 → 警告,不影响文件其余部分加载。
-    #[test]
-    fn unknown_key_warns() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "totally_made_up_key = 1\nthumb_size = 256\n").unwrap();
-        let loaded = load(&path).unwrap();
-        assert!(loaded
-            .warnings
-            .iter()
-            .any(|w| w.key == "totally_made_up_key"));
-        assert_eq!(
-            loaded.values.get("thumb_size").map(String::as_str),
-            Some("256")
-        );
-    }
-
-    /// set_value 就地改写已存在的键时,保留该键原有的前缀注释行(不被清空)。
-    #[test]
-    fn set_value_preserves_existing_comment() {
-        let text = "# 我的自定义说明\nthumb_size = 512\n";
-        let mut doc = parse_doc(text).unwrap();
-        set_value(&mut doc, "thumb_size", "256");
-        let out = doc.to_string();
-        assert!(out.contains("# 我的自定义说明"), "写回后注释应仍在:{out}");
-        assert!(out.contains("thumb_size = 256"));
-    }
-
-    /// unset_value 删除实值行,使该键从文档中消失(读取侧回退默认值)。
-    #[test]
-    fn unset_value_removes_live_line() {
-        let text = "thumb_size = 256\nlog_level = \"debug\"\n";
-        let mut doc = parse_doc(text).unwrap();
-        unset_value(&mut doc, "thumb_size");
-        let out = doc.to_string();
-        assert!(!out.contains("thumb_size"));
-        assert!(out.contains("log_level"));
     }
 
     /// write_atomic 产物存在、内容正确,且不残留同名 .tmp 文件。

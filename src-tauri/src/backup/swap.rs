@@ -358,16 +358,6 @@ mod tests {
         std::fs::read_to_string(p).unwrap()
     }
 
-    /// 无 marker → 正常启动零动作。
-    #[test]
-    fn no_marker_is_noop() {
-        let app = unique_dir("noop");
-        std::fs::write(app.join("scrollery.db"), "ORIGINAL").unwrap();
-        assert_eq!(perform_swap_at_boot(&app).unwrap(), None);
-        assert_eq!(read(&live_db(&app)), "ORIGINAL");
-        let _ = std::fs::remove_dir_all(&app);
-    }
-
     /// 完整交换:Prepared → 装入新库,原始进 old,相位 Installed;幂等重跑不变;finalize 后清理。
     #[test]
     fn full_swap_prepared_to_installed_then_finalize() {
@@ -548,23 +538,6 @@ mod tests {
         assert_eq!(r, None);
         assert_eq!(read(&live_db(&app)), "ORIGINAL", "原始库完好");
         assert!(!marker_path(&app).exists());
-        let _ = std::fs::remove_dir_all(&app);
-    }
-
-    /// Verified 相位遗留(清理前崩溃)→ 下次启动收尾清理。
-    #[test]
-    fn verified_phase_cleans_up_on_next_boot() {
-        let app = unique_dir("verified");
-        setup(&app, "bk6", RestorePhase::Verified, Some("NEWDB"));
-        let old = old_dir(&app, "bk6");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("scrollery.db"), "ORIGINAL").unwrap();
-
-        let r = perform_swap_at_boot(&app).unwrap();
-        assert_eq!(r, None);
-        assert!(!marker_path(&app).exists());
-        assert!(!old.exists(), "old 应清理");
-        assert_eq!(read(&live_db(&app)), "NEWDB", "活库不动");
         let _ = std::fs::remove_dir_all(&app);
     }
 

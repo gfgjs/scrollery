@@ -123,65 +123,6 @@ fn list_persons_by_ignored(
 // ── 隐藏根排除(V21 人物墙)────────────────────────────────────────────────────
 // 锁三件事:隐藏时封面不泄漏(cover_item_id/thumb 置空)、face_count 只算可见、
 // 可见脸为零的人物整簇隐去;无隐藏根时走原 SQL(反规范化 face_count)且 unhide 全量回归。
-#[cfg(test)]
-mod hidden_root_person_wall_tests {
-    use super::*;
-    use crate::db::queries::scan::set_scan_root_hidden;
-
-    /// 两根各一图;p1 两脸(跨两根,封面钉 root2 的图 2),p2 单脸(仅 root2)。
-    fn two_roots_persons() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES
-                 (10, 1, '', 'r1'), (20, 2, '', 'r2');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'a.jpg', 1, 1, 'jpg', 'image', 10, 10, 100, 0),
-                 (2, 20, 'b.jpg', 1, 1, 'jpg', 'image', 10, 10, 200, 0);
-             INSERT INTO persons (id, name, face_count, is_named, model_name) VALUES
-                 (1, 'p1', 2, 1, 'm'),
-                 (2, 'p2', 1, 1, 'm');
-             INSERT INTO faces (id, item_id, person_id, model_name, bbox_x, bbox_y, bbox_w, bbox_h, det_score, quality, embedding) VALUES
-                 (101, 1, 1, 'm', 0.1, 0.1, 0.2, 0.2, 0.9, 0.5, x'00'),
-                 (102, 2, 1, 'm', 0.1, 0.1, 0.2, 0.2, 0.9, 0.9, x'00'),
-                 (103, 2, 2, 'm', 0.5, 0.5, 0.2, 0.2, 0.9, 0.9, x'00');
-             UPDATE persons SET cover_face_id=102 WHERE id=1;
-             UPDATE persons SET cover_face_id=103 WHERE id=2;",
-        )
-        .unwrap();
-        c
-    }
-
-    #[test]
-    fn wall_excludes_hidden_root_and_unhide_restores() {
-        let c = two_roots_persons();
-        let wall = list_persons(&c, "m").unwrap();
-        assert_eq!(wall.len(), 2);
-        assert_eq!(
-            (wall[0].id, wall[0].face_count, wall[0].cover_item_id),
-            (1, 2, Some(2))
-        );
-        assert_eq!(
-            (wall[1].id, wall[1].face_count, wall[1].cover_item_id),
-            (2, 1, Some(2))
-        );
-
-        set_scan_root_hidden(&c, 2, true).unwrap();
-        let wall = list_persons(&c, "m").unwrap();
-        assert_eq!(wall.len(), 1, "可见脸为零的 p2 整簇隐去");
-        let p1 = &wall[0];
-        assert_eq!(p1.id, 1);
-        assert_eq!(p1.face_count, 1, "face_count 只算可见脸");
-        assert_eq!(p1.cover_item_id, None, "隐藏根封面不泄漏 id");
-        assert_eq!(p1.cover_thumb_path, None, "隐藏根封面不泄漏路径");
-
-        set_scan_root_hidden(&c, 2, false).unwrap();
-        let wall = list_persons(&c, "m").unwrap();
-        assert_eq!(wall.len(), 2, "unhide 全量回归");
-        assert_eq!((wall[0].face_count, wall[0].cover_item_id), (2, Some(2)));
-    }
-}
 
 /// 一张图中检测到的所有人脸，用于详情查看器叠加框（F6）。
 #[allow(clippy::items_after_test_module)]

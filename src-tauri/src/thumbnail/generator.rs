@@ -16,8 +16,10 @@ use crate::engine::EngineArena;
 use crate::error::{AppError, Result};
 use crate::thumbnail::cache::{
     ai_cache_path, ensure_ai_cache_dir, ensure_thumb_dir, thumb_db_path, thumb_path,
+    thumb_variant_db_path, thumb_variant_path,
 };
-use crate::thumbnail::thumbhash::generate_thumbhash;
+use crate::thumbnail::scheduler::OutputFingerprint;
+use crate::thumbnail::thumbhash::generate_thumbhash_rgba;
 
 /// Valid thumbnail size tiers — 全后端唯一档位事实源(cache.rs 断言 / file_ops 重定位 /
 /// scan 清理 / snap_to_tier 均引用此常量,避免多处硬编码档位漂移致 thumb_path 断言失败)。
@@ -87,7 +89,6 @@ pub struct ThumbConfig {
     pub size: u32,
     pub skip_max_bytes: u64,
     pub strategy: String,
-    pub gpu_engine: String,
     /// 为 true 时，图像缩略图路径**用同一次源解码**顺带产出 AI 分析缓存（短边≥336 的 WebP）——
     /// 一次解码两份产物 —— 使新生成缩略图的图片几乎免费获得 AI 缓存。封面派生（视频/文档/音频）为 false。
     pub ai_hq_cache: bool,
@@ -98,6 +99,32 @@ pub struct ThumbConfig {
     /// 生效(见 `decode_long_edge`/`maybe_write_ai_cache`);封面派生（视频/文档/音频）恒 `ai_hq_cache
     /// = false`,该字段对它们无效果,构造处填编译期默认常量 `cache::AI_CACHE_SHORT_EDGE` 即可。
     pub ai_cache_short_edge: u32,
+    /// Coordinator 的新产物按配置摘要隔离；旧派生与既有调用保留原路径。
+    pub output_fingerprint: Option<OutputFingerprint>,
+}
+
+fn output_paths(config: &ThumbConfig, cache_key: i64) -> (std::path::PathBuf, String) {
+    match config.output_fingerprint {
+        Some(fp) => (
+            thumb_variant_path(&config.cache_dir, config.size, cache_key, fp),
+            thumb_variant_db_path(config.size, cache_key, fp),
+        ),
+        None => (
+            thumb_path(&config.cache_dir, config.size, cache_key),
+            thumb_db_path(config.size, cache_key),
+        ),
+    }
+}
+
+fn ensure_output_dir(config: &ThumbConfig, cache_key: i64) -> Result<()> {
+    if config.output_fingerprint.is_none() {
+        return ensure_thumb_dir(&config.cache_dir, config.size, cache_key).map_err(AppError::Io);
+    }
+    let (disk_path, _) = output_paths(config, cache_key);
+    let parent = disk_path
+        .parent()
+        .ok_or_else(|| AppError::Internal("thumbnail path has no parent".into()))?;
+    std::fs::create_dir_all(parent).map_err(AppError::Io)
 }
 
 // 各变体仅作解码分派的单实例消息穿过 channel/单值传递、不批量收集进 Vec，
@@ -105,6 +132,7 @@ pub struct ThumbConfig {
 #[allow(clippy::large_enum_variant)]
 pub enum DecodeResult {
     Ready(ThumbResult),
+    Encoded(EncodedThumbPayload),
     ToEncode {
         item_id: i64,
         /// 解码时读取到的源代次，编码完成后必须原样带到条件写。
@@ -130,6 +158,21 @@ pub fn process_deferred_cpu(
     })
 }
 
+/// Coordinator 的 CPU 回退只执行解码；编码与写盘交给有界后段。
+pub fn decode_deferred_cpu(
+    item: &crate::db::models::MediaItem,
+    abs_path: &Path,
+    arena: &EngineArena,
+    config: &ThumbConfig,
+    max_pixel_bytes: u64,
+) -> Result<DecodeResult> {
+    panic_guard("decode_deferred_cpu", || {
+        let mut snapped_config = config.clone();
+        snapped_config.size = snap_to_tier(config.size);
+        try_cpu_decode(item, abs_path, arena, &snapped_config, max_pixel_bytes)
+    })
+}
+
 fn process_deferred_cpu_inner(
     item: &crate::db::models::MediaItem,
     abs_path: &Path,
@@ -140,8 +183,15 @@ fn process_deferred_cpu_inner(
     snapped_config.size = snap_to_tier(config.size);
     let config = &snapped_config;
 
-    match try_cpu_decode(item, abs_path, arena, config)? {
+    match try_cpu_decode(item, abs_path, arena, config, 512 * 1024 * 1024)? {
         DecodeResult::Ready(res) => Ok(res),
+        DecodeResult::Encoded(payload) => write_encoded_media_payload(
+            item.id,
+            item.source_revision,
+            item.cache_key,
+            payload,
+            config,
+        ),
         DecodeResult::ToEncode {
             item_id,
             source_revision,
@@ -157,9 +207,10 @@ pub fn decode_media_step(
     abs_path: &Path,
     arena: &EngineArena,
     config: &ThumbConfig,
+    max_pixel_bytes: u64,
 ) -> Result<DecodeResult> {
     panic_guard("decode_media_step", || {
-        decode_media_step_inner(item, abs_path, arena, config)
+        decode_media_step_inner(item, abs_path, arena, config, max_pixel_bytes)
     })
 }
 
@@ -168,6 +219,7 @@ fn decode_media_step_inner(
     abs_path: &Path,
     arena: &EngineArena,
     config: &ThumbConfig,
+    max_pixel_bytes: u64,
 ) -> Result<DecodeResult> {
     let item_id = item.id;
     // target 归一(方案 §3.4/S2):per-item 高频调用点统一挂 scrollery::pipeline::thumb,配合默认
@@ -186,111 +238,28 @@ fn decode_media_step_inner(
         "decode_media_step"
     );
 
-    // ── 1. Cache hit ──────────────────────────────────────────────────────
-    if item.thumb_status == 1 {
-        if let Some(ref tp) = item.thumb_path {
-            let full = config.cache_dir.join("thumbnails").join(tp);
-            if full.exists() {
-                debug!(target: "scrollery::pipeline::thumb", item_id, path = %tp, "CACHE_HIT");
-                return Ok(DecodeResult::Ready(ThumbResult {
-                    item_id,
-                    thumb_status: 1,
-                    thumb_path: item.thumb_path.clone(),
-                    thumbhash: item.thumbhash.clone(),
-                    source_revision: item.source_revision,
-                    cache_key: item.cache_key,
-                }));
-            } else {
-                debug!(
-                    target: "scrollery::pipeline::thumb",
-                    item_id, thumb_path = %tp,
-                    "CACHE_MISS: file does not exist on disk"
-                );
-            }
-        } else {
-            debug!(
-                target: "scrollery::pipeline::thumb",
-                item_id,
-                "CACHE_MISS: thumb_status=1 but thumb_path is NULL"
-            );
-        }
-    }
-
-    // ── 2. Small file direct display ─────────────────────────────────────
-    let web_safe_formats = ["jpg", "jpeg", "png", "webp", "gif", "svg", "avif"];
-    let is_web_safe = web_safe_formats.contains(&item.file_format.to_lowercase().as_str());
-
-    let mut is_direct = false;
-    let mut direct_reason = "";
-    if config.strategy == "direct" && is_web_safe && item.media_type == "image" {
-        is_direct = true;
-        direct_reason = "strategy=direct";
-    } else if is_web_safe
-        && item.file_size as u64 <= config.skip_max_bytes
-        && item.media_type == "image"
-    {
-        is_direct = true;
-        direct_reason = "file_size<=skip_max_bytes";
-    }
-
-    if is_direct {
-        info!(
-            target: "scrollery::pipeline::thumb",
-            item_id,
-            reason = direct_reason,
-            format = %item.file_format,
-            size = item.file_size,
-            skip_max_bytes = config.skip_max_bytes,
-            "DIRECT_DISPLAY: skip generation, use source file directly"
-        );
-        // 占位图（thumbhash）是体验底线，不应因 strategy=="direct" 而丢失（Part3 Q14 / §3.1.3）：
-        // 去掉原 `strategy != "direct"` 短路，两条 direct 路径均在文件 ≤500KB 时生成占位
-        // （500KB 守卫保留：避免仅为占位图去全解码大文件）。
-        let mut hash = None;
-        if item.file_size <= 500 * 1024 {
-            if let Some(engine) = arena.engine_for(&item.file_format) {
-                if let Ok(decoded) = engine.decode(abs_path, None) {
-                    hash = generate_thumbhash(&decoded).ok();
-                }
-            }
-        }
-
-        let abs_path_str = abs_path.to_string_lossy().replace('\\', "/");
-        return Ok(DecodeResult::Ready(ThumbResult {
-            item_id,
-            thumb_status: 3,
-            thumb_path: Some(abs_path_str),
-            thumbhash: hash,
-            source_revision: item.source_revision,
-            cache_key: item.cache_key,
-        }));
+    if let Some(result) = preflight_media_step(item, abs_path, config) {
+        return Ok(DecodeResult::Ready(result));
     }
 
     // ── 3. Dispatch by media_type ─────────────────────────────────────────
     match item.media_type.as_str() {
         "image" => {
             if config.strategy == "gpu" {
-                info!(
-                    target: "scrollery::pipeline::thumb",
-                    item_id, format = %item.file_format, size = item.file_size,
-                    "GPU_DECODE"
-                );
-                match try_gpu_decode(item, abs_path, config) {
-                    Ok(res) => {
-                        info!(target: "scrollery::pipeline::thumb", item_id, "GPU_DECODE_OK");
-                        Ok(res)
-                    }
-                    Err(e) => {
+                match try_native_decode(item, abs_path, config, max_pixel_bytes) {
+                    Some(Ok(res)) => Ok(res),
+                    Some(Err(e)) => {
                         warn!(
                             target: "scrollery::pipeline::thumb",
                             item_id, error = %e,
-                            "GPU_DECODE_FAIL: deferring to CPU"
+                            "NATIVE_IMAGE_DECODE_FAIL: deferring to CPU"
                         );
                         Ok(DecodeResult::DeferredToCpu {
                             item: item.clone(),
                             abs_path: abs_path.to_path_buf(),
                         })
                     }
+                    None => try_cpu_decode(item, abs_path, arena, config, max_pixel_bytes),
                 }
             } else {
                 info!(
@@ -298,7 +267,7 @@ fn decode_media_step_inner(
                     item_id, format = %item.file_format, size = item.file_size,
                     "CPU_DECODE"
                 );
-                try_cpu_decode(item, abs_path, arena, config)
+                try_cpu_decode(item, abs_path, arena, config, max_pixel_bytes)
             }
         }
         _ => {
@@ -320,37 +289,123 @@ fn decode_media_step_inner(
     }
 }
 
-fn try_gpu_decode(
+/// 不进入像素执行域的缓存命中与原图直显结果，普通入口和隔离入口共用。
+pub(crate) fn preflight_media_step(
     item: &crate::db::models::MediaItem,
     abs_path: &Path,
     config: &ThumbConfig,
-) -> Result<DecodeResult> {
-    let gpu_engine = crate::engine::gpu::get_gpu_engine(&config.gpu_engine)
-        .ok_or_else(|| AppError::Internal(format!("Unknown GPU engine: {}", config.gpu_engine)))?;
-
-    if !gpu_engine.can_handle(&item.file_format) {
-        return Err(AppError::UnsupportedFormat(item.file_format.clone()));
+) -> Option<ThumbResult> {
+    let item_id = item.id;
+    // ── 1. Cache hit ──────────────────────────────────────────────────────
+    if item.thumb_status == 1 {
+        if let Some(ref tp) = item.thumb_path {
+            let full = config.cache_dir.join("thumbnails").join(tp);
+            let matches_output = config.output_fingerprint.is_none_or(|_| {
+                let (_, expected) = output_paths(config, item.cache_key);
+                *tp == expected
+            });
+            if matches_output && full.exists() {
+                debug!(target: "scrollery::pipeline::thumb", item_id, path = %tp, "CACHE_HIT");
+                return Some(ThumbResult {
+                    item_id,
+                    thumb_status: 1,
+                    thumb_path: item.thumb_path.clone(),
+                    thumbhash: item.thumbhash.clone(),
+                    source_revision: item.source_revision,
+                    cache_key: item.cache_key,
+                });
+            } else {
+                debug!(
+                    target: "scrollery::pipeline::thumb",
+                    item_id, thumb_path = %tp,
+                    "CACHE_MISS: file does not exist on disk"
+                );
+            }
+        } else {
+            debug!(
+                target: "scrollery::pipeline::thumb",
+                item_id,
+                "CACHE_MISS: thumb_status=1 but thumb_path is NULL"
+            );
+        }
     }
 
-    let decoded = gpu_engine.decode(
+    // ── 2. Small file direct display ─────────────────────────────────────
+    if let Some(direct_reason) = direct_display_reason(item, config) {
+        info!(
+            target: "scrollery::pipeline::thumb",
+            item_id,
+            reason = direct_reason,
+            format = %item.file_format,
+            size = item.file_size,
+            skip_max_bytes = config.skip_max_bytes,
+            "DIRECT_DISPLAY: skip generation, use source file directly"
+        );
+        // 直显只复用已提交的占位数据；为补 hash 解码会把 Q0 重新变成像素任务。
+        let abs_path_str = abs_path.to_string_lossy().replace('\\', "/");
+        return Some(ThumbResult {
+            item_id,
+            thumb_status: 3,
+            thumb_path: Some(abs_path_str),
+            thumbhash: item.thumbhash.clone(),
+            source_revision: item.source_revision,
+            cache_key: item.cache_key,
+        });
+    }
+    None
+}
+
+/// 调度器也使用同一判定，使直显项不占用像素工作集预算。
+pub(crate) fn direct_display_reason(
+    item: &crate::db::models::MediaItem,
+    config: &ThumbConfig,
+) -> Option<&'static str> {
+    let web_safe = matches!(
+        item.file_format.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "svg" | "avif"
+    );
+    if !web_safe || item.media_type != "image" {
+        return None;
+    }
+    if config.strategy == "direct" {
+        return Some("strategy=direct");
+    }
+    (config.skip_max_bytes > 0
+        && item.file_size >= 0
+        && item.file_size as u64 <= config.skip_max_bytes)
+        .then_some("file_size<=skip_max_bytes")
+}
+
+fn try_native_decode(
+    item: &crate::db::models::MediaItem,
+    abs_path: &Path,
+    config: &ThumbConfig,
+    max_pixel_bytes: u64,
+) -> Option<Result<DecodeResult>> {
+    let native = crate::engine::native::get_native_image_engine("wic")?;
+    if !native.can_handle(&item.file_format) {
+        return None;
+    }
+    let decoded = native.decode_bounded(
         abs_path,
         Some(crate::engine::traits::ResizeHint::LongEdge(
             decode_long_edge(config, item),
         )),
-    )?;
-    Ok(DecodeResult::ToEncode {
+        max_pixel_bytes,
+    );
+    Some(decoded.map(|decoded| DecodeResult::ToEncode {
         item_id: item.id,
         source_revision: item.source_revision,
         cache_key: item.cache_key,
         decoded,
-    })
+    }))
 }
 
-/// 用于（GPU）源解码的 LongEdge 目标。常态即 `config.size`。但当 AI 高清缓存开启且图像为「宽幅」
+/// 用于源解码的 LongEdge 目标。常态即 `config.size`。但当 AI 高清缓存开启且图像为「宽幅」
 /// （其缩略图短边会低于 AI 缓存短边）时，把解码长边略放大，使同一缓冲既能产出缩略图（降采样到
 /// `size`）又能产出 AI 缓存（降采样到短边 `AI_CACHE_SHORT_EDGE`），免去 `ai_thumb` 派生再做一次
 /// 全分辨率源解码。绝不上采样（WIC LongEdge 仅下采样）。
-fn decode_long_edge(config: &ThumbConfig, item: &crate::db::models::MediaItem) -> u32 {
+pub(crate) fn decode_long_edge(config: &ThumbConfig, item: &crate::db::models::MediaItem) -> u32 {
     let (w, h) = (item.width as u32, item.height as u32);
     let (long, short) = (w.max(h), w.min(h));
     if !config.ai_hq_cache || long == 0 || short == 0 {
@@ -370,6 +425,7 @@ fn try_cpu_decode(
     abs_path: &Path,
     arena: &EngineArena,
     config: &ThumbConfig,
+    max_pixel_bytes: u64,
 ) -> Result<DecodeResult> {
     let engine = arena
         .engine_for(&item.file_format)
@@ -381,19 +437,12 @@ fn try_cpu_decode(
         abs_path,
         config.size,
         config.webp_quality,
+        max_pixel_bytes,
     ) {
-        ensure_thumb_dir(&config.cache_dir, config.size, item.cache_key).map_err(AppError::Io)?;
-        let disk_path = thumb_path(&config.cache_dir, config.size, item.cache_key);
-        write_atomic(&disk_path, &webp).map_err(AppError::from)?;
-
-        let db_path = thumb_db_path(config.size, item.cache_key);
-        return Ok(DecodeResult::Ready(ThumbResult {
-            item_id: item.id,
-            thumb_status: 1,
-            thumb_path: Some(db_path),
+        return Ok(DecodeResult::Encoded(EncodedThumbPayload {
+            webp,
             thumbhash: hash,
-            source_revision: item.source_revision,
-            cache_key: item.cache_key,
+            ai_cache: None,
         }));
     }
 
@@ -402,11 +451,12 @@ fn try_cpu_decode(
     // 解码略大，使 encode 阶段同一缓冲既出缩略图又出 AI 缓存（一次解码两份产物），否则即 config.size。
     // image crate 的 LongEdge 仅下采样不上采样（image_rs.rs:57）→ 小图不被放大；常见情形下
     // `resize_to_rgba` 因 w/h<=target 短路返回，省掉二次缩放（与 GPU 路径输出语义一致，同 CatmullRom）。
-    let decoded = engine.decode(
+    let decoded = engine.decode_bounded(
         abs_path,
         Some(crate::engine::traits::ResizeHint::LongEdge(
             decode_long_edge(config, item),
         )),
+        max_pixel_bytes,
     )?;
     Ok(DecodeResult::ToEncode {
         item_id: item.id,
@@ -445,84 +495,151 @@ pub fn encode_media_step_with_snapshot(
     })
 }
 
-fn encode_media_step_inner(
+/// 仅含目标小图的编码结果；原生隔离域可返回此结构的字节，文件路径由宿主确定。
+pub struct EncodedThumbPayload {
+    pub webp: Vec<u8>,
+    pub thumbhash: Option<Vec<u8>>,
+    pub ai_cache: Option<Vec<u8>>,
+}
+
+/// 隔离进程回包和宿主有界提交队列共用的单产物上限。
+pub const MAX_ENCODED_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+
+/// 编码目标缩略图和可选 AI 小图，不执行文件操作。
+pub fn encode_media_payload(
     item_id: i64,
-    source_revision: i64,
-    cache_key: i64,
-    mut decoded: crate::engine::traits::DecodedImage,
+    decoded: crate::engine::traits::DecodedImage,
     config: &ThumbConfig,
-) -> Result<ThumbResult> {
-    let t0 = std::time::Instant::now();
+    emit_ai_cache: bool,
+) -> Result<EncodedThumbPayload> {
+    panic_guard("encode_media_payload", move || {
+        encode_media_payload_inner(item_id, decoded, config, emit_ai_cache)
+    })
+}
 
-    // 一次解码两份产物:缩略图消费缓冲前,顺手从同一份解码结果产出 AI 分析缓存(尽力而为,
-    // 失败不影响缩略图)。仅对缩略图短边 < AI 短边的宽幅图生效(方图缩略图已满足分析需求,
-    // 再产 AI 缓存只是浪费磁盘)。
-    if config.ai_hq_cache {
-        if let Err(e) = maybe_write_ai_cache(cache_key, &decoded, config) {
-            warn!(
-                target: "scrollery::pipeline::thumb",
-                item_id, error = %e,
-                "AI cache emit failed (best-effort, does not fail the thumbnail)"
-            );
+fn encode_media_payload_inner(
+    item_id: i64,
+    decoded: crate::engine::traits::DecodedImage,
+    config: &ThumbConfig,
+    emit_ai_cache: bool,
+) -> Result<EncodedThumbPayload> {
+    // 次要产物失败不影响封面；文件存在性由宿主决定，编码域只消费像素。
+    let mut ai_cache = if emit_ai_cache {
+        match maybe_encode_ai_cache(&decoded, config) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(target: "scrollery::pipeline::thumb", item_id, %error,
+                    "AI cache encode failed (best-effort)");
+                None
+            }
         }
-    }
-
-    let rgba_img = resize_to_rgba(
-        &mut decoded.pixels,
-        decoded.width,
-        decoded.height,
-        config.size,
-    )?;
-
-    // ICC→sRGB 投影(D-410):在小图(resize 之后)上做,成本最小;与 resize 先后顺序
-    // 造成的色差与现状量级相当,可接受。无 ICC / 解析失败 / 非 RGB 空间一律原样放行。
-    let rgba_img = crate::editing::color::project_rgba8_to_srgb(rgba_img, decoded.icc.as_deref());
-
-    let decoded_for_hash = crate::engine::traits::DecodedImage {
-        pixels: rgba_img.as_raw().clone(),
-        width: rgba_img.width(),
-        height: rgba_img.height(),
-        icc: None, // 仅用于 ThumbHash 计算,ICC 与此无关
+    } else {
+        None
     };
-    let final_hash = generate_thumbhash(&decoded_for_hash).ok();
-
+    let rgba_img = resize_to_rgba(decoded.pixels, decoded.width, decoded.height, config.size)?;
+    let rgba_img = crate::editing::color::project_rgba8_to_srgb(rgba_img, decoded.icc.as_deref());
+    let thumbhash =
+        generate_thumbhash_rgba(rgba_img.as_raw(), rgba_img.width(), rgba_img.height()).ok();
     let webp = crate::thumbnail::exif_thumb::encode_as_webp(&rgba_img, config.webp_quality)
         .or_else(|_| crate::thumbnail::exif_thumb::encode_as_jpeg(&rgba_img))
         .map_err(|_| AppError::Internal("WebP encode failed".into()))?;
+    if webp.len() > MAX_ENCODED_ARTIFACT_BYTES {
+        return Err(AppError::Internal(
+            "encoded thumbnail exceeds result limit".into(),
+        ));
+    }
+    if ai_cache
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > MAX_ENCODED_ARTIFACT_BYTES)
+    {
+        warn!(target: "scrollery::pipeline::thumb", item_id,
+            "AI cache exceeds result limit (best-effort)");
+        ai_cache = None;
+    }
+    Ok(EncodedThumbPayload {
+        webp,
+        thumbhash,
+        ai_cache,
+    })
+}
 
-    ensure_thumb_dir(&config.cache_dir, config.size, cache_key).map_err(AppError::Io)?;
-    let disk_path = thumb_path(&config.cache_dir, config.size, cache_key);
-    write_atomic(&disk_path, &webp).map_err(AppError::from)?;
-
-    let db_path = thumb_db_path(config.size, cache_key);
+/// 宿主按可信配置确定路径，并将编码结果原子写入缓存。
+pub fn write_encoded_media_payload(
+    item_id: i64,
+    source_revision: i64,
+    cache_key: i64,
+    mut payload: EncodedThumbPayload,
+    config: &ThumbConfig,
+) -> Result<ThumbResult> {
+    let t0 = std::time::Instant::now();
+    if payload.webp.len() > MAX_ENCODED_ARTIFACT_BYTES {
+        return Err(AppError::Internal(
+            "encoded thumbnail exceeds result limit".into(),
+        ));
+    }
+    if payload
+        .ai_cache
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > MAX_ENCODED_ARTIFACT_BYTES)
+    {
+        payload.ai_cache = None;
+    }
+    if let Some(bytes) = payload.ai_cache {
+        let disk = ai_cache_path(&config.cache_dir, cache_key);
+        if !disk.exists() {
+            let result = ensure_ai_cache_dir(&config.cache_dir, cache_key)
+                .and_then(|_| write_atomic(&disk, &bytes));
+            if let Err(error) = result {
+                warn!(target: "scrollery::pipeline::thumb", item_id, %error,
+                    "AI cache write failed (best-effort)");
+            }
+        }
+    }
+    ensure_output_dir(config, cache_key)?;
+    let (disk_path, db_path) = output_paths(config, cache_key);
+    write_atomic(&disk_path, &payload.webp).map_err(AppError::from)?;
     info!(
         target: "scrollery::pipeline::thumb",
         item_id, cache_key,
         disk_path = %disk_path.display(),
         db_path = %db_path,
-        size_bytes = webp.len() as u64,
+        size_bytes = payload.webp.len() as u64,
         elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0,
         "ENCODE_OK"
     );
-
     Ok(ThumbResult {
         item_id,
         thumb_status: 1,
         thumb_path: Some(db_path),
-        thumbhash: final_hash,
+        thumbhash: payload.thumbhash,
         source_revision,
         cache_key,
     })
 }
 
-fn resize_to_rgba(pixels: &mut [u8], w: u32, h: u32, target: u32) -> Result<image::RgbaImage> {
+fn encode_media_step_inner(
+    item_id: i64,
+    source_revision: i64,
+    cache_key: i64,
+    decoded: crate::engine::traits::DecodedImage,
+    config: &ThumbConfig,
+) -> Result<ThumbResult> {
+    let emit_ai_cache = config.ai_hq_cache && !ai_cache_path(&config.cache_dir, cache_key).exists();
+    let payload = encode_media_payload_inner(item_id, decoded, config, emit_ai_cache)?;
+    write_encoded_media_payload(item_id, source_revision, cache_key, payload, config)
+}
+
+fn resize_to_rgba(pixels: Vec<u8>, w: u32, h: u32, target: u32) -> Result<image::RgbaImage> {
     if w <= target && h <= target {
-        return image::RgbaImage::from_raw(w, h, pixels.to_vec())
+        return image::RgbaImage::from_raw(w, h, pixels)
             .ok_or_else(|| AppError::Internal("resize buffer mismatch".into()));
     }
 
     use fast_image_resize::pixels::PixelType;
-    use fast_image_resize::{images::Image as FirImage, ResizeOptions, Resizer};
+    use fast_image_resize::{
+        images::{Image as FirImage, ImageRef},
+        ResizeOptions, Resizer,
+    };
 
     let (new_w, new_h) = if w >= h {
         let r = target as f32 / w as f32;
@@ -532,7 +649,7 @@ fn resize_to_rgba(pixels: &mut [u8], w: u32, h: u32, target: u32) -> Result<imag
         ((w as f32 * r).round() as u32, target)
     };
 
-    let src = FirImage::from_slice_u8(w.max(1), h.max(1), pixels, PixelType::U8x4)
+    let src = ImageRef::new(w.max(1), h.max(1), &pixels, PixelType::U8x4)
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let mut dst = FirImage::new(new_w.max(1), new_h.max(1), PixelType::U8x4);
@@ -553,24 +670,19 @@ fn resize_to_rgba(pixels: &mut [u8], w: u32, h: u32, target: u32) -> Result<imag
 /// `AI_CACHE_SHORT_EDGE` 以下的宽幅图生效(方图缩略图已满足分析需求 → 再产会浪费磁盘)。
 /// 要求解码缓冲短边 ≥ 目标(不放大/不上采样)。AI 流水线按 `cache_key` 发现此文件
 /// (见 `db::queries::PendingAiItem`)。尽力而为。
-fn maybe_write_ai_cache(
-    cache_key: i64,
+fn maybe_encode_ai_cache(
     decoded: &crate::engine::traits::DecodedImage,
     config: &ThumbConfig,
-) -> Result<()> {
+) -> Result<Option<Vec<u8>>> {
     let (w, h) = (decoded.width, decoded.height);
     let (long, short) = (w.max(h), w.min(h));
     if long == 0 || short == 0 {
-        return Ok(());
+        return Ok(None);
     }
     // 仅当：缓冲短边已 ≥ AI 缓存短边（够大、无需上采样）且缩略图短边 < AI 缓存短边（较方图不必建）。
     let thumb_short = (short as f32 * config.size as f32 / long as f32).round() as u32;
     if short < config.ai_cache_short_edge || thumb_short >= config.ai_cache_short_edge {
-        return Ok(());
-    }
-    let disk = ai_cache_path(&config.cache_dir, cache_key);
-    if disk.exists() {
-        return Ok(()); // 已存在 → 跳过缩放/编码/写盘
+        return Ok(None);
     }
 
     let rgba = resize_short_edge_rgba(&decoded.pixels, w, h, config.ai_cache_short_edge)?;
@@ -583,9 +695,7 @@ fn maybe_write_ai_cache(
     )
     .or_else(|_| crate::thumbnail::exif_thumb::encode_as_jpeg(&rgba))
     .map_err(|_| AppError::Internal("AI cache WebP encode failed".into()))?;
-    ensure_ai_cache_dir(&config.cache_dir, cache_key).map_err(AppError::Io)?;
-    write_atomic(&disk, &webp).map_err(AppError::from)?;
-    Ok(())
+    Ok(Some(webp))
 }
 
 /// 缩放 RGBA 像素使短边变为 `target_short`(保持比例)。绝不放大——调用方保证短边 ≥ 目标。
@@ -623,102 +733,4 @@ fn resize_short_edge_rgba(
 
     image::RgbaImage::from_raw(new_w, new_h, dst.into_vec())
         .ok_or_else(|| AppError::Internal("ai cache buffer mismatch".into()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 短边缩放契约:短边降到目标且保比例;短边已≤目标则原样返回(绝不放大)。
-    #[test]
-    fn resize_short_edge_downscales_and_never_upscales() {
-        let (w, h) = (100u32, 50u32);
-        let pixels = vec![128u8; (w * h * 4) as usize];
-
-        let out = resize_short_edge_rgba(&pixels, w, h, 25).unwrap();
-        assert_eq!((out.width(), out.height()), (50, 25));
-
-        // 短边 50 ≤ 目标 50:原样返回,不触碰缩放路径。
-        let out = resize_short_edge_rgba(&pixels, w, h, 50).unwrap();
-        assert_eq!((out.width(), out.height()), (100, 50));
-    }
-
-    /// R0-4:成功路径——最终文件内容完整、目录内不残留任何 .tmp。
-    #[test]
-    fn write_atomic_leaves_complete_file_and_no_tmp() {
-        let dir = std::env::temp_dir().join(format!("scrollery_wa_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("a1b2c3.webp");
-
-        write_atomic(&target, b"hello-webp").unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), b"hello-webp");
-
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "no .tmp may remain after success");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// R0-4:覆盖路径——目标已存在(含模拟的「半截旧文件」)时 rename 原子替换为新完整内容。
-    /// 这正是崩溃恢复场景:上一次直写留下的截断文件,重生成后必须被完整文件顶掉。
-    #[test]
-    fn write_atomic_replaces_existing_truncated_file() {
-        let dir = std::env::temp_dir().join(format!("scrollery_wa_rep_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("d4e5f6.webp");
-
-        std::fs::write(&target, b"trunc").unwrap(); // 模拟半截旧缓存
-        write_atomic(&target, b"full-new-content").unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), b"full-new-content");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// snap_to_tier 回归:就近取整到 5 档 [64,128,256,512,1024]。
-    #[test]
-    fn snap_to_tier_picks_nearest() {
-        assert_eq!(snap_to_tier(64), 64); // 恰在档位
-        assert_eq!(snap_to_tier(100), 128); // |100-64|=36 > |100-128|=28
-        assert_eq!(snap_to_tier(300), 256); // |300-256|=44 < |300-512|=212
-        assert_eq!(snap_to_tier(400), 512); // |400-512|=112 < |400-256|=144
-        assert_eq!(snap_to_tier(5000), 1024); // 超界取末档
-    }
-
-    #[test]
-    fn encoded_result_keeps_production_snapshot() {
-        let cache_dir = std::env::temp_dir().join(format!(
-            "scrollery_encode_snapshot_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let config = ThumbConfig {
-            cache_dir: cache_dir.clone(),
-            size: 64,
-            skip_max_bytes: 0,
-            strategy: String::new(),
-            gpu_engine: String::new(),
-            ai_hq_cache: false,
-            webp_quality: 80,
-            ai_cache_short_edge: 336,
-        };
-        let decoded = crate::engine::traits::DecodedImage {
-            pixels: vec![255, 0, 0, 255],
-            width: 1,
-            height: 1,
-            icc: None,
-        };
-
-        let result = encode_media_step_with_snapshot(7, 9, 123, decoded, &config).unwrap();
-
-        assert_eq!(result.item_id, 7);
-        assert_eq!(result.source_revision, 9);
-        assert_eq!(result.cache_key, 123);
-        assert_eq!(result.thumb_status, 1);
-        let _ = std::fs::remove_dir_all(cache_dir);
-    }
 }

@@ -13,6 +13,7 @@ pub mod core;
 pub mod manifest;
 pub mod naming;
 mod source;
+pub(crate) use source::open as open_authorized_source;
 
 pub use core::{
     ensure_target_writable, is_inside_library, run_export, ExportConflict, ExportItemResult,

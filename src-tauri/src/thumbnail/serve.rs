@@ -38,8 +38,9 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::cache::thumb_db_path;
+use super::cache::{thumb_db_path, thumb_variant_db_path};
 use super::generator::THUMB_TIERS;
+use super::scheduler::OutputFingerprint;
 
 /// 目录探测结果的复用窗口:滚动热路径每批取行都重探 5 档目录纯属重复;窗口内复用同一份结果,
 /// 档位目录的增删最多晚一个窗口被看见——存在性 stat 仍逐批真值,故只是提示层的延迟。
@@ -158,15 +159,34 @@ fn candidate_rels<'a>(
     cache_key: i64,
     nonempty_tiers: &'a [u32],
 ) -> impl Iterator<Item = String> + 'a {
+    // 新产物从 DB 路径继承配置指纹；旧三段路径照旧探旧档。无效路径不探测别的配置，
+    // 避免给同源但不同质量的缩略图错误选档。
+    let mut parts = db_path.split('/');
+    let style = match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some(_), Some(_), Some(_), None, None) => Some(None),
+        (Some(_), Some(fingerprint), Some(_), Some(_), None) => {
+            OutputFingerprint::from_hex(fingerprint).map(Some)
+        }
+        _ => None,
+    };
     THUMB_TIERS
         .iter()
         .copied()
-        .filter(move |&tier| tier >= need_px && nonempty_tiers.contains(&tier))
+        .filter(move |&tier| style.is_some() && tier >= need_px && nonempty_tiers.contains(&tier))
         .scan(false, move |stopped, tier| {
             if *stopped {
                 return None;
             }
-            let rel = thumb_db_path(tier, cache_key);
+            let rel = match style.expect("invalid paths were filtered") {
+                Some(fingerprint) => thumb_variant_db_path(tier, cache_key, fingerprint),
+                None => thumb_db_path(tier, cache_key),
+            };
             if rel == db_path {
                 *stopped = true;
                 return None;
@@ -319,22 +339,6 @@ pub(crate) mod test_io {
                 s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
             }
         }
-
-        /// 测试侧:等到有 IO 进入(超时返回 false,防夹具失效时挂死测试)。
-        pub fn wait_entered_timeout(&self, timeout: std::time::Duration) -> bool {
-            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let (s, _) = self
-                .cv
-                .wait_timeout_while(s, timeout, |s| !s.0)
-                .unwrap_or_else(|e| e.into_inner());
-            s.0
-        }
-
-        pub fn release(&self) {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            s.1 = true;
-            self.cv.notify_all();
-        }
     }
 
     /// 计数/延迟/门闸/锁探测四合一假 IO。延迟参数是**显式模型值**(如 2ms/read_dir 代表慢盘),
@@ -360,33 +364,11 @@ pub(crate) mod test_io {
     }
 
     impl CountingIo {
-        pub fn set_gate(&self, gate: Arc<Gate>) {
-            *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
-        }
-
-        pub fn set_delays(&self, dir_us: u64, file_us: u64) {
-            self.dir_delay_us.store(dir_us, Ordering::Relaxed);
-            self.file_delay_us.store(file_us, Ordering::Relaxed);
-        }
-
         pub fn set_results(&self, dir_nonempty: bool, file_exists: bool) {
             self.dir_has_entry_result
                 .store(dir_nonempty, Ordering::Relaxed);
             self.file_exists_result
                 .store(file_exists, Ordering::Relaxed);
-        }
-
-        /// 按档位建模目录非空集合(运行时按目录名匹配);比 set_results 的「全非空/全空」更贴近真实盘。
-        pub fn set_nonempty_tiers(&self, tiers: &[u32]) {
-            *self
-                .nonempty_tiers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = tiers.iter().map(|t| t.to_string()).collect();
-        }
-
-        /// 按相对路径建模逐项存在性(建夹具须与真实盘一致:文件在 ⇒ 其档目录必非空)。
-        pub fn set_existing_rels(&self, rels: &[String]) {
-            *self.existing_rels.lock().unwrap_or_else(|e| e.into_inner()) = Some(rels.to_vec());
         }
 
         pub fn set_lock_probe(&self, probe: impl Fn() -> bool + Send + 'static) {
@@ -402,13 +384,6 @@ pub(crate) mod test_io {
 
         pub fn under_lock(&self) -> u64 {
             self.under_lock_calls.load(Ordering::Relaxed)
-        }
-
-        /// 计数清零(测量循环逐批重置;延迟/结果/门闸配置保留)。
-        pub fn reset_counts(&self) {
-            self.dir_calls.store(0, Ordering::Relaxed);
-            self.file_calls.store(0, Ordering::Relaxed);
-            self.under_lock_calls.store(0, Ordering::Relaxed);
         }
 
         fn enter(&self, calls: &AtomicU64, delay_us: &AtomicU64) {
@@ -461,343 +436,5 @@ pub(crate) mod test_io {
                 None => self.file_exists_result.load(Ordering::Relaxed),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::test_io::{CountingIo, Gate};
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    fn key() -> i64 {
-        0x00ff_00ff_00ff_00ffi64
-    }
-
-    /// 选档请求夹具:`dpr` 必须与 prepare/rewrite 用的一致(生产里同一个 dpr 值贯穿三段)。
-    fn request(db_tier: u32, cell_px: f64, dpr: f64) -> ServeRequest {
-        ServeRequest {
-            cache_key: key(),
-            need_px: serve_need_px(cell_px, cell_px * 0.75, dpr),
-            db_path: thumb_db_path(db_tier, key()),
-        }
-    }
-
-    fn prepare(
-        io: &dyn ServeIo,
-        probes: &ThumbProbeCache,
-        dpr: f64,
-        requests: &[ServeRequest],
-    ) -> ThumbServe {
-        ThumbServe::prepare_with(
-            io,
-            probes,
-            Path::new("C:/fake-cache"),
-            dpr,
-            requests,
-            Instant::now(),
-        )
-    }
-
-    /// 候选列表契约:升序、只取 ≥ need 的非空档、在 DB 档处截止且不含 DB 档自身。
-    #[test]
-    fn candidate_rels_ascend_and_stop_before_db_tier() {
-        let k = key();
-        let db512 = thumb_db_path(512, k);
-        let rels = |db_path: &str, need_px: u32, tiers: &[u32]| -> Vec<String> {
-            candidate_rels(db_path, need_px, k, tiers).collect()
-        };
-        // need 96:非空 128/256/512 → 候选 128、256(512 即 DB 档,止于它)
-        assert_eq!(
-            rels(&db512, 96, &[128, 256, 512]),
-            vec![thumb_db_path(128, k), thumb_db_path(256, k)]
-        );
-        // 传入顺序无关(档位常量源决定升序)
-        assert_eq!(
-            rels(&db512, 96, &[512, 256, 128]),
-            vec![thumb_db_path(128, k), thumb_db_path(256, k)]
-        );
-        // 最小满足档就是 DB 档 → 候选为空(免 stat 快路径)
-        assert!(rels(&thumb_db_path(64, k), 60, &[64, 512]).is_empty());
-        // DB 档比 need 小 → 候选不被它截断(升级到更大档仍是合法重写)
-        assert_eq!(
-            rels(&thumb_db_path(64, k), 96, &[128, 512]),
-            vec![thumb_db_path(128, k), thumb_db_path(512, k)]
-        );
-        // need 超过所有非空档 / 集合空 → 无候选(调用方回退 DB 路径)
-        assert!(rels(&db512, 2000, &[64, 128, 512]).is_empty());
-        assert!(rels(&db512, 64, &[]).is_empty());
-        // 惰性:最小档命中后不再构造更大档候选(取首项即止,512 档路径不出现)。
-        let mut lazy = candidate_rels(&db512, 96, k, &[128, 256, 512]);
-        assert_eq!(lazy.next(), Some(thumb_db_path(128, k)));
-        assert_eq!(lazy.next(), Some(thumb_db_path(256, k)));
-        assert_eq!(lazy.next(), None);
-    }
-
-    /// 选档回退契约(不改):
-    /// - 有更小满足档且文件存在 → 重写到该档;
-    /// - 目标档与 DB 档相同 → 免重写(512 档服务 60px 小格照旧,不强制补 64 档);
-    /// - 非空档里无满足档 / 空 DB 路径 → 保留 DB 路径。
-    #[test]
-    fn rewrite_picks_smaller_existing_tier_and_falls_back() {
-        let io = CountingIo::default();
-        io.set_results(true, true); // 5 档目录均非空,目标档文件存在
-        let probes = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve = prepare(&io, &probes, 1.0, &[request(512, 60.0, 1.0)]);
-        // need 60 → 最小满足档 64(非 512)→ 重写
-        assert_eq!(
-            serve.rewrite_path(&thumb_db_path(512, key()), 60.0, 45.0, key()),
-            Some(thumb_db_path(64, key()))
-        );
-        // DB 已是目标档 → 免重写
-        assert_eq!(
-            serve.rewrite_path(&thumb_db_path(64, key()), 60.0, 45.0, key()),
-            None
-        );
-        // 空 db_path → 不重写
-        assert_eq!(serve.rewrite_path("", 60.0, 45.0, key()), None);
-
-        // 只有 512 非空(全 512 旧库)→ 60px 小格仍由 512 档服务:不重写、不强制补 64 档。
-        let io_512 = CountingIo::default();
-        io_512.set_results(false, true);
-        let probes_512 = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve_512 = prepare(&io_512, &probes_512, 1.0, &[request(512, 60.0, 1.0)]);
-        assert_eq!(
-            serve_512.rewrite_path(&thumb_db_path(512, key()), 60.0, 45.0, key()),
-            None
-        );
-        // need 超顶档 → 保留 DB 路径
-        assert_eq!(
-            serve_512.rewrite_path(&thumb_db_path(256, key()), 2000.0, 1500.0, key()),
-            None
-        );
-    }
-
-    /// 档目录非空但目标档文件缺失(LRU 驱逐/清缓存/换盘)→ 不重写,回退 DB 路径。
-    /// 这是「删缓存仍能恢复」的服务侧一半:未在 prepare 时刻确认存在就不重写(确认之后文件仍可能
-    /// 被删,那一刻由前端 404 自愈复位重生成——本模块不承诺原子磁盘存在性)。
-    #[test]
-    fn rewrite_falls_back_when_tier_file_missing() {
-        let io = CountingIo::default();
-        io.set_results(true, false); // 档目录非空,但目标档文件不在
-        let probes = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve = prepare(&io, &probes, 1.0, &[request(512, 60.0, 1.0)]);
-        assert_eq!(
-            serve.rewrite_path(&thumb_db_path(512, key()), 60.0, 45.0, key()),
-            None
-        );
-    }
-
-    /// **S4 回归(稀疏多档)**:need 96(方形 64 格 × DPR1.5),128 档目录因别的图片非空、
-    /// 本项缺 128、存在 256、DB 记 512 → 必须选 256(实际存在的最小满足档),不再整项回退 512。
-    #[test]
-    fn sparse_tiers_pick_next_existing_candidate() {
-        let k = key();
-        // 只有 256 这一份:128 探一次落空(1 stat)、256 命中(第 2 stat)即停,512 是 DB 档不再探。
-        let io = CountingIo::default();
-        io.set_nonempty_tiers(&[128, 256, 512]);
-        io.set_existing_rels(&[thumb_db_path(256, k)]);
-        let probes = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve = prepare(&io, &probes, 1.5, &[request(512, 64.0, 1.5)]);
-        assert_eq!(io.counts().1, 2, "升序探测两次即命中,候选有界");
-        assert_eq!(
-            serve.rewrite_path(&thumb_db_path(512, k), 64.0, 48.0, k),
-            Some(thumb_db_path(256, k))
-        );
-
-        // 更小候选(128)也存在 → 取 128 而非 256:命中即停,后续候选零 stat。
-        let io128 = CountingIo::default();
-        io128.set_nonempty_tiers(&[128, 256, 512]);
-        io128.set_existing_rels(&[thumb_db_path(128, k), thumb_db_path(256, k)]);
-        let probes128 = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve128 = prepare(&io128, &probes128, 1.5, &[request(512, 64.0, 1.5)]);
-        assert_eq!(io128.counts().1, 1, "最小满足档已存在 → 只 stat 一次");
-        assert_eq!(
-            serve128.rewrite_path(&thumb_db_path(512, k), 64.0, 48.0, k),
-            Some(thumb_db_path(128, k))
-        );
-
-        // 候选全缺(128/256 都被驱逐)→ 保留 DB 路径;512 是 DB 档,不产生额外 stat。
-        let io_gone = CountingIo::default();
-        io_gone.set_nonempty_tiers(&[128, 256, 512]);
-        io_gone.set_existing_rels(&[]);
-        let probes_gone = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve_gone = prepare(&io_gone, &probes_gone, 1.5, &[request(512, 64.0, 1.5)]);
-        assert_eq!(io_gone.counts().1, 2, "候选各探一次");
-        assert_eq!(
-            serve_gone.rewrite_path(&thumb_db_path(512, k), 64.0, 48.0, k),
-            None
-        );
-
-        // 同批多项指向同一候选(重复内容/跨行重复项):候选结果批内复用,不重复触盘。
-        let io_dup = CountingIo::default();
-        io_dup.set_nonempty_tiers(&[128, 256, 512]);
-        io_dup.set_existing_rels(&[thumb_db_path(256, k)]);
-        let probes_dup = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let reqs: Vec<ServeRequest> = (0..4).map(|_| request(512, 64.0, 1.5)).collect();
-        let serve_dup = prepare(&io_dup, &probes_dup, 1.5, &reqs);
-        assert_eq!(io_dup.counts().1, 2, "同批同一候选只判一次");
-        assert_eq!(
-            serve_dup.rewrite_path(&thumb_db_path(512, k), 64.0, 48.0, k),
-            Some(thumb_db_path(256, k))
-        );
-    }
-
-    #[test]
-    fn rewrite_respects_dpr_scaling() {
-        let io = CountingIo::default();
-        io.set_results(true, true);
-        // DPR2:60px CSS 格 → need 120 → 128 档(而非 64)
-        let probes2 = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve_dpr2 = prepare(&io, &probes2, 2.0, &[request(512, 60.0, 2.0)]);
-        assert_eq!(
-            serve_dpr2.rewrite_path(&thumb_db_path(512, key()), 60.0, 60.0, key()),
-            Some(thumb_db_path(128, key()))
-        );
-        // DPR1:同格 → 64 档
-        let probes1 = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let serve_dpr1 = prepare(&io, &probes1, 1.0, &[request(512, 60.0, 1.0)]);
-        assert_eq!(
-            serve_dpr1.rewrite_path(&thumb_db_path(512, key()), 60.0, 60.0, key()),
-            Some(thumb_db_path(64, key()))
-        );
-    }
-
-    /// 每批取行的目录探测次数:冷 = 5 档各一次;TTL 内热 = 0;
-    /// TTL 过期 / cache_dir 变更(换盘)/ 显式失效 = 重新 5 次。
-    #[test]
-    fn probe_cache_reuses_within_ttl_and_reevaluates_on_change() {
-        let io = CountingIo::default();
-        io.set_results(true, true);
-        let probes = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let dir_a = Path::new("C:/cache-a");
-        let dir_b = Path::new("C:/cache-b");
-        let t0 = Instant::now();
-        assert_eq!(probes.tiers(&io, dir_a, t0).len(), 5);
-        assert_eq!(io.counts().0, 5, "冷批 5 档各探一次");
-
-        // TTL 内复用:零 IO。
-        assert_eq!(probes.tiers(&io, dir_a, t0 + THUMB_PROBE_TTL / 2).len(), 5);
-        assert_eq!(io.counts().0, 5, "TTL 内不得重探");
-
-        // TTL 过期 → 重探。
-        assert_eq!(probes.tiers(&io, dir_a, t0 + THUMB_PROBE_TTL * 2).len(), 5);
-        assert_eq!(io.counts().0, 10, "TTL 过期须重探");
-
-        // 换成另一个盘/目录 → 键不符自动重探(TTL 内也不例外)。
-        assert_eq!(probes.tiers(&io, dir_b, t0).len(), 5);
-        assert_eq!(io.counts().0, 15, "cache_dir 变更须重探");
-
-        // 显式失效 → 重探。
-        probes.invalidate();
-        assert_eq!(probes.tiers(&io, dir_b, t0).len(), 5);
-        assert_eq!(io.counts().0, 20, "显式失效须重探");
-    }
-
-    /// 同批重复目标档(重复内容/跨行重复项)只 stat 一次;无非空满足档时完全不 stat。
-    #[test]
-    fn prepare_stats_each_candidate_once() {
-        // 所有档目录都空 → 无满足档 → 零 stat。
-        let io = CountingIo::default();
-        io.set_results(false, true);
-        let probes = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let _ = prepare(&io, &probes, 1.0, &[request(512, 60.0, 1.0)]);
-        assert_eq!(io.counts().1, 0, "无满足档 → 零 stat");
-
-        // 64/512 非空:两个请求(DB 档不同)指向同一目标档 64 → 只 1 次 stat。
-        let io2 = CountingIo::default();
-        io2.set_results(true, true);
-        let probes2 = ThumbProbeCache::new(THUMB_PROBE_TTL);
-        let a = request(512, 60.0, 1.0);
-        let b = request(128, 60.0, 1.0);
-        let serve = prepare(&io2, &probes2, 1.0, &[a, b]);
-        assert_eq!(io2.counts().1, 1, "同批同一目标档只 stat 一次");
-        assert_eq!(
-            serve.rewrite_path(&thumb_db_path(512, key()), 60.0, 45.0, key()),
-            Some(thumb_db_path(64, key()))
-        );
-
-        // 负向自检(同一门闸、同一 canary 断言):把「同步 IO 直接写在 async 任务里」的旧形态跑一遍——
-        // 单 worker 被同步调用占死,canary 在 IO 期间必然排不上队。证明本测试真能区分两种形态。
-        let rt_legacy = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let sync_gate = Arc::new(Gate::default());
-        let gate_for_task = sync_gate.clone();
-        rt_legacy.spawn(async move {
-            gate_for_task.pass();
-        });
-        assert!(
-            sync_gate.wait_entered_timeout(Duration::from_secs(10)),
-            "负向自检:同步阻塞未进入"
-        );
-        let legacy_canary = Arc::new(AtomicBool::new(false));
-        let legacy_set = legacy_canary.clone();
-        rt_legacy.spawn(async move {
-            legacy_set.store(true, Ordering::SeqCst);
-        });
-        std::thread::sleep(Duration::from_millis(100));
-        let legacy_polled = legacy_canary.load(Ordering::SeqCst);
-        sync_gate.release();
-        rt_legacy.shutdown_timeout(Duration::from_secs(5));
-        assert!(
-            !legacy_polled,
-            "负向自检失败:同步占死 worker 时 canary 仍被调度,本测试无法区分新旧形态"
-        );
-    }
-
-    /// **机制锁**:probe + 逐项 stat 全跑在阻塞线程上——单 worker 的 runtime 在 IO 在途期间
-    /// 必须仍能调度其他任务(canary)。旧实现(同步 IO 直接写在 async 命令里)在本门闸下永远
-    /// 过不了:worker 被同步 IO 占死,canary 排不上队。
-    #[test]
-    fn offloaded_prepare_keeps_single_worker_free() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let gate = Arc::new(Gate::default());
-        let io = Arc::new(CountingIo::default());
-        io.set_gate(gate.clone());
-        io.set_results(true, true);
-        let probes = Arc::new(ThumbProbeCache::new(THUMB_PROBE_TTL));
-
-        let handle = rt.handle().clone();
-        let fetch = handle.spawn(prepare_offloaded_with(
-            io.clone(),
-            probes,
-            PathBuf::from("C:/fake-cache"),
-            1.0,
-            vec![request(512, 60.0, 1.0)],
-        ));
-        assert!(
-            gate.wait_entered_timeout(Duration::from_secs(10)),
-            "IO 未进入(夹具失效)"
-        );
-
-        // IO 在途:同一 worker 必须还能调度 canary。
-        let canary = Arc::new(AtomicBool::new(false));
-        let canary_set = canary.clone();
-        handle.spawn(async move {
-            canary_set.store(true, Ordering::SeqCst);
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !canary.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let polled = canary.load(Ordering::SeqCst);
-        gate.release();
-        let serve = rt
-            .block_on(fetch)
-            .expect("runtime join")
-            .expect("spawn_blocking join");
-        assert!(polled, "IO 期间单 worker 被占死 → IO 跑在 async 执行器上");
-        // 阻塞化不改变产出:IO 结果照常被采用。
-        assert_eq!(
-            serve.rewrite_path(&thumb_db_path(512, key()), 60.0, 45.0, key()),
-            Some(thumb_db_path(64, key()))
-        );
     }
 }

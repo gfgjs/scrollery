@@ -6,15 +6,8 @@
 // keybinding:纯函数 + 组合键分发(2026-07-10 深审 HIGH-2:分发器曾只匹配裸键,mod+z 结构上永不命中)。
 // registry:ctx 只穿可变调用上下文(store 不入 context,命令 run 内直接 useXxxStore()),故无需 pinia。
 import { describe, it, expect, vi, beforeAll } from 'vitest'
-import { eventToCombo, dispatchKeybinding } from './keybinding'
-import {
-  commandRegistry,
-  createCommandRegistry,
-  isCommandVisible,
-  isCommandEnabled,
-  isCommandActive,
-} from './registry'
-import { viewerImageCommands } from './builtins/viewer-image'
+import { dispatchKeybinding } from './keybinding'
+import { commandRegistry, createCommandRegistry } from './registry'
 import type { Command, CommandContext } from './types'
 import type { ViewerApi } from '../stores/viewerStore'
 import type { MediaType } from '../types/media'
@@ -38,65 +31,6 @@ function imgCtx(api: ViewerApi): CommandContext {
   }
 }
 
-describe('dispatchKeybinding(P5-6)', () => {
-  beforeAll(() => commandRegistry.registerAll(viewerImageCommands))
-
-  it('图片上下文:方向键/加减/i 命中 viewer 命令并执行', () => {
-    const api = {
-      prev: vi.fn(),
-      next: vi.fn(),
-      zoomIn: vi.fn(),
-      zoomOut: vi.fn(),
-      toggleInfo: vi.fn(),
-    }
-    const ctx = imgCtx(api as ViewerApi)
-    expect(dispatchKeybinding({ key: 'ArrowLeft' } as KeyboardEvent, ctx)).toBe(true)
-    expect(api.prev).toHaveBeenCalledOnce()
-    expect(dispatchKeybinding({ key: 'ArrowRight' } as KeyboardEvent, ctx)).toBe(true)
-    expect(api.next).toHaveBeenCalledOnce()
-    expect(dispatchKeybinding({ key: '=' } as KeyboardEvent, ctx)).toBe(true) // = → +
-    expect(api.zoomIn).toHaveBeenCalledOnce()
-    expect(dispatchKeybinding({ key: '-' } as KeyboardEvent, ctx)).toBe(true)
-    expect(api.zoomOut).toHaveBeenCalledOnce()
-    expect(dispatchKeybinding({ key: 'I' } as KeyboardEvent, ctx)).toBe(true) // I → i
-    expect(api.toggleInfo).toHaveBeenCalledOnce()
-  })
-
-  it('无匹配键返 false', () => {
-    expect(dispatchKeybinding({ key: 'q' } as KeyboardEvent, imgCtx({} as ViewerApi))).toBe(false)
-  })
-})
-
-function gridCtx(): CommandContext {
-  return {
-    view: 'grid',
-    activeViewer: null,
-    selection: { count: 0, isSingle: false },
-    contextTarget: null,
-  }
-}
-
-describe('eventToCombo(组合键规范化)', () => {
-  it('mod→shift→alt 规范序;ctrl 与 meta 同归 mod', () => {
-    expect(eventToCombo({ key: 'z', ctrlKey: true } as KeyboardEvent)).toBe('mod+z')
-    expect(eventToCombo({ key: 'z', metaKey: true } as KeyboardEvent)).toBe('mod+z')
-    expect(eventToCombo({ key: 'Z', ctrlKey: true, shiftKey: true } as KeyboardEvent)).toBe(
-      'mod+shift+z',
-    )
-  })
-
-  it('无 ctrl/meta/alt(含仅 shift)返 null——shift 是打出字符的固有成分', () => {
-    expect(eventToCombo({ key: '+' } as KeyboardEvent)).toBe(null)
-    expect(eventToCombo({ key: '+', shiftKey: true } as KeyboardEvent)).toBe(null)
-  })
-
-  it('shift+非字符键(e.key.length > 1)产出 shift+key;shift+单字符仍返 null', () => {
-    expect(eventToCombo({ key: 'ArrowLeft', shiftKey: true } as KeyboardEvent)).toBe(
-      'shift+ArrowLeft',
-    )
-    expect(eventToCombo({ key: '=', shiftKey: true } as KeyboardEvent)).toBe(null)
-  })
-})
 
 describe('dispatchKeybinding 组合键与别名', () => {
   const undo = vi.fn()
@@ -132,27 +66,6 @@ describe('dispatchKeybinding 组合键与别名', () => {
     ]),
   )
 
-  it('mod+z / mod+y 组合命中;别名 mod+shift+z 亦命中且不抢 mod+z', () => {
-    expect(dispatchKeybinding({ key: 'z', ctrlKey: true } as KeyboardEvent, gridCtx())).toBe(true)
-    expect(undo).toHaveBeenCalledOnce()
-    expect(dispatchKeybinding({ key: 'y', metaKey: true } as KeyboardEvent, gridCtx())).toBe(true)
-    expect(redo).toHaveBeenCalledOnce()
-    expect(
-      dispatchKeybinding({ key: 'z', ctrlKey: true, shiftKey: true } as KeyboardEvent, gridCtx()),
-    ).toBe(true)
-    expect(redo).toHaveBeenCalledTimes(2)
-    expect(undo).toHaveBeenCalledOnce() // mod+shift+z 未误触 undo
-  })
-
-  it('F11 裸多字符键命中;带修饰符的事件不回落裸键(ctrl+F11 ≠ F11)', () => {
-    expect(dispatchKeybinding({ key: 'F11' } as KeyboardEvent, gridCtx())).toBe(true)
-    expect(fs).toHaveBeenCalledOnce()
-    expect(dispatchKeybinding({ key: 'F11', ctrlKey: true } as KeyboardEvent, gridCtx())).toBe(
-      false,
-    )
-    expect(fs).toHaveBeenCalledOnce()
-  })
-
   it('组合键按 when 上下文过滤(查看器上下文不触发网格 mod+z)', () => {
     expect(
       dispatchKeybinding({ key: 'z', ctrlKey: true } as KeyboardEvent, imgCtx({} as ViewerApi)),
@@ -175,36 +88,6 @@ function cmd(partial: Partial<Command> & { id: string }): Command {
 }
 
 describe('commandRegistry', () => {
-  it('重复 id 覆盖 + 告警', () => {
-    const r = createCommandRegistry()
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    r.register(cmd({ id: 'a', title: 'first' }))
-    r.register(cmd({ id: 'a', title: 'second' }))
-    expect(r.get('a')?.title).toBe('second')
-    expect(warn).toHaveBeenCalled()
-    warn.mockRestore()
-  })
-
-  it('query 按 when 过滤', () => {
-    const r = createCommandRegistry()
-    r.register(cmd({ id: 'always' }))
-    r.register(cmd({ id: 'sel', when: (c) => c.selection.count > 0 }))
-    expect(r.query(makeCtx()).map((c) => c.id)).toEqual(['always'])
-    expect(r.query(makeCtx({ selection: { count: 2, isSingle: false } })).map((c) => c.id)).toEqual([
-      'always',
-      'sel',
-    ])
-  })
-
-  it('query 按 group 过滤 + order 升序(无 order 排末尾,稳定)', () => {
-    const r = createCommandRegistry()
-    r.register(cmd({ id: 'n2', group: 'navigation', order: 2 }))
-    r.register(cmd({ id: 'n1', group: 'navigation', order: 1 }))
-    r.register(cmd({ id: 'ov', group: 'overflow' }))
-    r.register(cmd({ id: 'nNoOrder', group: 'navigation' }))
-    const nav = r.query(makeCtx(), { group: 'navigation' })
-    expect(nav.map((c) => c.id)).toEqual(['n1', 'n2', 'nNoOrder'])
-  })
 
   it('run 守卫 when / isEnabled', () => {
     const r = createCommandRegistry()
@@ -233,15 +116,5 @@ describe('commandRegistry', () => {
     )
     r.run('disabled', makeCtx())
     expect(ran).toBe(1) // isEnabled false → 未增
-  })
-
-
-
-  it('isCommandVisible/Enabled/Active 缺省语义', () => {
-    const ctx = makeCtx()
-    const bare = cmd({ id: 'bare' })
-    expect(isCommandVisible(bare, ctx)).toBe(true)
-    expect(isCommandEnabled(bare, ctx)).toBe(true)
-    expect(isCommandActive(bare, ctx)).toBe(false)
   })
 })

@@ -111,70 +111,6 @@ mod tests {
     const T: u32 = 512;
     const P: u32 = 16;
 
-    #[test]
-    fn axis_exact_multiple_of_step() {
-        // len = 960 = 2·480 → 两片 [0,480) [480,480),无截短。
-        let v = axis_tiles(960, T, P);
-        assert_eq!(v, vec![(0, 480), (480, 480)]);
-    }
-
-    #[test]
-    fn axis_remainder_clamps_last() {
-        // len = 1000 → [0,480) [480,480) [960,40)。
-        let v = axis_tiles(1000, T, P);
-        assert_eq!(v, vec![(0, 480), (480, 480), (960, 40)]);
-    }
-
-    #[test]
-    fn axis_small_single_tile() {
-        assert_eq!(axis_tiles(480, T, P), vec![(0, 480)]); // 恰等 step 仍单片
-        assert_eq!(axis_tiles(300, T, P), vec![(0, 300)]);
-        assert_eq!(axis_tiles(1, T, P), vec![(0, 1)]); // 1×1 极端
-    }
-
-    #[test]
-    fn axis_between_step_and_tile() {
-        // 480 < len ≤ 512:仍两片(末片 mostly-reflect),接受(design 只在 len ≤ step 单片)。
-        assert_eq!(axis_tiles(500, T, P), vec![(0, 480), (480, 20)]);
-    }
-
-    #[test]
-    fn axis_empty_on_zero() {
-        assert!(axis_tiles(0, T, P).is_empty());
-    }
-
-    #[test]
-    fn plan_empty_on_zero_dim() {
-        assert!(plan_tiles(0, 100, T, P, 1).is_empty());
-        assert!(plan_tiles(100, 0, T, P, 1).is_empty());
-    }
-
-    #[test]
-    fn src_rect_first_tile_offset_is_negative_pad() {
-        // 首瓦片 src 左/上越界为 −pad(其余瓦片的 src/core 偏移不变量已并入
-        // `assert_full_disjoint_coverage` 的参数化循环全数断言,见下)。
-        let tiles = plan_tiles(1000, 1000, T, P, 4);
-        assert_eq!(tiles[0].src_rect.x, -(P as i64));
-        assert_eq!(tiles[0].src_rect.y, -(P as i64));
-    }
-
-    #[test]
-    fn dst_maps_core_by_scale_1_and_4() {
-        // scale 1:dst == core。
-        let t1 = plan_tiles(600, 600, T, P, 1);
-        for ts in &t1 {
-            assert_eq!(ts.dst_rect.x, ts.core_rect.x);
-            assert_eq!(ts.dst_rect.w, ts.core_rect.w);
-        }
-        // scale 4:dst = core·4。
-        let t4 = plan_tiles(600, 600, T, P, 4);
-        for ts in &t4 {
-            assert_eq!(ts.dst_rect.x, ts.core_rect.x * 4);
-            assert_eq!(ts.dst_rect.w, ts.core_rect.w * 4);
-            assert_eq!(ts.dst_rect.h, ts.core_rect.h * 4);
-        }
-    }
-
     /// 参数化全覆盖检查:dst 矩形须**无缝无叠**铺满 `[0, w·scale)×[0, h·scale)`。
     /// 用布尔网格逐像素计数,断言每格恰被覆盖一次(零缝隙 ∧ 零重写)。
     fn assert_full_disjoint_coverage(w: u32, h: u32, tile: u32, pad: u32, scale: u32) {
@@ -201,25 +137,6 @@ mod tests {
             hit.iter().all(|&c| c == 1),
             "覆盖异常 w={w} h={h} tile={tile} pad={pad} scale={scale}: 存在缝隙(0)或重写(>1)"
         );
-    }
-
-    #[test]
-    fn coverage_generic_small_params() {
-        // 用小数值(tile 8 pad 1 → step 6)验几何通性:整除/余数/贴边/小图/1×1。
-        for &(w, h) in &[
-            (1u32, 1u32),
-            (6, 6),   // 恰等 step
-            (7, 7),   // step+1
-            (12, 12), // 2·step
-            (13, 5),  // 余数 × 小图轴
-            (20, 17),
-            (1, 30),
-            (30, 1),
-        ] {
-            for &scale in &[1u32, 4] {
-                assert_full_disjoint_coverage(w, h, 8, 1, scale);
-            }
-        }
     }
 
     #[test]

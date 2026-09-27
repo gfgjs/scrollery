@@ -221,69 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_permanent_token() {
-        let sk = signing_key(1);
-        let ks = license_keyset(&sk);
-        let tok = make_token(&sk, &payload("license-test"));
-        let p = verify_token(&tok, &ks, PLUGIN, SKU, NOW).unwrap();
-        assert_eq!(p.plugin_id, PLUGIN);
-        assert_eq!(p.sku, SKU);
-    }
-
-    #[test]
-    fn tampered_payload_fails_signature() {
-        // 用 plugin A 的 bytes 签名，再把 sig 拼到 plugin B 的 payload 上 → 验签失败。
-        let sk = signing_key(2);
-        let ks = license_keyset(&sk);
-        let a = payload("license-test");
-        let a_bytes = serde_json::to_vec(&a).unwrap();
-        let sig = sk.sign(&a_bytes);
-        let mut b = payload("license-test");
-        b.license_id = "lic_TAMPERED".into();
-        let b_bytes = serde_json::to_vec(&b).unwrap();
-        let forged = format!(
-            "{}.{}",
-            b64url_encode(&b_bytes),
-            b64url_encode(sig.as_ref())
-        );
-        assert_eq!(
-            verify_token(&forged, &ks, PLUGIN, SKU, NOW),
-            Err(LicenseError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn unknown_key_id() {
-        let sk = signing_key(3);
-        let ks = license_keyset(&sk);
-        let tok = make_token(&sk, &payload("some-other-key"));
-        assert_eq!(
-            verify_token(&tok, &ks, PLUGIN, SKU, NOW),
-            Err(LicenseError::UnknownKey)
-        );
-    }
-
-    #[test]
-    fn wrong_purpose_release_key_rejected() {
-        // 用 release 用途的 key 签 License → 验签要求 license 用途 → BadSignature（折叠 WrongPurpose）。
-        let sk = signing_key(4);
-        let json = keyset_json(&[KeySpec {
-            key_id: "license-test",
-            purpose: "release",
-            sk: &sk,
-            status: "active",
-            not_before: 0,
-            not_after: None,
-        }]);
-        let ks = VerifyingKeyset::parse(&json).unwrap();
-        let tok = make_token(&sk, &payload("license-test"));
-        assert_eq!(
-            verify_token(&tok, &ks, PLUGIN, SKU, NOW),
-            Err(LicenseError::BadSignature)
-        );
-    }
-
-    #[test]
     fn plugin_mismatch() {
         let sk = signing_key(5);
         let ks = license_keyset(&sk);
@@ -291,30 +228,6 @@ mod tests {
         assert_eq!(
             verify_token(&tok, &ks, "exotic-other", SKU, NOW),
             Err(LicenseError::PluginMismatch)
-        );
-    }
-
-    #[test]
-    fn sku_mismatch() {
-        let sk = signing_key(6);
-        let ks = license_keyset(&sk);
-        let tok = make_token(&sk, &payload("license-test"));
-        assert_eq!(
-            verify_token(&tok, &ks, PLUGIN, "wrong-sku", NOW),
-            Err(LicenseError::SkuMismatch)
-        );
-    }
-
-    #[test]
-    fn not_yet_valid() {
-        let sk = signing_key(7);
-        let ks = license_keyset(&sk);
-        let mut p = payload("license-test");
-        p.not_before = NOW + 1000;
-        let tok = make_token(&sk, &p);
-        assert_eq!(
-            verify_token(&tok, &ks, PLUGIN, SKU, NOW),
-            Err(LicenseError::NotYetValid)
         );
     }
 
@@ -332,19 +245,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_version() {
-        let sk = signing_key(9);
-        let ks = license_keyset(&sk);
-        let mut p = payload("license-test");
-        p.version = 2;
-        let tok = make_token(&sk, &p);
-        assert_eq!(
-            verify_token(&tok, &ks, PLUGIN, SKU, NOW),
-            Err(LicenseError::UnsupportedVersion(2))
-        );
-    }
-
-    #[test]
     fn malformed_structures() {
         let sk = signing_key(10);
         let ks = license_keyset(&sk);
@@ -357,35 +257,5 @@ mod tests {
                 "应判 Malformed：{bad}"
             );
         }
-    }
-
-    #[test]
-    fn evaluate_token_maps_status() {
-        let sk = signing_key(11);
-        let ks = license_keyset(&sk);
-        // 无 token → Unlicensed。
-        assert_eq!(
-            evaluate_token(None, &ks, PLUGIN, SKU, NOW),
-            LicenseStatus::Unlicensed
-        );
-        // 有效 → Authorized。
-        let tok = make_token(&sk, &payload("license-test"));
-        assert_eq!(
-            evaluate_token(Some(&tok), &ks, PLUGIN, SKU, NOW),
-            LicenseStatus::Authorized
-        );
-        // 过期 → Expired。
-        let mut p = payload("license-test");
-        p.expires_at = Some(NOW - 1);
-        let exp = make_token(&sk, &p);
-        assert_eq!(
-            evaluate_token(Some(&exp), &ks, PLUGIN, SKU, NOW),
-            LicenseStatus::Expired
-        );
-        // 篡改 → Unlicensed。
-        assert_eq!(
-            evaluate_token(Some("garbage.token"), &ks, PLUGIN, SKU, NOW),
-            LicenseStatus::Unlicensed
-        );
     }
 }

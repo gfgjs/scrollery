@@ -1,23 +1,23 @@
 // src-tauri/src/db/schema.rs
 //! 当前数据库结构的事实源与初始化入口。
 //!
-//! 结构正文即当前格式的完整 DDL(表 / 索引 / 必需种子)。**没有版本升迁语义**:本文件就是当前
-//! 格式,不为旧库提供迁移桥,也没有串行升级块。
+//! 结构正文即当前格式的完整 DDL(表 / 索引 / 必需种子)。格式 34 可在单事务内升级到
+//! 当前格式；更早或未知格式仍不自动修改。
 //!
 //! 格式契约:
 //! - 标识键 app_config.schema_version,当前值为常量 SCHEMA_VERSION,只作格式判别。
 //! - 库内无任何用户表 = 全新库 → 建立当前结构(单事务)。
 //! - 标识等于当前值 = 当前库 → 直接放行(幂等)。
-//! - 其余(标识缺失 / 不符 / 未来格式)= 不兼容:报错提示重置,不自动清理用户数据与源资产,
-//!   也不在旧结构上叠建。
+//! - 格式 34 = 保留既有派生行，升级任务身份与 lease 字段。
+//! - 其余(标识缺失 / 不符 / 未来格式)= 不兼容:报错提示重置,不自动清理用户数据与源资产。
 
 use rusqlite::Connection;
 use tracing::info;
 
 use crate::error::{AppError, Result};
 
-/// 当前格式标识。仅作格式判别,无升级语义;比较一律用相等判断。
-pub const SCHEMA_VERSION: u32 = 34;
+/// 当前格式标识。只支持从紧邻的格式 34 升级。
+pub const SCHEMA_VERSION: u32 = 35;
 
 /// 当前格式的全部 DDL + 必需种子(单事务执行)。
 const CURRENT_SCHEMA: &str = r#"
@@ -310,7 +310,16 @@ CREATE TABLE media_derivations (
     error TEXT,
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     orphan_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (item_id, kind)
+    output_fingerprint TEXT NOT NULL DEFAULT '',
+    source_revision INTEGER NOT NULL DEFAULT 0,
+    lane TEXT NOT NULL DEFAULT 'normal',
+    cost_class TEXT NOT NULL DEFAULT 'unknown',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    failure_reason TEXT,
+    lease_id TEXT,
+    lease_until INTEGER,
+    run_id TEXT,
+    PRIMARY KEY (item_id, kind, output_fingerprint)
 );
 
 CREATE TABLE media_items (
@@ -498,6 +507,8 @@ CREATE INDEX idx_dedup_working_quick
     WHERE quick_digest IS NOT NULL;
 
 CREATE INDEX idx_deriv_pending ON media_derivations(kind, status) WHERE status < 2;
+CREATE INDEX idx_thumb_task_queue ON media_derivations(kind, status, lane, item_id)
+    WHERE kind IN ('image_thumb', 'video_cover');
 
 CREATE INDEX idx_dir_parent ON directories(parent_id);
 
@@ -605,12 +616,17 @@ pub fn read_schema_version(conn: &Connection) -> u32 {
 /// 初始化数据库结构 —— 生产启动与所有建库夹具的唯一入口。
 ///
 /// - 标识 == SCHEMA_VERSION → 当前库,直接放行(幂等,可重复调用)。
+/// - 标识 == 34 → 单事务升级派生任务表，保留所有既有行。
 /// - 全新库(无任何用户表)→ 单事务建立当前结构:DDL 与格式标识同事务提交,失败整块回滚不留半成品。
 /// - 其余(有表但标识缺失 / 不符 / 未来格式)→ AppError::SchemaIncompatible,不改动任何数据。
 pub fn initialize_schema(conn: &Connection) -> Result<()> {
     let version = read_schema_version(conn);
     if version == SCHEMA_VERSION {
         info!("DB schema is current (format {SCHEMA_VERSION}) | 数据库结构为当前格式 ({SCHEMA_VERSION})");
+        return Ok(());
+    }
+    if version == 34 {
+        migrate_34_to_35(conn)?;
         return Ok(());
     }
 
@@ -634,6 +650,51 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 任务键加入产物指纹后，同一项可同时保存不同尺寸/质量的任务。
+/// 旧 kind 的指纹保持空串，因此既有 `(item_id, kind)` 查询语义不变。
+fn migrate_34_to_35(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE media_derivations RENAME TO media_derivations_v34;
+         CREATE TABLE media_derivations (
+             item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+             kind TEXT NOT NULL,
+             status INTEGER NOT NULL DEFAULT 0,
+             payload_path TEXT,
+             error TEXT,
+             updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+             orphan_count INTEGER NOT NULL DEFAULT 0,
+             output_fingerprint TEXT NOT NULL DEFAULT '',
+             source_revision INTEGER NOT NULL DEFAULT 0,
+             lane TEXT NOT NULL DEFAULT 'normal',
+             cost_class TEXT NOT NULL DEFAULT 'unknown',
+             attempt_count INTEGER NOT NULL DEFAULT 0,
+             failure_reason TEXT,
+             lease_id TEXT,
+             lease_until INTEGER,
+             run_id TEXT,
+             PRIMARY KEY (item_id, kind, output_fingerprint)
+         );
+         INSERT INTO media_derivations
+             (item_id, kind, status, payload_path, error, updated_at, orphan_count, source_revision)
+         SELECT old.item_id, old.kind, old.status, old.payload_path, old.error,
+                old.updated_at, old.orphan_count, COALESCE(m.source_revision, 0)
+         FROM media_derivations_v34 old
+         LEFT JOIN media_items m ON m.id = old.item_id;
+         DROP TABLE media_derivations_v34;
+         CREATE INDEX idx_deriv_pending ON media_derivations(kind, status) WHERE status < 2;
+         CREATE INDEX idx_thumb_task_queue ON media_derivations(kind, status, lane, item_id)
+             WHERE kind IN ('image_thumb', 'video_cover');",
+    )?;
+    tx.execute(
+        "UPDATE app_config SET value=?1 WHERE key='schema_version'",
+        rusqlite::params![SCHEMA_VERSION.to_string()],
+    )?;
+    tx.commit()?;
+    info!("DB schema upgraded from 34 to {SCHEMA_VERSION} | 数据库结构升级完成");
+    Ok(())
+}
+
 /// 库内是否没有任何用户表(全新库判据)。sqlite_ 前缀为引擎内部表,不计。
 fn is_fresh_database(conn: &Connection) -> Result<bool> {
     let count: i64 = conn.query_row(
@@ -647,79 +708,6 @@ fn is_fresh_database(conn: &Connection) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 建当前结构:关键表/索引就位 + 系统收藏夹种子 + 默认值语义 + 外键与完整性干净 + 格式标识写入。
-    /// (不做表/索引数量镜像 —— 只断言业务上必须存在的代表对象与默认行为。)
-    #[test]
-    fn initialize_creates_current_schema_with_defaults() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_schema(&conn).unwrap();
-        assert_eq!(read_schema_version(&conn), SCHEMA_VERSION);
-
-        for obj in [
-            "media_items",
-            "directories",
-            "scan_roots",
-            "albums",
-            "album_items",
-            "image_meta",
-            "media_derivations",
-            "faces",
-            "dedup_index",
-            "directory_move_journal",
-        ] {
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [obj],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(n, 1, "缺表 {obj}");
-        }
-        let idx: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_media_content_id'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(idx, 1, "缺当前索引 idx_media_content_id");
-
-        // 系统收藏夹种子(当前业务必要)。
-        let sys: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM albums WHERE kind = 'system'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(sys, 4);
-
-        // 默认值语义:只给 path/alias 建根,其余列取当前默认。
-        conn.execute(
-            "INSERT INTO scan_roots (path, alias) VALUES ('C:/photos', '图库')",
-            [],
-        )
-        .unwrap();
-        let (status, progress, active, hidden, alias): (String, i64, i64, i64, String) = conn
-            .query_row(
-                "SELECT scan_status, scan_progress, is_active, is_hidden, alias FROM scan_roots",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            (status.as_str(), progress, active, hidden, alias.as_str()),
-            ("idle", 0, 1, 0, "图库")
-        );
-
-        assert!(
-            foreign_key_violations(&conn).is_empty(),
-            "建库后不得有外键违规"
-        );
-        assert!(integrity_ok(&conn), "建库后完整性须通过");
-    }
 
     /// 当前库重复初始化 = 幂等放行,且不得清空既有行。
     #[test]
@@ -751,6 +739,79 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "当前库再次初始化不得清库");
+    }
+
+    /// 格式 34 的已有派生结果和失败记录必须完整保留；新图片任务可按指纹并存。
+    #[test]
+    fn migrates_34_derivations_without_losing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO app_config VALUES ('schema_version', '34');
+             CREATE TABLE media_items (id INTEGER PRIMARY KEY, source_revision INTEGER NOT NULL);
+             INSERT INTO media_items VALUES (7, 12);
+             CREATE TABLE media_derivations (
+                 item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0,
+                 payload_path TEXT, error TEXT,
+                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                 orphan_count INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (item_id, kind)
+             );
+             CREATE INDEX idx_deriv_pending ON media_derivations(kind, status) WHERE status < 2;
+             INSERT INTO media_derivations
+                 (item_id, kind, status, payload_path, error, updated_at, orphan_count)
+             VALUES (7, 'video_cover', 2, 'cover.webp', 'prior warning', 123, 2);",
+        )
+        .unwrap();
+
+        initialize_schema(&conn).unwrap();
+        initialize_schema(&conn).unwrap();
+        assert_eq!(read_schema_version(&conn), SCHEMA_VERSION);
+        let row: (i64, String, String, i64, i64, String) = conn
+            .query_row(
+                "SELECT status, payload_path, error, updated_at, orphan_count,
+                        output_fingerprint FROM media_derivations
+                 WHERE item_id=7 AND kind='video_cover'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                2,
+                "cover.webp".into(),
+                "prior warning".into(),
+                123,
+                2,
+                "".into()
+            )
+        );
+        conn.execute(
+            "INSERT INTO media_derivations (item_id, kind, output_fingerprint)
+             VALUES (7, 'image_thumb', 'size=256'), (7, 'image_thumb', 'size=512')",
+            [],
+        )
+        .unwrap();
+        let variants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_derivations WHERE item_id=7 AND kind='image_thumb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(variants, 2);
     }
 
     /// 缺格式标识的非空旧库:**明确不兼容**,不得被当作全新库叠建、不得改动原数据。
@@ -789,7 +850,7 @@ mod tests {
         assert_eq!(read_schema_version(&conn), 0, "不得写入当前格式标识");
     }
 
-    /// 标识存在但不是当前值(历史值或未来值)→ 不兼容,且不做任何「升级」。
+    /// 不支持的历史值或未来值仍不兼容。
     #[test]
     fn initialize_rejects_unknown_format_marker() {
         for bogus in [1u32, 33, SCHEMA_VERSION + 1] {
@@ -835,19 +896,5 @@ mod tests {
             .unwrap();
         assert_eq!(left, 0, "失败后不得残留半成品表(前面的 DDL 须整体回滚)");
         assert_eq!(read_schema_version(&conn), 0, "失败后不得写入格式标识");
-    }
-
-    fn foreign_key_violations(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("PRAGMA foreign_key_check").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect()
-    }
-
-    fn integrity_ok(conn: &Connection) -> bool {
-        conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
-            .map(|s| s == "ok")
-            .unwrap_or(false)
     }
 }

@@ -44,6 +44,16 @@ pub trait ImageEngine: Send + Sync {
         &self,
         file_path: &Path,
         resize: Option<ResizeHint>,
+    ) -> Result<DecodedImage, AppError> {
+        self.decode_bounded(file_path, resize, 512 * 1024 * 1024)
+    }
+
+    /// 按调用方已取得的字节额度解码；后端在分配像素前执行限制。
+    fn decode_bounded(
+        &self,
+        file_path: &Path,
+        resize: Option<ResizeHint>,
+        max_pixel_bytes: u64,
     ) -> Result<DecodedImage, AppError>;
 
     /// 尝试提取嵌入的缩略图（例如 EXIF JPEG 缩略图）。

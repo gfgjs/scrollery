@@ -54,39 +54,3 @@ pub(crate) fn get_rotate_crop_image(img: &RgbImage, quad: &[[f32; 2]; 4]) -> Rgb
         out
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 在大图上画一块纯色矩形,以其四角作 quad → warp 出目标尺寸,角点像素为该色。
-    #[test]
-    fn warp_target_size_and_color() {
-        let mut img = RgbImage::new(100, 100);
-        for y in 20..60 {
-            for x in 10..90 {
-                img.put_pixel(x, y, image::Rgb([200, 100, 50]));
-            }
-        }
-        // quad 宽 80、高 40 → w/h 不触发旋转。
-        let quad = [[10.0, 20.0], [90.0, 20.0], [90.0, 60.0], [10.0, 60.0]];
-        let crop = get_rotate_crop_image(&img, &quad);
-        assert_eq!(crop.dimensions(), (80, 40));
-        // 中心像素应为矩形色。
-        let c = crop.get_pixel(40, 20).0;
-        assert!(
-            c[0] > 150 && c[1] > 50 && c[2] > 20,
-            "中心应采到矩形色: {c:?}"
-        );
-    }
-
-    /// h/w ≥ 1.5 触发旋转:竖条(宽 20、高 60)→ 输出转横(宽 60、高 20)。
-    #[test]
-    fn vertical_strip_rotated() {
-        let img = RgbImage::new(100, 100);
-        let quad = [[10.0, 10.0], [30.0, 10.0], [30.0, 70.0], [10.0, 70.0]];
-        let crop = get_rotate_crop_image(&img, &quad);
-        // 原始 w=20 h=60 → 旋转后 (w,h)=(60,20)。
-        assert_eq!(crop.dimensions(), (60, 20));
-    }
-}

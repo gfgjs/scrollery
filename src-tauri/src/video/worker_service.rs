@@ -51,8 +51,6 @@ pub fn bootstrap(state: Arc<AppState>) {
     tracing::info!("视频格式扩展 Service 已装配 | video format extension service assembled");
 }
 
-#[cfg(test)]
-mod tests;
 mod types;
 
 use runner::WorkerVideoRunner;

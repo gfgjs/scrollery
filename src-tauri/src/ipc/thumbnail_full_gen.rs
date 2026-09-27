@@ -1,25 +1,22 @@
-//! 全库缩略图生成流水线（从 `thumbnail_commands.rs` 拆出，见超长文件拆分方案 tierB-3）:
-//! 与 `batch_request_thumbnails` 服务的「批量视口路径」几乎独立的第二条流水线,
-//! 服务全库生成 + Phase2 CPU 兜底,两者仅共享 generation-aware flush helper（留在
-//! `thumbnail_commands.rs`, `pub(super)` 可见）。
+//! 全库/增量图片与原生视频封面入口。成员快照、分级、领取和执行由统一任务机制管理。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::bounded;
-use rayon::prelude::*;
 use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::db::models::ThumbResult;
+use crate::db::queries::{self as q, ThumbnailLane, ThumbnailTaskKey, ThumbnailTaskKind};
 use crate::error::{AppError, Result};
 use crate::state::AppState;
+use crate::thumbnail::coordinator::{unique_id, ExecutionFacts, ImageExecution, VideoCoverPhase};
 use crate::thumbnail::generator::snap_to_tier;
-use crate::thumbnail::{decode_media_step, process_deferred_cpu, DecodeResult};
-
-use crate::thumbnail::qos::{refresh_worker_qos, thumb_cpu_budget};
-
-use super::thumbnail_commands::flush_thumb_results_for_generation;
+use crate::thumbnail::native_protocol::NativeExecution;
+use crate::thumbnail::scheduler::{
+    advance_run_phase, classify_image_cost, OutputFingerprint, ThumbnailRunPhase,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,33 +28,301 @@ pub struct FullThumbProgressPayload {
     pub current_item: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    #[serde(default)]
+    pub results: ThumbResultCounts,
+    #[serde(default)]
+    pub executions: Vec<ThumbExecutionCount>,
 }
 
-/// 进度传输事件名。原实现用 Tauri Channel——Channel 生命周期绑定发起 invoke 的 webview,
-/// 页面刷新后永久失联而后台任务照跑,进度 UI 就此丢失。改 app 级事件 + AppState 快照:
-/// 事件广播给当前(含重建后的)webview,快照供重载瞬间 `full_thumb_gen_status` 查询回填。
+/// 本轮已条件完成的结果；available = newly_generated + cache_hit，暂不可用不改媒体展示行。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbResultCounts {
+    pub available: u64,
+    pub direct: u64,
+    pub failed: u64,
+    #[serde(default)]
+    pub newly_generated: u64,
+    #[serde(default)]
+    pub cache_hit: u64,
+    #[serde(default)]
+    pub temporarily_unavailable: u64,
+}
+
+/// 本轮新发布产物的实际后端；共享执行向各订阅轮次分别归属，不累计历史缓存的硬件。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThumbExecutionCount {
+    /// 宿主未提供后端事实时为 None；MF 普通路径仍保持加速程度未知。
+    pub native: Option<NativeExecution>,
+    pub count: u64,
+}
+
+#[derive(Default)]
+struct PublishedSummary {
+    results: ThumbResultCounts,
+    executions: Vec<ThumbExecutionCount>,
+}
+
+impl PublishedSummary {
+    fn record(&mut self, status: i64, execution: ExecutionFacts) {
+        match status {
+            3 => self.results.direct += 1,
+            2 => self.results.failed += 1,
+            1 => {
+                self.results.available += 1;
+                if execution.newly_generated {
+                    self.results.newly_generated += 1;
+                    if let Some(entry) = self
+                        .executions
+                        .iter_mut()
+                        .find(|entry| entry.native == execution.native)
+                    {
+                        entry.count += 1;
+                    } else {
+                        self.executions.push(ThumbExecutionCount {
+                            native: execution.native,
+                            count: 1,
+                        });
+                    }
+                } else {
+                    self.results.cache_hit += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn processed(&self) -> u64 {
+        self.results.available
+            + self.results.direct
+            + self.results.failed
+            + self.results.temporarily_unavailable
+    }
+}
+
+impl FullThumbProgressPayload {
+    fn with_results(mut self, metrics: &ThumbPerfMetrics) -> Self {
+        let published = metrics.published.lock().unwrap_or_else(|e| e.into_inner());
+        self.generated = published.processed();
+        self.results = published.results.clone();
+        self.executions = published.executions.clone();
+        self
+    }
+}
+
 pub const THUMB_GEN_PROGRESS_EVENT: &str = "thumb:gen_progress";
 
-/// 更新快照并广播进度事件(快照先行,保证事件消费者查询到的状态不落后于事件)。
-///
-/// generation、取消状态和数据库 epoch 在同一短临界区内检查；旧轮不能在新轮启动后
-/// 覆盖全局快照，取消后的普通 running 进度也不会重新复活前端状态。
+#[derive(Default)]
+struct ThumbPerfMetrics {
+    processed: AtomicU64,
+    published: Mutex<PublishedSummary>,
+    deferred: AtomicU64,
+    skipped: AtomicU64,
+    phase: AtomicU8,
+}
+
+impl ThumbPerfMetrics {
+    fn record_committed(&self, outcome: &ImageExecution) {
+        let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            ImageExecution::Published(result, execution) => {
+                published.record(result.thumb_status, *execution)
+            }
+            ImageExecution::Unavailable(_) => published.results.temporarily_unavailable += 1,
+            _ => return,
+        }
+        self.processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn running_progress(&self, total: u64) -> FullThumbProgressPayload {
+        let phase = match self.phase.load(Ordering::Relaxed) {
+            0 => ThumbnailRunPhase::Fast,
+            1 => ThumbnailRunPhase::Heavy,
+            2 => ThumbnailRunPhase::Exception,
+            _ => ThumbnailRunPhase::Complete,
+        };
+        progress(
+            self.processed.load(Ordering::Relaxed),
+            total,
+            "running",
+            Some(phase),
+        )
+        .with_results(self)
+    }
+}
+
+fn log_thumb_window(
+    run_id: &str,
+    origin: &str,
+    event: &str,
+    total: u64,
+    started: Instant,
+    metrics: &ThumbPerfMetrics,
+    state: &AppState,
+) {
+    let phase = match metrics.phase.load(Ordering::Relaxed) {
+        0 => "fast",
+        1 => "heavy",
+        2 => "exception",
+        _ => "complete",
+    };
+    let (shared_workset_reserved_bytes, shared_workset_peak_reserved_bytes, thumb_queued) =
+        state.thumb_coordinator.resource_snapshot();
+    let native = state.thumb_coordinator.native_counters();
+    let host_qos = crate::thumbnail::qos::host_qos_counts(native.qos_revision);
+    let combined_cpu_ms = native
+        .host_cpu_ms
+        .zip(native.worker_job_cpu_ms)
+        .map(|(host, worker)| host.saturating_add(worker));
+    let host_stage = state.thumb_coordinator.host_stage_timings();
+    let heavy_available = state.background_heavy_limiter.available();
+    let (cpu_admission_total, cpu_admission_active, cpu_fast_active, cpu_admission_peak) =
+        state.background_heavy_limiter.snapshot();
+    let source_io = state.background_volume_io_budget.snapshot();
+    let published = metrics.published.lock().unwrap_or_else(|e| e.into_inner());
+    info!(
+        target: "scrollery::thumb_perf",
+        run_id,
+        origin,
+        event,
+        phase,
+        total,
+        processed = published.processed(),
+        encoded_published = published.results.available,
+        encoded_new = published.results.newly_generated,
+        cache_hit = published.results.cache_hit,
+        direct_registered = published.results.direct,
+        failed = published.results.failed,
+        temporarily_unavailable = published.results.temporarily_unavailable,
+        run_published_executions = ?published.executions,
+        deferred = metrics.deferred.load(Ordering::Relaxed),
+        skipped = metrics.skipped.load(Ordering::Relaxed),
+        shared_workset_reserved_bytes,
+        shared_workset_peak_reserved_bytes,
+        thumb_queued,
+        heavy_available,
+        cpu_admission_total,
+        cpu_admission_active,
+        cpu_fast_active,
+        cpu_admission_peak,
+        heavy_total = state.background_heavy_limiter.total(),
+        source_io_active_by_volume = ?source_io.active_by_volume,
+        source_io_permits = source_io.current,
+        app_source_io_peak_permits = source_io.peak,
+        app_source_io_denied_attempts = source_io.denied_attempts,
+        source_io_media_epoch = source_io.media_epoch,
+        source_io_volume_device_seek_penalty = ?source_io.media_by_volume,
+        source_io_ssd_limit = source_io.ssd_limit,
+        source_io_hdd_limit = source_io.hdd_limit,
+        source_io_unknown_volume_limit = source_io.unknown_limit,
+        app_native_embedded_jpeg_total = native.embedded_jpeg,
+        app_gpu_inflight = native.gpu_inflight,
+        app_gpu_peak_inflight = native.gpu_peak,
+        app_gpu_admission_denied = native.gpu_denied,
+        app_gpu_inflight_limit = native.gpu_limit,
+        app_native_image_d2d_total = native.image_d2d,
+        app_native_image_vpl_total = native.image_vpl,
+        app_native_image_wic_total = native.image_wic,
+        app_native_image_rs_total = native.image_rs,
+        app_native_video_mf_total = native.video_mf,
+        app_native_video_hardware_mft_total = native.video_hardware_mft,
+        app_native_failed_total = native.failed_responses,
+        app_native_timeout_total = native.timed_out,
+        app_native_worker_lost_total = native.worker_lost,
+        app_native_qos_apply_accepted_total = native.qos_apply_accepted,
+        app_native_qos_apply_failed_total = native.qos_apply_failed,
+        app_native_qos_cross_boundary_total = native.qos_cross_boundary,
+        app_native_domain_wait_count = native.domain_wait.count,
+        app_native_domain_wait_ms_sum = native.domain_wait.sum_ms,
+        app_native_domain_wait_ms_max = native.domain_wait.max_ms,
+        app_native_domain_wait_p50_ms_upper = native.domain_wait.p50_ms_upper,
+        app_native_domain_wait_p95_ms_upper = native.domain_wait.p95_ms_upper,
+        app_native_request_wall_count = native.request_wall.count,
+        app_native_request_wall_ms_sum = native.request_wall.sum_ms,
+        app_native_request_wall_ms_max = native.request_wall.max_ms,
+        app_native_request_wall_p50_ms_upper = native.request_wall.p50_ms_upper,
+        app_native_request_wall_p95_ms_upper = native.request_wall.p95_ms_upper,
+        app_native_decode_transform_count = native.decode_transform.count,
+        app_native_decode_transform_ms_sum = native.decode_transform.sum_ms,
+        app_native_decode_transform_ms_max = native.decode_transform.max_ms,
+        app_native_decode_transform_p50_ms_upper = native.decode_transform.p50_ms_upper,
+        app_native_decode_transform_p95_ms_upper = native.decode_transform.p95_ms_upper,
+        app_native_encode_hash_count = native.encode_hash.count,
+        app_native_encode_hash_ms_sum = native.encode_hash.sum_ms,
+        app_native_encode_hash_ms_max = native.encode_hash.max_ms,
+        app_native_encode_hash_p50_ms_upper = native.encode_hash.p50_ms_upper,
+        app_native_encode_hash_p95_ms_upper = native.encode_hash.p95_ms_upper,
+        app_native_embedded_jpeg_combined_count = native.embedded_jpeg_combined.count,
+        app_native_embedded_jpeg_combined_ms_sum = native.embedded_jpeg_combined.sum_ms,
+        app_native_embedded_jpeg_combined_ms_max = native.embedded_jpeg_combined.max_ms,
+        app_native_embedded_jpeg_combined_p50_ms_upper = native.embedded_jpeg_combined.p50_ms_upper,
+        app_native_embedded_jpeg_combined_p95_ms_upper = native.embedded_jpeg_combined.p95_ms_upper,
+        app_host_working_set_bytes = ?native.host_working_set_bytes,
+        app_host_private_bytes = ?native.host_private_bytes,
+        app_host_cpu_ms = ?native.host_cpu_ms,
+        app_native_job_cpu_ms = ?native.worker_job_cpu_ms,
+        app_host_native_cpu_ms = ?combined_cpu_ms,
+        cpu_scope = "whole host process + native thumbnail Job, not exclusive to this run",
+        qos_revision = native.qos_revision,
+        qos_foreground = native.qos_foreground,
+        qos_host_current = ?host_qos,
+        qos_native_current = ?native.qos_workers,
+        host_qos_platform_supported = cfg!(any(windows, target_vendor = "apple")),
+        qos_confirmation = "system request accepted; not CPU placement or frequency",
+        qos_scope = "coordinator processing and native request threads; codec-internal threads unavailable",
+        stage_timing_scope = "app lifetime; decode+transform and hash+encode combined",
+        unavailable_stage_timings = "per-item read/upload/GPU-wait/GPU-timestamp/readback/resize/color/hash",
+        gpu_utilization = "unavailable",
+        app_native_worker_processes = native.worker_processes,
+        app_native_worker_memory_samples = native.worker_memory_samples,
+        app_native_worker_working_set_bytes = ?native.worker_working_set_bytes,
+        app_native_worker_private_bytes = ?native.worker_private_bytes,
+        queue_timing_scope = "unique execution: enqueue to host resource admission; excludes producer backpressure and pre-admission cancellations",
+        e2e_timing_scope = "unique execution: enqueue to result fanout, including cancellation/failure/defer; retries are separate executions",
+        app_host_queue = ?host_stage.queue_wall,
+        app_host_e2e = ?host_stage.e2e_wall,
+        app_host_encode_count = host_stage.encode_wall.count,
+        app_host_encode_ms_sum = host_stage.encode_wall.sum_ms,
+        app_host_encode_ms_max = host_stage.encode_wall.max_ms,
+        app_host_encode_p50_ms_upper = host_stage.encode_wall.p50_ms_upper,
+        app_host_encode_p95_ms_upper = host_stage.encode_wall.p95_ms_upper,
+        app_host_write_count = host_stage.write_wall.count,
+        app_host_write_ms_sum = host_stage.write_wall.sum_ms,
+        app_host_write_ms_max = host_stage.write_wall.max_ms,
+        app_host_write_p50_ms_upper = host_stage.write_wall.p50_ms_upper,
+        app_host_write_p95_ms_upper = host_stage.write_wall.p95_ms_upper,
+        app_host_db_transaction_count = host_stage.db_transaction_wall.count,
+        app_host_db_transaction_ms_sum = host_stage.db_transaction_wall.sum_ms,
+        app_host_db_transaction_ms_max = host_stage.db_transaction_wall.max_ms,
+        app_host_db_transaction_p50_ms_upper = host_stage.db_transaction_wall.p50_ms_upper,
+        app_host_db_transaction_p95_ms_upper = host_stage.db_transaction_wall.p95_ms_upper,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "thumbnail run summary"
+    );
+}
+
+struct RunConfigs<'a> {
+    image: &'a crate::thumbnail::ThumbConfig,
+    video: Option<&'a crate::thumbnail::ThumbConfig>,
+}
+
 fn publish_thumb_progress(
     app: &AppHandle,
     state: &AppState,
     epoch: u64,
     generation: u64,
     cancel_token: &CancellationToken,
-    payload: FullThumbProgressPayload,
+    payload: impl FnOnce() -> FullThumbProgressPayload,
 ) -> bool {
     state.with_thumb_generation_gate(|| {
-        if !state.thumb_gen_token.is_generation_current(generation)
-            || (payload.status == "running" && cancel_token.is_cancelled())
-        {
+        if !state.thumb_gen_token.is_generation_current(generation) || cancel_token.is_cancelled() {
             return false;
         }
         state
             .with_database_lifecycle_read(epoch, || {
+                // 在发布门内采样，避免定时器旧快照晚到后覆盖更新进度或终态。
+                let payload = payload();
                 *state
                     .thumb_gen_progress
                     .lock()
@@ -68,10 +333,6 @@ fn publish_thumb_progress(
     })
 }
 
-/// 在同一缩略图代次临界区内发布终态、失效布局缓存并 compare-and-clear。
-///
-/// 终态发布必须先于清槽，且不能在旧轮释放闸门后再清新轮缓存；清库 epoch 失效时只
-/// 清掉自己的 token，不写入新数据库快照。
 fn finish_thumb_generation(
     app: &AppHandle,
     state: &AppState,
@@ -98,9 +359,23 @@ fn finish_thumb_generation(
     })
 }
 
-/// 缩略图生成状态查询(webview 重载恢复用):最近进度快照 + 运行态真相(token 存在)。
-/// 快照说 "running" 但 token 已不在(停止后收尾窗口/异常终止)→ 报 "cancelled",
-/// 避免前端恢复出一个永不结束的假运行态。
+fn abandon_thumb_generation(
+    app: &AppHandle,
+    state: &AppState,
+    epoch: u64,
+    generation: u64,
+    cancel_token: &CancellationToken,
+) {
+    cancel_token.cancel();
+    let _ = finish_thumb_generation(
+        app,
+        state,
+        epoch,
+        generation,
+        progress(0, 0, "cancelled", None),
+    );
+}
+
 #[tauri::command]
 pub fn full_thumb_gen_status(state: State<'_, Arc<AppState>>) -> Result<FullThumbProgressPayload> {
     Ok(state.with_thumb_generation_gate(|| {
@@ -117,6 +392,8 @@ pub fn full_thumb_gen_status(state: State<'_, Arc<AppState>>) -> Result<FullThum
             status: "idle".to_string(),
             current_item: None,
             phase: None,
+            results: ThumbResultCounts::default(),
+            executions: Vec::new(),
         });
         if (!is_running || is_cancelled) && payload.status == "running" {
             payload.status = "cancelled".to_string();
@@ -133,8 +410,6 @@ pub async fn start_full_thumbnail_generation(
     run_thumbnail_generation(app, state, true).await
 }
 
-/// 增量生成:只处理 thumb_status=0 的项(从未生成,或经 mtime 变更/LRU 驱逐/启动 stat
-/// 兜底被复位),不做全表重置。与「全量」共用同一条多阶段流水线,唯一分叉是前置 reset。
 #[tauri::command]
 pub async fn start_incremental_thumbnail_generation(
     app: AppHandle,
@@ -151,11 +426,11 @@ async fn run_thumbnail_generation(
     let Some(start_epoch) = state.current_database_epoch() else {
         return Ok(());
     };
-
-    // 全量 reset 必须先撤销并换代，再清空数据库中的缩略图状态。否则旧 worker 会在
-    // reset 提交后、新 generation 安装前通过旧代次检查，把刚复位的行重新写成完成。
-    // thumb gate → database lifecycle write 的锁序与 clear_all_thumbnails 相同；reset
-    // 闭包结束前一直持有 thumb gate，因此旧 flush 无法穿过这个线性化点。
+    let native_video_enabled = state
+        .config
+        .get("enable_video_cover")
+        .map(|value| value != "false")
+        .unwrap_or(true);
     let reset_generation: Option<(u64, CancellationToken, u64)> = if reset_all {
         let reset_state = Arc::clone(&*state);
         let reset = tokio::task::spawn_blocking(move || {
@@ -166,12 +441,16 @@ async fn run_thumbnail_generation(
                         .db_writer
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    // 复位面限 media_type='image'(2026-07-10 审查 B6)：video/epub 封面由派生
-                    // 流水线重建，pdf/svg 由前端渲染队列重建，不能交给主 generator 标灰卡。
-                    conn.execute("UPDATE media_items SET thumb_status = 0, thumb_path = NULL, thumbhash = NULL WHERE is_deleted = 0 AND media_type = 'image'", [])
+                    let tx = conn.unchecked_transaction().map_err(AppError::Db)?;
+                    tx.execute("UPDATE media_items SET thumb_status=0, thumb_path=NULL, thumbhash=NULL WHERE is_deleted=0 AND media_type='image'", [])
                         .map_err(AppError::Db)?;
-                    // 同步失效 exotic thumbnail 任务（问题1）：否则 done PSD 既不被重领、又被放回主 generator。
-                    crate::db::queries::reset_all_exotic_thumbnail_tasks(&conn)?;
+                    q::reset_image_thumbnail_leases(&tx)?;
+                    if native_video_enabled {
+                        q::reset_native_video_covers_for_full_run(&tx)?;
+                        q::reset_native_video_cover_leases(&tx)?;
+                    }
+                    q::reset_all_exotic_thumbnail_tasks(&tx)?;
+                    tx.commit().map_err(AppError::Db)?;
                     Ok(())
                 })?;
                 let epoch = reset_state.current_database_epoch().ok_or_else(|| {
@@ -183,504 +462,540 @@ async fn run_thumbnail_generation(
         })
         .await
         .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
-        // 让 Coordinator 重领被退回 pending 的 exotic 任务（重做覆盖同路径产物）。
         state.wake_exotic(crate::exotic::coordinator::WakeReason::ConfigChanged);
         Some(reset)
     } else {
         None
     };
-
-    // R1-3：计数（读池）走 read_blocking。
-    let total = super::blocking::read_blocking(&state, |conn| {
-        crate::db::queries::count_pending_thumb_items(conn)
-    })
-    .await?;
-
     let (generation, cancel_token, epoch) = match reset_generation {
-        Some(generation) => generation,
+        Some(value) => value,
         None => {
-            let Some(generation) = state.try_new_thumb_gen_token() else {
+            let Some(value) = state.try_new_thumb_gen_token() else {
                 return Ok(());
             };
-            generation
+            value
         }
     };
-
-    // 增量入口保留原有的「调用期间生命周期已换代则不启动」语义；全量入口的 epoch
-    // 必然因自身 reset 变化，因此只检查它在计数结束后仍然有效。
-    let epoch_invalidated = if reset_all {
-        !state.is_database_epoch_current(epoch)
-    } else {
-        epoch != start_epoch
-    };
-    if epoch_invalidated {
+    if (reset_all && !state.is_database_epoch_current(epoch))
+        || (!reset_all && epoch != start_epoch)
+    {
         cancel_token.cancel();
         state.with_thumb_generation_gate(|| {
             let _ = state.thumb_gen_token.finish(generation);
         });
         return Ok(());
     }
+
+    let mut config = state
+        .thumb_config
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    config.size = snap_to_tier(config.size);
+    let fp = OutputFingerprint::for_image(&config);
+    config.output_fingerprint = Some(fp);
+    let mut video_config = config.clone();
+    video_config.ai_hq_cache = false;
+    let video_fp = OutputFingerprint::for_native_video_cover(&video_config);
+    video_config.output_fingerprint = Some(video_fp);
+    let run_id = match unique_id() {
+        Ok(id) => id,
+        Err(error) => {
+            abandon_thumb_generation(&app, &state, epoch, generation, &cancel_token);
+            return Err(error);
+        }
+    };
+    let metrics = Arc::new(ThumbPerfMetrics::default());
+    let observer = state.thumb_coordinator.observe_run(&run_id, {
+        let metrics = Arc::clone(&metrics);
+        Arc::new(move |outcome| metrics.record_committed(outcome))
+    });
+    let state_arc = Arc::clone(&*state);
+    let enrolled = tokio::task::spawn_blocking(move || {
+        state_arc.with_database_lifecycle_read(epoch, || {
+            let conn = state_arc
+                .db_writer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let images = q::enroll_image_thumbnail_run(&conn, &run_id, fp)?;
+            let videos = if native_video_enabled {
+                q::enroll_native_video_cover_run(&conn, &run_id, video_fp)?
+            } else {
+                0
+            };
+            Ok((run_id, images + videos))
+        })
+    })
+    .await
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))
+    .and_then(|value| value.transpose());
+    let (run_id, total) = match enrolled {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            abandon_thumb_generation(&app, &state, epoch, generation, &cancel_token);
+            return Ok(());
+        }
+        Err(error) => {
+            abandon_thumb_generation(&app, &state, epoch, generation, &cancel_token);
+            return Err(error);
+        }
+    };
     if total == 0 {
+        info!(target: "scrollery::thumb_perf", run_id,
+            origin = if reset_all { "full" } else { "incremental" },
+            epoch, generation, total = 0, status = "completed",
+            "thumbnail run empty");
         let _ = finish_thumb_generation(
             &app,
             &state,
             epoch,
             generation,
-            FullThumbProgressPayload {
-                generated: 0,
-                total: 0,
-                status: "completed".to_string(),
-                current_item: None,
-                phase: None,
-            },
+            progress(0, 0, "completed", None),
         );
         return Ok(());
     }
 
-    let state_arc = Arc::clone(&*state);
-    let generated_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    state.thumb_coordinator.begin_native_run();
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let start_time = std::time::Instant::now();
-        publish_thumb_progress(
+    let origin = if reset_all { "full" } else { "incremental" };
+    let started = Instant::now();
+    info!(
+        target: "scrollery::thumb_perf",
+        run_id,
+        origin,
+        epoch,
+        generation,
+        total,
+        image_fingerprint = %fp.hex(),
+        native_video_enabled,
+        build_profile = env!("SCROLLERY_BUILD_PROFILE"),
+        build_opt_level = env!("SCROLLERY_BUILD_OPT_LEVEL"),
+        build_target = env!("SCROLLERY_BUILD_TARGET"),
+        package_kind = env!("SCROLLERY_PACKAGE_KIND"),
+        debug_assertions = cfg!(debug_assertions),
+        app_version = env!("CARGO_PKG_VERSION"),
+        schema_version = crate::db::schema::SCHEMA_VERSION,
+        requested_strategy = %config.strategy,
+        size = config.size,
+        webp_quality = config.webp_quality,
+        ai_hq_cache = config.ai_hq_cache,
+        "thumbnail run started"
+    );
+    let ticker_stop = CancellationToken::new();
+    let ticker_stop_task = ticker_stop.clone();
+    let ticker_metrics = Arc::clone(&metrics);
+    let ticker_run_id = run_id.clone();
+    let ticker_state = Arc::clone(&*state);
+    let ticker_app = app.clone();
+    let ticker_cancel = cancel_token.clone();
+    let mut focus_changes = crate::thumbnail::qos::subscribe_focus_changes();
+    let mut observed_focus = crate::thumbnail::qos::native_worker_qos_request();
+    tokio::spawn(async move {
+        let mut focus_observed_at = Instant::now();
+        let period = Duration::from_secs(5);
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = ticker_stop_task.cancelled() => break,
+                changed = focus_changes.changed() => {
+                    if changed.is_err() { break; }
+                    let current = crate::thumbnail::qos::native_worker_qos_request();
+                    if current != observed_focus {
+                        info!(target: "scrollery::thumb_perf", run_id = %ticker_run_id,
+                            previous_foreground = observed_focus.0, previous_revision = observed_focus.1,
+                            foreground = current.0, qos_revision = current.1,
+                            observed_window_ms = focus_observed_at.elapsed().as_millis() as u64,
+                            observed_revision_changes = current.1.wrapping_sub(observed_focus.1),
+                            focus_window_scope = "async observation boundary; cumulative counters, rapid changes may coalesce",
+                            "thumbnail focus window closed");
+                        log_thumb_window(&ticker_run_id, origin, "focus_change", total as u64, started, &ticker_metrics, &ticker_state);
+                        observed_focus = current;
+                        focus_observed_at = Instant::now();
+                    }
+                },
+                _ = ticker.tick() => {
+                    log_thumb_window(&ticker_run_id, origin, "window", total as u64, started, &ticker_metrics, &ticker_state);
+                    publish_thumb_progress(&ticker_app, &ticker_state, epoch, generation, &ticker_cancel,
+                        || ticker_metrics.running_progress(total as u64));
+                }
+            }
+        }
+    });
+    let state_arc = Arc::clone(&*state);
+    tokio::task::spawn_blocking(move || {
+        let report = |phase: ThumbnailRunPhase| {
+            let phase_code = match phase {
+                ThumbnailRunPhase::Fast => 0,
+                ThumbnailRunPhase::Heavy => 1,
+                ThumbnailRunPhase::Exception => 2,
+                ThumbnailRunPhase::Complete => 3,
+            };
+            let prior = metrics.phase.swap(phase_code, Ordering::Relaxed);
+            if prior != phase_code {
+                log_thumb_window(
+                    &run_id,
+                    origin,
+                    "phase",
+                    total as u64,
+                    started,
+                    &metrics,
+                    &state_arc,
+                );
+            }
+            let _ =
+                publish_thumb_progress(&app, &state_arc, epoch, generation, &cancel_token, || {
+                    metrics.running_progress(total as u64)
+                });
+        };
+        let on_result = |outcome: ImageExecution| match outcome {
+            ImageExecution::Published(..) | ImageExecution::Unavailable(_) => {
+                let current = metrics.processed.load(Ordering::Relaxed);
+                if current.is_multiple_of(50) {
+                    let phase = match metrics.phase.load(Ordering::Relaxed) {
+                        0 => ThumbnailRunPhase::Fast,
+                        1 => ThumbnailRunPhase::Heavy,
+                        _ => ThumbnailRunPhase::Exception,
+                    };
+                    report(phase);
+                }
+            }
+            ImageExecution::Deferred(_) => {
+                metrics.deferred.fetch_add(1, Ordering::Relaxed);
+            }
+            ImageExecution::Skipped(_) => {
+                metrics.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        report(ThumbnailRunPhase::Fast);
+        let result = run_background_images(
+            &state_arc,
+            epoch,
+            &run_id,
+            RunConfigs {
+                image: &config,
+                video: native_video_enabled.then_some(&video_config),
+            },
+            &cancel_token,
+            &on_result,
+            &report,
+        );
+        observer.synchronize();
+        let status = match result {
+            Err(error) => {
+                error!("thumbnail run failed: {error}");
+                cancel_token.cancel();
+                "error"
+            }
+            Ok(()) if cancel_token.is_cancelled() => "cancelled",
+            Ok(()) => "completed",
+        };
+        let _ = finish_thumb_generation(
             &app,
             &state_arc,
             epoch,
             generation,
-            &cancel_token,
-            FullThumbProgressPayload {
-                generated: 0,
-                total: total as u64,
-                status: "running".to_string(),
-                current_item: None,
-                phase: Some("GPU".to_string()),
-            },
+            progress(
+                metrics.processed.load(Ordering::Relaxed),
+                total as u64,
+                status,
+                None,
+            )
+            .with_results(&metrics),
         );
-
-        let mut config = state_arc
-            .thumb_config
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        // 同 batch_request_thumbnails:直调 decode/encode_media_step,须先把可能的非档位尺寸
-        // (如历史默认 480)吸附到有效档位,否则 thumb_path 断言失败(panic during encode_media_step)。
-        config.size = snap_to_tier(config.size);
-        info!(
-            "[FullThumbGen] START: total={} strategy={} gpu_engine={} size={} skip_max_bytes={} cache_dir={:?} | 全量缩略图生成开始",
-            total, config.strategy, config.gpu_engine, config.size, config.skip_max_bytes, config.cache_dir
+        ticker_stop.cancel();
+        log_thumb_window(
+            &run_id,
+            origin,
+            status,
+            total as u64,
+            started,
+            &metrics,
+            &state_arc,
         );
+    });
+    Ok(())
+}
 
-        // 进度 IPC 节流:逐张发送在大库下是 IPC 风暴(8 万+ 条)并挤掉侧栏 rAF。
-        // 最终 completed/cancelled 恒发送,进度条仍走到 100%。
-        const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
-
-        {
-            // 多阶段流水线(生成引擎终局,2026-07-10 A/B 实测裁决后唯一实现,见文件头注)。
-            let (decode_tx, decode_rx) = bounded(1024);
-            let (encode_tx, encode_rx) = bounded(1024);
-            let (result_tx, result_rx) = bounded::<
-                std::result::Result<
-                    ThumbResult,
-                    (crate::db::models::MediaItem, std::path::PathBuf),
-                >,
-            >(1024);
-
-            let state_dispatcher = state_arc.clone();
-            let cancel_dispatcher = cancel_token.clone();
-            std::thread::spawn(move || {
-                let all_ids = {
-                    let pool = match state_dispatcher.db_read_pool.get() {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
-                    crate::db::queries::get_all_pending_thumb_ids(&pool).unwrap_or_default()
-                };
-                info!("[FullThumbGen] Dispatcher: {} pending IDs fetched | 调度器: 获取到 {} 个待处理 ID", all_ids.len(), all_ids.len());
-
-                for chunk in all_ids.chunks(50) {
-                    if cancel_dispatcher.is_cancelled()
-                        || !state_dispatcher.is_database_epoch_current(epoch)
-                    {
-                        break;
-                    }
-                    let pool = match state_dispatcher.db_read_pool.get() {
-                        Ok(p) => p,
-                        Err(_) => break,
-                    };
-
-                    for &id in chunk {
-                        if cancel_dispatcher.is_cancelled()
-                            || !state_dispatcher.is_database_epoch_current(epoch)
-                        {
-                            break;
-                        }
-                        if let Ok(item) = crate::db::queries::get_media_item(&pool, id) {
-                            if let Ok((root_path, rel_path, file_name)) =
-                                crate::db::queries::get_item_path_info(&pool, id)
-                            {
-                                let abs_path_str = crate::utils::path::resolve_media_path(
-                                    &root_path, &rel_path, &file_name,
-                                );
-                                let abs_path = std::path::PathBuf::from(abs_path_str);
-                                if decode_tx.send((item, abs_path)).is_err() {
-                                    return;
-                                }
-                            } else {
-                                error!("[FullThumbGen] path_info failed for id={}", id);
-                            }
-                        } else {
-                            error!("[FullThumbGen] get_media_item failed for id={}", id);
-                        }
-                    }
-                }
-                info!("[FullThumbGen] Dispatcher: done sending items | 调度器: 发送完毕");
-            });
-
-            let config_decode = config.clone();
-            let cancel_decode = cancel_token.clone();
-            // CPU 预算限流(2026-07-13,同批量路径):解码/编码池按 thumb_cpu_budget 上限,
-            // 让出 reserve 核给 UI;Phase 2 deferred(GPU 失败回退,罕见)仍走全局 rayon 池。
-            let budget = thumb_cpu_budget();
-            let decode_threads = budget;
-            for _ in 0..decode_threads {
-                let rx = decode_rx.clone();
-                let tx = encode_tx.clone();
-                let res_tx = result_tx.clone();
-                let state_worker = state_arc.clone();
-                let cfg = config_decode.clone();
-                let cancel = cancel_decode.clone();
-                std::thread::spawn(move || {
-                    let mut qos_state: Option<bool> = None;
-                    while let Ok((item, abs_path)) = rx.recv() {
-                        refresh_worker_qos(&mut qos_state);
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        let decoded = match state_worker.with_database_lifecycle_read(epoch, || {
-                            decode_media_step(&item, &abs_path, &state_worker.engine_arena, &cfg)
-                        }) {
-                            Some(result) => result,
-                            None => break,
-                        };
-                        match decoded {
-                            Ok(DecodeResult::Ready(res)) => {
-                                let _ = res_tx.send(Ok(res));
-                            }
-                            Ok(DecodeResult::ToEncode {
-                                item_id,
-                                source_revision,
-                                cache_key,
-                                decoded,
-                            }) => {
-                                if tx
-                                    .send((item_id, source_revision, cache_key, decoded))
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Ok(DecodeResult::DeferredToCpu { item, abs_path }) => {
-                                let _ = res_tx.send(Err((item, abs_path)));
-                            }
-                            Err(e) => {
-                                error!("Full gen decode failed for id={}: {}", item.id, e);
-                                let _ = res_tx.send(Ok(ThumbResult {
-                                    item_id: item.id,
-                                    thumb_status: 2,
-                                    thumb_path: None,
-                                    thumbhash: None,
-                                    source_revision: item.source_revision,
-                                    cache_key: item.cache_key,
-                                }));
-                            }
-                        }
-                    }
-                });
+fn progress(
+    generated: u64,
+    total: u64,
+    status: &str,
+    phase: Option<ThumbnailRunPhase>,
+) -> FullThumbProgressPayload {
+    FullThumbProgressPayload {
+        generated,
+        total,
+        status: status.into(),
+        current_item: None,
+        results: ThumbResultCounts::default(),
+        executions: Vec::new(),
+        phase: phase.map(|phase| {
+            match phase {
+                ThumbnailRunPhase::Fast => "fast",
+                ThumbnailRunPhase::Heavy => "heavy",
+                ThumbnailRunPhase::Exception => "exception",
+                ThumbnailRunPhase::Complete => "complete",
             }
-            drop(encode_tx);
+            .to_owned()
+        }),
+    }
+}
 
-            let config_encode = config.clone();
-            let cancel_encode = cancel_token.clone();
-            for _ in 0..budget {
-                let rx = encode_rx.clone();
-                let tx = result_tx.clone();
-                let state_worker = state_arc.clone();
-                let cfg = config_encode.clone();
-                let cancel = cancel_encode.clone();
-                std::thread::spawn(move || {
-                    let mut qos_state: Option<bool> = None;
-                    while let Ok((item_id, source_revision, cache_key, decoded)) = rx.recv() {
-                        refresh_worker_qos(&mut qos_state);
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        let encoded = match state_worker.with_database_lifecycle_read(epoch, || {
-                            crate::thumbnail::encode_media_step_with_snapshot(
-                                item_id,
-                                source_revision,
-                                cache_key,
-                                decoded,
-                                &cfg,
-                            )
-                        }) {
-                            Some(result) => result,
-                            None => break,
-                        };
-                        match encoded {
-                            Ok(res) => {
-                                let _ = tx.send(Ok(res));
-                            }
-                            Err(e) => {
-                                error!("Full gen encode failed for id={}: {}", item_id, e);
-                                let _ = tx.send(Ok(ThumbResult {
-                                    item_id,
-                                    thumb_status: 2,
-                                    thumb_path: None,
-                                    thumbhash: None,
-                                    source_revision,
-                                    cache_key,
-                                }));
-                            }
-                        }
-                    }
-                });
-            }
-            drop(result_tx);
-
-            let mut successful_results = Vec::new();
-            let mut deferred_items = Vec::new();
-
-            // 进度节流时钟(常量已提升到两方案共用):收集器单线程,裸 Instant 即可。
-            let mut last_progress_emit = std::time::Instant::now();
-
-            while let Ok(msg) = result_rx.recv() {
-                if cancel_token.is_cancelled() || !state_arc.is_database_epoch_current(epoch) {
+fn run_background_images<F, P>(
+    state: &Arc<AppState>,
+    epoch: u64,
+    run_id: &str,
+    configs: RunConfigs<'_>,
+    cancel: &CancellationToken,
+    on_result: &F,
+    report: &P,
+) -> Result<()>
+where
+    F: Fn(ImageExecution) + Sync,
+    P: Fn(ThumbnailRunPhase),
+{
+    let RunConfigs {
+        image: config,
+        video: video_config,
+    } = configs;
+    let fp = config
+        .output_fingerprint
+        .expect("run config has fingerprint");
+    // 分类生产者不打开源文件，逐页送 Q1；Q2 只留下持久任务行，不占图片缓冲。
+    state.thumb_coordinator.run_images(
+        state,
+        epoch,
+        config,
+        cancel,
+        |tx| {
+            let mut cursor = 0;
+            loop {
+                if cancel.is_cancelled() || !state.is_database_epoch_current(epoch) {
                     break;
                 }
-
-                match msg {
-                    Ok(res) => {
-                        successful_results.push(res.clone());
-                        generated_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_progress_emit) >= PROGRESS_THROTTLE {
-                            last_progress_emit = now;
-                            let current =
-                                generated_count.load(std::sync::atomic::Ordering::Relaxed);
-                            publish_thumb_progress(
-                                &app,
-                                &state_arc,
-                                epoch,
-                                generation,
-                                &cancel_token,
-                                FullThumbProgressPayload {
-                                    generated: current,
-                                    total: total as u64,
-                                    status: "running".to_string(),
-                                    current_item: None,
-                                    phase: Some("GPU".to_string()),
-                                },
+                let page = {
+                    let conn = state.db_read_pool.get().map_err(AppError::from)?;
+                    q::image_thumbnail_run_page(&conn, run_id, cursor, 256)?
+                };
+                if page.is_empty() {
+                    break;
+                }
+                let mut candidates = page.into_iter();
+                loop {
+                    let batch: Vec<_> = candidates
+                        .by_ref()
+                        .take(50)
+                        .map(|candidate| {
+                            cursor = candidate.item.id;
+                            let lane = classify_image_cost(
+                                &candidate.item.file_format,
+                                candidate.item.file_size,
+                                candidate.item.width,
+                                candidate.item.height,
                             );
+                            (candidate, lane)
+                        })
+                        .collect();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    let entries: Vec<_> = batch
+                        .iter()
+                        .map(|(candidate, lane)| {
+                            (
+                                ThumbnailTaskKey {
+                                    item_id: candidate.item.id,
+                                    source_revision: candidate.item.source_revision,
+                                    kind: ThumbnailTaskKind::Image,
+                                    output_fingerprint: fp.hex(),
+                                },
+                                *lane,
+                            )
+                        })
+                        .collect();
+                    let classified = state.with_database_lifecycle_read(epoch, || {
+                        let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+                        q::classify_image_thumbnail_batch(&conn, run_id, &entries)
+                    });
+                    let Some(classified) = classified.transpose()? else {
+                        return Ok(());
+                    };
+                    for ((candidate, lane), accepted) in batch.into_iter().zip(classified) {
+                        if accepted
+                            && lane == ThumbnailLane::Fast
+                            && tx.send((candidate, lane)).is_err()
+                        {
+                            return Ok(());
                         }
                     }
-                    Err(deferred) => {
-                        deferred_items.push(deferred);
-                    }
-                }
-
-                if successful_results.len() >= 50 {
-                    // 记录批次状态分布
-                    let n_encoded = successful_results
-                        .iter()
-                        .filter(|r| r.thumb_status == 1)
-                        .count();
-                    let n_direct = successful_results
-                        .iter()
-                        .filter(|r| r.thumb_status == 3)
-                        .count();
-                    let n_failed = successful_results
-                        .iter()
-                        .filter(|r| r.thumb_status == 2)
-                        .count();
-                    info!(
-                        "[FullThumbGen] Batch flush: {} results (encoded={}, direct={}, failed={}) | 批次写入",
-                        successful_results.len(), n_encoded, n_direct, n_failed
-                    );
-
-                    if !flush_thumb_results_for_generation(
-                        &state_arc,
-                        epoch,
-                        generation,
-                        &cancel_token,
-                        &successful_results,
-                    ) {
-                        cancel_token.cancel();
-                        break;
-                    }
-                    successful_results.clear();
                 }
             }
+            Ok(())
+        },
+        on_result,
+    )?;
 
-            // 落盘剩余结果
-            if !successful_results.is_empty()
-                && !flush_thumb_results_for_generation(
-                    &state_arc,
-                    epoch,
-                    generation,
-                    &cancel_token,
-                    &successful_results,
-                )
-                && !cancel_token.is_cancelled()
-            {
-                cancel_token.cancel();
-            }
-
-            // 并行化(2026-07-10 修复 F3):原实现单线程逐个消化——批量路径(T12)为
-            // deferred 建了 cores/2 专用池,唯独全库路径此处单核爬行;strategy=gpu 且
-            // GPU 回退较多时 Phase 2 成瓶颈。分块 par_iter:块尺寸取 max(cores, 10)
-            // 喂饱 rayon 池,每块一次事务批写(近似原 10-flush 节奏),取消粒度=块。
-            if !deferred_items.is_empty() && !cancel_token.is_cancelled() {
-                info!("[FullThumbGen] Phase 2: Processing {} deferred CPU tasks | 阶段2：处理延迟的 CPU 任务", deferred_items.len());
-                let phase2_chunk = budget.max(10);
-                // Phase 2 也受亲和性约束:GPU 回退较多时它会吃满 CPU,若走全局 rayon 池会摊到所有
-                // 核、抵消预留核。局部池 num_threads=budget + start_handler 逐线程钉核;建池失败(极少)
-                // 退回全局池,行为不变。
-                let phase2_pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(budget)
-                    .start_handler(|_| crate::thumbnail::qos::apply_current_thread_qos())
-                    .build()
-                    .ok();
-                for chunk in deferred_items.chunks(phase2_chunk) {
-                    if cancel_token.is_cancelled() || !state_arc.is_database_epoch_current(epoch) {
-                        break;
-                    }
-
-                    let run = || {
-                        chunk
-                            .par_iter()
-                            .filter_map(|(item, abs_path)| {
-                                let result =
-                                    state_arc.with_database_lifecycle_read(epoch, || {
-                                        process_deferred_cpu(
-                                            item,
-                                            abs_path,
-                                            &state_arc.engine_arena,
-                                            &config,
-                                        )
-                                    })?;
-                                Some(match result {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        error!(
-                                            "Full gen CPU fallback failed for id={}: {}",
-                                            item.id, e
-                                        );
-                                        ThumbResult {
-                                            item_id: item.id,
-                                            thumb_status: 2,
-                                            thumb_path: None,
-                                            thumbhash: None,
-                                            source_revision: item.source_revision,
-                                            cache_key: item.cache_key,
-                                        }
-                                    }
-                                })
-                            })
-                            .collect::<Vec<ThumbResult>>()
-                    };
-                    // 有局部池走池,否则退回全局池(直接调用)。
-                    let chunk_results: Vec<ThumbResult> = match &phase2_pool {
-                        Some(pool) => pool.install(run),
-                        None => run(),
-                    };
-
-                    generated_count.fetch_add(
-                        chunk_results.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    if !flush_thumb_results_for_generation(
-                        &state_arc,
-                        epoch,
-                        generation,
-                        &cancel_token,
-                        &chunk_results,
-                    ) {
-                        cancel_token.cancel();
-                        break;
-                    }
-
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_progress_emit) >= PROGRESS_THROTTLE {
-                        last_progress_emit = now;
-                        let current = generated_count.load(std::sync::atomic::Ordering::Relaxed);
-                        publish_thumb_progress(
-                            &app,
-                            &state_arc,
+    let mut phase = ThumbnailRunPhase::Fast;
+    for (lane, index) in [
+        (ThumbnailLane::Fast, 0),
+        (ThumbnailLane::Heavy, 1),
+        (ThumbnailLane::Exception, 2),
+    ] {
+        if cancel.is_cancelled() || !state.is_database_epoch_current(epoch) {
+            break;
+        }
+        report(phase);
+        // 图片与视频使用同一 Coordinator 的额度；两个生产者并行避免慢视频挡住同阶段图片。
+        let counts = run_parallel_phases(
+            || run_background_image_phase(state, epoch, run_id, config, lane, cancel, on_result),
+            video_config
+                .filter(|_| lane != ThumbnailLane::Fast)
+                .map(|video_config| {
+                    || {
+                        state.thumb_coordinator.run_background_video_cover_phase(
+                            state,
                             epoch,
-                            generation,
-                            &cancel_token,
-                            FullThumbProgressPayload {
-                                generated: current,
-                                total: total as u64,
-                                status: "running".to_string(),
-                                current_item: None,
-                                phase: Some("CPU".to_string()),
+                            video_config,
+                            VideoCoverPhase {
+                                run_id,
+                                lane,
+                                index,
                             },
-                        );
+                            cancel,
+                            on_result,
+                        )
+                    }
+                }),
+            cancel,
+        )?;
+        phase = advance_run_phase(phase, true, counts);
+    }
+    Ok(())
+}
+
+fn run_parallel_phases<I, V>(
+    images: I,
+    video: Option<V>,
+    cancel: &CancellationToken,
+) -> Result<[u64; 3]>
+where
+    I: FnOnce() -> Result<[u64; 3]> + Send,
+    V: FnOnce() -> Result<()> + Send,
+{
+    std::thread::scope(|scope| {
+        let video = video.map(|video| {
+            scope.spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(video))
+                    .unwrap_or_else(|_| {
+                        Err(AppError::Internal("video cover phase panicked".into()))
+                    });
+                if result.is_err() {
+                    cancel.cancel();
+                }
+                result
+            })
+        });
+        let images = std::panic::catch_unwind(std::panic::AssertUnwindSafe(images))
+            .unwrap_or_else(|_| Err(AppError::Internal("image thumbnail phase panicked".into())));
+        if images.is_err() {
+            cancel.cancel();
+        }
+        let videos = video.map(|handle| {
+            handle
+                .join()
+                .map_err(|_| AppError::Internal("video cover phase panicked".into()))?
+        });
+        let counts = images?;
+        if let Some(result) = videos {
+            result?;
+        }
+        Ok(counts)
+    })
+}
+
+/// 一段图片阶段与同阶段原生视频并行派发，结束后再推进整轮阶段。
+fn run_background_image_phase<F>(
+    state: &Arc<AppState>,
+    epoch: u64,
+    run_id: &str,
+    config: &crate::thumbnail::ThumbConfig,
+    lane: ThumbnailLane,
+    cancel: &CancellationToken,
+    on_result: &F,
+) -> Result<[u64; 3]>
+where
+    F: Fn(ImageExecution) + Sync,
+{
+    let index = match lane {
+        ThumbnailLane::Fast => 0,
+        ThumbnailLane::Heavy => 1,
+        ThumbnailLane::Exception => 2,
+        _ => unreachable!("background image phase uses only run lanes"),
+    };
+    loop {
+        if cancel.is_cancelled() || !state.is_database_epoch_current(epoch) {
+            return Ok([0; 3]);
+        }
+        let counts = {
+            let conn = state.db_read_pool.get().map_err(AppError::from)?;
+            q::image_thumbnail_run_open_counts(&conn, run_id)?
+        };
+        if counts[index] == 0 {
+            return Ok(counts);
+        }
+        let has_ready = {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| AppError::Internal("system clock before Unix epoch".into()))?
+                .as_secs() as i64;
+            let conn = state.db_read_pool.get().map_err(AppError::from)?;
+            !q::image_thumbnail_lane_page(&conn, run_id, lane, 0, 1, now)?.is_empty()
+        };
+        if !has_ready {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        let mut dispatched = 0;
+        state.thumb_coordinator.run_images(
+            state,
+            epoch,
+            config,
+            cancel,
+            |tx| {
+                let mut cursor = 0;
+                loop {
+                    if cancel.is_cancelled() || !state.is_database_epoch_current(epoch) {
+                        break;
+                    }
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| AppError::Internal("system clock before Unix epoch".into()))?
+                        .as_secs() as i64;
+                    let page = {
+                        let conn = state.db_read_pool.get().map_err(AppError::from)?;
+                        q::image_thumbnail_lane_page(&conn, run_id, lane, cursor, 256, now)?
+                    };
+                    if page.is_empty() {
+                        break;
+                    }
+                    for candidate in page {
+                        cursor = candidate.item.id;
+                        if tx.send((candidate, lane)).is_err() {
+                            return Ok(());
+                        }
+                        dispatched += 1;
                     }
                 }
-            }
-        }
-
-        let final_gen = generated_count.load(std::sync::atomic::Ordering::Relaxed);
-        let lifecycle_current = state_arc.is_database_epoch_current(epoch);
-        if !lifecycle_current {
-            // clear_database 不依赖 thumb token；让本轮尽快收尾，但不要触碰新轮 token。
-            cancel_token.cancel();
-        }
-        info!(
-            "[FullThumbGen] FINISHED: generated={} total={} cancelled={} elapsed={}ms | 全量缩略图生成完成",
-            final_gen, total, cancel_token.is_cancelled(), start_time.elapsed().as_millis()
-        );
-        let final_status = if cancel_token.is_cancelled() {
-            "cancelled"
-        } else {
-            "completed"
-        };
-        // Compare-and-clear:仅当槽内仍是本轮才在同一短临界区发布终态并清 token。
-        // 旧轮迟到收尾不能覆盖新轮快照，也不能在新轮启动后清其布局缓存。
-        let finished_current = finish_thumb_generation(
-            &app,
-            &state_arc,
-            epoch,
-            generation,
-            FullThumbProgressPayload {
-                generated: final_gen,
-                total: total as u64,
-                status: final_status.to_string(),
-                current_item: None,
-                phase: None,
+                Ok(())
             },
-        );
-        if finished_current {
-            tracing::info!(
-                "Thumbnail gen token cleared after completion | 全量缩略图 token 已清除"
-            );
-        } else {
-            tracing::info!(
-                "Thumbnail gen superseded or database lifecycle changed; skip final publish | 本轮已被新轮取代或数据库生命周期已变化,跳过终态发布"
-            );
+            on_result,
+        )?;
+        if dispatched == 0 {
+            std::thread::sleep(Duration::from_millis(200));
         }
-
-        tracing::info!(
-            "Layout cache invalidated after full thumb gen | 全量缩略图后已清空布局缓存"
-        );
-
-        Ok(())
-    });
-
-    Ok(())
+    }
 }
 
 #[tauri::command]

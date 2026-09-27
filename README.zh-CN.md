@@ -67,6 +67,17 @@ Scrollery 是一款桌面优先的媒体整理、浏览与检索应用。围绕�
 
 ```bash
 npm install
+```
+
+Windows x64 首次开发启动或发布构建前，需要准备锁定版本的 Intel VPL dispatcher。此步骤会下载第三方源码，并使用 Visual Studio 的 C++ 和 CMake 工具编译。删除 `target/native-vpl` 或更新锁定的 VPL 版本后需重新执行：
+
+```bash
+node scripts/build-vpl-dispatcher.mjs
+```
+
+启动开发环境：
+
+```bash
 npm run tauri dev
 ```
 
