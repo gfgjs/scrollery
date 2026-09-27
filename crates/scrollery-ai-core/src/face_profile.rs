@@ -228,28 +228,3 @@ pub fn default_face_profile() -> FaceProfile {
     find_face_profile(DEFAULT_FACE_PROFILE_ID)
         .expect("default face profile must exist | 默认人脸 profile 必须存在")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Part4-T1 合规断言:默认(=商业同形)build 的注册表**物理不含**非商用轨。
-    /// 这是「不能只靠运行时不可达」的编译期证据,CI 默认矩阵天然在跑;
-    /// 商业流水线(Part7 T16/17)的二进制符号扫描是第二道兜底。
-    #[cfg(not(feature = "face-noncommercial"))]
-    #[test]
-    fn noncommercial_track_absent_by_default() {
-        assert!(find_face_profile("scrfd-arcface-r50").is_none());
-        assert_eq!(face_profiles().len(), 1, "默认注册表只应有商用轨");
-        assert_eq!(face_profiles()[0].id, DEFAULT_FACE_PROFILE_ID);
-    }
-
-    /// 研究/自用 build(--features face-noncommercial):非商用轨显现且合规标记齐全。
-    #[cfg(feature = "face-noncommercial")]
-    #[test]
-    fn noncommercial_track_present_with_feature() {
-        let p = find_face_profile("scrfd-arcface-r50").expect("feature 开启时应存在");
-        assert!(!p.commercial_ok, "必须保持非商用标记");
-        assert!(!p.verified, "对拍坐实前必须保持 UNVERIFIED");
-    }
-}

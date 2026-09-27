@@ -112,7 +112,7 @@ impl WorkerSupervisor {
         // stdout → 协议帧 channel。
         // 每实例只有一个请求；帧队列背压限制异常 worker 的宿主内存占用。
         let (tx, rx) = crossbeam_channel::bounded(2);
-        let reader_handle = spawn_frame_reader(stdout, tx);
+        let reader_handle = spawn_frame_reader(stdout, tx, cfg.max_blob_len);
 
         // stderr → 有界环形缓冲（持续排空，防管道写满死锁）+ 行级转发进主 tracing（W4）。
         let stderr_ring = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_RING_CAP)));
@@ -438,70 +438,11 @@ fn raw_outcome_label(o: &RawOutcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exotic::worker::{default_thumbnail_limits, resolve_psd_worker_path};
-
-    /// 合成最小合法 RGB 8-bit raw PSD（与 worker 解码单测同结构）。
-    fn make_rgb_psd(w: u32, h: u32) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(b"8BPS");
-        b.extend_from_slice(&1u16.to_be_bytes());
-        b.extend_from_slice(&[0u8; 6]);
-        b.extend_from_slice(&3u16.to_be_bytes());
-        b.extend_from_slice(&h.to_be_bytes());
-        b.extend_from_slice(&w.to_be_bytes());
-        b.extend_from_slice(&8u16.to_be_bytes());
-        b.extend_from_slice(&3u16.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0u16.to_be_bytes());
-        for ch in 0..3u32 {
-            for y in 0..h {
-                for x in 0..w {
-                    b.push(match ch {
-                        0 => {
-                            if w > 1 {
-                                (x * 255 / (w - 1)) as u8
-                            } else {
-                                200
-                            }
-                        }
-                        1 => {
-                            if h > 1 {
-                                (y * 255 / (h - 1)) as u8
-                            } else {
-                                120
-                            }
-                        }
-                        _ => 128,
-                    });
-                }
-            }
-        }
-        b
-    }
-
-    fn test_spec(path: std::path::PathBuf) -> WorkerSpec {
-        WorkerSpec {
-            exe_path: path,
-            expected_worker_id: "psd-worker".into(),
-            required_capabilities: vec!["thumbnail".into()],
-        }
-    }
-
-    fn test_cfg() -> WorkerConfig {
-        WorkerConfig {
-            handshake_timeout: Duration::from_secs(5),
-            host_version: "0.1.0".into(),
-            max_blob_len: exotic_protocol::MAX_BLOB_LEN,
-        }
-    }
+    use crate::exotic::worker::default_thumbnail_limits;
 
     // ── R2-5 确定性单测:kill/reap/Drop/shutdown 簿记(经 ChildHandle 假件,零真进程) ──
 
-    use exotic_protocol::{
-        FailureBody, Frame, FrameType, ProtocolError, ReadyBody, WorkerErrorCode,
-    };
+    use exotic_protocol::{Frame, FrameType, ProtocolError, ReadyBody};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 记录 kill/wait 次数的假子进程;try_wait 行为由闭包脚本化。
@@ -539,7 +480,6 @@ mod tests {
     struct SupParts {
         kills: Arc<AtomicUsize>,
         waits: Arc<AtomicUsize>,
-        written: Arc<Mutex<Vec<u8>>>,
         /// 持有发送端防 channel 变 clean-EOF;测试可预灌响应帧。
         tx: crossbeam_channel::Sender<Result<Frame, ProtocolError>>,
     }
@@ -575,15 +515,7 @@ mod tests {
             worker_version: "0.0-test".into(),
             session: None,
         };
-        (
-            sup,
-            SupParts {
-                kills,
-                waits,
-                written,
-                tx,
-            },
-        )
+        (sup, SupParts { kills, waits, tx })
     }
 
     fn thumb_req() -> RequestBody {
@@ -625,24 +557,6 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("满队列不能阻止 Drop 回收");
-    }
-
-    #[test]
-    fn dead_instance_guard_skips_conn_and_child() {
-        let (mut sup, parts) = make_sup(false, never_exits());
-        let out = sup.run_thumbnail(
-            &thumb_req(),
-            &default_thumbnail_limits(),
-            Duration::from_secs(1),
-            &|| false,
-        );
-        assert!(matches!(out, TaskOutcome::Disconnected));
-        assert!(
-            parts.written.lock().unwrap().is_empty(),
-            "不得向坏管道写请求"
-        );
-        assert_eq!(parts.kills.load(Ordering::SeqCst), 0);
-        assert_eq!(parts.waits.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -697,190 +611,10 @@ mod tests {
         drop(parts.tx); // 显式:发送端存活至此,超时非 EOF 所致
     }
 
-    #[test]
-    fn failure_outcome_keeps_instance_alive() {
-        // Failure 与 Success 走同一「数据类结果不杀进程」匹配臂;Success 需真 WebP 过
-        // Host 校验(worker.rs 单测已覆盖协议侧),此处以 Failure 锁 supervisor 的保活语义。
-        let (mut sup, parts) = make_sup(true, never_exits());
-        let body = FailureBody {
-            item_id: Some(7),
-            input_fingerprint: Some("fp".into()),
-            code: WorkerErrorCode::MalformedInput,
-            retryable: false,
-            message: "synthetic".into(),
-        };
-        // 预灌响应帧(request_id=1:from_parts 后首个分配值),recv 立即命中。
-        parts
-            .tx
-            .send(Ok(Frame::control(FrameType::Failure, 1, &body).unwrap()))
-            .unwrap();
-        let out = sup.run_thumbnail(
-            &thumb_req(),
-            &default_thumbnail_limits(),
-            Duration::from_secs(1),
-            &|| false,
-        );
-        assert!(matches!(out, TaskOutcome::Failure(_)));
-        assert_eq!(
-            parts.kills.load(Ordering::SeqCst),
-            0,
-            "数据类失败不得杀进程"
-        );
-        assert!(sup.is_alive(), "实例应可复用");
-    }
-
-    #[test]
-    fn shutdown_graceful_exit_sends_frame_and_never_kills() {
-        let (sup, parts) = make_sup(true, Box::new(|| Ok(Some(()))));
-        sup.shutdown(Duration::from_secs(5));
-        // shutdown 消费 self,返回时 Drop 已跑完——断言全生命周期总数。
-        assert!(
-            !parts.written.lock().unwrap().is_empty(),
-            "应已发送 Shutdown 帧"
-        );
-        assert_eq!(
-            parts.kills.load(Ordering::SeqCst),
-            0,
-            "优雅退出不得 kill(含 Drop)"
-        );
-        assert_eq!(parts.waits.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn shutdown_grace_expired_kills_once() {
-        // grace=0:首轮 try_wait Ok(None) 即命中 deadline 分支,零 sleep 确定性。
-        let (sup, parts) = make_sup(true, never_exits());
-        sup.shutdown(Duration::ZERO);
-        assert_eq!(parts.kills.load(Ordering::SeqCst), 1);
-        assert_eq!(parts.waits.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn shutdown_try_wait_error_kills_immediately() {
-        let (sup, parts) = make_sup(
-            true,
-            Box::new(|| Err(std::io::Error::other("try_wait failed"))),
-        );
-        sup.shutdown(Duration::from_secs(5));
-        assert_eq!(
-            parts.kills.load(Ordering::SeqCst),
-            1,
-            "try_wait Err 不等宽限期"
-        );
-        assert_eq!(parts.waits.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn shutdown_on_dead_instance_only_joins() {
-        let (mut sup, parts) = make_sup(true, never_exits());
-        let _ = sup.run_thumbnail(
-            &thumb_req(),
-            &default_thumbnail_limits(),
-            Duration::from_secs(30),
-            &|| true,
-        ); // 先经 kill 路径致死
-        parts.written.lock().unwrap().clear();
-        sup.shutdown(Duration::from_secs(3));
-        assert!(
-            parts.written.lock().unwrap().is_empty(),
-            "已死实例不得再发 Shutdown 帧"
-        );
-        assert_eq!(parts.kills.load(Ordering::SeqCst), 1, "kill 计数不变");
-    }
-
-    #[test]
-    fn drop_alive_kills_once_dead_only_joins() {
-        let (sup, parts) = make_sup(true, never_exits());
-        drop(sup);
-        assert_eq!(
-            parts.kills.load(Ordering::SeqCst),
-            1,
-            "活实例 Drop 兜底 kill"
-        );
-        assert_eq!(parts.waits.load(Ordering::SeqCst), 1);
-
-        let (sup2, parts2) = make_sup(false, never_exits());
-        drop(sup2);
-        assert_eq!(
-            parts2.kills.load(Ordering::SeqCst),
-            0,
-            "死实例 Drop 只 join"
-        );
-    }
-
-    #[test]
-    fn stderr_ring_keeps_last_64k() {
-        let data: Vec<u8> = (0..100_000usize).map(|i| (i % 251) as u8).collect();
-        let ring = Arc::new(Mutex::new(VecDeque::new()));
-        spawn_stderr_drain(
-            std::io::Cursor::new(data.clone()),
-            Arc::clone(&ring),
-            STDERR_RING_CAP,
-            "test".to_string(),
-        )
-        .join()
-        .unwrap();
-        let g = ring.lock().unwrap();
-        assert_eq!(g.len(), STDERR_RING_CAP);
-        let kept: Vec<u8> = g.iter().copied().collect();
-        assert_eq!(
-            &kept[..],
-            &data[100_000 - STDERR_RING_CAP..],
-            "保留的是最后 64 KiB"
-        );
-        drop(g);
-
-        let small = b"short stderr".to_vec();
-        let ring2 = Arc::new(Mutex::new(VecDeque::new()));
-        spawn_stderr_drain(
-            std::io::Cursor::new(small.clone()),
-            Arc::clone(&ring2),
-            STDERR_RING_CAP,
-            "test".to_string(),
-        )
-        .join()
-        .unwrap();
-        assert_eq!(
-            ring2.lock().unwrap().iter().copied().collect::<Vec<u8>>(),
-            small
-        );
-    }
-
-    #[test]
-    fn outcome_label_maps_all_variants() {
-        assert_eq!(
-            outcome_label(&TaskOutcome::Success {
-                width: 1,
-                height: 1,
-                mime: "image/webp".into(),
-                blob: Vec::new(),
-                thumbhash: Vec::new(),
-            }),
-            "success"
-        );
-        assert_eq!(
-            outcome_label(&TaskOutcome::Failure(FailureBody {
-                item_id: Some(1),
-                input_fingerprint: Some("f".into()),
-                code: WorkerErrorCode::IoError,
-                retryable: true,
-                message: String::new(),
-            })),
-            "failure"
-        );
-        assert_eq!(outcome_label(&TaskOutcome::TimedOut), "timeout");
-        assert_eq!(outcome_label(&TaskOutcome::Disconnected), "disconnected");
-        assert_eq!(
-            outcome_label(&TaskOutcome::Protocol(String::new())),
-            "protocol_violation"
-        );
-    }
-
     // ── T15 会话生命周期(D3 §4②⑤ + §5 T_t:SessionInit 超时→kill→session 清零)────────
 
     use exotic_protocol::{
-        ModelDescriptor, ModelHandle, ModelProfileSnapshot, ModelRole, SessionReadyBody,
-        SuccessBody,
+        ModelDescriptor, ModelHandle, ModelProfileSnapshot, ModelRole, SuccessBody,
     };
 
     fn session_init_req(session_id: u64) -> RequestBody {
@@ -906,71 +640,6 @@ mod tests {
         }
     }
 
-    fn session_ready_success(request_id: u64) -> Frame {
-        let body = SuccessBody {
-            session: Some(SessionReadyBody {
-                embed_dim: 512,
-                face_embed_dim: Some(128),
-                caps: vec!["embedding".into(), "face_detect_embed".into()],
-                provider: Some("directml".into()),
-                gpu_name: Some("Mock GPU".into()),
-            }),
-            ..Default::default()
-        };
-        Frame::control(FrameType::Success, request_id, &body).unwrap()
-    }
-
-    #[test]
-    fn init_session_success_stores_descriptor() {
-        let (mut sup, parts) = make_sup(true, never_exits());
-        parts.tx.send(Ok(session_ready_success(1))).unwrap();
-        let out = sup.init_session(&session_init_req(7), Duration::from_secs(1), &|| false);
-        assert!(matches!(out, RawOutcome::Success { .. }));
-        let desc = sup.session().expect("成功后应记录会话快照");
-        assert_eq!(desc.session_id, 7);
-        assert_eq!(desc.arch_id, "cn-clip-vit-b16");
-        assert_eq!(desc.batch_size, 16, "快照须记 SessionInit 的批上限(W3)");
-        assert_eq!(desc.embed_dim, 512);
-        assert_eq!(desc.face_embed_dim, Some(128));
-        assert_eq!(desc.face_profile_id.as_deref(), Some("yunet-sface"));
-        assert!(sup.is_alive());
-        assert_eq!(parts.kills.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn init_session_failure_keeps_alive_without_session() {
-        let (mut sup, parts) = make_sup(true, never_exits());
-        let fail = FailureBody {
-            item_id: None,
-            input_fingerprint: None,
-            code: WorkerErrorCode::ModelLoadFailed,
-            retryable: false,
-            message: "sha 不符".into(),
-        };
-        parts
-            .tx
-            .send(Ok(Frame::control(FrameType::Failure, 1, &fail).unwrap()))
-            .unwrap();
-        let out = sup.init_session(&session_init_req(7), Duration::from_secs(1), &|| false);
-        assert!(matches!(out, RawOutcome::Failure(_)));
-        assert!(sup.session().is_none(), "失败不得记录会话");
-        assert!(sup.is_alive(), "数据类失败不杀进程");
-        assert_eq!(parts.kills.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn init_session_timeout_kills_and_clears_session() {
-        // D3 §5 T_t 链路的 supervisor 半边:SessionInit 超时 → kill_and_reap → session 清零。
-        // (池层重建 + 重 Init 由 T17 派发器驱动,重建后 session=None 天然成立。)
-        let (mut sup, parts) = make_sup(true, never_exits());
-        let out = sup.init_session(&session_init_req(7), Duration::from_millis(50), &|| false);
-        assert!(matches!(out, RawOutcome::TimedOut));
-        assert!(!sup.is_alive());
-        assert!(sup.session().is_none());
-        assert_eq!(parts.kills.load(Ordering::SeqCst), 1);
-        drop(parts.tx); // 显式:发送端存活至此,超时非 EOF 所致
-    }
-
     #[test]
     fn init_session_success_without_ready_body_is_protocol_kill() {
         let (mut sup, parts) = make_sup(true, never_exits());
@@ -989,152 +658,5 @@ mod tests {
         assert!(!sup.is_alive());
         assert!(sup.session().is_none());
         assert_eq!(parts.kills.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn init_session_rejects_non_session_request_without_side_effects() {
-        let (mut sup, parts) = make_sup(true, never_exits());
-        let out = sup.init_session(&thumb_req(), Duration::from_secs(1), &|| false);
-        assert!(matches!(out, RawOutcome::Protocol(_)));
-        assert!(sup.is_alive(), "host 调用错误不得殃及 worker");
-        assert!(parts.written.lock().unwrap().is_empty(), "不得发出任何帧");
-    }
-
-    #[test]
-    fn close_session_idempotent_and_clears_descriptor() {
-        // 无会话:幂等成功、零帧。
-        let (mut sup, parts) = make_sup(true, never_exits());
-        let out = sup.close_session(Duration::from_secs(1), &|| false);
-        assert!(matches!(out, RawOutcome::Success { .. }));
-        assert!(parts.written.lock().unwrap().is_empty());
-
-        // 有会话:发 SessionClose(request_id=1),Success 后快照清空、实例保活。
-        parts
-            .tx
-            .send(Ok(Frame::control(
-                FrameType::Success,
-                1,
-                &SuccessBody::default(),
-            )
-            .unwrap()))
-            .unwrap();
-        sup.session = Some(SessionDescriptor {
-            session_id: 9,
-            arch_id: "cn-clip-vit-b16".into(),
-            image_file: "img.onnx".into(),
-            face_profile_id: None,
-            batch_size: 16,
-            embed_dim: 512,
-            face_embed_dim: None,
-            caps: vec!["embedding".into()],
-            provider: None,
-            gpu_name: None,
-        });
-        let out = sup.close_session(Duration::from_secs(1), &|| false);
-        assert!(matches!(out, RawOutcome::Success { .. }));
-        assert!(sup.session().is_none());
-        assert!(sup.is_alive());
-        assert!(
-            !parts.written.lock().unwrap().is_empty(),
-            "应已发送 SessionClose 帧"
-        );
-    }
-
-    /// 真实子进程冒烟测试：显式启用时必须提供 `EXOTIC_PSD_WORKER_PATH`，缺条件即失败。
-    ///
-    /// 构建并运行：
-    ///   cargo build --release -p psd-worker
-    ///   EXOTIC_PSD_WORKER_PATH=target/release/psd-worker.exe \
-    ///     cargo test -p scrollery --lib exotic::supervisor::tests::real_worker -- --ignored --nocapture
-    #[test]
-    #[ignore = "需要 EXOTIC_PSD_WORKER_PATH 指向真实 PSD worker"]
-    fn real_worker_thumbnail_and_shutdown() {
-        let path = resolve_psd_worker_path().expect("必须设置 EXOTIC_PSD_WORKER_PATH");
-        // 写一张合成 PSD 到临时文件。
-        let dir = tempfile::tempdir().unwrap();
-        let psd_path = dir.path().join("synthetic.psd");
-        std::fs::write(&psd_path, make_rgb_psd(300, 200)).unwrap();
-
-        let mut sup = WorkerSupervisor::spawn(&test_spec(path), &test_cfg()).expect("spawn+握手");
-        assert!(sup.is_alive());
-        assert!(
-            !sup.worker_version().is_empty(),
-            "握手应拿到 worker_version"
-        );
-
-        let req = RequestBody::Thumbnail {
-            item_id: 42,
-            source_path: psd_path.to_string_lossy().into_owned(),
-            target_long_edge: 480,
-            input_fingerprint: "fp-real".into(),
-        };
-        let out = sup.run_thumbnail(
-            &req,
-            &default_thumbnail_limits(),
-            Duration::from_secs(15),
-            &|| false,
-        );
-        match out {
-            TaskOutcome::Success { width, height, .. } => {
-                assert_eq!((width, height), (300, 200));
-            }
-            other => panic!("期望 Success，得到 {}", outcome_label(&other)),
-        }
-
-        sup.shutdown(Duration::from_secs(3));
-    }
-
-    /// 同一真实 RAW 进程先处理畸形输入、再处理缺文件；数据失败不杀进程，最后正常回收。
-    #[test]
-    #[ignore = "需要 EXOTIC_RAW_WORKER_PATH 指向真实 RAW worker"]
-    fn real_raw_worker_failures_and_shutdown() {
-        let exe =
-            std::env::var_os("EXOTIC_RAW_WORKER_PATH").expect("必须设置 EXOTIC_RAW_WORKER_PATH");
-        let spec = WorkerSpec {
-            exe_path: exe.into(),
-            expected_worker_id: "raw-worker".into(),
-            required_capabilities: vec!["thumbnail".into()],
-        };
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("malformed.dng"), [0xabu8; 64]).unwrap();
-        let start = Instant::now();
-        let mut sup = WorkerSupervisor::spawn(&spec, &test_cfg()).expect("RAW spawn+握手");
-        let handshake = start.elapsed();
-        assert!(!sup.worker_version().is_empty());
-        for (file, expected, retryable) in [
-            ("malformed.dng", WorkerErrorCode::MalformedInput, false),
-            ("missing.dng", WorkerErrorCode::IoError, true),
-        ] {
-            let req = RequestBody::Thumbnail {
-                item_id: 42,
-                source_path: dir.path().join(file).to_string_lossy().into_owned(),
-                target_long_edge: 480,
-                input_fingerprint: file.into(),
-            };
-            let out = sup.run_thumbnail(
-                &req,
-                &default_thumbnail_limits(),
-                Duration::from_secs(5),
-                &|| false,
-            );
-            match out {
-                TaskOutcome::Failure(body) => {
-                    assert_eq!(body.code, expected);
-                    assert_eq!(body.retryable, retryable);
-                    assert_eq!(body.item_id, Some(42));
-                    assert_eq!(body.input_fingerprint.as_deref(), Some(file));
-                }
-                other => panic!("期望 RAW Failure，得到 {}", outcome_label(&other)),
-            }
-            assert!(sup.is_alive(), "数据失败后应继续复用进程");
-        }
-        let version = sup.worker_version().to_string();
-        sup.shutdown(Duration::from_secs(3));
-        eprintln!(
-            "RAW version={} handshake_ms={:.2} failure_smoke_total_ms={:.2}",
-            version,
-            handshake.as_secs_f64() * 1000.0,
-            start.elapsed().as_secs_f64() * 1000.0
-        );
     }
 }

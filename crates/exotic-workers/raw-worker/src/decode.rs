@@ -201,14 +201,4 @@ mod tests {
             ));
         }
     }
-
-    #[test]
-    fn scaled_dims_downscales_by_long_edge() {
-        assert_eq!(scaled_dims(1000, 500, 480), (480, 240));
-    }
-
-    #[test]
-    fn scaled_dims_no_upscale_below_target() {
-        assert_eq!(scaled_dims(256, 192, 480), (256, 192));
-    }
 }

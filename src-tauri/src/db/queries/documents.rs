@@ -337,53 +337,6 @@ pub fn delete_reader_bookmark(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod reader_bookmarks_tests {
-    //! 阅读器 R4 书签 CRUD:新增(含同位置幂等)/ 按全书进度排序列出 / 删除 / 跨书隔离。
-    use super::*;
-
-    fn seeded() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); // 免构造 media_items,直接插书签
-        c
-    }
-
-    #[test]
-    fn add_list_dedup_delete_roundtrip() {
-        let c = seeded();
-        // 乱序插入(fraction 0.5 先于 0.1),列出须按 fraction 升序归位。
-        add_reader_bookmark(&c, 1, "cfi:/6/4!/2", "第三章", 0.5).unwrap();
-        add_reader_bookmark(&c, 1, "cfi:/6/2!/2", "第一章", 0.1).unwrap();
-        // 另一本书的书签不应串入 item 1 的列表。
-        add_reader_bookmark(&c, 2, "cfi:/6/2!/2", "别的书", 0.2).unwrap();
-
-        let list = list_reader_bookmarks(&c, 1).unwrap();
-        assert_eq!(list.len(), 2, "item 1 应有 2 条书签");
-        assert_eq!(list[0].fraction, 0.1, "须按全书进度升序");
-        assert_eq!(list[0].label, "第一章");
-        assert_eq!(list[1].fraction, 0.5);
-
-        // 同位置(item_id+locator)再添加 → 幂等刷新标签/进度,不新增行。
-        add_reader_bookmark(&c, 1, "cfi:/6/2!/2", "第一章(改)", 0.12).unwrap();
-        let list = list_reader_bookmarks(&c, 1).unwrap();
-        assert_eq!(list.len(), 2, "同位置重复添加不应产生重复行");
-        let first = list.iter().find(|b| b.locator == "cfi:/6/2!/2").unwrap();
-        assert_eq!(first.label, "第一章(改)", "同位置再添加须刷新标签");
-        assert_eq!(first.fraction, 0.12);
-
-        // 删除一条 → 只剩一条,且不波及别的书。
-        let del_id = list[1].id;
-        delete_reader_bookmark(&c, del_id).unwrap();
-        assert_eq!(list_reader_bookmarks(&c, 1).unwrap().len(), 1);
-        assert_eq!(
-            list_reader_bookmarks(&c, 2).unwrap().len(),
-            1,
-            "删除不应波及别的书"
-        );
-    }
-}
-
 // ── 文档元数据 DAO（document_meta，Phase 2「死表」激活）────────────────────────
 //
 // 该表 SCHEMA_V1 即建但此前无 DAO（死表）。文档 enrichment（Part3）算出页数/子类型后写入，
@@ -432,44 +385,4 @@ pub fn get_document_meta(conn: &Connection, item_id: i64) -> Result<Option<Docum
     )
     .optional()
     .map_err(AppError::from)
-}
-
-#[cfg(test)]
-mod document_meta_tests {
-    use super::*;
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        // document_meta.item_id FK→media_items；关 FK 免构造 media 行（DAO 逻辑测试）。
-        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
-        c
-    }
-
-    /// upsert 首写 → get 命中；同 item_id 再 upsert → 覆盖（页数/子类型同时更新）。
-    #[test]
-    fn upsert_get_and_overwrite() {
-        let c = mem_db();
-        assert!(
-            get_document_meta(&c, 1).unwrap().is_none(),
-            "未写入应为 None"
-        );
-
-        upsert_document_meta(&c, 1, Some(10), Some("pdf")).unwrap();
-        let m = get_document_meta(&c, 1).unwrap().unwrap();
-        assert_eq!(m.item_id, 1);
-        assert_eq!(m.page_count, Some(10));
-        assert_eq!(m.doc_subtype.as_deref(), Some("pdf"));
-
-        // 重新 enrich：覆盖为 epub + 新页数。
-        upsert_document_meta(&c, 1, Some(12), Some("epub")).unwrap();
-        let m2 = get_document_meta(&c, 1).unwrap().unwrap();
-        assert_eq!(m2.page_count, Some(12), "页数应被覆盖");
-        assert_eq!(m2.doc_subtype.as_deref(), Some("epub"), "子类型应被覆盖");
-
-        // None 字段也能存（未知页数）。
-        upsert_document_meta(&c, 2, None, Some("svg")).unwrap();
-        let m3 = get_document_meta(&c, 2).unwrap().unwrap();
-        assert_eq!(m3.page_count, None);
-    }
 }

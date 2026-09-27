@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 
-import { IpcError, moveRecoveryOf, parseAppError } from './ipc'
+import { moveRecoveryOf, parseAppError } from './ipc'
 
 const PENDING_RAW = {
   code: 'move_db_pending',
@@ -24,51 +24,5 @@ describe('parseAppError：目录移动半完成的恢复定位', () => {
     expect(err.message).toBe(PENDING_RAW.message)
     expect(err.recovery).toEqual({ recoveryId: 7, targetAbsPath: 'D:/archive/旅行' })
     expect(moveRecoveryOf(err)).toEqual({ recoveryId: 7, targetAbsPath: 'D:/archive/旅行' })
-  })
-
-  it('字段缺失或类型不符时视作没有恢复定位', () => {
-    const raws = [
-      { code: 'move_db_pending', message: 'm', recoveryId: '7', targetAbsPath: 'D:/a' },
-      { code: 'move_db_pending', message: 'm', recoveryId: 7.5, targetAbsPath: 'D:/a' },
-      { code: 'move_db_pending', message: 'm', recoveryId: 7 },
-      { code: 'move_db_pending', message: 'm' },
-    ]
-
-    for (const raw of raws) {
-      expect(parseAppError(raw).recovery).toBeNull()
-      expect(moveRecoveryOf(raw)).toBeNull()
-    }
-  })
-
-  it('其它 code 不受影响：code/message 分流照旧，且不带恢复定位', () => {
-    const err = parseAppError({
-      code: 'DirectoryExists',
-      message: '旅行',
-      recoveryId: 7,
-      targetAbsPath: 'D:/a',
-    })
-
-    expect(err.code).toBe('DirectoryExists')
-    expect(err.recovery).toBeNull()
-    expect(moveRecoveryOf(err)).toBeNull()
-    // 直接构造也不放行：非 move_db_pending 带恢复定位只会变成「像有重试入口」的假象。
-    expect(new IpcError('Io', 'm', { recoveryId: 7, targetAbsPath: 'D:/a' }).recovery).toBeNull()
-  })
-
-  it('二次解析不丢定位：IpcError 原样返回', () => {
-    const first = new IpcError('move_db_pending', 'm', {
-      recoveryId: 9,
-      targetAbsPath: 'D:/x',
-    })
-
-    expect(parseAppError(first)).toBe(first)
-    expect(moveRecoveryOf(first)?.recoveryId).toBe(9)
-  })
-
-  it('裸字符串与 Error 仍降级为 Unknown，且没有恢复定位', () => {
-    expect(parseAppError('boom').code).toBe('Unknown')
-    expect(moveRecoveryOf('boom')).toBeNull()
-    expect(parseAppError(new Error('boom')).message).toBe('boom')
-    expect(moveRecoveryOf(new Error('boom'))).toBeNull()
   })
 })

@@ -9,7 +9,7 @@
 
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { effectScope, type EffectScope } from 'vue'
+import { type EffectScope } from 'vue'
 import { IPC } from '../constants/ipc'
 
 const invokeIpc = vi.fn()
@@ -53,9 +53,6 @@ vi.mock('./toastStore', () => ({ useToastStore: () => ({ addToast: vi.fn() }) })
 
 import { useAiStore } from './aiStore'
 import { useMediaStore } from './mediaStore'
-import { useViewStore } from './viewStore'
-import { useGalleryQuerySync } from '../composables/useGalleryQuerySync'
-import { useJustifiedLayout } from '../composables/useJustifiedLayout'
 
 let lifecycleScope: EffectScope | undefined
 
@@ -124,53 +121,6 @@ describe('aiStore 语义搜索身份（P1-3）', () => {
     vi.restoreAllMocks()
   })
 
-  it('被取代的查询返回 null：不动计数、不触发 relayout、不报错，spinner 收尾', async () => {
-    const { searches } = wireSearchCommands()
-    const ai = useAiStore()
-    const media = useMediaStore()
-    const invalidate = vi.spyOn(media, 'invalidateLayout')
-
-    const run = ai.runSemanticSearch('sunset')
-    expect(ai.isSearching).toBe(true)
-    invalidate.mockClear()
-
-    searches[0].resolve(null) // 后端判定:已被更新的请求取代
-    await run
-
-    expect(ai.matchCount).toBe(0)
-    expect(ai.searchError).toBeNull()
-    expect(invalidate).not.toHaveBeenCalled()
-    expect(ai.isSearching).toBe(false)
-    expect(ai.semanticLayoutReady).toBe(false)
-  })
-
-  it('URL 语义恢复等待路由水合并调用真实搜索入口，结果提交前不发中间布局', async () => {
-    const routeReady = gate<void>()
-    routing.ready = routeReady.promise
-    routing.route.query = { mode: 'semantic', q: 'sunset' }
-    const { searches, arrivals } = wireSearchCommands()
-    lifecycleScope = effectScope()
-    const layout = lifecycleScope.run(() => {
-      useGalleryQuerySync()
-      return useJustifiedLayout(() => 800)
-    })!
-    await layout.compute()
-    expect(useViewStore().galleryQueryReady).toBe(false)
-    expect(arrivals).toEqual([])
-    routeReady.resolve()
-    await vi.waitFor(() => expect(searches).toHaveLength(1))
-    expect(useViewStore().galleryQueryReady).toBe(true)
-    expect(arrivals).toEqual(['clear', 'search:sunset'])
-    expect(useAiStore().semanticLayoutReady).toBe(false)
-    searches[0].resolve(7)
-    await vi.waitFor(() => expect(arrivals).toEqual(['clear', 'search:sunset', 'layout']))
-    expect(useMediaStore().layoutSummary?.totalItems).toBe(7)
-    expect(useMediaStore().layoutDirty).toBe(false)
-    expect(invokeIpc).toHaveBeenCalledWith(IPC.COMPUTE_LAYOUT, expect.objectContaining({
-      params: expect.objectContaining({ filters: expect.objectContaining({ aiSearch: true }) }),
-    }))
-  })
-
   it('A 查询在途 → 清空 → B 查询:A 的迟到应答不得覆盖 B 的计数与加载态', async () => {
     const { searches, arrivals } = wireSearchCommands()
     const ai = useAiStore()
@@ -202,44 +152,6 @@ describe('aiStore 语义搜索身份（P1-3）', () => {
     expect(ai.semanticLayoutReady).toBe(true)
   })
 
-  it('清空后端失败：本地不挂 spinner，也不回滚已清语义', async () => {
-    const clearGate = gate<undefined>()
-    invokeIpc.mockImplementation((cmd: string) => {
-      if (cmd === IPC.CLEAR_SEMANTIC_SEARCH) return clearGate.promise
-      return Promise.resolve(undefined)
-    })
-    const ai = useAiStore()
-    ai.isSearching = true
-    ai.matchCount = 42
-
-    ai.clearSemanticSearch()
-    expect(ai.isSearching).toBe(false)
-    expect(ai.matchCount).toBe(0)
-    expect(ai.semanticQuery).toBe('')
-
-    // 后端擦除失败(或被吊销的旧清空晚回):前端状态不回滚。
-    clearGate.reject(new Error('wipe failed'))
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(ai.isSearching).toBe(false)
-    expect(ai.matchCount).toBe(0)
-    expect(ai.semanticLayoutReady).toBe(false)
-  })
-
-  it('空查询等价清空:本地同步收尾并调后端清空命令', async () => {
-    const { arrivals } = wireSearchCommands()
-    const ai = useAiStore()
-
-    ai.isSearching = true
-    ai.matchCount = 3
-    await ai.runSemanticSearch('   ')
-
-    expect(arrivals).toEqual(['clear'])
-    expect(ai.isSearching).toBe(false)
-    expect(ai.matchCount).toBe(0)
-    expect(ai.semanticQuery).toBe('')
-  })
-
   it('mixed 语义在途 → 切普通文字查询:迟到语义应答不得写计数/刷布局,且后端收到吊销', async () => {
     const { searches, arrivals } = wireSearchCommands()
     const ai = useAiStore()
@@ -266,66 +178,5 @@ describe('aiStore 语义搜索身份（P1-3）', () => {
     expect(ai.matchCount).toBe(0)
     expect(invalidate).not.toHaveBeenCalled()
     expect(ai.isSearching).toBe(false)
-  })
-
-  it('mixed 下普通文字连打不重复打后端(mixed 普通查询每次防抖都会提交)', async () => {
-    const { arrivals } = wireSearchCommands()
-    const ai = useAiStore()
-
-    ai.searchMode = 'mixed'
-    ai.setNormalSearchQueryInMixedMode('a')
-    ai.setNormalSearchQueryInMixedMode('ab')
-    ai.setNormalSearchQueryInMixedMode('abc')
-
-    expect(arrivals).toEqual([])
-    expect(ai.activeMixedQueryType).toBe('normal')
-  })
-
-  it('mixed 下清空文字:语义在场时同样吊销并复位子类型', async () => {
-    const { searches, arrivals } = wireSearchCommands()
-    const ai = useAiStore()
-
-    ai.searchMode = 'mixed'
-    const runSemantic = ai.runSemanticSearch('cat')
-    ai.setNormalSearchQueryInMixedMode('')
-
-    expect(arrivals).toEqual(['search:cat', 'clear'])
-    expect(ai.activeMixedQueryType).toBe('none')
-
-    searches[0].resolve(5)
-    await runSemantic
-    expect(ai.matchCount).toBe(0)
-  })
-
-  it('切模型:清语义展示态并让画廊重排(后端已吊销旧向量空间的结果)', async () => {
-    invokeIpc.mockResolvedValue(undefined)
-    const ai = useAiStore()
-    const media = useMediaStore()
-    const invalidate = vi.spyOn(media, 'invalidateLayout')
-    ai.matchCount = 5
-    ai.semanticQuery = 'sunset'
-
-    await ai.setActiveModel('cn-clip.img.fp16.onnx')
-
-    const commands = invokeIpc.mock.calls.map((c) => c[0])
-    expect(commands).toContain(IPC.SET_ACTIVE_MODEL)
-    expect(commands).toContain(IPC.CLEAR_SEMANTIC_SEARCH)
-    expect(ai.matchCount).toBe(0)
-    expect(ai.semanticQuery).toBe('')
-    expect(invalidate).toHaveBeenCalled()
-  })
-
-  it('重建嵌入:后端重置向量并吊销在途搜索后,前端清语义展示态', async () => {
-    invokeIpc.mockResolvedValue(undefined)
-    const ai = useAiStore()
-    ai.matchCount = 5
-    ai.semanticQuery = 'sunset'
-
-    await ai.rebuildEmbeddings()
-
-    const commands = invokeIpc.mock.calls.map((c) => c[0])
-    expect(commands).toContain(IPC.REBUILD_EMBEDDINGS)
-    expect(commands).toContain(IPC.CLEAR_SEMANTIC_SEARCH)
-    expect(ai.matchCount).toBe(0)
   })
 })

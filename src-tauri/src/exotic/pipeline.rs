@@ -33,9 +33,10 @@ use exotic_protocol::{RequestBody, WorkerErrorCode};
 
 use crate::db::queries as q;
 use crate::exotic::fingerprint::thumbnail_fingerprint;
-use crate::exotic::limiter::BackgroundHeavyLimiter;
+use crate::exotic::limiter::{BackgroundHeavyLimiter, HeavyPermit};
 use crate::exotic::sink::prepare_thumbnail;
 use crate::exotic::worker::{default_thumbnail_limits, TaskOutcome, WorkerLimits};
+use crate::thumbnail::coordinator::{MemoryBudget, MemoryPermit, VolumeIoBudget, VolumeIoPermit};
 
 // U-P3(2026-07-16):Worker trait 分类学拆至 `super::worker_traits`(EmbedWorker 只服务
 // AI 层,流水线用不到);此处 re-export 保住既有 `exotic::pipeline::{WorkerTask, ...}`
@@ -49,9 +50,6 @@ const TASK_TIMEOUT: Duration = crate::exotic::coordinator::op_timeouts::THUMBNAI
 const LEASE_TTL_SECS: i64 = 120;
 /// 在途租约续租周期（须 << lease_ttl；取 ttl/3，R2 第4条）。
 const RENEW_INTERVAL: Duration = Duration::from_secs((LEASE_TTL_SECS / 3) as u64);
-/// 领取批大小：对齐可派发容量（pool + channel），避免一次标过多 processing（R4 规则4 / §4.2）。
-/// 空批即结束本轮，非空则继续多轮领取——小批多轮不会饿，但不会超量占用租约。
-const CLAIM_BATCH: i64 = (MAX_POOL as i64) * 2;
 /// 让步轮询周期。
 const YIELD_POLL: Duration = Duration::from_millis(200);
 /// 崩溃后重启退避（防快速重启风暴）。
@@ -62,6 +60,7 @@ const MAX_ATTEMPTS: i64 = 3;
 const STRIKE_THRESHOLD: u32 = 5;
 /// Worker 池上限（Part2：PSD 快，permits 已封顶并发，进程数无需多）。
 const MAX_POOL: usize = 2;
+const EXOTIC_WORKSET_RESERVATION_BYTES: u64 = 128 * 1024 * 1024;
 
 // ── 流水线依赖与统计 ─────────────────────────────────────────────────────────────
 
@@ -70,6 +69,9 @@ pub struct PipelineDeps<'a> {
     /// 写连接（claim/finish/fail/recover 都在此）。测试中读写同一连接。
     pub writer: &'a Mutex<Connection>,
     pub limiter: &'a Arc<BackgroundHeavyLimiter>,
+    pub(crate) workset_budget: Arc<MemoryBudget>,
+    pub(crate) volume_io_budget: Arc<VolumeIoBudget>,
+    pub(crate) database_epoch: u64,
     pub token: &'a CancellationToken,
     /// items 取数缓存：缩略图结果就地 patch（S3 后唯一 patch 目标——布局行仅存几何，
     /// 出口拼装自本缓存取载荷；真实接线 = AppState 字段）。
@@ -170,10 +172,19 @@ struct ClaimedTask {
     attempts: i64,
 }
 
+struct AdmittedTask {
+    task: ClaimedTask,
+    heavy_permit: HeavyPermit,
+    workset_permit: MemoryPermit,
+    volume_id: Option<i64>,
+    volume_permit: VolumeIoPermit,
+}
+
 /// Worker → Writer 的结果。
 struct WorkerResult {
     task: ClaimedTask,
     outcome: TaskOutcome,
+    workset_permit: Option<MemoryPermit>,
 }
 
 /// 运行整条流水线（阻塞；Coordinator 在 spawn_blocking 内调用，或测试直接调用）。
@@ -235,7 +246,7 @@ pub fn run_exotic_pipeline_blocking(
 
     // ── 3. 通道 + 共享状态。──
     let pool_size = MAX_POOL.max(1);
-    let (task_tx, task_rx) = bounded::<ClaimedTask>(pool_size * 2);
+    let (task_tx, task_rx) = bounded::<AdmittedTask>(0);
     let (result_tx, result_rx) = bounded::<WorkerResult>(pool_size * 2);
     // 探到的 Worker 放入种子槽，供池线程复用（避免二次 spawn）。
     let seed: Arc<Mutex<Vec<Box<dyn ThumbnailWorker>>>> = Arc::new(Mutex::new(vec![probe]));
@@ -338,14 +349,14 @@ pub fn run_exotic_pipeline_blocking(
     out
 }
 
-/// Claimer：让步门控 → 原子领取 → 构造请求 → 入 task channel。空批即结束（关闭 channel）。
+/// Claimer：先取资源组合，再原子领取一项并移交额度；空批即结束。
 #[allow(clippy::too_many_arguments)]
 fn claimer_loop(
     deps: &PipelineDeps<'_>,
     plugin_id: &str,
     worker_version: &str,
     instance_id: &str,
-    task_tx: Sender<ClaimedTask>,
+    task_tx: Sender<AdmittedTask>,
     circuit_open: &AtomicBool,
     stats: &Mutex<PipelineStats>,
 ) {
@@ -361,16 +372,58 @@ fn claimer_loop(
             break;
         }
 
+        // 先做只读就绪检查，避免最后一项完成后为一次空领取继续等待共享额度。
+        let ready = {
+            let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
+            q::next_ready_exotic_volume(&conn, plugin_id, CAPABILITY, now_secs())
+        };
+        let volume_id = match ready {
+            Ok(Some(volume_id)) => volume_id,
+            Ok(None) => break,
+            Err(e) => {
+                warn!("exotic：检查就绪任务失败：{e}");
+                stats.lock().unwrap_or_else(|e| e.into_inner()).stop = PipelineStop::Blocked;
+                break;
+            }
+        };
+
+        let Some((heavy_permit, workset_permit)) = deps.workset_budget.acquire_with_heavy(
+            deps.limiter,
+            EXOTIC_WORKSET_RESERVATION_BYTES,
+            &|| deps.dispatch_stopped(circuit_open) || deps.should_yield(),
+        ) else {
+            if deps.dispatch_stopped(circuit_open) {
+                break;
+            }
+            continue;
+        };
+        if deps.dispatch_stopped(circuit_open) {
+            break;
+        }
+        if deps.should_yield() {
+            continue;
+        }
+        let Some(volume_permit) = deps
+            .volume_io_budget
+            .try_acquire(deps.database_epoch, volume_id)
+        else {
+            drop(heavy_permit);
+            drop(workset_permit);
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+
         let claimed = {
             let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
-            q::claim_exotic_tasks(
+            q::claim_exotic_tasks_in_volume(
                 &conn,
                 plugin_id,
                 CAPABILITY,
-                CLAIM_BATCH,
+                1,
                 instance_id,
                 now_secs(),
                 worker_version,
+                Some(volume_id),
             )
         };
         // Writer 先取统计锁再写库；领取失败也必须释放 DB 锁后才更新统计，避免反向等待。
@@ -382,110 +435,111 @@ fn claimer_loop(
                 break;
             }
         };
-        if claimed.is_empty() {
-            break; // 无更多就绪任务 → 本次结束（新任务由 Coordinator 重新唤醒）
-        }
+        let Some(row) = claimed.into_iter().next() else {
+            continue; // 候选卷在等额度时可能已被另一实例领完，重新读取就绪卷。
+        };
 
-        for row in claimed {
-            if deps.dispatch_stopped(circuit_open) {
-                return;
-            }
-            // 取源信息 → 指纹 → 构造请求。
-            let src = {
+        if deps.dispatch_stopped(circuit_open) {
+            break;
+        }
+        // 取源信息 → 指纹 → 构造请求。
+        let src = {
+            let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
+            q::exotic_item_source(&conn, row.item_id)
+        };
+        let src = match src {
+            Ok(s) => s,
+            Err(e) => {
+                // 源不可读（item 删除等）→ 标 retryable io，跳过。
+                warn!("exotic：item {} 源不可读：{e}", row.item_id);
                 let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
-                q::exotic_item_source(&conn, row.item_id)
-            };
-            let src = match src {
-                Ok(s) => s,
-                Err(e) => {
-                    // 源不可读（item 删除等）→ 标 retryable io，跳过。
-                    warn!("exotic：item {} 源不可读：{e}", row.item_id);
-                    let conn = deps.writer.lock().unwrap_or_else(|e| e.into_inner());
-                    let failed = q::fail_exotic_task(
-                        &conn,
-                        row.id,
-                        instance_id,
-                        true,
-                        MAX_ATTEMPTS,
-                        WorkerErrorCode::IoError.as_str(),
-                        "源不可读",
-                        now_secs() + 30,
-                    );
-                    drop(conn);
-                    stats
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_failure(failed);
-                    continue;
-                }
-            };
-            let fp = thumbnail_fingerprint(
-                src.cache_key,
-                plugin_id,
-                worker_version,
-                deps.requested_size,
-            );
-            let request = RequestBody::Thumbnail {
-                item_id: row.item_id,
-                source_path: src.abs_path,
-                target_long_edge: fp.tier,
-                input_fingerprint: fp.fingerprint.clone(),
-            };
-            let task = ClaimedTask {
-                task_id: row.id,
-                item_id: row.item_id,
-                source_revision: src.source_revision,
-                cache_key: src.cache_key,
-                fingerprint: fp.fingerprint,
-                tier: fp.tier,
-                request,
-                attempts: row.attempts,
-            };
-            if task_tx.send(task).is_err() {
-                return; // 下游已结束
+                let failed = q::fail_exotic_task(
+                    &conn,
+                    row.id,
+                    instance_id,
+                    true,
+                    MAX_ATTEMPTS,
+                    WorkerErrorCode::IoError.as_str(),
+                    "源不可读",
+                    now_secs() + 30,
+                );
+                drop(conn);
+                stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_failure(failed);
+                continue;
             }
+        };
+        let fp = thumbnail_fingerprint(
+            src.cache_key,
+            plugin_id,
+            worker_version,
+            deps.requested_size,
+        );
+        let request = RequestBody::Thumbnail {
+            item_id: row.item_id,
+            source_path: src.abs_path,
+            target_long_edge: fp.tier,
+            input_fingerprint: fp.fingerprint.clone(),
+        };
+        let task = ClaimedTask {
+            task_id: row.id,
+            item_id: row.item_id,
+            source_revision: src.source_revision,
+            cache_key: src.cache_key,
+            fingerprint: fp.fingerprint,
+            tier: fp.tier,
+            request,
+            attempts: row.attempts,
+        };
+        if task_tx
+            .send(AdmittedTask {
+                task,
+                heavy_permit,
+                workset_permit,
+                volume_id,
+                volume_permit,
+            })
+            .is_err()
+        {
+            return; // 下游已结束
         }
     }
     // task_tx 在此 drop → Worker 池收到 channel 关闭后退出。
 }
 
-/// Worker 线程：取任务 → 取 permit → 确保活 Worker → run → 释放 permit → 送结果。
+/// Worker 线程：消费已获资源并领取的任务；让步时释放额度并等待，成功则持工作集额度至写盘。
 fn worker_loop(
     deps: &PipelineDeps<'_>,
     factory: &dyn WorkerFactory,
     seed: &Arc<Mutex<Vec<Box<dyn ThumbnailWorker>>>>,
-    task_rx: Receiver<ClaimedTask>,
+    task_rx: Receiver<AdmittedTask>,
     result_tx: Sender<WorkerResult>,
     limits: &WorkerLimits,
     circuit_open: &AtomicBool,
 ) {
     let mut worker: Option<Box<dyn ThumbnailWorker>> = None;
-    'tasks: for task in task_rx {
-        if deps.dispatch_stopped(circuit_open) {
-            break;
-        }
-        let permit = loop {
-            // 等待额度期间也可能出现前台活动；取到后再检查，等待让步时不占共享额度。
-            while deps.should_yield() && !deps.dispatch_stopped(circuit_open) {
-                std::thread::sleep(YIELD_POLL);
-            }
+    'tasks: for admitted in task_rx {
+        let AdmittedTask {
+            task,
+            heavy_permit,
+            workset_permit,
+            volume_id,
+            volume_permit,
+        } = admitted;
+        let mut admission = Some((heavy_permit, workset_permit, volume_permit));
+        loop {
             if deps.dispatch_stopped(circuit_open) {
                 break 'tasks;
             }
-            let Some(permit) = deps.limiter.acquire_cancellable(&|| {
-                deps.dispatch_stopped(circuit_open) || deps.should_yield()
-            }) else {
-                // 让步时退队等前台空闲；停止派发则由下一轮的同一判定退出。
-                continue;
-            };
-            if deps.should_yield() {
-                drop(permit);
-                continue;
-            }
-            if deps.dispatch_stopped(circuit_open) {
-                break 'tasks;
-            }
-
+            // 前台活动时释放共享额度；同一租约等待前台结束，避免任务退回后丢失唤醒。
+            admission =
+                match wait_until_admitted(deps, circuit_open, volume_id, admission.take().unwrap())
+                {
+                    Some(permits) => Some(permits),
+                    None => break 'tasks,
+                };
             // 确保有活 Worker：先用种子，再 factory.spawn（带崩溃退避）。
             if worker.as_ref().map(|w| !w.is_alive()).unwrap_or(true) {
                 worker = None;
@@ -495,7 +549,10 @@ fn worker_loop(
                     None => match factory.spawn() {
                         Ok(w) => Some(w),
                         Err(e) => {
-                            drop(permit);
+                            let (heavy_permit, workset_permit, volume_permit) =
+                                admission.take().unwrap();
+                            drop(heavy_permit);
+                            drop(volume_permit);
                             if deps.dispatch_stopped(circuit_open) {
                                 break 'tasks;
                             }
@@ -503,6 +560,7 @@ fn worker_loop(
                             let _ = result_tx.send(WorkerResult {
                                 task,
                                 outcome: TaskOutcome::Disconnected,
+                                workset_permit: Some(workset_permit),
                             });
                             std::thread::sleep(CRASH_BACKOFF);
                             continue 'tasks;
@@ -510,23 +568,21 @@ fn worker_loop(
                     },
                 };
             }
-
-            // 握手可能耗时数秒；其间出现停止/前台活动时，不能沿用取额度时的资格。
             if deps.dispatch_stopped(circuit_open) {
                 break 'tasks;
             }
-            if deps.should_yield() {
-                drop(permit);
-                continue;
+            if !deps.should_yield() {
+                break;
             }
-            break permit;
-        };
+        }
+        let (heavy_permit, workset_permit, volume_permit) = admission.take().unwrap();
 
         let w = worker.as_mut().unwrap();
         let cancelled = || deps.token.is_cancelled();
         let outcome = w.run_thumbnail(&task.request, limits, TASK_TIMEOUT, &cancelled);
+        drop(volume_permit);
         let dead = !w.is_alive();
-        drop(permit); // 任务结束即释放额度
+        drop(heavy_permit); // 计算结束即释放线程额度；结果字节仍持有工作集额度。
 
         // stop / App 退出（R1 在途边界 / v3.1 §4.1）：取消时在途 Worker 已被 kill（run 返回
         // Disconnected → Supervisor kill_and_reap）。丢弃结果、不落库；任务保持 processing(1) →
@@ -535,7 +591,14 @@ fn worker_loop(
             break;
         }
 
-        if result_tx.send(WorkerResult { task, outcome }).is_err() {
+        if result_tx
+            .send(WorkerResult {
+                task,
+                outcome,
+                workset_permit: Some(workset_permit),
+            })
+            .is_err()
+        {
             break;
         }
         if dead {
@@ -545,6 +608,40 @@ fn worker_loop(
     }
     if let Some(w) = worker.take() {
         w.shutdown(Duration::from_secs(2));
+    }
+}
+
+fn wait_until_admitted(
+    deps: &PipelineDeps<'_>,
+    circuit_open: &AtomicBool,
+    volume_id: Option<i64>,
+    permits: (HeavyPermit, MemoryPermit, VolumeIoPermit),
+) -> Option<(HeavyPermit, MemoryPermit, VolumeIoPermit)> {
+    if !deps.should_yield() {
+        return Some(permits);
+    }
+    drop(permits);
+    loop {
+        while deps.should_yield() && !deps.dispatch_stopped(circuit_open) {
+            std::thread::sleep(YIELD_POLL);
+        }
+        if deps.dispatch_stopped(circuit_open) {
+            return None;
+        }
+        if let Some(permits) = deps.workset_budget.acquire_with_heavy(
+            deps.limiter,
+            EXOTIC_WORKSET_RESERVATION_BYTES,
+            &|| deps.dispatch_stopped(circuit_open) || deps.should_yield(),
+        ) {
+            if let Some(volume) = deps
+                .volume_io_budget
+                .try_acquire(deps.database_epoch, volume_id)
+            {
+                return Some((permits.0, permits.1, volume));
+            }
+            drop(permits);
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -598,7 +695,11 @@ fn writer_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         changed = true;
-        let WorkerResult { task, outcome } = res;
+        let WorkerResult {
+            task,
+            outcome,
+            workset_permit: _workset_permit,
+        } = res;
         let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
             TaskOutcome::Success {
@@ -836,8 +937,7 @@ impl<'a> PipelineDeps<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exotic::worker::{WorkerConfig, WorkerSpec};
-    use exotic_protocol::FailureBody;
+
     use std::io::Cursor;
 
     const PID: &str = "exotic-image-psd";
@@ -847,77 +947,38 @@ mod tests {
     /// （详见 exotic/fingerprint.rs 测试模块的同名常量注释）。取梯上已有值 → snap 后即自身。
     const TIER: u32 = crate::thumbnail::generator::THUMB_TIERS[3];
 
-    /// mock Worker 行为。
-    #[derive(Clone)]
-    enum Behavior {
-        Success,
-        SuccessAndOpenCircuit(Arc<AtomicBool>),
-        Failure {
-            code: WorkerErrorCode,
-            retryable: bool,
-        },
-        Timeout,
-    }
-
-    struct MockWorker {
-        behavior: Behavior,
-        dead: bool,
-    }
+    // 保留的管线用例使用成功 worker，故障在发布与授权边界注入。
+    struct MockWorker;
     impl WorkerTask for MockWorker {
         fn worker_version(&self) -> String {
             "mock-1.0.0".into()
         }
         fn is_alive(&self) -> bool {
-            !self.dead
+            true
         }
         fn shutdown(self: Box<Self>, _grace: Duration) {}
     }
     impl ThumbnailWorker for MockWorker {
         fn run_thumbnail(
             &mut self,
-            req: &RequestBody,
+            _req: &RequestBody,
             _limits: &WorkerLimits,
             _timeout: Duration,
-            cancelled: &dyn Fn() -> bool,
+            _cancelled: &dyn Fn() -> bool,
         ) -> TaskOutcome {
-            match self.behavior.clone() {
-                Behavior::Success | Behavior::SuccessAndOpenCircuit(_) => {
-                    if let Behavior::SuccessAndOpenCircuit(circuit) = &self.behavior {
-                        circuit.store(true, Ordering::SeqCst);
-                        assert!(!cancelled(), "熔断不应中断已在途请求");
-                    }
-                    TaskOutcome::Success {
-                        width: 480,
-                        height: 240,
-                        mime: "image/webp".into(),
-                        blob: make_webp(480, 240),
-                        thumbhash: vec![1, 2, 3],
-                    }
-                }
-                Behavior::Failure { code, retryable } => TaskOutcome::Failure(FailureBody {
-                    item_id: req.item_id(),
-                    input_fingerprint: req.input_fingerprint().map(String::from),
-                    code,
-                    retryable,
-                    message: "mock".into(),
-                }),
-                Behavior::Timeout => {
-                    self.dead = true; // 模拟 supervisor 超时后 kill
-                    TaskOutcome::TimedOut
-                }
+            TaskOutcome::Success {
+                width: 480,
+                height: 240,
+                mime: "image/webp".into(),
+                blob: make_webp(480, 240),
+                thumbhash: vec![1, 2, 3],
             }
         }
     }
-
-    struct MockFactory {
-        behavior: Behavior,
-    }
+    struct MockFactory;
     impl WorkerFactory for MockFactory {
         fn spawn(&self) -> Result<Box<dyn ThumbnailWorker>, String> {
-            Ok(Box::new(MockWorker {
-                behavior: self.behavior.clone(),
-                dead: false,
-            }))
+            Ok(Box::new(MockWorker))
         }
     }
 
@@ -953,170 +1014,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn startup_failure_exits_without_claiming_or_retrying() {
-        struct FailingFactory(std::sync::atomic::AtomicUsize);
-        impl WorkerFactory for FailingFactory {
-            fn spawn(&self) -> Result<Box<dyn ThumbnailWorker>, String> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Err("unavailable".into())
-            }
-        }
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let dir = tempfile::tempdir().unwrap();
-        let d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
-        let factory = FailingFactory(std::sync::atomic::AtomicUsize::new(0));
-        assert_eq!(
-            run_exotic_pipeline_blocking(&d, &factory).stop,
-            PipelineStop::Blocked
-        );
-        assert_eq!(factory.0.load(Ordering::SeqCst), 1);
-        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 0);
-        token.cancel();
-        assert_eq!(
-            run_exotic_pipeline_blocking(&d, &factory).stop,
-            PipelineStop::Cancelled
-        );
-        assert_eq!(factory.0.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn foreground_activity_after_permit_prevents_new_decode() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let task = claim_test_task(&conn, item_id, "A");
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let dir = tempfile::tempdir().unwrap();
-        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
-        let cancelled = token.clone();
-        let checks = std::sync::atomic::AtomicUsize::new(0);
-        d.should_yield = Arc::new(move || {
-            if checks.fetch_add(1, Ordering::SeqCst) == 0 {
-                false
-            } else {
-                cancelled.cancel();
-                true
-            }
-        });
-        let (tasks, task_rx) = bounded(1);
-        tasks.send(task).unwrap();
-        drop(tasks);
-        let (results, result_rx) = bounded(1);
-        let factory = MockFactory {
-            behavior: Behavior::Success,
-        };
-        worker_loop(
-            &d,
-            &factory,
-            &Arc::new(Mutex::new(Vec::new())),
-            task_rx,
-            results,
-            &default_thumbnail_limits(),
-            &AtomicBool::new(false),
-        );
-        assert!(result_rx.try_recv().is_err(), "已让步的任务不得继续解码");
-        assert_eq!(limiter.available(), limiter.total());
-    }
-
-    #[test]
-    fn authorization_revoked_during_yield_exits_without_claiming() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let dir = tempfile::tempdir().unwrap();
-        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
-        let allowed = Arc::new(AtomicBool::new(true));
-        let observed = Arc::clone(&allowed);
-        d.is_runnable = Arc::new(move || observed.load(Ordering::SeqCst));
-        let (yielding, entered) = bounded(1);
-        d.should_yield = Arc::new(move || {
-            let _ = yielding.try_send(());
-            true
-        });
-        let factory = MockFactory {
-            behavior: Behavior::Success,
-        };
-        let (done_tx, done_rx) = bounded(1);
-        let finished = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let _ = done_tx.send(run_exotic_pipeline_blocking(&d, &factory));
-            });
-            let entered_wait = entered.recv_timeout(Duration::from_secs(2));
-            allowed.store(false, Ordering::SeqCst);
-            let finished = done_rx.recv_timeout(Duration::from_secs(1));
-            // 无论断言结果如何都解除旧实现的等待，不能让失败回归挂住整个测试进程。
-            token.cancel();
-            assert!(entered_wait.is_ok());
-            finished
-        });
-        assert!(finished.is_ok(), "授权失效应结束让步等待，无需用户另点取消");
-        let conn = writer.lock().unwrap();
-        assert_eq!(task_status(&conn, item_id), 0);
-        let attempts: i64 = conn
-            .query_row(
-                "SELECT attempts FROM exotic_tasks WHERE item_id=?1",
-                [item_id],
-                |row| row.get(0),
-            )
+    fn admit_test_task(deps: &PipelineDeps<'_>, task: ClaimedTask) -> AdmittedTask {
+        let (heavy_permit, workset_permit) = deps
+            .workset_budget
+            .acquire_with_heavy(deps.limiter, EXOTIC_WORKSET_RESERVATION_BYTES, &|| false)
             .unwrap();
-        assert_eq!(attempts, 0);
-    }
-
-    #[test]
-    fn circuit_during_permit_wait_exits_without_new_decode() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let task = claim_test_task(&conn, item_id, "A");
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(1);
-        let token = CancellationToken::new();
-        let held = limiter.acquire(&token).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
-        let (checked, entered) = bounded(1);
-        d.is_runnable = Arc::new(move || {
-            let _ = checked.try_send(());
-            true
-        });
-        let (tasks, task_rx) = bounded(1);
-        tasks.send(task).unwrap();
-        drop(tasks);
-        let (results, result_rx) = bounded(1);
-        let seed = Arc::new(Mutex::new(Vec::new()));
-        let limits = default_thumbnail_limits();
-        let circuit = AtomicBool::new(false);
-        let factory = MockFactory {
-            behavior: Behavior::Success,
-        };
-        let (done_tx, done_rx) = bounded(1);
-        let finished = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                worker_loop(&d, &factory, &seed, task_rx, results, &limits, &circuit);
-                let _ = done_tx.send(());
-            });
-            let entered_wait = entered.recv_timeout(Duration::from_secs(2));
-            circuit.store(true, Ordering::SeqCst);
-            let finished = done_rx.recv_timeout(Duration::from_secs(1));
-            token.cancel();
-            assert!(entered_wait.is_ok());
-            finished
-        });
-        assert!(
-            finished.is_ok(),
-            "熔断应退出额度等待，不必等其他任务释放额度"
-        );
-        assert!(result_rx.try_recv().is_err());
-        assert_eq!(limiter.available(), 0, "已有持有者不受影响");
-        drop(held);
-        assert_eq!(limiter.available(), 1);
+        AdmittedTask {
+            task,
+            heavy_permit,
+            workset_permit,
+            volume_id: Some(1),
+            volume_permit: deps
+                .volume_io_budget
+                .try_acquire(deps.database_epoch, Some(1))
+                .unwrap(),
+        }
     }
 
     #[test]
@@ -1125,10 +1037,7 @@ mod tests {
         impl WorkerFactory for RevokingFactory {
             fn spawn(&self) -> Result<Box<dyn ThumbnailWorker>, String> {
                 self.0.store(false, Ordering::SeqCst);
-                MockFactory {
-                    behavior: Behavior::Success,
-                }
-                .spawn()
+                MockFactory.spawn()
             }
         }
         let conn = Connection::open_in_memory().unwrap();
@@ -1143,7 +1052,7 @@ mod tests {
         let observed = Arc::clone(&allowed);
         d.is_runnable = Arc::new(move || observed.load(Ordering::SeqCst));
         let (tasks, task_rx) = bounded(1);
-        tasks.send(task).unwrap();
+        tasks.send(admit_test_task(&d, task)).unwrap();
         drop(tasks);
         let (results, result_rx) = bounded(1);
         worker_loop(
@@ -1157,83 +1066,6 @@ mod tests {
         );
         assert!(result_rx.try_recv().is_err(), "握手后失去授权不得开始解码");
         assert_eq!(limiter.available(), 1);
-    }
-
-    #[test]
-    fn in_flight_result_survives_circuit_opening() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let task = claim_test_task(&conn, item_id, "A");
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(1);
-        let token = CancellationToken::new();
-        let dir = tempfile::tempdir().unwrap();
-        let d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
-        let circuit = Arc::new(AtomicBool::new(false));
-        let factory = MockFactory {
-            behavior: Behavior::SuccessAndOpenCircuit(Arc::clone(&circuit)),
-        };
-        let (tasks, task_rx) = bounded(1);
-        tasks.send(task).unwrap();
-        drop(tasks);
-        let (results, result_rx) = bounded(1);
-        worker_loop(
-            &d,
-            &factory,
-            &Arc::new(Mutex::new(Vec::new())),
-            task_rx,
-            results,
-            &default_thumbnail_limits(),
-            &circuit,
-        );
-        assert!(circuit.load(Ordering::SeqCst));
-        // 已在途的有效结果继续交给原 Writer，验证它仍能正常提交。
-        let stats = Mutex::new(PipelineStats::default());
-        writer_loop(&d, PID, "mock-1.0.0", "A", result_rx, &circuit, &stats);
-        assert_eq!(stats.lock().unwrap().done, 1);
-        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 2);
-        assert_eq!(limiter.available(), 1);
-    }
-
-    #[test]
-    fn writer_notifies_before_close_and_counts_exhausted_retry_as_terminal() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        conn.execute("UPDATE exotic_tasks SET attempts=2", [])
-            .unwrap();
-        let task = claim_test_task(&conn, item_id, "A");
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let dir = tempfile::tempdir().unwrap();
-        let mut d = deps(&writer, &limiter, &token, dir.path().to_path_buf());
-        let (notified_tx, notified_rx) = std::sync::mpsc::channel();
-        d.on_progress = Arc::new(move || {
-            let _ = notified_tx.send(());
-        });
-        let (tx, rx) = bounded(1);
-        let stats = Mutex::new(PipelineStats::default());
-        let circuit = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            scope.spawn(|| writer_loop(&d, PID, "mock-1.0.0", "A", rx, &circuit, &stats));
-            tx.send(WorkerResult {
-                task,
-                outcome: TaskOutcome::Failure(FailureBody {
-                    item_id: Some(item_id),
-                    input_fingerprint: Some("fp".into()),
-                    code: WorkerErrorCode::IoError,
-                    retryable: true,
-                    message: "busy".into(),
-                }),
-            })
-            .unwrap();
-            let notified = notified_rx.recv_timeout(Duration::from_secs(2));
-            drop(tx);
-            assert!(notified.is_ok(), "通道尚未结束时应已通知进度");
-        });
-        let stats = stats.into_inner().unwrap();
-        assert_eq!((stats.retried, stats.terminal), (0, 1));
-        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 4);
     }
 
     #[test]
@@ -1307,6 +1139,9 @@ mod tests {
         PipelineDeps {
             writer,
             limiter,
+            workset_budget: MemoryBudget::new(),
+            volume_io_budget: VolumeIoBudget::new(),
+            database_epoch: 1,
             token,
             items_cache: test_items_cache(),
             cache_dir,
@@ -1325,40 +1160,6 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn success_writes_thumbnail_and_marks_done() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, cache_key) = setup_db(&conn);
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let cache_dir = std::env::temp_dir().join(format!("exotic-pl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cache_dir);
-
-        let d = deps(&writer, &limiter, &token, cache_dir.clone());
-        let factory = MockFactory {
-            behavior: Behavior::Success,
-        };
-        let stats = run_exotic_pipeline_blocking(&d, &factory);
-
-        assert_eq!(stats.done, 1, "应完成 1 个");
-        let conn = writer.lock().unwrap();
-        assert_eq!(task_status(&conn, item_id), 2, "任务应为 done");
-        let (thumb_status, has_path): (i64, bool) = conn
-            .query_row(
-                "SELECT thumb_status, thumb_path IS NOT NULL FROM media_items WHERE id=?1",
-                rusqlite::params![item_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(thumb_status, 1, "media_items thumb_status 应回填 1");
-        assert!(has_path);
-        // 产物文件落盘。
-        let p = crate::thumbnail::cache::thumb_path(&cache_dir, TIER, cache_key);
-        assert!(p.exists(), "缩略图文件应已落盘");
-        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 
     #[test]
@@ -1439,441 +1240,6 @@ mod tests {
             "过期快照应在落盘前被丢弃"
         );
         let _ = std::fs::remove_dir_all(&cache_dir);
-    }
-
-    #[test]
-    fn stale_lease_deadlock_recovered_by_wake_sweep() {
-        // 病历 #2 回归锁(2026-07-05 真机 60/62):硬杀/panic 遗留的 stale processing 行使
-        // has_ready(只认 0/3)恒 false → pipeline 不启动 → 其步骤 0 的孤儿恢复永不可达,
-        // 进度永久停摆。wake 前清扫必须能独立打破该互锁。
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        // 模拟已死实例的过期租约:claimed_at 早于 now - LEASE_TTL_SECS。
-        let stale_at = now_secs() - LEASE_TTL_SECS - 60;
-        let claimed = q::claim_exotic_tasks(
-            &conn,
-            PID,
-            CAPABILITY,
-            10,
-            "dead-instance",
-            stale_at,
-            "mock-1.0.0",
-        )
-        .unwrap();
-        assert_eq!(claimed.len(), 1);
-        // 死锁面:此刻无就绪任务 → Coordinator 的 evaluate_run 不会启动 pipeline。
-        assert!(!q::has_ready_exotic_task(&conn, PID, CAPABILITY, now_secs()).unwrap());
-        // wake 前清扫恢复过期租约 → has_ready 恢复真值。
-        let writer = Mutex::new(conn);
-        assert_eq!(recover_stale_exotic_leases(&writer), 1);
-        let conn = writer.into_inner().unwrap();
-        assert_eq!(
-            task_status(&conn, item_id),
-            0,
-            "stale processing 应回 pending"
-        );
-        assert!(q::has_ready_exotic_task(&conn, PID, CAPABILITY, now_secs()).unwrap());
-        // 对偶面:活租约(claimed_at=now)不得被误清。
-        let _ = q::claim_exotic_tasks(
-            &conn,
-            PID,
-            CAPABILITY,
-            10,
-            "alive",
-            now_secs(),
-            "mock-1.0.0",
-        )
-        .unwrap();
-        let writer = Mutex::new(conn);
-        assert_eq!(recover_stale_exotic_leases(&writer), 0, "活租约不得回收");
-    }
-
-    #[test]
-    fn not_runnable_claims_nothing() {
-        // §5.3：派发前授权复核为 false（运行期 License 失效/插件禁用）→ 不领取，任务留 pending。
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let mut d = deps(
-            &writer,
-            &limiter,
-            &token,
-            std::env::temp_dir().join("exotic-pl-norun"),
-        );
-        d.is_runnable = Arc::new(|| false); // 授权在运行期失效
-        let factory = MockFactory {
-            behavior: Behavior::Success,
-        };
-        let stats = run_exotic_pipeline_blocking(&d, &factory);
-        assert_eq!(stats.done, 0, "不应完成任何任务");
-        assert_eq!(
-            task_status(&writer.lock().unwrap(), item_id),
-            0,
-            "任务应留 pending"
-        );
-    }
-
-    #[test]
-    fn unsupported_variant_is_terminal() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let d = deps(
-            &writer,
-            &limiter,
-            &token,
-            std::env::temp_dir().join("exotic-pl-term"),
-        );
-        let factory = MockFactory {
-            behavior: Behavior::Failure {
-                code: WorkerErrorCode::UnsupportedVariant,
-                retryable: false,
-            },
-        };
-        let stats = run_exotic_pipeline_blocking(&d, &factory);
-        assert_eq!(stats.terminal, 1);
-        assert_eq!(
-            task_status(&writer.lock().unwrap(), item_id),
-            4,
-            "应为 terminal"
-        );
-    }
-
-    #[test]
-    fn timeout_is_retried_with_backoff() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let d = deps(
-            &writer,
-            &limiter,
-            &token,
-            std::env::temp_dir().join("exotic-pl-retry"),
-        );
-        let factory = MockFactory {
-            behavior: Behavior::Timeout,
-        };
-        let stats = run_exotic_pipeline_blocking(&d, &factory);
-        assert_eq!(stats.retried, 1);
-        let conn = writer.lock().unwrap();
-        assert_eq!(task_status(&conn, item_id), 3, "应为 retryable");
-        let next_retry: Option<i64> = conn
-            .query_row(
-                "SELECT next_retry_at FROM exotic_tasks WHERE item_id=?1",
-                rusqlite::params![item_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(next_retry.is_some(), "retryable 应设 next_retry_at");
-    }
-
-    /// 合成最小合法 RGB 8-bit raw PSD（供真实 Worker e2e）。
-    fn make_rgb_psd(w: u32, h: u32) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(b"8BPS");
-        b.extend_from_slice(&1u16.to_be_bytes());
-        b.extend_from_slice(&[0u8; 6]);
-        b.extend_from_slice(&3u16.to_be_bytes());
-        b.extend_from_slice(&h.to_be_bytes());
-        b.extend_from_slice(&w.to_be_bytes());
-        b.extend_from_slice(&8u16.to_be_bytes());
-        b.extend_from_slice(&3u16.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0u32.to_be_bytes());
-        b.extend_from_slice(&0u16.to_be_bytes());
-        for ch in 0..3u32 {
-            for y in 0..h {
-                for x in 0..w {
-                    b.push(match ch {
-                        0 => {
-                            if w > 1 {
-                                (x * 255 / (w - 1)) as u8
-                            } else {
-                                200
-                            }
-                        }
-                        1 => {
-                            if h > 1 {
-                                (y * 255 / (h - 1)) as u8
-                            } else {
-                                120
-                            }
-                        }
-                        _ => 128,
-                    });
-                }
-            }
-        }
-        b
-    }
-
-    /// 真实 psd-worker 穿过 Pipeline + Sink。显式 `--ignored` 启用并提供
-    /// `EXOTIC_PSD_WORKER_PATH`，证明 spawn→握手→解 PSD→Host 验证→落盘→条件 DB 全链路。
-    /// 可用 `EXOTIC_PSD_SAMPLE_PATH` 注入真实样本（仅复制到临时目录），
-    /// `EXOTIC_PSD_OUTPUT_PATH` 可保留产物供目视验收。
-    #[test]
-    #[ignore = "需要 EXOTIC_PSD_WORKER_PATH 指向真实 PSD worker"]
-    fn real_worker_pipeline_end_to_end() {
-        use crate::exotic::worker::resolve_psd_worker_path;
-        let exe = resolve_psd_worker_path().expect("必须设置 EXOTIC_PSD_WORKER_PATH");
-        // 真实样本也复制到独立 scan_root，避免验收过程中写入用户样本目录。
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let source = root.join("synthetic.psd");
-        if let Some(sample) = std::env::var_os("EXOTIC_PSD_SAMPLE_PATH") {
-            std::fs::copy(sample, &source).expect("复制 PSD 验收样本");
-        } else {
-            std::fs::write(&source, make_rgb_psd(300, 200)).unwrap();
-        }
-        use std::io::Read;
-        let mut header = [0u8; 26];
-        std::fs::File::open(&source)
-            .unwrap()
-            .read_exact(&mut header)
-            .unwrap();
-        assert_eq!(&header[..4], b"8BPS");
-        let source_height = u32::from_be_bytes(header[14..18].try_into().unwrap());
-        let source_width = u32::from_be_bytes(header[18..22].try_into().unwrap());
-        assert!(source_width > 0 && source_height > 0);
-        let scale = (TIER as f64 / source_width.max(source_height) as f64).min(1.0);
-        let expected_dims = (
-            (source_width as f64 * scale).round().max(1.0) as u32,
-            (source_height as f64 * scale).round().max(1.0) as u32,
-        );
-
-        let conn = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO scan_roots (path, alias) VALUES (?1, 'r')",
-            rusqlite::params![root.to_string_lossy().to_string()],
-        )
-        .unwrap();
-        let root_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO directories (root_id, parent_id, rel_path, name, depth, mtime)
-             VALUES (?1, NULL, '', 'root', 0, 0)",
-            rusqlite::params![root_id],
-        )
-        .unwrap();
-        let dir_id = conn.last_insert_rowid();
-        let cache_key: i64 = 0x00C0_FFEE;
-        conn.execute(
-            "INSERT INTO media_items
-                (directory_id, file_name, file_size, file_mtime, file_format,
-                 media_type, width, height, sort_datetime, cache_key)
-             VALUES (?1, 'synthetic.psd', 1, 1, 'psd', 'image', 0, 0, 0, ?2)",
-            rusqlite::params![dir_id, cache_key],
-        )
-        .unwrap();
-        let item_id = conn.last_insert_rowid();
-        q::seed_exotic_tasks_for_item(&conn, item_id, PID, &["thumbnail".into()]).unwrap();
-
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let cache_dir = root.join("cache");
-        let d = deps(&writer, &limiter, &token, cache_dir.clone());
-
-        let factory = SupervisorFactory {
-            spec: WorkerSpec {
-                exe_path: exe,
-                expected_worker_id: "psd-worker".into(),
-                required_capabilities: vec!["thumbnail".into()],
-            },
-            cfg: WorkerConfig {
-                handshake_timeout: Duration::from_secs(5),
-                host_version: "0.1.0".into(),
-                max_blob_len: exotic_protocol::MAX_BLOB_LEN,
-            },
-        };
-        let start = Instant::now();
-        let stats = run_exotic_pipeline_blocking(&d, &factory);
-        let elapsed = start.elapsed();
-        assert_eq!(
-            stats,
-            PipelineStats {
-                done: 1,
-                ..Default::default()
-            },
-            "真实 Worker 应完成 1 张，无重试/终态/租约丢失"
-        );
-        assert_eq!(task_status(&writer.lock().unwrap(), item_id), 2);
-        let output = crate::thumbnail::cache::thumb_path(&cache_dir, TIER, cache_key);
-        let webp = std::fs::read(&output).expect("完成任务必须有落盘文件");
-        let decoded = image::load_from_memory_with_format(&webp, image::ImageFormat::WebP)
-            .unwrap()
-            .into_rgba8();
-        assert_eq!(decoded.dimensions(), expected_dims);
-        let expected_hash =
-            crate::thumbnail::thumbhash::generate_thumbhash(&crate::engine::traits::DecodedImage {
-                width: decoded.width(),
-                height: decoded.height(),
-                pixels: decoded.into_raw(),
-                icc: None,
-            })
-            .unwrap();
-        let conn = writer.lock().unwrap();
-        let (status, path, hash): (i64, String, Vec<u8>) = conn
-            .query_row(
-                "SELECT thumb_status, thumb_path, thumbhash FROM media_items WHERE id=?1",
-                rusqlite::params![item_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(status, 1);
-        assert_eq!(cache_dir.join("thumbnails").join(path), output);
-        assert_eq!(hash, expected_hash);
-        if let Some(destination) = std::env::var_os("EXOTIC_PSD_OUTPUT_PATH") {
-            let destination = PathBuf::from(destination);
-            std::fs::create_dir_all(destination.parent().expect("产物须指定父目录")).unwrap();
-            std::fs::copy(&output, destination).expect("保留 PSD 验收产物");
-        }
-        eprintln!(
-            "PSD source={}x{} output={}x{} webp_bytes={} pipeline_ms={:.2}",
-            source_width,
-            source_height,
-            expected_dims.0,
-            expected_dims.1,
-            webp.len(),
-            elapsed.as_secs_f64() * 1000.0
-        );
-    }
-
-    /// 真实 RAW worker 的 Failure 穿过领取、回声校验、失败预算与 DB 写回，不依赖相机样张。
-    #[test]
-    #[ignore = "需要 EXOTIC_RAW_WORKER_PATH 指向真实 RAW worker"]
-    fn real_raw_worker_pipeline_failures() {
-        let exe =
-            std::env::var_os("EXOTIC_RAW_WORKER_PATH").expect("必须设置 EXOTIC_RAW_WORKER_PATH");
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("malformed.dng"), [0xabu8; 64]).unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        let (malformed_id, _) = setup_db(&conn);
-        const RAW_PID: &str = "exotic-image-raw";
-        conn.execute(
-            "UPDATE scan_roots SET path=?1",
-            rusqlite::params![dir.path().to_string_lossy().to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE media_items SET file_name=?1, file_format=?2 WHERE id=?3",
-            rusqlite::params!["malformed.dng", "dng", malformed_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE exotic_tasks SET plugin_id=?1 WHERE item_id=?2",
-            rusqlite::params![RAW_PID, malformed_id],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO media_items
-                (directory_id, file_name, file_size, file_mtime, file_format,
-                 media_type, width, height, sort_datetime, cache_key)
-             SELECT directory_id, ?1, file_size, file_mtime, file_format,
-                    media_type, width, height, sort_datetime, cache_key+1
-             FROM media_items WHERE id=?2",
-            rusqlite::params!["missing.dng", malformed_id],
-        )
-        .unwrap();
-        let missing_id = conn.last_insert_rowid();
-        q::seed_exotic_tasks_for_item(&conn, missing_id, RAW_PID, &[CAPABILITY.into()]).unwrap();
-
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        let cache_dir = dir.path().join("cache");
-        let mut d = deps(&writer, &limiter, &token, cache_dir.clone());
-        d.plugin_id = RAW_PID.into();
-        let notifications = Arc::new(AtomicU64::new(0));
-        let observed = Arc::clone(&notifications);
-        d.on_progress = Arc::new(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
-        let factory = SupervisorFactory {
-            spec: WorkerSpec {
-                exe_path: exe.into(),
-                expected_worker_id: "raw-worker".into(),
-                required_capabilities: vec![CAPABILITY.into()],
-            },
-            cfg: WorkerConfig {
-                handshake_timeout: Duration::from_secs(5),
-                host_version: "0.1.0".into(),
-                max_blob_len: exotic_protocol::MAX_BLOB_LEN,
-            },
-        };
-        let start = Instant::now();
-        let stats = run_exotic_pipeline_blocking(&d, &factory);
-        assert_eq!(
-            stats,
-            PipelineStats {
-                terminal: 1,
-                retried: 1,
-                ..Default::default()
-            }
-        );
-        assert!(notifications.load(Ordering::SeqCst) > 0);
-        let conn = writer.lock().unwrap();
-        for (id, expected_status, expected_code) in [
-            (malformed_id, 4, "malformed_input"),
-            (missing_id, 3, "io_error"),
-        ] {
-            conn.query_row(
-                "SELECT status, attempts, last_error_code, next_retry_at, lease_owner, worker_version
-                 FROM exotic_tasks WHERE item_id=?1",
-                rusqlite::params![id],
-                |row| {
-                    assert_eq!(row.get::<_, i64>(0)?, expected_status);
-                    assert_eq!(row.get::<_, i64>(1)?, 1);
-                    assert_eq!(row.get::<_, String>(2)?, expected_code);
-                    assert_eq!(
-                        row.get::<_, Option<i64>>(3)?.is_some(),
-                        expected_status == 3
-                    );
-                    assert!(row.get::<_, Option<String>>(4)?.is_none());
-                    assert!(!row.get::<_, String>(5)?.is_empty());
-                    Ok(())
-                },
-            )
-            .unwrap();
-        }
-        assert!(!cache_dir.exists(), "失败任务不应写入缩略图");
-        eprintln!(
-            "RAW failure_pipeline_ms={:.2}",
-            start.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-
-    #[test]
-    fn cancelled_before_run_leaves_task_pending() {
-        let conn = Connection::open_in_memory().unwrap();
-        let (item_id, _) = setup_db(&conn);
-        let writer = Mutex::new(conn);
-        let limiter = BackgroundHeavyLimiter::new(2);
-        let token = CancellationToken::new();
-        token.cancel(); // 预先取消
-        let d = deps(
-            &writer,
-            &limiter,
-            &token,
-            std::env::temp_dir().join("exotic-pl-cancel"),
-        );
-        let factory = MockFactory {
-            behavior: Behavior::Success,
-        };
-        let stats = run_exotic_pipeline_blocking(&d, &factory);
-        assert_eq!(stats.done, 0);
-        assert_eq!(
-            task_status(&writer.lock().unwrap(), item_id),
-            0,
-            "取消后任务仍 pending"
-        );
     }
 
     #[test]

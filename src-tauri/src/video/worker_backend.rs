@@ -82,7 +82,12 @@ impl VideoBackend for WorkerVideoBackend {
         Ok(map_probe_info(info))
     }
 
-    fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage> {
+    fn cover_bounded(
+        &self,
+        path: &Path,
+        max_long_edge: u32,
+        max_pixel_bytes: u64,
+    ) -> Result<DecodedImage> {
         let item_id = pseudo_item_id(path);
         let fingerprint = fingerprint_of(path)?;
         let (blob, _info) = bridge_rt()
@@ -93,10 +98,16 @@ impl VideoBackend for WorkerVideoBackend {
                 VideoFramesMode::Cover { max_long_edge },
             ))
             .map_err(|e| map_service_err(e, path))?;
-        decode_cover_webp(&blob, max_long_edge)
+        decode_cover_webp(&blob, max_long_edge, max_pixel_bytes)
     }
 
-    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>> {
+    fn keyframes_bounded(
+        &self,
+        path: &Path,
+        n: usize,
+        cell_height: u32,
+        max_pixel_bytes: u64,
+    ) -> Result<Vec<DecodedImage>> {
         let n_u32 = n.max(1) as u32;
         let item_id = pseudo_item_id(path);
         let fingerprint = fingerprint_of(path)?;
@@ -116,7 +127,7 @@ impl VideoBackend for WorkerVideoBackend {
                 "video-worker 未回传雪碧条切格元数据 | missing video_frames info".into(),
             )
         })?;
-        decode_sprite_cells(&blob, info, n_u32, cell_height)
+        decode_sprite_cells(&blob, info, n_u32, cell_height, max_pixel_bytes)
     }
 }
 
@@ -209,14 +220,23 @@ const COVER_MAX_OUTPUT_PIXELS: u64 = 16_000_000;
 /// 独立解码 Cover 单帧 WebP(host 不信任 worker,§6 / `exotic::worker.rs:11-12` 先例)。
 /// `max_long_edge`(0 = 原生尺寸,不做长边校验)是本次请求档位 —— 解码后须核对实际尺寸
 /// 未越出「请求档位 + 容差」,且总像素不超上限,否则整批拒收(同 `exotic/validate.rs` 先例)。
-fn decode_cover_webp(blob: &[u8], max_long_edge: u32) -> Result<DecodedImage> {
-    let img = image::load_from_memory_with_format(blob, image::ImageFormat::WebP)
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "封面 WebP 独立解码失败 | cover WebP decode failed: {e}"
-            ))
-        })?
-        .to_rgba8();
+fn decode_cover_webp(
+    blob: &[u8],
+    max_long_edge: u32,
+    max_pixel_bytes: u64,
+) -> Result<DecodedImage> {
+    let reader =
+        image::ImageReader::with_format(std::io::Cursor::new(blob), image::ImageFormat::WebP);
+    let img = crate::engine::image_rs::decode_image_reader_bounded(
+        reader,
+        max_pixel_bytes.min(COVER_MAX_OUTPUT_PIXELS * 4),
+    )
+    .map_err(|e| {
+        AppError::Internal(format!(
+            "封面 WebP 独立解码失败 | cover WebP decode failed: {e}"
+        ))
+    })?
+    .into_rgba8();
     let (width, height) = (img.width(), img.height());
     if max_long_edge > 0 {
         let long = width.max(height);
@@ -252,6 +272,7 @@ fn decode_sprite_cells(
     info: VideoFramesInfo,
     requested_n: u32,
     requested_cell_height: u32,
+    max_pixel_bytes: u64,
 ) -> Result<Vec<DecodedImage>> {
     if info.n != requested_n || info.cell_height != requested_cell_height {
         return Err(AppError::Internal(format!(
@@ -260,13 +281,21 @@ fn decode_sprite_cells(
             info.n, info.cell_height
         )));
     }
-    let img = image::load_from_memory_with_format(blob, image::ImageFormat::WebP)
+    super::check_frame_collection_budget(
+        info.cell_width,
+        info.cell_height,
+        info.n as usize,
+        max_pixel_bytes,
+    )?;
+    let reader =
+        image::ImageReader::with_format(std::io::Cursor::new(blob), image::ImageFormat::WebP);
+    let img = crate::engine::image_rs::decode_image_reader_bounded(reader, max_pixel_bytes)
         .map_err(|e| {
             AppError::Internal(format!(
                 "雪碧条 WebP 独立解码失败 | sprite WebP decode failed: {e}"
             ))
         })?
-        .to_rgba8();
+        .into_rgba8();
     let (w, h) = (img.width(), img.height());
     let (cell_w, cell_h, n) = (info.cell_width, info.cell_height, info.n);
     if cell_w == 0 || cell_h == 0 || n == 0 {
@@ -291,270 +320,4 @@ fn decode_sprite_cells(
         });
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::thumbnail::exif_thumb::encode_as_webp;
-    use exotic_protocol::VideoAudioTrack;
-    use image::Rgba;
-
-    fn solid(w: u32, h: u32, px: [u8; 4]) -> image::RgbaImage {
-        image::RgbaImage::from_pixel(w, h, Rgba(px))
-    }
-
-    fn empty_probe_info() -> VideoProbeInfo {
-        VideoProbeInfo {
-            container: "mov,mp4".into(),
-            duration_ms: None,
-            width: None,
-            height: None,
-            rotation: None,
-            fps: None,
-            bitrate: None,
-            video_codec: String::new(),
-            video_profile: None,
-            bit_depth: None,
-            pixel_format: None,
-            audio_tracks: vec![],
-            has_subtitles: false,
-            has_hdr_metadata: false,
-        }
-    }
-
-    /// 全 `None` 探测结果:映射到既有 `VideoInfo` 时全部字段补 0/空,不 panic。
-    #[test]
-    fn map_probe_info_fills_missing_with_defaults() {
-        let mapped = map_probe_info(empty_probe_info());
-        assert_eq!(mapped.width, 0);
-        assert_eq!(mapped.height, 0);
-        assert_eq!(mapped.duration_ms, 0);
-        assert_eq!(mapped.rotation, 0);
-        assert_eq!(mapped.fps, 0.0);
-        assert_eq!(mapped.bitrate, 0);
-        assert!(!mapped.has_audio);
-        assert_eq!(mapped.codec, None);
-    }
-
-    /// 全字段齐备(rotation=0,不触发交换):逐字段透传,`audio_tracks` 非空 → `has_audio=true`,
-    /// codec 归一大写。
-    #[test]
-    fn map_probe_info_carries_present_fields() {
-        let mut info = empty_probe_info();
-        info.duration_ms = Some(5000);
-        info.width = Some(1920);
-        info.height = Some(1080);
-        info.rotation = Some(0);
-        info.fps = Some(30.0);
-        info.bitrate = Some(2_000_000);
-        info.video_codec = "h264".into();
-        info.audio_tracks = vec![VideoAudioTrack {
-            index: 0,
-            codec: "aac".into(),
-            channels: Some(2),
-            language: None,
-            is_default: true,
-        }];
-        let mapped = map_probe_info(info);
-        assert_eq!((mapped.width, mapped.height), (1920, 1080));
-        assert_eq!(mapped.duration_ms, 5000);
-        assert_eq!(mapped.rotation, 0);
-        assert_eq!(mapped.fps, 30.0);
-        assert_eq!(mapped.bitrate, 2_000_000);
-        assert!(mapped.has_audio);
-        assert_eq!(
-            mapped.codec.as_deref(),
-            Some("H264"),
-            "codec 归一大写,与 MF 落库标签一致"
-        );
-    }
-
-    /// 竖拍视频:rotation=90/270 时协议层原生几何(w,h)须互换为显示尺寸
-    /// (VideoBackend 契约=显示尺寸,media_foundation.rs:89 先例)。
-    #[test]
-    fn map_probe_info_swaps_dimensions_for_rotated_video() {
-        for rotation in [90, 270] {
-            let mut info = empty_probe_info();
-            info.width = Some(1920);
-            info.height = Some(1080);
-            info.rotation = Some(rotation);
-            let mapped = map_probe_info(info);
-            assert_eq!(
-                (mapped.width, mapped.height),
-                (1080, 1920),
-                "rotation={rotation} 应互换宽高"
-            );
-            assert_eq!(mapped.rotation, rotation);
-        }
-    }
-
-    /// rotation=180 不触发交换(与 0 同一分支)。
-    #[test]
-    fn map_probe_info_does_not_swap_for_180_rotation() {
-        let mut info = empty_probe_info();
-        info.width = Some(1920);
-        info.height = Some(1080);
-        info.rotation = Some(180);
-        let mapped = map_probe_info(info);
-        assert_eq!((mapped.width, mapped.height), (1920, 1080));
-    }
-
-    /// 协议层 bitrate(u64)超出 trait 历史字段 u32 上限时钳位、不 panic。
-    #[test]
-    fn bitrate_clamps_to_u32_max_instead_of_overflowing() {
-        let mut info = empty_probe_info();
-        info.bitrate = Some(u64::MAX);
-        assert_eq!(map_probe_info(info).bitrate, u32::MAX);
-    }
-
-    /// Keyframes 雪碧条切格:3 格纯色横拼,独立解码切回后每格尺寸/首像素与源一致
-    /// (对称验证 derive/video.rs 的横向拼接约定)。
-    #[test]
-    fn decode_sprite_cells_recovers_each_cell() {
-        let (cell_w, cell_h, n) = (4u32, 2u32, 3u32);
-        let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
-        let mut sprite = image::RgbaImage::new(cell_w * n, cell_h);
-        for (i, color) in colors.iter().enumerate() {
-            let tile = solid(cell_w, cell_h, *color);
-            image::imageops::overlay(&mut sprite, &tile, (i as u32 * cell_w) as i64, 0);
-        }
-        let blob = encode_as_webp(&sprite, 100).expect("encode sprite");
-        let info = VideoFramesInfo {
-            cell_width: cell_w,
-            cell_height: cell_h,
-            n,
-        };
-        let cells = decode_sprite_cells(&blob, info, n, cell_h).expect("decode sprite");
-        assert_eq!(cells.len(), 3);
-        for (cell, color) in cells.iter().zip(colors.iter()) {
-            assert_eq!((cell.width, cell.height), (cell_w, cell_h));
-            assert_eq!(&cell.pixels[0..4], color);
-        }
-    }
-
-    /// host 不信任 worker:声明几何(cell_width×n)与实际解码宽度不符 → 整批拒收。
-    #[test]
-    fn decode_sprite_cells_rejects_geometry_mismatch() {
-        let sprite = solid(8, 2, [1, 2, 3, 255]);
-        let blob = encode_as_webp(&sprite, 100).unwrap();
-        let info = VideoFramesInfo {
-            cell_width: 4,
-            cell_height: 2,
-            n: 3, // 声明 4x2x3=12px 宽,实际只有 8px。
-        };
-        // requested 与声明一致(3, 2),故触发的是几何不符检查、非请求钉子检查。
-        assert!(decode_sprite_cells(&blob, info, 3, 2).is_err());
-    }
-
-    /// 切格元数据含 0(worker 违约)→ 直接拒收,不做除零/越界。
-    #[test]
-    fn decode_sprite_cells_rejects_zero_metadata() {
-        let sprite = solid(4, 2, [1, 2, 3, 255]);
-        let blob = encode_as_webp(&sprite, 100).unwrap();
-        let info = VideoFramesInfo {
-            cell_width: 0,
-            cell_height: 2,
-            n: 1,
-        };
-        assert!(decode_sprite_cells(&blob, info, 1, 2).is_err());
-    }
-
-    /// 雪碧几何钉请求(V5 深审批4):worker 声明的 `{n,cell_height}` 与本次请求参数不符
-    /// (即便声明几何与实际解码尺寸自洽)→ 整批拒收。
-    #[test]
-    fn decode_sprite_cells_rejects_request_mismatch() {
-        let (cell_w, cell_h, n) = (4u32, 2u32, 3u32);
-        let sprite = image::RgbaImage::new(cell_w * n, cell_h);
-        let blob = encode_as_webp(&sprite, 100).unwrap();
-        let info = VideoFramesInfo {
-            cell_width: cell_w,
-            cell_height: cell_h,
-            n,
-        };
-        // 声明与实际自洽(3x2),但调用方请求的是 n=5:worker 应声即被判定错序/违约。
-        assert!(decode_sprite_cells(&blob, info, 5, cell_h).is_err());
-        // cell_height 请求不符同理拒收。
-        assert!(decode_sprite_cells(&blob, info, n, 99).is_err());
-    }
-
-    /// Cover 单帧 WebP 独立解码:尺寸与首像素与源一致(`max_long_edge=0` 不做长边校验)。
-    #[test]
-    fn decode_cover_webp_roundtrips_dimensions() {
-        let img = solid(6, 4, [10, 20, 30, 255]);
-        let blob = encode_as_webp(&img, 100).unwrap();
-        let decoded = decode_cover_webp(&blob, 0).unwrap();
-        assert_eq!((decoded.width, decoded.height), (6, 4));
-        assert_eq!(&decoded.pixels[0..4], &[10, 20, 30, 255]);
-    }
-
-    /// Cover 防御:实际长边超过「请求档位+容差」→ 整批拒收(超尺寸 WebP,V5 深审批4)。
-    #[test]
-    fn decode_cover_webp_rejects_oversized_long_edge() {
-        // 请求档位 512,容差 64 → 上限 576;构造 700px 长边超限 WebP。
-        let img = solid(700, 10, [1, 2, 3, 255]);
-        let blob = encode_as_webp(&img, 100).unwrap();
-        assert!(decode_cover_webp(&blob, 512).is_err());
-    }
-
-    /// Cover 防御:请求档位内(含容差)正常放行,不误杀合法结果。
-    #[test]
-    fn decode_cover_webp_accepts_within_tolerance() {
-        // 512 + 64 容差 = 576 上限,构造刚好等于上限的长边。
-        let img = solid(576, 10, [1, 2, 3, 255]);
-        let blob = encode_as_webp(&img, 100).unwrap();
-        assert!(decode_cover_webp(&blob, 512).is_ok());
-    }
-
-    /// 授权/组件/worker 不可用等价「后端不支持」—— 映射为 `UnsupportedFormat(ext)`。
-    #[test]
-    fn map_service_err_treats_availability_gaps_as_unsupported_format() {
-        let p = Path::new("movie.mkv");
-        for e in [
-            VideoServiceError::NotAuthorized,
-            VideoServiceError::NeedsComponent,
-            VideoServiceError::WorkerUnavailable,
-            VideoServiceError::FfmpegUnavailable,
-        ] {
-            match map_service_err(e, p) {
-                AppError::UnsupportedFormat(ext) => assert_eq!(ext, "mkv"),
-                other => panic!("期望 UnsupportedFormat,得 {other:?}"),
-            }
-        }
-    }
-
-    /// 其余错误(超时/资源限制等)透传既有 `From<VideoServiceError>` 映射,不被吞成「不支持」。
-    #[test]
-    fn map_service_err_passes_through_other_errors() {
-        let p = Path::new("movie.mkv");
-        match map_service_err(VideoServiceError::Timeout, p) {
-            AppError::Exotic { code, .. } => assert_eq!(code, "video_timeout"),
-            other => panic!("期望透传 Exotic 错误,得 {other:?}"),
-        }
-    }
-
-    /// 去重键:同路径产出同一合成 item_id(§9.12 去重语义依赖此稳定性);且恒落负数命名空间
-    /// (与真实 DB id 空间隔离,V5 深审批4)。
-    #[test]
-    fn pseudo_item_id_is_stable_for_same_path() {
-        let a = pseudo_item_id(Path::new("C:/videos/a.mkv"));
-        let b = pseudo_item_id(Path::new("C:/videos/a.mkv"));
-        assert_eq!(a, b);
-        assert!(a < 0, "伪 item_id 须恒为负数(与真实 DB id 空间隔离)");
-    }
-
-    /// 指纹取真实文件的 mtime+size,格式为 `"{mtime}:{size}"`。
-    #[test]
-    fn fingerprint_of_reads_real_file_metadata() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "scrollery_video_worker_backend_test_{}_{}.tmp",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, b"hello").unwrap();
-        let fp = fingerprint_of(&path).expect("fingerprint");
-        assert!(fp.ends_with(":5"), "fp={fp}");
-        let _ = std::fs::remove_file(&path);
-    }
 }

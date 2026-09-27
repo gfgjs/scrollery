@@ -9,7 +9,6 @@ export const DEFAULTS = {
   THUMB_QUALITY: 80,
   THUMB_FORMAT: 'webp',
   THUMB_STRATEGY: 'cpu',
-  GPU_ENGINE: 'wic',
   SIDEBAR_WIDTH: 260,
   GRID_ROW_HEIGHT: 200,
   GRID_GAP: 4,

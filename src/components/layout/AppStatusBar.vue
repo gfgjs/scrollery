@@ -17,7 +17,7 @@
     <span
       v-else-if="scan.thumbGenProgress.isRunning"
       class="statusbar__scanning statusbar__hint"
-      :title="$t('statusbar.thumbGenBgTitle')"
+      :title="scan.thumbGenSummaryTitle || $t('statusbar.thumbGenBgTitle')"
     >
       <span class="spinner" />
       {{
@@ -27,15 +27,16 @@
         })
       }}
       <span
-        v-if="scan.thumbGenProgress.phase"
+        v-if="scan.thumbGenPhaseLabel"
         class="statusbar__phase"
-        >{{ scan.thumbGenProgress.phase }}</span
+        >{{ scan.thumbGenPhaseLabel }}</span
       >
       <span
         v-if="scan.thumbGenProgress.currentItem"
         class="statusbar__current-item"
         >({{ scan.thumbGenProgress.currentItem }})</span
       >
+      <span v-if="scan.thumbGenHardwareLabel" class="statusbar__phase">{{ scan.thumbGenHardwareLabel }}</span>
       <button
         @click="scan.stopFullThumbnailGeneration()"
         class="statusbar__stop-btn"

@@ -19,9 +19,9 @@ Application version at generation time: 0.1.0
 
 | License (as declared) | Packages |
 | --- | ---: |
-| MIT | 249 |
-| MIT OR Apache-2.0 | 216 |
-| Apache-2.0 OR MIT | 33 |
+| MIT | 250 |
+| MIT OR Apache-2.0 | 215 |
+| Apache-2.0 OR MIT | 32 |
 | MIT/Apache-2.0 | 27 |
 | Unicode-3.0 | 18 |
 | Apache-2.0 | 16 |
@@ -61,7 +61,7 @@ Application version at generation time: 0.1.0
 | Unlicense | 1 |
 | Zlib | 1 |
 
-## Rust crates (460) — desktop application and workers
+## Rust crates (459) — desktop application and workers
 
 Dependency closure (normal deps) of the shipped binaries `scrollery`,
 `ai-worker` and `psd-worker`, resolved for `x86_64-pc-windows-msvc`.
@@ -402,7 +402,6 @@ Dependency closure (normal deps) of the shipped binaries `scrollery`,
 | [tauri-plugin-os](https://crates.io/crates/tauri-plugin-os) | 2.3.2 | Apache-2.0 OR MIT |
 | [tauri-plugin-shell](https://crates.io/crates/tauri-plugin-shell) | 2.3.5 | Apache-2.0 OR MIT |
 | [tauri-plugin-updater](https://crates.io/crates/tauri-plugin-updater) | 2.10.1 | Apache-2.0 OR MIT |
-| [tauri-plugin-window-state](https://crates.io/crates/tauri-plugin-window-state) | 2.4.1 | Apache-2.0 OR MIT |
 | [tauri-runtime](https://crates.io/crates/tauri-runtime) | 2.11.3 | Apache-2.0 OR MIT |
 | [tauri-runtime-wry](https://crates.io/crates/tauri-runtime-wry) | 2.11.4 | Apache-2.0 OR MIT |
 | [tauri-utils](https://crates.io/crates/tauri-utils) | 2.9.3 | Apache-2.0 OR MIT |
@@ -529,7 +528,7 @@ Dependency closure (normal deps) of the shipped binaries `scrollery`,
 | [zune-core](https://crates.io/crates/zune-core) | 0.5.1 | MIT OR Apache-2.0 OR Zlib |
 | [zune-jpeg](https://crates.io/crates/zune-jpeg) | 0.5.15 | MIT OR Apache-2.0 OR Zlib |
 
-## npm packages (164) — frontend bundle
+## npm packages (163) — frontend bundle
 
 Production dependency closure from `package-lock.json`, plus explicitly shipped native runtime packages.
 
@@ -586,7 +585,6 @@ Production dependency closure from `package-lock.json`, plus explicitly shipped 
 | [@tauri-apps/plugin-dialog](https://www.npmjs.com/package/@tauri-apps/plugin-dialog) | 2.7.1 | MIT OR Apache-2.0 |  |
 | [@tauri-apps/plugin-os](https://www.npmjs.com/package/@tauri-apps/plugin-os) | 2.3.2 | MIT OR Apache-2.0 |  |
 | [@tauri-apps/plugin-shell](https://www.npmjs.com/package/@tauri-apps/plugin-shell) | 2.3.5 | MIT OR Apache-2.0 |  |
-| [@tauri-apps/plugin-window-state](https://www.npmjs.com/package/@tauri-apps/plugin-window-state) | 2.4.1 | MIT OR Apache-2.0 |  |
 | [@types/debug](https://www.npmjs.com/package/@types/debug) | 4.1.13 | MIT |  |
 | [@types/hast](https://www.npmjs.com/package/@types/hast) | 3.0.4 | MIT |  |
 | [@types/katex](https://www.npmjs.com/package/@types/katex) | 0.16.8 | MIT |  |
@@ -711,7 +709,7 @@ Production dependency closure from `package-lock.json`, plus explicitly shipped 
 | [Graphviz (embedded in Viz.js full.render.js)](https://gitlab.com/graphviz/graphviz) | 2.40.1 | EPL-1.0 | Emscripten object code built by Viz.js 2.1.2 (MIT); unmodified upstream, source availability entry recorded in legal/graphviz |
 | [Lute (lute.min.js)](https://github.com/88250/lute) | 1.7.6 | MulanPSL-2.0 | Go object code shipped by Vditor 3.11.3; unmodified upstream, text in legal/lute |
 
-## Additional shipped runtimes (2)
+## Additional shipped runtimes (3)
 
 这些组件不由根 lockfile 的普通依赖闭包完整表达，但其代码或二进制会进入产品运行路径。
 完整许可证/归属材料由 `node scripts/prepare-legal-resources.mjs` 生成到安装包 `legal/`。
@@ -719,6 +717,7 @@ Production dependency closure from `package-lock.json`, plus explicitly shipped 
 | Component | Version | License | Notes |
 | --- | --- | --- | --- |
 | [FFmpeg (BtbN LGPL-shared runtime)](https://github.com/BtbN/FFmpeg-Builds) | autobuild-2026-07-24-13-32 | LGPL-2.1-or-later | downloaded on demand; fixed FFmpeg/BtbN license texts are emitted under legal/ffmpeg; source link is shown in the app |
+| [Intel libvpl (static dispatcher)](https://github.com/intel/libvpl) | 2.17.0 | MIT | statically linked into the bundled native thumbnail worker; pinned to commit d77f9195cf495b937631607333288fd917ae8939, texts kept under legal/libvpl |
 | [LibRaw (embedded by rsraw-sys)](https://www.libraw.org) | rsraw-sys-0.1.1 | CDDL-1.0 OR LGPL-2.1-only | embedded in raw-worker; LGPL-2.1-only branch elected from CDDL-1.0 OR LGPL-2.1-only, upstream texts kept under legal/LibRaw; the OSS source release ships no RAW binary, and a future static-link distribution still owes LGPL-2.1 source/relink materials or the §3 GPL-3.0 route — the installer is not thereby declared compliant |
 
 ## Review notes

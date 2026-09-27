@@ -233,10 +233,6 @@ const selectBindings: Record<string, { get: () => string; set: (v: string) => vo
     get: () => config.thumbStrategy,
     set: (v) => void config.setThumbStrategy(v as typeof config.thumbStrategy),
   },
-  gpuEngine: {
-    get: () => config.gpuEngine,
-    set: (v) => void config.setGpuEngine(v as typeof config.gpuEngine),
-  },
   aiHardwareStrategy: {
     get: () => config.aiProviderOverride,
     set: (v) => void config.setAiProviderOverride(v as typeof config.aiProviderOverride),

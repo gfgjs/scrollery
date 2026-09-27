@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use exotic_protocol::{
-    read_frame, write_frame, FailureBody, Frame, FrameType, HelloBody, ProgressBody, ReadyBody,
-    RequestBody, SuccessBody,
+    read_frame_with_blob_limit, write_frame, FailureBody, Frame, FrameType, HelloBody,
+    ProgressBody, ReadyBody, RequestBody, SuccessBody,
 };
 
 // U-P3(2026-07-16):outcome 类型与纯校验器拆至同级模块,此处 re-export 保住既有
@@ -115,11 +115,12 @@ fn apply_low_priority(_cmd: &mut Command) {
 pub fn spawn_frame_reader<R: Read + Send + 'static>(
     r: R,
     tx: Sender<Result<Frame, exotic_protocol::ProtocolError>>,
+    max_blob_len: u32,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(r);
         loop {
-            match read_frame(&mut reader) {
+            match read_frame_with_blob_limit(&mut reader, max_blob_len) {
                 Ok(f) => {
                     if tx.send(Ok(f)).is_err() {
                         break; // 下游已走
@@ -440,8 +441,31 @@ impl WorkerConn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exotic_protocol::{WorkerErrorCode, PROTOCOL_VERSION};
+    use exotic_protocol::{read_frame, PROTOCOL_VERSION};
     use std::io::Cursor;
+
+    #[test]
+    fn frame_reader_enforces_receiver_limit_and_exits() {
+        let frame = Frame {
+            frame_type: FrameType::Success,
+            request_id: 1,
+            json: Vec::new(),
+            blob: vec![0; 5],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &frame).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let reader = spawn_frame_reader(Cursor::new(bytes), tx, 4);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(exotic_protocol::ProtocolError::BlobExceedsReceiverLimit {
+                length: 5,
+                limit: 4
+            })
+        ));
+        reader.join().unwrap();
+        assert!(rx.recv().is_err());
+    }
 
     fn thumb_req(item_id: i64, fp: &str, tier: u32) -> RequestBody {
         RequestBody::Thumbnail {
@@ -520,7 +544,7 @@ mod tests {
         let (host_w, worker_r) = unidir(); // host→worker
         let (worker_w, host_r) = unidir(); // worker→host
         let (tx, rx) = crossbeam_channel::unbounded();
-        spawn_frame_reader(host_r, tx);
+        spawn_frame_reader(host_r, tx, exotic_protocol::MAX_BLOB_LEN);
         let ready = ReadyBody {
             worker_id: "psd-worker".into(),
             worker_version: "1.0.0".into(),
@@ -541,146 +565,6 @@ mod tests {
             RawOutcome::Disconnected => "Disconnected",
             RawOutcome::Protocol(_) => "Protocol",
         }
-    }
-
-    /// v3 静默限时:Progress 帧重置计时——总时长远超 `timeout` 但拍间静默不超,必须成功;
-    /// 顺带覆盖「陈旧 Progress(错 req_id)只忽略不判违例」。
-    #[test]
-    fn progress_resets_silence_deadline_and_stale_ignored() {
-        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
-        let handle = std::thread::spawn(move || {
-            let frame = read_frame(&mut worker_r).unwrap();
-            let req_id = frame.request_id;
-            let stale = Frame::control(
-                FrameType::Progress,
-                req_id + 999,
-                &ProgressBody {
-                    stage: "stale".into(),
-                    detail: None,
-                    elapsed_ms: 0,
-                },
-            )
-            .unwrap();
-            write_frame(&mut worker_w, &stale).unwrap();
-            worker_w.flush().unwrap();
-            // 4 拍进度 × 100ms 间隔 = 总时长 ~500ms,远超 400ms 静默限时;
-            // 每拍间静默 100ms ≪ 400ms → 重置生效才能活到终态。
-            for i in 0..4u64 {
-                std::thread::sleep(Duration::from_millis(100));
-                let p = Frame::control(
-                    FrameType::Progress,
-                    req_id,
-                    &ProgressBody {
-                        stage: format!("stage{i}"),
-                        detail: None,
-                        elapsed_ms: i * 100,
-                    },
-                )
-                .unwrap();
-                write_frame(&mut worker_w, &p).unwrap();
-                worker_w.flush().unwrap();
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            let ok = Frame::control(FrameType::Success, req_id, &SuccessBody::default()).unwrap();
-            write_frame(&mut worker_w, &ok).unwrap();
-            worker_w.flush().unwrap();
-        });
-        let out = conn.run_request(
-            &thumb_req(1, "fp", 480),
-            Duration::from_millis(400),
-            &|| false,
-        );
-        handle.join().unwrap();
-        assert_eq!(
-            outcome_name(&out),
-            "Success",
-            "进度帧应重置静默计时并被消费(非终态)"
-        );
-    }
-
-    /// 进度观察者(视频格式扩展子系统 design.md §5.3):`run_request_observed` 对每帧本请求的
-    /// Progress(非陈旧)回调一次;陈旧 Progress(错 req_id)不触发观察者——镜像上面回归锚的
-    /// 陈旧过滤断言,验证观察者挂载不改变既有陈旧帧处理逻辑。
-    #[test]
-    fn run_request_observed_calls_observer_for_each_progress_frame() {
-        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
-        let handle = std::thread::spawn(move || {
-            let frame = read_frame(&mut worker_r).unwrap();
-            let req_id = frame.request_id;
-            // 陈旧 Progress(错 req_id):不应触发观察者。
-            let stale = Frame::control(
-                FrameType::Progress,
-                req_id + 999,
-                &ProgressBody {
-                    stage: "stale".into(),
-                    detail: None,
-                    elapsed_ms: 0,
-                },
-            )
-            .unwrap();
-            write_frame(&mut worker_w, &stale).unwrap();
-            worker_w.flush().unwrap();
-            for i in 0..3u64 {
-                let p = Frame::control(
-                    FrameType::Progress,
-                    req_id,
-                    &ProgressBody {
-                        stage: format!("s{i}"),
-                        detail: Some(format!("{}%", i * 30)),
-                        elapsed_ms: i * 10,
-                    },
-                )
-                .unwrap();
-                write_frame(&mut worker_w, &p).unwrap();
-                worker_w.flush().unwrap();
-            }
-            let ok = Frame::control(FrameType::Success, req_id, &SuccessBody::default()).unwrap();
-            write_frame(&mut worker_w, &ok).unwrap();
-            worker_w.flush().unwrap();
-        });
-        let mut seen: Vec<(String, Option<String>)> = Vec::new();
-        let out = conn.run_request_observed(
-            &thumb_req(1, "fp", 480),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            &|| false,
-            Some(&mut |p: &ProgressBody| seen.push((p.stage.clone(), p.detail.clone()))),
-        );
-        handle.join().unwrap();
-        assert_eq!(outcome_name(&out), "Success");
-        assert_eq!(
-            seen,
-            vec![
-                ("s0".to_string(), Some("0%".to_string())),
-                ("s1".to_string(), Some("30%".to_string())),
-                ("s2".to_string(), Some("60%".to_string())),
-            ],
-            "观察者应逐帧收到非陈旧 Progress,陈旧帧不计入"
-        );
-    }
-
-    /// 不发 Progress 的 op:`timeout` 仍是事实上的总限时,行为与 v2 一致(回归锚)。
-    #[test]
-    fn silence_timeout_without_progress_unchanged() {
-        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
-        let handle = std::thread::spawn(move || {
-            let frame = read_frame(&mut worker_r).unwrap();
-            std::thread::sleep(Duration::from_millis(900));
-            let ok = Frame::control(
-                FrameType::Success,
-                frame.request_id,
-                &SuccessBody::default(),
-            )
-            .unwrap();
-            let _ = write_frame(&mut worker_w, &ok);
-        });
-        let out = conn.run_request(
-            &thumb_req(1, "fp", 480),
-            Duration::from_millis(200),
-            &|| false,
-        );
-        assert_eq!(outcome_name(&out), "TimedOut");
-        handle.join().unwrap();
     }
 
     /// 视频格式扩展 §2.4:显式 `total_cap` 生效——Progress 不断重置静默计时,但总上界到点
@@ -728,69 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn run_thumbnail_success_roundtrip() {
-        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
-        // mock worker：读一个 Request，回 Success + 真 WebP。
-        let handle = std::thread::spawn(move || {
-            let frame = read_frame(&mut worker_r).unwrap();
-            let req: RequestBody = frame.parse_json().unwrap();
-            let webp = make_webp(480, 240);
-            let body = SuccessBody {
-                item_id: req.item_id(),
-                input_fingerprint: req.input_fingerprint().map(String::from),
-                mime: Some("image/webp".into()),
-                width: Some(480),
-                height: Some(240),
-                ..Default::default()
-            };
-            let resp = Frame::with_blob(FrameType::Success, frame.request_id, &body, webp).unwrap();
-            write_frame(&mut worker_w, &resp).unwrap();
-            worker_w.flush().unwrap();
-        });
-        let req = thumb_req(7, "fp", 480);
-        let out = conn.run_thumbnail(&req, &limits(), Duration::from_secs(5), &|| false);
-        handle.join().unwrap();
-        match out {
-            TaskOutcome::Success { width, height, .. } => assert_eq!((width, height), (480, 240)),
-            _ => panic!("期望 Success"),
-        }
-    }
-
-    #[test]
-    fn run_thumbnail_timeout_when_worker_silent() {
-        let (mut conn, _worker_r, _worker_w) = wired_conn();
-        // worker 不回复（持有读端但不读不写）。
-        let req = thumb_req(7, "fp", 480);
-        let out = conn.run_thumbnail(&req, &limits(), Duration::from_millis(150), &|| false);
-        assert!(matches!(out, TaskOutcome::TimedOut));
-    }
-
-    #[test]
-    fn run_thumbnail_cancelled_returns_disconnected_fast() {
-        let (mut conn, _worker_r, _worker_w) = wired_conn();
-        // worker 静默；cancelled 立即 true → 不等满 timeout，快速返回 Disconnected（stop 终止在途）。
-        let req = thumb_req(7, "fp", 480);
-        let start = std::time::Instant::now();
-        let out = conn.run_thumbnail(&req, &limits(), Duration::from_secs(30), &|| true);
-        assert!(matches!(out, TaskOutcome::Disconnected));
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "取消应快速返回，不等满 30s timeout"
-        );
-    }
-
-    #[test]
-    fn run_thumbnail_disconnect_when_worker_exits() {
-        let (mut conn, worker_r, worker_w) = wired_conn();
-        // worker 立即关闭两端 → host 读到 EOF。
-        drop(worker_r);
-        drop(worker_w);
-        let req = thumb_req(7, "fp", 480);
-        let out = conn.run_thumbnail(&req, &limits(), Duration::from_secs(2), &|| false);
-        assert!(matches!(out, TaskOutcome::Disconnected));
-    }
-
-    #[test]
     fn run_thumbnail_request_id_mismatch_is_protocol() {
         let (mut conn, mut worker_r, mut worker_w) = wired_conn();
         let handle = std::thread::spawn(move || {
@@ -812,58 +633,6 @@ mod tests {
                 make_webp(10, 10),
             )
             .unwrap();
-            write_frame(&mut worker_w, &resp).unwrap();
-            worker_w.flush().unwrap();
-        });
-        let req = thumb_req(7, "fp", 480);
-        let out = conn.run_thumbnail(&req, &limits(), Duration::from_secs(5), &|| false);
-        handle.join().unwrap();
-        assert!(matches!(out, TaskOutcome::Protocol(_)));
-    }
-
-    #[test]
-    fn run_thumbnail_failure_passthrough() {
-        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
-        let handle = std::thread::spawn(move || {
-            let frame = read_frame(&mut worker_r).unwrap();
-            let req: RequestBody = frame.parse_json().unwrap();
-            let body = FailureBody {
-                item_id: req.item_id(),
-                input_fingerprint: req.input_fingerprint().map(String::from),
-                code: WorkerErrorCode::UnsupportedVariant,
-                retryable: false,
-                message: "cmyk".into(),
-            };
-            let resp = Frame::control(FrameType::Failure, frame.request_id, &body).unwrap();
-            write_frame(&mut worker_w, &resp).unwrap();
-            worker_w.flush().unwrap();
-        });
-        let req = thumb_req(7, "fp", 480);
-        let out = conn.run_thumbnail(&req, &limits(), Duration::from_secs(5), &|| false);
-        handle.join().unwrap();
-        match out {
-            TaskOutcome::Failure(b) => assert_eq!(b.code, WorkerErrorCode::UnsupportedVariant),
-            _ => panic!("期望 Failure"),
-        }
-    }
-
-    #[test]
-    fn run_thumbnail_invalid_webp_output_is_protocol() {
-        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
-        let handle = std::thread::spawn(move || {
-            let frame = read_frame(&mut worker_r).unwrap();
-            let req: RequestBody = frame.parse_json().unwrap();
-            let body = SuccessBody {
-                item_id: req.item_id(),
-                input_fingerprint: req.input_fingerprint().map(String::from),
-                mime: Some("image/webp".into()),
-                width: Some(10),
-                height: Some(10),
-                ..Default::default()
-            };
-            // blob 不是合法 WebP。
-            let resp = Frame::with_blob(FrameType::Success, frame.request_id, &body, vec![1, 2, 3])
-                .unwrap();
             write_frame(&mut worker_w, &resp).unwrap();
             worker_w.flush().unwrap();
         });

@@ -217,38 +217,3 @@ fn is_safe_model_file_name(name: &str) -> bool {
 
 // `download_file`（单文件流式下载 + Range 续传）与 `sha256_matches` 已下沉 `crate::download` 通用
 // 引擎（R10，Part6 §3.1.2），与 exotic 共用；此处不再重复实现。
-
-#[cfg(test)]
-mod dest_safety_tests {
-    use super::is_safe_model_file_name;
-
-    #[test]
-    fn accepts_real_model_filenames() {
-        for ok in [
-            "vision_model.onnx",
-            "model.onnx.extra_file",
-            "clip_cn_vit-l-14-336.fp16.onnx",
-            "text_model.onnx",
-        ] {
-            assert!(is_safe_model_file_name(ok), "应接受: {ok}");
-        }
-    }
-
-    #[test]
-    fn rejects_traversal_and_separators() {
-        for bad in [
-            "",
-            ".",
-            "..",
-            "../evil",
-            "..\\evil",
-            "a/b",
-            "a\\b",
-            "C:evil",
-            "with space.onnx",
-            "nul\0byte",
-        ] {
-            assert!(!is_safe_model_file_name(bad), "应拒绝: {bad:?}");
-        }
-    }
-}

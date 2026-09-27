@@ -271,7 +271,7 @@ async function main() {
         // 已固定正文按 kind 分组收录:onnxruntime/ffmpeg 属运行时侧,graphviz/lute 属前端
         // vendored 编译件(graphviz 含 Graphviz 2.40.1 与 Viz.js 2.1.2 两份正文)。
         ...Object.fromEntries(
-          ['onnxruntime', 'ffmpeg', 'graphviz', 'lute'].map((kind) => [
+          ['onnxruntime', 'ffmpeg', 'graphviz', 'lute', 'libvpl'].map((kind) => [
             kind,
             pinnedTexts(sourceManifest, kind),
           ]),

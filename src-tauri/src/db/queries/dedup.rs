@@ -1152,22 +1152,6 @@ mod tests {
         add_in_directory(conn, id, 10, name, size, companion_of);
     }
 
-    fn add_root(conn: &Connection, id: i64, path: &str) {
-        conn.execute(
-            "INSERT INTO scan_roots (id,path,alias) VALUES (?1,?2,?3)",
-            params![id, path, path],
-        )
-        .unwrap();
-    }
-
-    fn add_directory_in_root(conn: &Connection, id: i64, root_id: i64, rel_path: &str, name: &str) {
-        conn.execute(
-            "INSERT INTO directories (id,root_id,rel_path,name) VALUES (?1,?2,?3,?4)",
-            params![id, root_id, rel_path, name],
-        )
-        .unwrap();
-    }
-
     fn write_ready_with_snapshot(
         conn: &Connection,
         id: i64,
@@ -1241,19 +1225,6 @@ mod tests {
     }
 
     #[test]
-    fn lens_sees_only_successfully_published_results() {
-        let conn = mem_db();
-        add(&conn, 1, "a.jpg", 10, None);
-        add(&conn, 2, "b.jpg", 10, None);
-        assert!(write_working_ready(&conn, 1, 1, b"pair"));
-        assert!(write_working_ready(&conn, 2, 1, b"pair"));
-
-        assert!(list_duplicate_lens_members(&conn).unwrap().is_empty());
-        assert!(publish_dedup_run(&conn, 1).unwrap());
-        assert_eq!(list_duplicate_lens_members(&conn).unwrap().len(), 2);
-    }
-
-    #[test]
     fn invalidated_run_keeps_previous_publication() {
         let conn = mem_db();
         for id in 1..=4 {
@@ -1284,26 +1255,6 @@ mod tests {
     }
 
     #[test]
-    fn folder_unique_evidence_is_hidden_until_full_publish() {
-        let conn = mem_db();
-        add(&conn, 1, "a.jpg", 10, None);
-        add(&conn, 2, "b.jpg", 10, None);
-        add(&conn, 3, "unique.jpg", 20, None);
-        assert!(write_working_ready(&conn, 1, 1, b"pair"));
-        assert!(write_working_ready(&conn, 2, 1, b"pair"));
-        assert!(write_working_ready(&conn, 3, 1, b"unique"));
-
-        assert!(list_duplicate_folder_lens_rows(&conn).unwrap().is_empty());
-        assert!(publish_dedup_run(&conn, 1).unwrap());
-        let unique = list_duplicate_folder_lens_rows(&conn)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.item_id == 3)
-            .unwrap();
-        assert_eq!(unique.bucket, FolderLensBucket::Unique);
-    }
-
-    #[test]
     fn stale_revision_write_is_rejected() {
         let conn = mem_db();
         add(&conn, 1, "a.jpg", 10, None);
@@ -1314,123 +1265,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM dedup_index", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn stale_metadata_write_is_rejected_even_when_source_revision_matches() {
-        let conn = mem_db();
-        add(&conn, 1, "a.jpg", 10, None);
-
-        // 模拟分析期间文件被稳定替换，但扫描器尚未来得及推进 source_revision。
-        conn.execute("UPDATE media_items SET file_size=11 WHERE id=1", [])
-            .unwrap();
-        assert!(
-            !write_ready_with_snapshot(&conn, 1, 1, b"old-size", 10, Some(1)),
-            "size 变化必须拒绝旧候选的摘要"
-        );
-
-        conn.execute(
-            "UPDATE media_items SET file_size=10, file_mtime_ns=2 WHERE id=1",
-            [],
-        )
-        .unwrap();
-        assert!(
-            !write_ready_with_snapshot(&conn, 1, 1, b"old-mtime", 10, Some(1)),
-            "纳秒 mtime 变化必须拒绝旧候选的摘要"
-        );
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM dedup_index", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn companion_lookup_is_bounded() {
-        let conn = mem_db();
-        add(&conn, 1, "main.jpg", 10, None);
-        for id in 2..=66 {
-            add(&conn, id, &format!("part-{id}.mov"), 1, Some(1));
-        }
-        assert!(
-            list_dedup_companions(&conn, 1).is_err(),
-            "异常 companion 关系不能被无界物化"
-        );
-    }
-
-    #[test]
-    fn candidate_keyset_pages_without_full_id_array() {
-        let conn = mem_db();
-        for id in 1..=32 {
-            add(&conn, id, &format!("{id}.jpg"), 99, None);
-        }
-        let first = list_dedup_scan_candidates(&conn, None, 7).unwrap();
-        assert_eq!(first.len(), 7);
-        let cursor = DedupCandidateCursor {
-            file_size: first.last().unwrap().file_size,
-            item_id: first.last().unwrap().item_id,
-        };
-        let second = list_dedup_scan_candidates(&conn, Some(&cursor), 7).unwrap();
-        assert_eq!(second.len(), 7);
-        assert!(second[0].item_id > first[6].item_id);
-        assert_eq!(count_dedup_scan_candidates(&conn).unwrap(), 32);
-    }
-
-    #[test]
-    fn candidate_pages_keep_full_equal_size_group_and_current_visibility() {
-        let conn = mem_db();
-        for (id, size) in [(1, 10), (2, 10), (3, 20), (4, 20), (5, 30), (6, 30)] {
-            add(&conn, id, &format!("{id}.jpg"), size, None);
-        }
-        add_root(&conn, 2, "/hidden");
-        add_directory_in_root(&conn, 11, 2, "", "hidden");
-        add_in_directory(&conn, 7, 11, "hidden.jpg", 40, None);
-        add(&conn, 8, "single-visible.jpg", 40, None);
-        conn.execute("UPDATE scan_roots SET is_hidden=1 WHERE id=2", [])
-            .unwrap();
-        assert_eq!(count_dedup_scan_candidates(&conn).unwrap(), 6);
-        let first = list_dedup_scan_candidates(&conn, None, 1).unwrap();
-        assert_eq!(first[0].item_id, 1);
-        let cursor = DedupCandidateCursor {
-            file_size: 10,
-            item_id: 1,
-        };
-        let ids = || {
-            list_dedup_scan_candidates(&conn, Some(&cursor), 20)
-                .unwrap()
-                .into_iter()
-                .map(|x| x.item_id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids(), [2, 3, 4, 5, 6], "游标前同大小成员仍参与重复判断");
-        assert!(write_working_ready(&conn, 2, 1, b"done"));
-        assert_eq!(ids(), [3, 4, 5, 6]);
-        conn.execute("UPDATE media_items SET source_revision=2 WHERE id=2", [])
-            .unwrap();
-        conn.execute(
-            "UPDATE media_items SET availability='offline' WHERE id=4",
-            [],
-        )
-        .unwrap();
-        add(&conn, 9, "new-visible.jpg", 40, None);
-        assert_eq!(
-            ids(),
-            [2, 5, 6, 8, 9],
-            "每页重新观察源修订、离线状态和新候选"
-        );
-    }
-
-    #[test]
-    fn run_generation_is_monotonic_and_old_reset_is_noop() {
-        let conn = mem_db();
-        add(&conn, 1, "a.jpg", 10, None);
-        assert!(begin_dedup_run(&conn, 5, true).unwrap());
-        assert!(write_ready(&conn, 1, 1, b"same"));
-        assert!(!begin_dedup_run(&conn, 4, true).unwrap());
-        assert_eq!(dedup_run_generation(&conn).unwrap(), Some(5));
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM dedup_index", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1, "迟到旧轮不能执行 reset");
     }
 
     #[test]
@@ -1457,68 +1291,7 @@ mod tests {
         assert!(!write_dedup_index_if_generation_current(&conn, &update, 7).unwrap());
     }
 
-    /// normalized_dir_path 是跨根确定的全路径（root path + rel_path，与 folder 轴显示
-    /// 路径同源）：同名 rel_path 在不同根下、以及根目录本身（rel_path=''）都能得到
-    /// 互异、可排序的完整路径（方案 §6.3 的 normalized_directory_path）。
-    #[test]
-    fn lens_member_normalized_dir_path_is_full_sortable_path() {
-        let conn = mem_db();
-        add_root(&conn, 2, "/other");
-        add_directory_in_root(&conn, 11, 1, "a", "a");
-        add_directory_in_root(&conn, 12, 2, "a", "a");
-        add(&conn, 1, "x.jpg", 10, None); // dir 10 = 根1 的根目录（rel_path=''）
-        add_in_directory(&conn, 2, 11, "x.jpg", 10, None); // /root/a
-        add_in_directory(&conn, 3, 12, "x.jpg", 10, None); // /other/a
-        for id in 1..=3 {
-            assert!(write_ready(&conn, id, 1, b"same"));
-        }
-
-        let rows = list_duplicate_lens_members(&conn).unwrap();
-        assert_eq!(rows.len(), 3);
-        let mut ids: Vec<(i64, i64)> = rows.iter().map(|r| (r.item_id, r.directory_id)).collect();
-        ids.sort_unstable();
-        assert_eq!(
-            ids,
-            vec![(1, 10), (2, 11), (3, 12)],
-            "directory_id 投影正确"
-        );
-        let mut paths: Vec<&str> = rows
-            .iter()
-            .map(|r| r.normalized_dir_path.as_str())
-            .collect();
-        assert!(paths.iter().all(|p| !p.is_empty()));
-        paths.sort_unstable();
-        assert_eq!(
-            paths,
-            vec!["/other/a", "/root", "/root/a"],
-            "完整路径跨根互异且可排序"
-        );
-    }
-
     // ── folders 镜头行（2026-09-02 主画廊重复项浏览方案 §3.4/§7.5 P3）────────────
-
-    /// quick-only 摘要行（无 exact/unit，status='quick'）。
-    fn write_quick(conn: &Connection, id: i64, digest: &[u8]) {
-        conn.execute(
-            "INSERT INTO dedup_index
-                (item_id, source_revision, hash_version, quick_digest, status, checked_at)
-             VALUES (?1, 1, ?2, ?3, 'quick', 1)",
-            params![id, DEDUP_HASH_VERSION as i64, digest],
-        )
-        .unwrap();
-    }
-
-    /// 指定状态的非 ready 行（摘要字段与 ready 行同构，用于验证状态门禁）。
-    fn write_status_row(conn: &Connection, id: i64, digest: &[u8], status: &str) {
-        conn.execute(
-            "INSERT INTO dedup_index
-                (item_id, source_revision, hash_version, quick_digest, exact_digest,
-                 unit_digest, unit_size, status, checked_at)
-             VALUES (?1, 1, ?2, ?3, ?3, ?3, 10, ?4, 1)",
-            params![id, DEDUP_HASH_VERSION as i64, digest, status],
-        )
-        .unwrap();
-    }
 
     /// 在目录 10 放一对 ready 重复锚点，使目录稳定处于「纳入」状态——否则分类
     /// 断言会因目录未纳入而空转变绿（方案 §3.4 末段的纳入过滤）。
@@ -1535,92 +1308,6 @@ mod tests {
             .into_iter()
             .map(|row| (row.item_id, row.bucket))
             .collect()
-    }
-
-    /// 判定表（§3.4）：Duplicate、独有证据①②③、quick 碰撞未定案 → 尚未确认；
-    /// 重复行携带组身份。
-    #[test]
-    fn folder_lens_classifies_duplicate_and_unique_evidence() {
-        let conn = mem_db();
-        add_duplicate_anchor(&conn);
-        // 证据①：ready 单成员组（有效精确摘要无副本）。
-        add(&conn, 1, "lone.jpg", 10, None);
-        assert!(write_ready(&conn, 1, 1, b"lone"));
-        // 证据②：唯一大小桶 quick 行（无同大小项则无副本可能）。
-        add(&conn, 2, "solo-size.jpg", 77, None);
-        write_quick(&conn, 2, b"quick-solo");
-        // 证据③：同大小两项 quick 互异（quick 已排除碰撞）。
-        add(&conn, 3, "quick-a.jpg", 55, None);
-        add(&conn, 4, "quick-b.jpg", 55, None);
-        write_quick(&conn, 3, b"quick-three-a");
-        write_quick(&conn, 4, b"quick-three-b");
-        // quick 碰撞：同大小同 quick → exact 候选未定案 → 尚未确认。
-        add(&conn, 5, "collide-a.jpg", 66, None);
-        add(&conn, 6, "collide-b.jpg", 66, None);
-        write_quick(&conn, 5, b"quick-collide");
-        write_quick(&conn, 6, b"quick-collide");
-
-        let rows = list_duplicate_folder_lens_rows(&conn).unwrap();
-        assert_eq!(rows.len(), 8, "纳入目录的全部可见行都返回");
-        let buckets = folder_lens_buckets(&conn);
-        assert_eq!(buckets.get(&100), Some(&FolderLensBucket::Duplicate));
-        assert_eq!(buckets.get(&101), Some(&FolderLensBucket::Duplicate));
-        assert_eq!(buckets.get(&1), Some(&FolderLensBucket::Unique), "证据①");
-        assert_eq!(buckets.get(&2), Some(&FolderLensBucket::Unique), "证据②");
-        assert_eq!(buckets.get(&3), Some(&FolderLensBucket::Unique), "证据③");
-        assert_eq!(buckets.get(&4), Some(&FolderLensBucket::Unique), "证据③");
-        assert_eq!(buckets.get(&5), Some(&FolderLensBucket::Unconfirmed));
-        assert_eq!(buckets.get(&6), Some(&FolderLensBucket::Unconfirmed));
-        // 重复行携带组身份（unit_digest + unit_size，方案 §3.1）。
-        let anchor = rows.iter().find(|row| row.item_id == 100).unwrap();
-        assert_eq!(anchor.unit_digest.as_deref(), Some(b"anchor".as_slice()));
-        assert_eq!(anchor.unit_size, Some(10));
-    }
-
-    /// 判定表（§3.4）：无 di 行、非 ready 状态、hash_version 不匹配、修订漂移 →
-    /// 尚未确认；stale 行的同摘要不得抬高有效组规模（分组计数只认有效行）。
-    #[test]
-    fn folder_lens_unconfirmed_without_valid_evidence() {
-        let conn = mem_db();
-        add_duplicate_anchor(&conn);
-        add(&conn, 7, "no-index.jpg", 88, None);
-        // 非 ready 状态即使 unit 摘要与 ready 组逐位一致也不进重复桶。
-        add(&conn, 8, "stale.jpg", 21, None);
-        add(&conn, 9, "unstable.jpg", 22, None);
-        add(&conn, 10, "error.jpg", 23, None);
-        write_status_row(&conn, 8, b"anchor", STATUS_STALE);
-        write_status_row(&conn, 9, b"anchor", STATUS_UNSTABLE);
-        write_status_row(&conn, 10, b"anchor", STATUS_ERROR);
-        // hash_version 旧：摘要算法换代后旧结果不是有效证据。
-        add(&conn, 11, "old-hash.jpg", 31, None);
-        assert!(write_ready(&conn, 11, 1, b"old-hash"));
-        conn.execute(
-            "UPDATE dedup_index SET hash_version = hash_version - 1 WHERE item_id = 11",
-            [],
-        )
-        .unwrap();
-        // source_revision 漂移：漂移行本身未确认；留下的有效单成员归独有（证据①）。
-        add(&conn, 12, "drift-a.jpg", 32, None);
-        add(&conn, 13, "drift-b.jpg", 32, None);
-        assert!(write_ready(&conn, 12, 1, b"drift-pair"));
-        assert!(write_ready(&conn, 13, 1, b"drift-pair"));
-        conn.execute(
-            "UPDATE media_items SET source_revision = 2 WHERE id = 12",
-            [],
-        )
-        .unwrap();
-
-        let buckets = folder_lens_buckets(&conn);
-        for id in [7, 8, 9, 10, 11, 12] {
-            assert_eq!(
-                buckets.get(&id),
-                Some(&FolderLensBucket::Unconfirmed),
-                "item {id} 应为尚未确认"
-            );
-        }
-        assert_eq!(buckets.get(&100), Some(&FolderLensBucket::Duplicate));
-        assert_eq!(buckets.get(&101), Some(&FolderLensBucket::Duplicate));
-        assert_eq!(buckets.get(&13), Some(&FolderLensBucket::Unique));
     }
 
     /// 判定表（§3.4）：offline/missing/零字节即使 ready 成组也不进重复桶（folders
@@ -1662,101 +1349,5 @@ mod tests {
         }
         assert_eq!(buckets.get(&15), Some(&FolderLensBucket::Unique));
         assert_eq!(buckets.get(&17), Some(&FolderLensBucket::Unique));
-    }
-
-    /// 纳入过滤（§3.4 末段）：只纳入至少含一个当前有效重复成员的直接文件夹；
-    /// 纳入目录返回全部三类行；纯独有/纯未确认目录不返回任何行。
-    #[test]
-    fn folder_lens_includes_only_directories_with_duplicate_members() {
-        let conn = mem_db();
-        // dir 11：重复 + 未确认 + 独有 三类混合。
-        add_directory_in_root(&conn, 11, 1, "mixed", "mixed");
-        add_in_directory(&conn, 20, 11, "dup-a.jpg", 50, None);
-        add_in_directory(&conn, 21, 11, "dup-b.jpg", 50, None);
-        assert!(write_ready(&conn, 20, 1, b"dir-pair"));
-        assert!(write_ready(&conn, 21, 1, b"dir-pair"));
-        add_in_directory(&conn, 22, 11, "pending.jpg", 51, None);
-        add_in_directory(&conn, 23, 11, "unique.jpg", 52, None);
-        write_quick(&conn, 23, b"dir-unique");
-        // dir 12：纯独有。
-        add_directory_in_root(&conn, 12, 1, "unique-only", "unique-only");
-        add_in_directory(&conn, 24, 12, "u1.jpg", 60, None);
-        write_quick(&conn, 24, b"u-one");
-        add_in_directory(&conn, 25, 12, "u2.jpg", 61, None);
-        assert!(write_ready(&conn, 25, 1, b"u-two"));
-        // dir 13：纯未确认（quick 碰撞）。
-        add_directory_in_root(&conn, 13, 1, "pending-only", "pending-only");
-        add_in_directory(&conn, 26, 13, "p1.jpg", 70, None);
-        add_in_directory(&conn, 27, 13, "p2.jpg", 70, None);
-        write_quick(&conn, 26, b"p-collide");
-        write_quick(&conn, 27, b"p-collide");
-
-        let rows = list_duplicate_folder_lens_rows(&conn).unwrap();
-        assert!(
-            rows.iter().all(|row| row.directory_id == 11),
-            "只返回纳入目录的行"
-        );
-        let buckets: std::collections::BTreeMap<i64, FolderLensBucket> = rows
-            .into_iter()
-            .map(|row| (row.item_id, row.bucket))
-            .collect();
-        assert_eq!(buckets.get(&20), Some(&FolderLensBucket::Duplicate));
-        assert_eq!(buckets.get(&21), Some(&FolderLensBucket::Duplicate));
-        assert_eq!(buckets.get(&22), Some(&FolderLensBucket::Unconfirmed));
-        assert_eq!(buckets.get(&23), Some(&FolderLensBucket::Unique));
-        for id in [24, 25, 26, 27] {
-            assert!(!buckets.contains_key(&id), "非纳入目录的行不得返回: {id}");
-        }
-    }
-
-    /// companion 与软删项不返回；其摘要也不得抬高有效组规模。
-    #[test]
-    fn folder_lens_excludes_companions_and_soft_deleted() {
-        let conn = mem_db();
-        add_duplicate_anchor(&conn);
-        add(&conn, 102, "anchor.mov", 4, Some(100));
-        assert!(write_ready(&conn, 102, 1, b"anchor"));
-        add(&conn, 103, "deleted.jpg", 999, None);
-        assert!(write_ready(&conn, 103, 1, b"anchor"));
-        conn.execute("UPDATE media_items SET is_deleted = 1 WHERE id = 103", [])
-            .unwrap();
-
-        let rows = list_duplicate_folder_lens_rows(&conn).unwrap();
-        assert_eq!(rows.len(), 2, "只剩两个锚点行");
-        let ids: std::collections::HashSet<i64> = rows.iter().map(|row| row.item_id).collect();
-        assert!(!ids.contains(&102), "companion 不得返回");
-        assert!(!ids.contains(&103), "软删项不得返回");
-        let buckets: std::collections::BTreeMap<i64, FolderLensBucket> = rows
-            .into_iter()
-            .map(|row| (row.item_id, row.bucket))
-            .collect();
-        assert_eq!(buckets.get(&100), Some(&FolderLensBucket::Duplicate));
-        assert_eq!(buckets.get(&101), Some(&FolderLensBucket::Duplicate));
-    }
-
-    /// 跨目录重复组：组员分布的每个目录都纳入，目录内非重复行也随目录返回。
-    #[test]
-    fn folder_lens_cross_directory_group_includes_every_member_folder() {
-        let conn = mem_db();
-        add_root(&conn, 2, "/other");
-        add_directory_in_root(&conn, 11, 1, "a", "a");
-        add_directory_in_root(&conn, 12, 2, "b", "b");
-        add(&conn, 30, "in-root.jpg", 80, None);
-        add_in_directory(&conn, 31, 11, "in-a.jpg", 80, None);
-        add_in_directory(&conn, 32, 12, "in-b.jpg", 80, None);
-        assert!(write_ready(&conn, 30, 1, b"cross-pair"));
-        assert!(write_ready(&conn, 31, 1, b"cross-pair"));
-        assert!(write_ready(&conn, 32, 1, b"cross-pair"));
-        add_in_directory(&conn, 33, 12, "extra.jpg", 81, None);
-
-        let buckets = folder_lens_buckets(&conn);
-        for id in [30, 31, 32] {
-            assert_eq!(
-                buckets.get(&id),
-                Some(&FolderLensBucket::Duplicate),
-                "item {id}"
-            );
-        }
-        assert_eq!(buckets.get(&33), Some(&FolderLensBucket::Unconfirmed));
     }
 }

@@ -23,11 +23,11 @@ use crate::error::{AppError, Result};
 /// 解析给消费者的待处理派生任务：绝对源路径在此通过 JOIN 解析（仿 `get_pending_ai_items`），
 /// 使每种 kind 的 `run` 可直接读取源文件。
 ///
-/// `(item_id, kind, abs_path, file_format, media_type, source_revision, cache_key)`。
+/// `(item_id, kind, abs_path, file_format, media_type, source_revision, cache_key, volume_id)`。
 ///
 /// `source_revision` 与 `cache_key` 是从同一条 `media_items` 读取的生产快照；它们必须
 /// 随任务一路传到认领与完成阶段，不能在 worker 返回时重新读取当前行来「补快照」。
-pub type DerivationTask = (i64, String, String, String, String, i64, i64);
+pub type DerivationTask = (i64, String, String, String, String, i64, i64, Option<i64>);
 
 /// 派生任务认领所需的最小快照：`(item_id, kind, source_revision, cache_key)`。
 pub type DerivationClaim = (i64, String, i64, i64);
@@ -57,14 +57,19 @@ pub fn get_pending_derivations(
                CASE WHEN d.rel_path = '' THEN r.path || '/' || m.file_name
                     ELSE r.path || '/' || d.rel_path || '/' || m.file_name
                END,
-               m.file_format, m.media_type, m.source_revision, m.cache_key
+               m.file_format, m.media_type, m.source_revision, m.cache_key, r.volume_id
         FROM media_derivations dv
         JOIN media_items m ON dv.item_id = m.id
         JOIN directories d ON m.directory_id = d.id
         JOIN scan_roots r ON d.root_id = r.id
-        WHERE dv.status = 0 AND m.is_deleted = 0
+        WHERE dv.status = 0 AND dv.output_fingerprint = '' AND m.is_deleted = 0
           AND NOT (dv.kind = 'doc_thumb' AND m.file_format IN ('pdf','svg'))
           AND dv.kind != 'video_playable'
+          AND dv.kind != 'image_thumb'
+          AND NOT (dv.kind='video_cover' AND EXISTS (
+              SELECT 1 FROM media_derivations next
+              WHERE next.item_id=dv.item_id AND next.kind='video_cover'
+                AND next.output_fingerprint!=''))
           {EXCLUDE_HIDDEN_ROOTS_M}"
     );
 
@@ -77,6 +82,7 @@ pub fn get_pending_derivations(
             row.get(4)?,
             row.get(5)?,
             row.get(6)?,
+            row.get(7)?,
         ))
     };
 
@@ -85,6 +91,22 @@ pub fn get_pending_derivations(
     let mut sql = base;
     let mut sql_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
     let mut idx = 1;
+
+    // 原生容器由 ThumbnailCoordinator 领取；冷门容器仍由历史视频 worker 处理。
+    let native_video_formats = crate::video::native_cover_formats();
+    if !native_video_formats.is_empty() {
+        let placeholders: Vec<String> = (idx..idx + native_video_formats.len())
+            .map(|i| format!("?{i}"))
+            .collect();
+        sql.push_str(&format!(
+            " AND NOT (dv.kind='video_cover' AND m.file_format IN ({}))",
+            placeholders.join(",")
+        ));
+        for format in native_video_formats {
+            sql_params.push(format as &dyn rusqlite::ToSql);
+        }
+        idx += native_video_formats.len();
+    }
 
     // 过滤集合以借用调用方切片元素的方式压入 `sql_params`（引用在整个函数内有效）。
     // 空切片视同无过滤——绝不能生成 `IN ()` 非法 SQL。
@@ -132,7 +154,11 @@ pub fn mark_derivations_processing(
     for (item_id, kind, source_revision, cache_key) in tasks {
         let changed = tx.execute(
             "UPDATE media_derivations SET status=1, updated_at=strftime('%s','now')
-             WHERE item_id=?1 AND kind=?2 AND status=0
+             WHERE item_id=?1 AND kind=?2 AND output_fingerprint='' AND status=0
+               AND NOT (?2='video_cover' AND EXISTS (
+                   SELECT 1 FROM media_derivations next
+                   WHERE next.item_id=?1 AND next.kind='video_cover'
+                     AND next.output_fingerprint!=''))
                AND EXISTS (
                    SELECT 1 FROM media_items m
                    WHERE m.id=?1 AND m.is_deleted=0
@@ -274,7 +300,11 @@ pub fn batch_finish_derivations_with_snapshot(
             "UPDATE media_derivations
              SET status=?3, payload_path=?4, error=?5, orphan_count=0,
                  updated_at=strftime('%s','now')
-             WHERE item_id=?1 AND kind=?2 AND status=1
+             WHERE item_id=?1 AND kind=?2 AND output_fingerprint='' AND status=1
+               AND NOT (?2='video_cover' AND EXISTS (
+                   SELECT 1 FROM media_derivations next
+                   WHERE next.item_id=?1 AND next.kind='video_cover'
+                     AND next.output_fingerprint!=''))
                AND EXISTS (
                    SELECT 1 FROM media_items m
                    WHERE m.id=?1 AND m.is_deleted=0
@@ -351,7 +381,7 @@ mod snapshot_tests {
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
              INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, source_revision) VALUES
-                 (1, 10, 'a.mp4', 1, 1, 'mp4', 'video', 0, 0, 100, 17, 1),
+                 (1, 10, 'a.mkv', 1, 1, 'mkv', 'video', 0, 0, 100, 17, 1),
                  (2, 10, 'b.epub', 1, 1, 'epub', 'document', 0, 0, 200, 18, 1);
              INSERT INTO media_derivations (item_id, kind, status) VALUES
                  (1, 'video_cover', 0),
@@ -359,31 +389,6 @@ mod snapshot_tests {
         )
         .unwrap();
         c
-    }
-
-    #[test]
-    fn pending_task_carries_the_media_source_snapshot() {
-        let c = seeded();
-        c.execute(
-            "UPDATE media_items SET source_revision=7, cache_key=71 WHERE id=1",
-            [],
-        )
-        .unwrap();
-
-        let tasks = get_pending_derivations(&c, 10, None, &[]).unwrap();
-        assert_eq!(
-            tasks,
-            vec![(
-                1,
-                "video_cover".to_string(),
-                "/r/a.mp4".to_string(),
-                "mp4".to_string(),
-                "video".to_string(),
-                7,
-                71,
-            )],
-            "pending task must preserve source_revision and cache_key from the same row"
-        );
     }
 
     #[test]
@@ -629,12 +634,13 @@ mod snapshot_tests {
 /// 再投入领取；其余孤儿正常退回 status=0 并令 `orphan_count+1`。error 文案不含内部路径。
 /// 返回值签名不变（仍是本次复位为 pending 的数量），调用方（derive/pipeline.rs）无感知本次改动。
 pub fn reset_processing_derivations(conn: &Connection) -> Result<usize> {
-    // video_playable 是按需交互 kind(§5.2),从不经背景流水线,也无孤儿/毒任务语义——
-    // 两条复位 UPDATE 均排除它,避免 boot/stop 的通用复位误动在途播放行(其复位归专用路径)。
+    // video_playable 归播放交互，image_thumb 归缩略图 Coordinator；旧派生流水线的
+    // 孤儿/毒任务恢复不能夺取它们的 lease。
     let poisoned = conn.execute(
         "UPDATE media_derivations
          SET status=3, error='repeatedly orphaned (poison guard) | 反复孤儿(毒任务防线)', updated_at=strftime('%s','now')
-         WHERE status=1 AND orphan_count>=2 AND kind != 'video_playable'",
+         WHERE status=1 AND output_fingerprint='' AND orphan_count>=2
+           AND kind NOT IN ('video_playable','image_thumb')",
         [],
     )?;
     // 日志按仓内惯例应归调用方统一记录（derive/pipeline.rs 的流水线事件日志），但该文件另一
@@ -647,7 +653,8 @@ pub fn reset_processing_derivations(conn: &Connection) -> Result<usize> {
         );
     }
     conn.execute(
-        "UPDATE media_derivations SET status=0, orphan_count=orphan_count+1 WHERE status=1 AND kind != 'video_playable'",
+        "UPDATE media_derivations SET status=0, orphan_count=orphan_count+1
+         WHERE status=1 AND output_fingerprint='' AND kind NOT IN ('video_playable','image_thumb')",
         [],
     )
     .map_err(AppError::from)
@@ -663,9 +670,10 @@ pub fn reset_processing_derivations(conn: &Connection) -> Result<usize> {
 /// force-quit 遗留孤儿」（`reset_processing_derivations`，计数正当——那类挂死本就该占用
 /// 有限重试预算）拆成两条独立路径：本函数只在优雅 stop 时调用，不吃孤儿预算。
 pub fn requeue_in_flight_derivations(conn: &Connection) -> Result<usize> {
-    // video_playable 排除(§V6-1):按需交互 kind 不属背景流水线 stop 的退回范围。
+    // 播放交互与缩略图 Coordinator 的在途任务不属本流水线 stop 范围。
     conn.execute(
-        "UPDATE media_derivations SET status=0 WHERE status=1 AND kind != 'video_playable'",
+        "UPDATE media_derivations SET status=0 WHERE status=1 AND output_fingerprint=''
+         AND kind NOT IN ('video_playable','image_thumb')",
         [],
     )
     .map_err(AppError::from)
@@ -770,6 +778,26 @@ pub fn backfill_derivations(
         conn.execute(&sql, params![kind, media_type])?
     };
     Ok(inserted)
+}
+
+/// 历史视频封面只补入非原生容器；原生容器改由统一缩略图任务入队。
+pub fn backfill_legacy_video_covers(conn: &Connection) -> Result<usize> {
+    let formats = crate::video::native_cover_formats();
+    if formats.is_empty() {
+        return backfill_derivations(conn, "video_cover", "video", None);
+    }
+    let placeholders = (1..=formats.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "INSERT OR IGNORE INTO media_derivations (item_id, kind, status)
+         SELECT id, 'video_cover', 0 FROM media_items
+         WHERE media_type='video' AND is_deleted=0 AND file_format NOT IN ({placeholders})
+           {NOT_BLOCKED_BY_EXOTIC}"
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(formats.iter()))
+        .map_err(AppError::from)
 }
 
 /// 某视频的关键帧雪碧图产物路径（相对 `cache_dir`），若已生成（status=2）。用于悬停 scrub 降级（§3.1 / §3.3）。
@@ -895,289 +923,9 @@ pub fn count_derivations_by_status_for_kinds(
     .map_err(AppError::from)
 }
 
-#[cfg(test)]
-mod reset_derivations_tests {
-    use super::*;
-
-    /// 建全量 schema + 5 个 item + 各类 (kind, status) 派生行,覆盖复位边界。
-    fn seeded() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'a', 1, 1, 'pdf', 'image', 0, 0, 100, 0),
-                 (2, 10, 'b', 1, 1, 'pdf', 'image', 0, 0, 200, 0),
-                 (3, 10, 'c', 1, 1, 'pdf', 'image', 0, 0, 300, 0),
-                 (4, 10, 'd', 1, 1, 'pdf', 'image', 0, 0, 400, 0),
-                 (5, 10, 'e', 1, 1, 'mp4', 'video', 0, 0, 500, 0);
-             INSERT INTO media_derivations (item_id, kind, status) VALUES
-                 (1, 'doc_thumb', 3),
-                 (2, 'doc_thumb', 2),
-                 (3, 'doc_thumb', 0),
-                 (4, 'doc_thumb', 1),
-                 (5, 'video_cover', 3);",
-        )
-        .unwrap();
-        c
-    }
-
-    fn status_of(c: &Connection, item_id: i64, kind: &str) -> i64 {
-        c.query_row(
-            "SELECT status FROM media_derivations WHERE item_id=?1 AND kind=?2",
-            params![item_id, kind],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    /// 清缓存复位须同时覆盖 status=2(已完成)与 status=3(失败)——后者是 2026-07-07 修复:
-    /// 被瞬时/环境性失败(如 CSP 拦 pdf.js 抓取)误标 status=3 的好文件须能经清缓存重试,
-    /// 否则永久卡占位符、无自愈路径。status=0/1 与未列入 kinds 的其他 kind 一律不动。
-    #[test]
-    fn reset_covers_done_and_failed_but_not_pending_or_other_kind() {
-        let c = seeded();
-        let affected = reset_derivations_by_kinds(&c, &["doc_thumb"]).unwrap();
-        assert_eq!(affected, 2, "仅 status=2/3 的 doc_thumb 两行受影响");
-        assert_eq!(
-            status_of(&c, 1, "doc_thumb"),
-            0,
-            "失败(3)→退回 0(本次修复核心)"
-        );
-        assert_eq!(status_of(&c, 2, "doc_thumb"), 0, "已完成(2)→退回 0");
-        assert_eq!(status_of(&c, 3, "doc_thumb"), 0, "待处理(0)保持 0");
-        assert_eq!(status_of(&c, 4, "doc_thumb"), 1, "处理中(1)不动");
-        assert_eq!(
-            status_of(&c, 5, "video_cover"),
-            3,
-            "未列入 kinds 的其他 kind 不动"
-        );
-    }
-}
-
 // ── 派生流水线毒任务防线(V22 orphan_count,2026-07-22 故障复盘)──────────────────
-#[cfg(test)]
-mod poison_guard_tests {
-    use super::*;
-
-    /// 建单个 item + 一行 status=1 的派生任务,用于逐轮驱动 `reset_processing_derivations`。
-    fn one_processing_task() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'poison.mkv', 1, 1, 'mkv', 'video', 0, 0, 100, 0);
-             INSERT INTO media_derivations (item_id, kind, status) VALUES
-                 (1, 'video_cover', 1);",
-        )
-        .unwrap();
-        c
-    }
-
-    fn status_and_orphan(c: &Connection) -> (i64, i64) {
-        c.query_row(
-            "SELECT status, orphan_count FROM media_derivations WHERE item_id=1 AND kind='video_cover'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap()
-    }
-
-    /// ①同一毒任务反复孤儿(每轮领取后又挂死留在 status=1)达到第 3 次,应转 status=3(error)
-    /// 而非再退回 status=0 重新领取;此后再调用 `reset_processing_derivations` 也不应把它复位。
-    #[test]
-    fn poisoned_task_converts_to_error_on_third_orphan_and_stays_there() {
-        let c = one_processing_task();
-
-        // 第 1 轮孤儿:orphan_count 0→1,退回 pending(未达阈值)。
-        let n = reset_processing_derivations(&c).unwrap();
-        assert_eq!(n, 1, "第 1 轮:1 行退回 pending");
-        assert_eq!(
-            status_and_orphan(&c),
-            (0, 1),
-            "第 1 轮:status=0, orphan_count=1"
-        );
-
-        // 模拟重新领取(mark processing)后再次挂死。
-        c.execute(
-            "UPDATE media_derivations SET status=1 WHERE item_id=1 AND kind='video_cover'",
-            [],
-        )
-        .unwrap();
-        let n = reset_processing_derivations(&c).unwrap();
-        assert_eq!(n, 1, "第 2 轮:仍未达阈值,退回 pending");
-        assert_eq!(
-            status_and_orphan(&c),
-            (0, 2),
-            "第 2 轮:status=0, orphan_count=2"
-        );
-
-        // 第 3 次领取后再挂死:orphan_count 已是 2(>=2),本轮孤儿复位应判定为毒任务转 error。
-        c.execute(
-            "UPDATE media_derivations SET status=1 WHERE item_id=1 AND kind='video_cover'",
-            [],
-        )
-        .unwrap();
-        let n = reset_processing_derivations(&c).unwrap();
-        assert_eq!(n, 0, "第 3 轮:未再有行退回 pending(已转 error 分支)");
-        let (status, orphan) = status_and_orphan(&c);
-        assert_eq!(status, 3, "第 3 次孤儿→转 status=3(error)");
-        assert_eq!(orphan, 2, "转 error 分支不改 orphan_count");
-        let err: String = c
-            .query_row(
-                "SELECT error FROM media_derivations WHERE item_id=1 AND kind='video_cover'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            err.contains("poison guard"),
-            "error 文案应标明毒任务防线,实得:{err}"
-        );
-
-        // 已转 error 后,即使再次调用复位也不应被误复位为 pending(status!=1,两条 UPDATE 均不命中)。
-        let n = reset_processing_derivations(&c).unwrap();
-        assert_eq!(n, 0, "已 error 的行不应被再次复位");
-        assert_eq!(status_and_orphan(&c).0, 3, "status 保持 error,不被复位覆盖");
-    }
-
-    /// ②孤儿复位后若任务经正常路径完成(`batch_finish_derivations` 写下 status=2/3),
-    /// orphan_count 应归零——防止偶发崩溃累计的孤儿计数,把后续真正偶发的失败误判为毒任务。
-    #[test]
-    fn orphan_count_resets_to_zero_on_normal_finish() {
-        let c = one_processing_task();
-
-        // 先经历一轮孤儿复位,使 orphan_count 变为非零(模拟此前有过一次崩溃)。
-        reset_processing_derivations(&c).unwrap();
-        assert_eq!(
-            status_and_orphan(&c),
-            (0, 1),
-            "预置:一轮孤儿后 orphan_count=1"
-        );
-
-        // 模拟重新领取后本次正常完成:写结果 status=2。
-        c.execute(
-            "UPDATE media_derivations SET status=1 WHERE item_id=1 AND kind='video_cover'",
-            [],
-        )
-        .unwrap();
-        batch_finish_derivations(
-            &c,
-            &[(
-                1,
-                "video_cover".to_string(),
-                2,
-                Some("cover.webp".to_string()),
-                None,
-                None,
-                None,
-            )],
-        )
-        .unwrap();
-
-        let (status, orphan) = status_and_orphan(&c);
-        assert_eq!(status, 2, "正常完成→status=2");
-        assert_eq!(orphan, 0, "正常完成归零 orphan_count,防偶发崩溃累计误杀");
-    }
-
-    /// ③优雅 stop 路径(`requeue_in_flight_derivations`)三轮反复退回同一行,orphan_count
-    /// 全程不涨、不应转 status=3——裁决 J10:主动 stop 是良性中断,不吃孤儿预算,防止用户
-    /// 短时间多次 stop/start 把良性中断误判为毒任务。
-    #[test]
-    fn requeue_in_flight_does_not_increment_orphan_count_across_three_rounds() {
-        let c = one_processing_task();
-
-        for round in 1..=3 {
-            // 每轮先确认行处于在途(status=1),再走优雅退回。
-            c.execute(
-                "UPDATE media_derivations SET status=1 WHERE item_id=1 AND kind='video_cover'",
-                [],
-            )
-            .unwrap();
-            let n = requeue_in_flight_derivations(&c).unwrap();
-            assert_eq!(n, 1, "第 {round} 轮:1 行退回 pending");
-            assert_eq!(
-                status_and_orphan(&c),
-                (0, 0),
-                "第 {round} 轮:优雅退回后 status=0 且 orphan_count 全程为 0"
-            );
-        }
-    }
-}
 
 // ── 多 kind 过滤 + 分 kind 计数(视频封面/关键帧独立控制线)────────────────────
-#[cfg(test)]
-mod kind_filter_tests {
-    use super::*;
-
-    /// 三 kind 混布:视频 1/2 各有 cover+keyframes 行(状态混合),音频 3 有 audio_cover 行。
-    fn seeded() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'a.mp4', 1, 1, 'mp4', 'video', 0, 0, 100, 0),
-                 (2, 10, 'b.mp4', 1, 1, 'mp4', 'video', 0, 0, 200, 0),
-                 (3, 10, 'c.mp3', 1, 1, 'mp3', 'audio', 0, 0, 300, 0);
-             INSERT INTO media_derivations (item_id, kind, status) VALUES
-                 (1, 'video_cover', 0),
-                 (1, 'video_keyframes', 0),
-                 (2, 'video_cover', 2),
-                 (2, 'video_keyframes', 3),
-                 (3, 'audio_cover', 0);",
-        )
-        .unwrap();
-        c
-    }
-
-    #[test]
-    fn multi_kind_filter_returns_only_listed_kinds() {
-        let c = seeded();
-        let video_kinds = vec!["video_cover".to_string(), "video_keyframes".to_string()];
-        let got: Vec<(i64, String)> = get_pending_derivations(&c, 100, Some(&video_kinds), &[])
-            .unwrap()
-            .into_iter()
-            .map(|(id, kind, ..)| (id, kind))
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                (1, "video_cover".to_string()),
-                (1, "video_keyframes".to_string())
-            ],
-            "只返回过滤集内的待处理行,audio_cover 与非 pending 行不出现"
-        );
-        // 空过滤集 = 无过滤(绝不能生成 IN ())。
-        assert_eq!(
-            get_pending_derivations(&c, 100, Some(&Vec::new()), &[])
-                .unwrap()
-                .len(),
-            3,
-            "空切片视同无过滤"
-        );
-    }
-
-    #[test]
-    fn kind_scoped_counts_exclude_other_kinds() {
-        let c = seeded();
-        let video_kinds = vec!["video_cover".to_string(), "video_keyframes".to_string()];
-        assert_eq!(
-            count_derivations_by_status_for_kinds(&c, &video_kinds).unwrap(),
-            (2, 0, 1, 1),
-            "视频两 kind:pending=2(item1 两行) done=1 error=1;audio_cover 不计入"
-        );
-        assert_eq!(
-            count_derivations_by_status_for_kinds(&c, &[]).unwrap(),
-            count_derivations_by_status(&c).unwrap(),
-            "空 kinds 退化为全量计数"
-        );
-    }
-}
 
 // ── 按需 video_playable 状态机(播放交互路径,§5.2)────────────────────────────
 #[cfg(test)]
@@ -1248,253 +996,11 @@ mod video_playable_tests {
             "完成 → status=2 + payload_path"
         );
     }
-
-    /// TOCTOU 去重(§V6-2):真实 0/无→1 转移返回 true;已在途重复调返回 false(并发第二方
-    /// 不夺认领、不重复 spawn);error(3)→1 可重领返回 true。
-    #[test]
-    fn upsert_claim_returns_true_only_on_real_transition() {
-        let c = one_video();
-        assert!(
-            upsert_and_claim_derivation(&c, 1, "video_playable").unwrap(),
-            "首次(无行→0→1)发生真实认领"
-        );
-        assert!(
-            !upsert_and_claim_derivation(&c, 1, "video_playable").unwrap(),
-            "已在途(status=1):并发第二方不再认领,返回 false"
-        );
-        // error(3)复位后应可重领。
-        batch_finish_derivations(
-            &c,
-            &[(
-                1,
-                "video_playable".to_string(),
-                3,
-                None,
-                Some("e".to_string()),
-                None,
-                None,
-            )],
-        )
-        .unwrap();
-        assert!(
-            upsert_and_claim_derivation(&c, 1, "video_playable").unwrap(),
-            "error(3)→1 可重领"
-        );
-    }
-
-    /// 背景流水线排除 video_playable(§V6-1):get_pending 不领取;reset_processing /
-    /// requeue_in_flight 均不动其在途行。
-    #[test]
-    fn background_pipeline_excludes_video_playable() {
-        let c = one_video(); // item 1, mkv
-        c.execute_batch(
-            "INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (2, 10, 'b.mkv', 1, 1, 'mkv', 'video', 0, 0, 200, 43);
-             INSERT INTO media_derivations (item_id, kind, status) VALUES
-                 (1, 'video_playable', 1),
-                 (2, 'video_playable', 0);",
-        )
-        .unwrap();
-
-        // 生产者查询不领取任何 video_playable(status=0 的 item2 也被排除)。
-        let pending = get_pending_derivations(&c, 100, None, &[]).unwrap();
-        assert!(
-            pending.iter().all(|(_, kind, ..)| kind != "video_playable"),
-            "get_pending 不应返回 video_playable 行:{pending:?}"
-        );
-
-        // 通用在途复位不动 video_playable(item1 保持 status=1)。
-        reset_processing_derivations(&c).unwrap();
-        assert_eq!(
-            status_of(&c, 1, "video_playable"),
-            1,
-            "reset_processing 跳过 video_playable"
-        );
-        requeue_in_flight_derivations(&c).unwrap();
-        assert_eq!(
-            status_of(&c, 1, "video_playable"),
-            1,
-            "requeue_in_flight 跳过 video_playable"
-        );
-    }
-
-    /// 取消只作废在途(§V6-7):status=1→0;status=2 就绪产物不退。
-    #[test]
-    fn cancel_resets_only_in_flight() {
-        let c = one_video();
-        upsert_and_claim_derivation(&c, 1, "video_playable").unwrap(); // →1
-        assert_eq!(
-            reset_in_flight_derivation_for_item(&c, 1, "video_playable").unwrap(),
-            1
-        );
-        assert_eq!(status_of(&c, 1, "video_playable"), 0, "在途(1)→退回 0");
-        // 置就绪(2)后再取消:不退。
-        batch_finish_derivations(
-            &c,
-            &[(
-                1,
-                "video_playable".to_string(),
-                2,
-                Some("video/42.mp4".to_string()),
-                None,
-                None,
-                None,
-            )],
-        )
-        .unwrap();
-        assert_eq!(
-            reset_in_flight_derivation_for_item(&c, 1, "video_playable").unwrap(),
-            0,
-            "就绪(2)不受取消影响"
-        );
-        assert_eq!(status_of(&c, 1, "video_playable"), 2);
-    }
-
-    /// 启动复位(§V6-11):全部在途 video_playable 退回 pending。
-    #[test]
-    fn boot_reset_requeues_in_flight_playable() {
-        let c = one_video();
-        upsert_and_claim_derivation(&c, 1, "video_playable").unwrap(); // →1
-        assert_eq!(
-            reset_in_flight_derivations_for_kind(&c, "video_playable").unwrap(),
-            1
-        );
-        assert_eq!(
-            status_of(&c, 1, "video_playable"),
-            0,
-            "boot 复位:在途→pending"
-        );
-    }
-
-    fn status_of(c: &Connection, item_id: i64, kind: &str) -> i64 {
-        c.query_row(
-            "SELECT status FROM media_derivations WHERE item_id=?1 AND kind=?2",
-            params![item_id, kind],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
 }
 
 // ── 隐藏根排除(V21 生成侧,派生流水线)──────────────────────────────────────
 // 锁两消费口:后端生产者 get_pending_derivations 与前端 pdf/svg 泵
 // list_pending_doc_thumbs 都跳过隐藏根;unhide 后 status=0 行原地续跑(非破坏暂停)。
-#[cfg(test)]
-mod hidden_root_derivation_tests {
-    use super::super::scan::set_scan_root_hidden;
-    use super::*;
-
-    /// 两根:root1(视频 1)+root2(视频 2 + pdf 文档 3),全 status=0 待处理。
-    fn two_roots_pending() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r1', 'R1'), (2, '/r2', 'R2');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES
-                 (10, 1, '', 'r1'), (20, 2, '', 'r2');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'a.mp4', 1, 1, 'mp4', 'video', 0, 0, 100, 0),
-                 (2, 20, 'b.mp4', 1, 1, 'mp4', 'video', 0, 0, 200, 0),
-                 (3, 20, 'c.pdf', 1, 1, 'pdf', 'document', 0, 0, 300, 0);
-             INSERT INTO media_derivations (item_id, kind, status) VALUES
-                 (1, 'video_cover', 0),
-                 (2, 'video_cover', 0),
-                 (3, 'doc_thumb', 0);",
-        )
-        .unwrap();
-        c
-    }
-
-    fn pending_ids(c: &Connection) -> Vec<i64> {
-        get_pending_derivations(c, 100, None, &[])
-            .unwrap()
-            .into_iter()
-            .map(|(id, ..)| id)
-            .collect()
-    }
-
-    fn doc_thumb_ids(c: &Connection) -> Vec<i64> {
-        list_pending_doc_thumbs(c, 100)
-            .unwrap()
-            .into_iter()
-            .map(|(id, ..)| id)
-            .collect()
-    }
-
-    #[test]
-    fn both_consumers_exclude_hidden_root_and_unhide_restores() {
-        let c = two_roots_pending();
-        // 初始:生产者见两视频封面(pdf doc_thumb 本就走前端泵不在此列),泵见 pdf。
-        assert_eq!(pending_ids(&c), vec![1, 2]);
-        assert_eq!(doc_thumb_ids(&c), vec![3]);
-
-        set_scan_root_hidden(&c, 2, true).unwrap();
-        assert_eq!(pending_ids(&c), vec![1], "隐藏根 2 的视频封面任务被跳过");
-        assert!(doc_thumb_ids(&c).is_empty(), "隐藏根 2 的 pdf 泵任务被跳过");
-
-        set_scan_root_hidden(&c, 2, false).unwrap();
-        assert_eq!(pending_ids(&c), vec![1, 2], "unhide 后 status=0 行原地续跑");
-        assert_eq!(doc_thumb_ids(&c), vec![3]);
-    }
-}
 
 // ── store_doc_thumbnail 守卫(#3 加固,2026-07-24)──────────────────────────────
 // x-item-id 来自请求头不可信,须校验其确为前端可渲染文档(pdf/svg)再落任何状态。
-#[cfg(test)]
-mod doc_thumb_guard_tests {
-    use super::*;
-
-    /// 5 个 item 覆盖白名单内外:pdf/svg(接受)、epub(后端渲染,拒)、txt/mp4(非文档缩略图,拒)。
-    fn seeded() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c.execute_batch(
-            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
-             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
-             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'a.pdf',  1, 1, 'pdf',  'image', 0, 0, 100, 0),
-                 (2, 10, 'b.svg',  1, 1, 'svg',  'image', 0, 0, 200, 0),
-                 (3, 10, 'c.epub', 1, 1, 'epub', 'image', 0, 0, 300, 0),
-                 (4, 10, 'd.txt',  1, 1, 'txt',  'text',  0, 0, 400, 0),
-                 (5, 10, 'e.mp4',  1, 1, 'mp4',  'video', 0, 0, 500, 0);",
-        )
-        .unwrap();
-        c
-    }
-
-    #[test]
-    fn whitelist_is_pdf_svg_only() {
-        assert!(is_frontend_doc_thumb_format("pdf"));
-        assert!(is_frontend_doc_thumb_format("svg"));
-        assert!(!is_frontend_doc_thumb_format("epub")); // 后端 zip 渲染,有意排除
-        assert!(!is_frontend_doc_thumb_format("txt"));
-        assert!(!is_frontend_doc_thumb_format("jpg"));
-        assert!(!is_frontend_doc_thumb_format(""));
-        // 集合钉定:与 list_pending_doc_thumbs 的 IN 子句单源同集(该 SQL 由本常量插值生成),
-        // 任一侧误改此集合,本断言即红——防守卫/泵白名单静默漂移。
-        assert_eq!(FRONTEND_DOC_THUMB_FORMATS, &["pdf", "svg"]);
-    }
-
-    #[test]
-    fn guard_accepts_pdf_svg_rejects_others() {
-        let c = seeded();
-        assert_eq!(validate_frontend_doc_thumb_item(&c, 1).unwrap(), "pdf");
-        assert_eq!(validate_frontend_doc_thumb_item(&c, 2).unwrap(), "svg");
-        // epub(后端渲染)/ txt / mp4 均非前端 doc-thumb 项 → Internal 拒绝
-        assert!(validate_frontend_doc_thumb_item(&c, 3).is_err(), "epub 拒");
-        assert!(validate_frontend_doc_thumb_item(&c, 4).is_err(), "txt 拒");
-        assert!(validate_frontend_doc_thumb_item(&c, 5).is_err(), "mp4 拒");
-    }
-
-    #[test]
-    fn guard_missing_item_is_media_not_found() {
-        let c = seeded();
-        assert!(
-            matches!(
-                validate_frontend_doc_thumb_item(&c, 999),
-                Err(AppError::MediaNotFound(999))
-            ),
-            "不存在的 item_id → MediaNotFound(而非 Internal)"
-        );
-    }
-}

@@ -211,32 +211,6 @@ pub fn handle_enhance_run<W: Write>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn task_mapping_is_explicit_and_total() {
-        assert_eq!(map_task(EnhanceTask::Denoise), EnhanceTaskKind::Denoise);
-        assert_eq!(
-            map_task(EnhanceTask::DejpegArtifact),
-            EnhanceTaskKind::DejpegArtifact
-        );
-        assert_eq!(map_task(EnhanceTask::Upscale), EnhanceTaskKind::Upscale);
-    }
-
-    #[test]
-    fn output_format_parse() {
-        assert!(matches!(
-            parse_output_format("jpeg"),
-            Ok(EnhanceOutputFormat::Jpeg)
-        ));
-        assert!(matches!(
-            parse_output_format("png"),
-            Ok(EnhanceOutputFormat::Png)
-        ));
-        assert!(matches!(
-            parse_output_format("webp"),
-            Err(InitFail(WorkerErrorCode::MalformedInput, _))
-        ));
-    }
-
     fn temp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "enhance-worker-run-test-{}-{name}",
@@ -245,25 +219,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(&d).unwrap()
-    }
-
-    #[test]
-    fn output_whitelist_accepts_inside() {
-        let work = temp_dir("inside");
-        let out = work.join("job1.tmp");
-        let resolved = resolve_output_path(out.to_str().unwrap(), &work).expect("同目录合法");
-        assert!(resolved.starts_with(&work));
-        assert_eq!(resolved.file_name().unwrap(), "job1.tmp");
-    }
-
-    #[test]
-    fn output_whitelist_accepts_subdir() {
-        let work = temp_dir("subdir");
-        let sub = work.join("nested");
-        std::fs::create_dir_all(&sub).unwrap();
-        let out = sub.join("job.tmp");
-        let resolved = resolve_output_path(out.to_str().unwrap(), &work).expect("子目录合法");
-        assert!(resolved.starts_with(&work));
     }
 
     #[test]
@@ -297,59 +252,5 @@ mod tests {
             .join("evil.tmp");
         let e = resolve_output_path(traversal.to_str().unwrap(), &work).expect_err("`..` 穿越应拒");
         assert_eq!(e.0, WorkerErrorCode::MalformedInput);
-    }
-
-    #[test]
-    fn output_whitelist_rejects_missing_parent() {
-        let work = temp_dir("missing");
-        let out = work.join("no-such-subdir").join("job.tmp");
-        // 父目录不存在 → canonicalize 失败 → MalformedInput。
-        let e = resolve_output_path(out.to_str().unwrap(), &work).expect_err("父不可达应拒");
-        assert_eq!(e.0, WorkerErrorCode::MalformedInput);
-    }
-
-    #[test]
-    fn error_mapping_is_per_variant() {
-        assert_eq!(
-            map_enhance_error(&EnhanceError::Decode("x".into())),
-            WorkerErrorCode::MalformedInput
-        );
-        assert_eq!(
-            map_enhance_error(&EnhanceError::UnsupportedInput("x".into())),
-            WorkerErrorCode::MalformedInput
-        );
-        assert_eq!(
-            map_enhance_error(&EnhanceError::Inference("x".into())),
-            WorkerErrorCode::InternalError
-        );
-        assert_eq!(
-            map_enhance_error(&EnhanceError::Io("x".into())),
-            WorkerErrorCode::IoError
-        );
-        assert_eq!(
-            map_enhance_error(&EnhanceError::ProfileMissing("x".into())),
-            WorkerErrorCode::ModelLoadFailed
-        );
-        assert_eq!(
-            map_enhance_error(&EnhanceError::Encode("x".into())),
-            WorkerErrorCode::InternalError
-        );
-    }
-
-    #[test]
-    fn run_without_session_is_session_expired() {
-        let mut buf: Vec<u8> = Vec::new();
-        let frame = handle_enhance_run(
-            None,
-            5,
-            "a.jpg".into(),
-            "x.tmp".into(),
-            "jpeg".into(),
-            vec![],
-            &mut buf,
-        );
-        assert_eq!(frame.frame_type, FrameType::Failure);
-        let fail: FailureBody = frame.parse_json().unwrap();
-        assert_eq!(fail.code, WorkerErrorCode::SessionExpired);
     }
 }

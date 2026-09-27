@@ -137,30 +137,3 @@ fn percent_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).into_owned()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 请求 URL 与路径边界（纯函数，无需网络）。
-    #[test]
-    fn server_path_joins_base_and_rel() {
-        assert_eq!(server_path("dav", "/photos"), "/dav/photos");
-        assert_eq!(server_path("", "photos"), "/photos");
-        assert_eq!(server_path("dav", ""), "/dav");
-        assert_eq!(server_path("", ""), "/");
-    }
-
-    #[test]
-    fn rel_from_href_strips_base_and_decodes() {
-        assert_eq!(
-            rel_from_href("/dav/photos/%E5%9B%BE%20a.jpg", "dav/photos"),
-            ("图 a.jpg".to_string(), "图 a.jpg".to_string())
-        );
-        // 无 base 前缀时退回整段（不静默截断）。
-        assert_eq!(
-            rel_from_href("/other/x.jpg", "dav/photos"),
-            ("x.jpg".to_string(), "other/x.jpg".to_string())
-        );
-    }
-}

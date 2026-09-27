@@ -95,6 +95,17 @@ const VENDORED_FRONTEND = [
 // NOTICE/SBOM；完整文本由 prepare-legal-resources.mjs 生成到安装包 legal/ 目录。
 const SHIPPED_RUNTIME_COMPONENTS = [
   {
+    name: 'Intel libvpl (static dispatcher)',
+    version: '2.17.0',
+    license: 'MIT',
+    homepage: 'https://github.com/intel/libvpl',
+    purl: 'pkg:github/intel/libvpl@v2.17.0',
+    note:
+      'statically linked into the bundled native thumbnail worker; pinned to commit ' +
+      'd77f9195cf495b937631607333288fd917ae8939, texts kept under legal/libvpl',
+    eco: 'embedded-runtime',
+  },
+  {
     name: 'LibRaw (embedded by rsraw-sys)',
     version: 'rsraw-sys-0.1.1',
     license: 'CDDL-1.0 OR LGPL-2.1-only',

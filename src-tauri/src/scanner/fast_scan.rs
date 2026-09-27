@@ -22,6 +22,8 @@ use tauri::ipc::Channel;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+use crate::db::queries::mark_missing;
 use crate::db::queries::{
     cleanup_scan_temp_tables_for_run, finish_scan_root, get_config, init_seen_table_for_run,
     invalidate_exotic_tasks_for_item, load_directory_mtime_snapshot,
@@ -29,8 +31,6 @@ use crate::db::queries::{
     set_directory_media_counts, update_scan_root_status, upsert_directory, upsert_fast_scan_item,
     FastScanItem, SeenWriter, UpsertOutcome,
 };
-#[cfg(test)]
-use crate::db::queries::{init_seen_table, mark_missing};
 use crate::error::{AppError, Result};
 use crate::exotic::catalog::CatalogSnapshot;
 use crate::scanner::metadata::{
@@ -269,52 +269,6 @@ fn prefetch_dir_mtimes(
             .map(|p| normalize_db_path(&p.to_string_lossy()))
             .unwrap_or_default();
     }
-}
-
-/// T17b opt-in「快速扫描」剪枝判定：某目录的 FS mtime 与基线（T17a 写入的 `directories.mtime`，
-/// 经由**扫描启动时一次性加载的快照** `dir_mtime_snapshot` 比对——即「上一轮扫描终态」）一致
-/// → 其**直接子项无增/删/改名** → 跳过该目录所有直接文件的 per-file 工作（metadata stat /
-/// cache_key / upsert / exotic 播种）。可剪枝时把该目录**全部未删媒体 id 回填进 `seen`**，确保
-/// 缺失检测差集不把它们误判为已删除（🔴 数据安全：跳过 ≠ 消失）。返回 `true` 表示该目录可剪枝。
-///
-/// **逐目录、非递归**：仅跳本目录直接文件，**不** `skip_current_dir`——子目录仍由 walkdir 独立下降、
-/// 各自比对 mtime，故嵌套目录的新增/删除**不漏**（目录 mtime 不向上冒泡，单祖先 mtime 不能代表子树）。
-///
-/// **J1 修复（方案 A 快照）**：基线只读 `dir_mtime_snapshot`（扫描启动时一次性 `SELECT` 全量加载，
-/// 见 `load_directory_mtime_snapshot`），**不再查活 DB 行**。原实现直接查 `directories` 表活行，
-/// 而本轮扫描的祖先链 `ensure_dir_chain` 会在遍历过程中持续覆写同一行的 `mtime`（每次经过都写当前
-/// FS mtime）——若某祖先目录先被下降到的子目录「顺路」upsert 过，其 `mtime` 已被改写为当前值，
-/// 此后该目录自身的直接文件再触发本判定时，查到的就是「已被本轮覆写」的新值而非「上一轮终态」，
-/// 导致 `cur == stored` 恒成立、误判为「未变」而漏扫新增文件，且基线被错误「治愈」、后续轮次永续漏
-/// （walkdir 无序遍历，子目录条目可能先于父目录的后续直接文件被访问，见 walker.rs 无 sort）。
-/// 快照在写入发生前取好，不受扫描期覆写影响，从根本上消除该失效模式。
-/// 快照未命中（新目录 / 无基线）= 不剪枝（与原「mtime 为 NULL」语义一致）。
-///
-/// **已知且唯一的漏检边界**：文件**就地编辑**（内容变、父目录 mtime 不变，如同大小 EXIF/评分写回）
-/// 会被跳过——这是快速扫描的设计取舍，全量扫描兜底。
-/// 测试用薄封装:保留旧「传文件路径」调用形态,生产 quick 路径已改走目录级
-/// `decide_dir_pruned_at`(walker 在 stat 之前询问)。
-#[cfg(test)]
-fn decide_dir_pruned(
-    tx: &rusqlite::Transaction,
-    root_id: i64,
-    rel_path_norm: &str,
-    file_abs: &Path,
-    dir_mtime_snapshot: &std::collections::HashMap<String, i64>,
-    seen: &mut HashSet<i64>,
-) -> Result<bool> {
-    let dir_abs = file_abs.parent().unwrap_or(file_abs);
-    let current_mtime = read_dir_mtime(dir_abs);
-    decide_dir_pruned_at(
-        tx,
-        root_id,
-        rel_path_norm,
-        current_mtime,
-        dir_mtime_snapshot,
-        |id| {
-            seen.insert(id);
-        },
-    )
 }
 
 /// 目录级剪枝判定(阶段3 walker 前置版):入参改为**目录绝对路径**,供 walker 在

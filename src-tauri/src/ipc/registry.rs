@@ -80,6 +80,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::media_commands::prioritize_dimensions,
         // thumbnails
         ipc::thumbnail_commands::batch_request_thumbnails,
+        ipc::thumbnail_commands::cancel_viewport_thumbnail_request,
         ipc::thumbnail_commands::start_full_thumbnail_generation,
         ipc::thumbnail_commands::start_incremental_thumbnail_generation,
         ipc::thumbnail_commands::stop_full_thumbnail_generation,

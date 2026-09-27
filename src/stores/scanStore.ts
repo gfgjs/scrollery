@@ -13,6 +13,8 @@ import type {
   ScanChannelPayload,
   MediaEnrichedPayload,
   EnrichmentCompletedPayload,
+  ThumbResultCounts,
+  ThumbExecutionCount,
 } from '../types/ipc'
 import { IPC, EVENTS } from '../constants/ipc'
 import i18n from '../i18n'
@@ -578,6 +580,8 @@ export const useScanStore = defineStore('scan', () => {
     status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error'
     currentItem?: string
     phase?: string
+    results: ThumbResultCounts
+    executions: ThumbExecutionCount[]
   }
 
   const thumbGenProgress = ref<ThumbGenProgress>({
@@ -587,7 +591,70 @@ export const useScanStore = defineStore('scan', () => {
     status: 'idle',
     currentItem: undefined,
     phase: undefined,
+    results: { available: 0, direct: 0, failed: 0, newlyGenerated: 0, cacheHit: 0, temporarilyUnavailable: 0 },
+    executions: [],
   })
+  const thumbGenPhaseLabel = computed(() => {
+    switch (thumbGenProgress.value.phase) {
+      case 'fast':
+        return i18n.global.t('settings.thumbPhaseFast')
+      case 'heavy':
+        return i18n.global.t('settings.thumbPhaseHeavy')
+      case 'exception':
+        return i18n.global.t('settings.thumbPhaseException')
+      default:
+        return ''
+    }
+  })
+  const thumbGenResultsLabel = computed(() => {
+    const results = thumbGenProgress.value.results
+    if (!results) return ''
+    return i18n.global.t('settings.thumbDetailedResults', results)
+  })
+  const thumbGenHardwareLabel = computed(() => {
+    const { executions = [], results, status } = thumbGenProgress.value
+    const gpuKinds = new Set<string>()
+    let cpu = false
+    let unknown = false
+    for (const { native, count } of executions) {
+      if (count <= 0) continue
+      if (!native || native.backend === 'videoMf') {
+        unknown = true
+      } else if (native.backend === 'imageD2d' || native.backend === 'imageVpl') {
+        gpuKinds.add(native.adapterKind === 'integrated' || native.adapterKind === 'discrete'
+          ? native.adapterKind : 'unknown')
+      } else if (native.backend === 'videoMfHardwareMft') {
+        // MF 已确认硬件 MFT，但回传的 LUID 仍是候选，不能据此断言解码设备类型。
+        gpuKinds.add('unknown')
+      } else {
+        cpu = true
+      }
+    }
+    let key: string
+    if (gpuKinds.size) {
+      key = gpuKinds.has('unknown') ? 'gpuUnknown'
+        : gpuKinds.size > 1 ? 'mixed'
+          : gpuKinds.has('integrated') ? 'integrated' : 'discrete'
+    } else if (unknown) key = 'unknown'
+    else if (cpu) key = 'cpu'
+    else if (results?.direct) key = 'direct'
+    else if (results?.cacheHit) key = 'cache'
+    else if (status === 'idle') return ''
+    else key = status === 'running' ? 'waiting' : 'unknown'
+    const label = i18n.global.t(`settings.thumbHardware.${key}`)
+    return unknown && gpuKinds.size
+      ? `${label} · ${i18n.global.t('settings.thumbHardware.unknown')}` : label
+  })
+  const thumbGenExecutionDetails = computed(() =>
+    thumbGenProgress.value.executions
+      .filter(({ count }) => count > 0)
+      .map(({ native, count }) =>
+        `${i18n.global.t(`settings.thumbBackends.${native?.backend ?? 'unknown'}`)} × ${count}`),
+  )
+  const thumbGenSummaryTitle = computed(() =>
+    [thumbGenResultsLabel.value, thumbGenHardwareLabel.value, ...thumbGenExecutionDetails.value]
+      .filter(Boolean).join('\n'),
+  )
 
   // State for automatic thumbnail generation (triggered by scrolling)
   const autoThumbQueueSize = ref(0)
@@ -602,6 +669,8 @@ export const useScanStore = defineStore('scan', () => {
     status: 'error' | 'completed' | 'running' | 'cancelled' | 'idle'
     currentItem?: string
     phase?: string
+    results: ThumbResultCounts
+    executions: ThumbExecutionCount[]
   }
 
   // withSideEffects=false 用于启动回填:completed/cancelled 快照只恢复显示,
@@ -614,10 +683,12 @@ export const useScanStore = defineStore('scan', () => {
       status: msg.status,
       currentItem: msg.currentItem,
       phase: msg.phase,
+      results: msg.results ?? { available: 0, direct: 0, failed: 0, newlyGenerated: 0, cacheHit: 0, temporarilyUnavailable: 0 },
+      executions: msg.executions ?? [],
     }
     // 当生成完成（完成/取消）时，使布局失效，
     // 以便网格从数据库重新获取最新的 thumb_status/thumb_path。
-    if (withSideEffects && (msg.status === 'completed' || msg.status === 'cancelled')) {
+    if (withSideEffects && (msg.status === 'completed' || msg.status === 'cancelled' || msg.status === 'error')) {
       const media = useMediaStore()
       media.invalidateLayout()
     }
@@ -626,10 +697,12 @@ export const useScanStore = defineStore('scan', () => {
   // 共享注册 Promise(而非布尔标记):并发调用都等同一次注册完成,不存在「标记已置真、
   // 监听尚未挂上」的窗口期漏事件。
   let thumbGenListenerPromise: Promise<unknown> | null = null
+  let thumbGenUpdateRevision = 0
   function ensureThumbGenListener(): Promise<unknown> {
-    thumbGenListenerPromise ??= listen<ThumbGenEventPayload>(EVENTS.THUMB_GEN_PROGRESS, (e) =>
-      applyThumbGenPayload(e.payload),
-    )
+    thumbGenListenerPromise ??= listen<ThumbGenEventPayload>(EVENTS.THUMB_GEN_PROGRESS, (e) => {
+      ++thumbGenUpdateRevision
+      applyThumbGenPayload(e.payload)
+    })
     return thumbGenListenerPromise
   }
 
@@ -637,8 +710,9 @@ export const useScanStore = defineStore('scan', () => {
   // 快照说 running 但 token 已不在的窗口期由后端归一为 cancelled(full_thumb_gen_status)。
   async function restoreThumbGenProgress() {
     await ensureThumbGenListener()
+    const revision = ++thumbGenUpdateRevision
     const snap = await invokeIpc<ThumbGenEventPayload>(IPC.FULL_THUMB_GEN_STATUS).catch(() => null)
-    if (!snap || snap.status === 'idle') return
+    if (revision !== thumbGenUpdateRevision || !snap || snap.status === 'idle') return
     applyThumbGenPayload(snap, snap.status === 'running')
   }
 
@@ -665,6 +739,7 @@ export const useScanStore = defineStore('scan', () => {
     // 先订阅再启动:total==0 时后端在 invoke 返回前就发 completed,晚订阅会漏终态。
     await ensureThumbGenListener()
 
+    ++thumbGenUpdateRevision
     thumbGenProgress.value = {
       generated: 0,
       total: 0,
@@ -672,6 +747,8 @@ export const useScanStore = defineStore('scan', () => {
       status: 'running',
       currentItem: undefined,
       phase: undefined,
+      results: { available: 0, direct: 0, failed: 0, newlyGenerated: 0, cacheHit: 0, temporarilyUnavailable: 0 },
+      executions: [],
     }
 
     try {
@@ -684,6 +761,7 @@ export const useScanStore = defineStore('scan', () => {
   }
 
   async function stopFullThumbnailGeneration() {
+    ++thumbGenUpdateRevision
     await invokeIpc(IPC.STOP_FULL_THUMBNAIL_GENERATION)
     thumbGenProgress.value.isRunning = false
     if (thumbGenProgress.value.status === 'running') {
@@ -709,6 +787,11 @@ export const useScanStore = defineStore('scan', () => {
     getProgress,
     clearDatabase,
     thumbGenProgress,
+    thumbGenPhaseLabel,
+    thumbGenResultsLabel,
+    thumbGenHardwareLabel,
+    thumbGenExecutionDetails,
+    thumbGenSummaryTitle,
     restoreThumbGenProgress,
     startFullThumbnailGeneration,
     startIncrementalThumbnailGeneration,

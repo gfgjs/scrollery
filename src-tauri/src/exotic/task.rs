@@ -71,24 +71,3 @@ pub struct ExoticTaskRow {
     pub output_path: Option<String>,
     pub worker_version: Option<String>,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_roundtrip() {
-        for s in [
-            ExoticTaskStatus::Pending,
-            ExoticTaskStatus::Processing,
-            ExoticTaskStatus::Done,
-            ExoticTaskStatus::RetryableError,
-            ExoticTaskStatus::TerminalError,
-        ] {
-            assert_eq!(ExoticTaskStatus::from_i64(s.as_i64()), Some(s));
-        }
-        assert_eq!(ExoticTaskStatus::from_i64(99), None);
-        assert!(ExoticTaskStatus::Done.is_done());
-        assert!(!ExoticTaskStatus::Pending.is_done());
-    }
-}

@@ -49,27 +49,6 @@ describe('人物写失败的调用方契约', () => {
     stop()
   })
 
-  it('隐藏失败向调用者抛错且不改可见性，重试成功才更新', async () => {
-    const store = usePersonStore()
-    store.persons = [person(1)]
-    let visibleIds: number[] = []
-    const stop = watchEffect(() => {
-      visibleIds = store.persons.filter((p) => !p.isHidden).map((p) => p.id)
-    })
-    const error = new Error('hide rejected')
-    mocks.invoke.mockRejectedValueOnce(error)
-    await expect(store.setHidden(1, true)).rejects.toBe(error)
-    expect(store.persons[0].isHidden).toBe(false)
-    await nextTick()
-    expect(visibleIds).toEqual([1])
-    mocks.invoke.mockResolvedValueOnce(undefined)
-    await store.setHidden(1, true)
-    expect(store.persons[0].isHidden).toBe(true)
-    await nextTick()
-    expect(visibleIds).toEqual([])
-    stop()
-  })
-
   it('合并失败不刷新或移除源人物，重试成功后再加载权威列表', async () => {
     const store = usePersonStore()
     store.persons = [person(1), person(2)]

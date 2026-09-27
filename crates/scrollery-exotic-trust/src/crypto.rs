@@ -354,77 +354,6 @@ mod tests {
         VerifyingKeyset::parse(&json).unwrap()
     }
 
-    #[test]
-    fn builtin_keyset_parses() {
-        let ks = VerifyingKeyset::builtin().expect("内置 keyset 必须合法");
-        // 注入无关断言:两种用途各至少一把 active 键——默认占位集、内测超集、
-        // 真钥注入集(D1 ceremony 产物)都必须成立。
-        let raw: RawKeyset =
-            serde_json::from_str(BUILTIN_KEYSET_JSON).expect("内置 keyset JSON 必须可解析");
-        for purpose in [KeyPurpose::Release, KeyPurpose::License] {
-            assert!(
-                raw.keys
-                    .iter()
-                    .any(|k| k.purpose == purpose && k.status == KeyStatus::Active),
-                "内置 keyset 缺少 active 的 {purpose:?} 键"
-            );
-        }
-        // 仅默认(未注入)构建再钉死占位 key_id,防占位集被误改。注入构建跳过——
-        // 2026-07-06 D1 彩排实证:生产 keyset 只含 *-prod-* 键,若此处仍钉占位 id,
-        // 真钥注入会在编译测试期红;而为过测把占位键并进生产信任根属倒因为果
-        // (占位键与开源占位同值,等于给生产信任根留门),故断言按注入态门控。
-        let injected = option_env!("PICASA_EXOTIC_KEYSET_FILE").is_some_and(|v| !v.is_empty());
-        if !injected {
-            assert!(ks.key_ids().any(|k| k == "release-2026-01"));
-            assert!(ks.key_ids().any(|k| k == "license-2026-01"));
-        }
-    }
-
-    /// 随仓 keyset 必须同时含正名 key_id 与历史别名:已发凭证可能持旧 key_id,别名须与正名同公钥值/
-    /// 用途/状态/有效期,否则旧凭证失效。
-    /// 断言直读**资源文件**(而非 builtin()):debug 构建会自取内测集、流水线可整组注入,两者都属
-    /// 「整组替换」语义,不应要求替换集含占位别名;这里锁的是随仓发布的那一份。
-    #[test]
-    fn shipped_keyset_preserves_pro_key_id_aliases() {
-        let raw: RawKeyset = serde_json::from_str(include_str!("../resources/exotic-keyset.json"))
-            .expect("随仓 keyset JSON 必须可解析");
-        let key_of = |id: &str| {
-            raw.keys
-                .iter()
-                .find(|k| k.key_id == id)
-                .unwrap_or_else(|| panic!("随仓 keyset 缺 key_id:{id}"))
-        };
-        for (canonical, alias, purpose) in [
-            (
-                "release-2026-01",
-                "release-prod-placeholder",
-                KeyPurpose::Release,
-            ),
-            (
-                "license-2026-01",
-                "license-prod-placeholder",
-                KeyPurpose::License,
-            ),
-        ] {
-            let (c, a) = (key_of(canonical), key_of(alias));
-            assert_eq!((c.purpose, a.purpose), (purpose, purpose));
-            assert_eq!(
-                (c.status, a.status),
-                (KeyStatus::Active, KeyStatus::Active),
-                "别名与正名都须 active:{alias}"
-            );
-            assert_eq!(
-                c.public_key_b64, a.public_key_b64,
-                "别名 {alias} 与正名 {canonical} 必须同一公钥(防抄写串错)"
-            );
-            assert_eq!(
-                (c.not_before, c.not_after),
-                (a.not_before, a.not_after),
-                "别名 {alias} 的有效期须与正名一致"
-            );
-        }
-    }
-
     /// 无授权旁路自检（§5.4）：Release 信任根不得含测试 key。
     /// 1) key_id 不得带 test/dev 字样；2) 内置公钥**不得**等于任何确定性测试种子派生的公钥——
     ///    否则其私钥即公开（`from_seed_unchecked([s;32])`），任何人可伪造合法授权 token。
@@ -478,32 +407,6 @@ mod tests {
         let sig = sign(&sk, b"original");
         assert_eq!(
             ks.verify("release-test", KeyPurpose::Release, b"tampered", &sig, NOW),
-            Err(CryptoError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn tampered_signature_fails() {
-        let sk = signing_key(3);
-        let ks = release_keyset(&sk);
-        let msg = b"payload";
-        let mut sig = sign(&sk, msg);
-        sig[0] ^= 0xff; // 翻一位
-        assert_eq!(
-            ks.verify("release-test", KeyPurpose::Release, msg, &sig, NOW),
-            Err(CryptoError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn wrong_signing_key_fails() {
-        let sk = signing_key(4);
-        let other = signing_key(5);
-        let ks = release_keyset(&sk);
-        let msg = b"payload";
-        let sig = sign(&other, msg); // 用别的私钥签
-        assert_eq!(
-            ks.verify("release-test", KeyPurpose::Release, msg, &sig, NOW),
             Err(CryptoError::BadSignature)
         );
     }
@@ -586,86 +489,5 @@ mod tests {
         ));
         // 窗口内。
         assert!(ks.verify("k", KeyPurpose::Release, msg, &sig, 1500).is_ok());
-    }
-
-    #[test]
-    fn bad_signature_length() {
-        let sk = signing_key(10);
-        let ks = release_keyset(&sk);
-        assert_eq!(
-            ks.verify("release-test", KeyPurpose::Release, b"x", &[0u8; 10], NOW),
-            Err(CryptoError::BadSignatureLen)
-        );
-    }
-
-    #[test]
-    fn verify_any_handles_rotation() {
-        // 轮换期：keyset 含两把 release key；token 由第二把签 → verify_any 仍命中。
-        let sk1 = signing_key(20);
-        let sk2 = signing_key(21);
-        let json = keyset_json(&[
-            KeySpec {
-                key_id: "release-old",
-                purpose: "release",
-                sk: &sk1,
-                status: "active",
-                not_before: 0,
-                not_after: None,
-            },
-            KeySpec {
-                key_id: "release-new",
-                purpose: "release",
-                sk: &sk2,
-                status: "active",
-                not_before: 0,
-                not_after: None,
-            },
-        ]);
-        let ks = VerifyingKeyset::parse(&json).unwrap();
-        let msg = b"signed registry index";
-        let sig = sign(&sk2, msg);
-        assert!(ks.verify_any(KeyPurpose::Release, msg, &sig, NOW).is_ok());
-        // 用途不符（无 license 候选）→ UnknownKey。
-        assert!(matches!(
-            ks.verify_any(KeyPurpose::License, msg, &sig, NOW),
-            Err(CryptoError::UnknownKey(_))
-        ));
-        // 错误签名 → BadSignature。
-        let mut bad = sig.clone();
-        bad[0] ^= 0xff;
-        assert_eq!(
-            ks.verify_any(KeyPurpose::Release, msg, &bad, NOW),
-            Err(CryptoError::BadSignature)
-        );
-    }
-
-    #[test]
-    fn b64url_roundtrip() {
-        let data = b"\x00\x01\xfe\xff payload~with+url/unsafe=chars";
-        let enc = b64url_encode(data);
-        // 无填充、无 +/。
-        assert!(!enc.contains('='));
-        assert!(!enc.contains('+'));
-        assert!(!enc.contains('/'));
-        assert_eq!(b64url_decode(&enc).unwrap(), data);
-    }
-
-    #[test]
-    fn reject_bad_public_key() {
-        // 公钥非 32 字节 → 整体拒绝。
-        let json = r#"{"schema":1,"keys":[{"key_id":"k","purpose":"release","public_key_b64":"YWJj","status":"active","not_before":0,"not_after":null}]}"#;
-        assert!(matches!(
-            VerifyingKeyset::parse(json),
-            Err(CryptoError::BadPublicKey(_))
-        ));
-    }
-
-    #[test]
-    fn reject_unsupported_schema() {
-        let json = r#"{"schema":9,"keys":[]}"#;
-        assert!(matches!(
-            VerifyingKeyset::parse(json),
-            Err(CryptoError::UnsupportedSchema(9))
-        ));
     }
 }

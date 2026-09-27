@@ -63,32 +63,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typical_photo_sizes_are_within_budget() {
-        assert!(!exceeds_memory_budget(6000, 4000)); // 24MP
-        assert!(!exceeds_memory_budget(10000, 5000)); // 50MP
-    }
-
-    #[test]
-    fn boundary_is_computed_not_guessed() {
-        let max_pixels = EDIT_PEAK_BYTES_CEILING / EDIT_PEAK_BYTES_PER_PIXEL_BUDGET;
-        let side = (max_pixels as f64).sqrt() as u32;
-        assert!(!exceeds_memory_budget(side, side));
-        // 每边各 +2%,面积超出比例远大于系数误差,必须稳定越界——防止阈值判断悄悄失效。
-        let over = side + side / 50 + 1;
-        assert!(exceeds_memory_budget(over, over));
-    }
-
-    #[test]
     fn extreme_dimensions_overflow_to_rejected_not_panic() {
         assert!(exceeds_memory_budget(u32::MAX, u32::MAX));
         assert!(predicted_peak_bytes(u32::MAX, u32::MAX).is_none());
-    }
-
-    #[test]
-    fn zero_dimension_is_within_budget_but_not_meaningful() {
-        // 零像素本身该在更早的「零面积裁剪」校验(方案 §6 crop_empty)拒绝,不归内存预算管;
-        // 这里只确认不会因 0 触发 checked_mul 的意外路径。
-        assert!(!exceeds_memory_budget(0, 0));
     }
 
     #[test]

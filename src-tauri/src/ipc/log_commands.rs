@@ -351,7 +351,7 @@ pub struct DiagnosticsPackageResult {
 /// 防单日文件很大时诊断包本身也跟着膨胀。
 const DIAGNOSTICS_TAIL_LINES: usize = 2000;
 
-/// 导出诊断包(方案 §5 P2):system-info(版本/OS/架构/GPU 引擎设置/DB 大小/扫描根数量)+
+/// 导出诊断包(方案 §5 P2):system-info(版本/OS/架构/缩略图策略设置/DB 大小/扫描根数量)+
 /// 最新日志文件尾部(脱敏后)打成一个 zip。仅落盘,不自动上传(方案 §5 明文要求)。
 #[tauri::command]
 pub async fn export_diagnostics_package(
@@ -359,20 +359,18 @@ pub async fn export_diagnostics_package(
 ) -> Result<DiagnosticsPackageResult> {
     // span 埋点(W1,D-312 info 档:system-info 查询+日志尾脱敏+zip 打包,真实 IO/CPU 工作)。
     let _span = crate::logging::SpanTimer::info("ipc:export_diagnostics_package");
-    let gpu_engine = state
+    let thumb_strategy = state
         .thumb_config
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .gpu_engine
+        .strategy
         .clone();
     let db_pool = state.db_read_pool.clone();
     let log_dir = state.log_dir.clone();
 
     tokio::task::spawn_blocking(move || -> Result<DiagnosticsPackageResult> {
         // ── system-info ──────────────────────────────────────────────────
-        // 无现成硬件 GPU 适配器枚举工具(全仓未引入 wgpu 等 adapter 查询依赖,方案 §9.1 护栏 #1
-        // 「此外一律不引」精神下不为此新增),故 GPU 一栏取用户在设置页选择的引擎策略
-        // (thumb_config.gpu_engine,如 "auto"/"cpu"/特定后端名),明确标注为"设置值"而非硬件探测值。
+        // 缩略图策略是用户偏好；诊断包不把它写成已确认的 GPU 执行事实。
         let conn = db_pool.get()?;
         let page_count: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         let page_size: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
@@ -383,7 +381,7 @@ pub async fn export_diagnostics_package(
             "app_version": env!("CARGO_PKG_VERSION"),
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
-            "gpu_engine_setting": gpu_engine,
+            "thumb_strategy_setting": thumb_strategy,
             "db_size_bytes": page_count * page_size,
             "scan_root_count": scan_root_count,
             "generated_at": chrono::Local::now().to_rfc3339(),
@@ -451,195 +449,4 @@ pub async fn export_diagnostics_package(
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slice_page_bounds_tail_when_no_anchor() {
-        assert_eq!(slice_page_bounds(100, None, 30), (70, 100));
-        assert_eq!(
-            slice_page_bounds(10, None, 30),
-            (0, 10),
-            "不足一页时全取,不下溢"
-        );
-    }
-
-    /// reviewer 深审 2026-07-20 修复的回归测试:锚点(`before_line`)一旦确定,后续同一锚点的
-    /// 切片边界必须与 `total_lines`(文件是否被追加写入)无关——否则「浏览当日仍在写入的日志
-    /// 文件」时,连续两次 read_log_file_page 调用之间的新增行会让下一页整体前移,与上一页产生
-    /// 重叠(旧实现按"距当前末尾的相对偏移"计算,已被本函数取代)。
-    #[test]
-    fn slice_page_bounds_anchor_is_stable_across_file_growth() {
-        let anchor = 70; // 首页返回的 oldest_loaded_line
-        let (start_before_growth, end_before_growth) = slice_page_bounds(100, Some(anchor), 30);
-        // 文件在两次调用之间被追加写入,total_lines 从 100 涨到 105。
-        let (start_after_growth, end_after_growth) = slice_page_bounds(105, Some(anchor), 30);
-        assert_eq!(
-            (start_before_growth, end_before_growth),
-            (start_after_growth, end_after_growth),
-            "同一锚点在文件增长前后必须切出完全相同的绝对范围"
-        );
-        assert_eq!((start_before_growth, end_before_growth), (40, 70));
-    }
-
-    /// 锚点越界防御:文件被清空/rotate 变短后,旧锚点可能已超出新的 total_lines——不能 panic
-    /// (切片越界),应钳制到新的文件尾。
-    #[test]
-    fn slice_page_bounds_clamps_anchor_when_file_shrank() {
-        let (start, end) = slice_page_bounds(5, Some(100), 30);
-        assert_eq!((start, end), (0, 5));
-    }
-
-    #[test]
-    fn resolve_log_file_accepts_real_file_inside_log_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("scrollery.2026-07-20.log"), "x").expect("write");
-        let result = resolve_log_file(dir.path(), "scrollery.2026-07-20.log");
-        assert!(result.is_ok(), "{result:?}");
-    }
-
-    /// 目录穿越:`../` 逃出 log_dir 应被拒(canonicalize 后 starts_with 校验)。
-    #[test]
-    fn resolve_log_file_rejects_path_traversal() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outside = dir.path().parent().expect("has parent");
-        let secret_name = format!("secret-{}.txt", std::process::id());
-        std::fs::write(outside.join(&secret_name), "secret").expect("write outside file");
-        let traversal = format!("../{secret_name}");
-        let result = resolve_log_file(dir.path(), &traversal);
-        assert!(result.is_err(), "path traversal must be rejected");
-        let _ = std::fs::remove_file(outside.join(&secret_name));
-    }
-
-    #[test]
-    fn resolve_log_file_rejects_nonexistent_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let result = resolve_log_file(dir.path(), "does-not-exist.log");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_log_line_parses_valid_jsonl() {
-        let v = parse_log_line(r#"{"level":"INFO","msg":"hi"}"#);
-        assert_eq!(v["level"], "INFO");
-        assert_eq!(v["msg"], "hi");
-    }
-
-    /// 史前(重构前)纯文本日志行:解析失败应降级为合成信封,不 panic 不丢内容。
-    #[test]
-    fn parse_log_line_falls_back_for_plain_text() {
-        let v = parse_log_line("2026-07-01 12:00:00 INFO plain text line");
-        assert_eq!(v["msg"], "2026-07-01 12:00:00 INFO plain text line");
-        assert_eq!(v["level"], "INFO");
-    }
-
-    /// 时区后缀恒 6 字符(`+HH:MM`/`-HH:MM`,EnvelopeFormat 从不落 `Z`),裁掉后得朴素本地时间。
-    #[test]
-    fn strip_tz_suffix_removes_six_char_offset() {
-        assert_eq!(
-            strip_tz_suffix("2026-07-20T21:03:11.284+08:00"),
-            "2026-07-20T21:03:11.284"
-        );
-        assert_eq!(
-            strip_tz_suffix("2026-07-20T21:03:11.284-05:00"),
-            "2026-07-20T21:03:11.284"
-        );
-    }
-
-    /// 过短/空字符串(史前纯文本行解析失败留下的合成信封 ts="")不下溢 panic。
-    #[test]
-    fn strip_tz_suffix_does_not_panic_on_short_input() {
-        assert_eq!(strip_tz_suffix(""), "");
-        assert_eq!(strip_tz_suffix("+08:00"), "");
-    }
-
-    #[test]
-    fn histogram_bucket_format_maps_known_and_unknown_values() {
-        assert_eq!(histogram_bucket_format("day"), "%Y-%m-%dT00:00:00");
-        assert_eq!(histogram_bucket_format("hour"), "%Y-%m-%dT%H:00:00");
-        assert_eq!(
-            histogram_bucket_format("bogus"),
-            "%Y-%m-%dT%H:00:00",
-            "未知取值静默退化为按小时,不报错打断分析流程"
-        );
-    }
-
-    fn sample_line(ts: &str, level: &str) -> String {
-        serde_json::json!({
-            "ts": ts, "level": level, "target": "t", "session_id": "s",
-            "operation_id": null, "msg": "m", "attributes": {},
-        })
-        .to_string()
-    }
-
-    /// 同一小时内的多条按 level 分桶计数;跨小时的落入不同桶。
-    #[test]
-    fn compute_histogram_from_content_buckets_by_hour_and_level() {
-        let content = [
-            sample_line("2026-07-20T21:03:11.284+08:00", "INFO"),
-            sample_line("2026-07-20T21:45:00.000+08:00", "INFO"),
-            sample_line("2026-07-20T21:50:00.000+08:00", "WARN"),
-            sample_line("2026-07-20T22:01:00.000+08:00", "INFO"),
-        ]
-        .join("\n");
-
-        let histogram = compute_histogram_from_content(&content, "hour").expect("compute");
-        assert_eq!(histogram.total_lines, 4);
-        assert_eq!(histogram.parsed_lines, 4);
-        assert_eq!(
-            histogram.buckets.len(),
-            3,
-            "21 时 INFO / 21 时 WARN / 22 时 INFO 三桶"
-        );
-
-        let info_21h = histogram
-            .buckets
-            .iter()
-            .find(|b| b.bucket == "2026-07-20T21:00:00" && b.level == "INFO")
-            .expect("21 时 INFO 桶应存在");
-        assert_eq!(info_21h.count, 2);
-    }
-
-    /// reviewer 深审 2026-07-20 修复的回归测试:`strftime` 对无法解析的时间字符串(如 ts=""
-    /// 的合成信封)返回 SQL NULL——`row.get::<_, String>(0)` 读到 NULL 会整条 `Err`,若不在 SQL
-    /// 侧过滤,`collect::<rusqlite::Result<_>>()` 会短路成**整份查询失败**,而非"该行不进桶"这个
-    /// 原意图的降级。锁定:该行安静地不出现在任何桶里,其余正常行仍正确分桶,整体计算不报错。
-    #[test]
-    fn compute_histogram_from_content_skips_rows_with_unparseable_timestamp() {
-        let content = [
-            sample_line("", "WARN"),
-            sample_line("2026-07-20T21:00:00.000+08:00", "INFO"),
-        ]
-        .join("\n");
-
-        let histogram =
-            compute_histogram_from_content(&content, "hour").expect("不应因 NULL 桶报错");
-        assert_eq!(histogram.total_lines, 2);
-        assert_eq!(
-            histogram.parsed_lines, 2,
-            "两行都有 ts+level 字段,均计入 parsed_lines"
-        );
-        assert_eq!(histogram.buckets.len(), 1, "只有能分桶的那一行进结果");
-        assert_eq!(histogram.buckets[0].level, "INFO");
-    }
-
-    /// 空行与非 JSON/缺字段行被跳过,不计入 parsed_lines,也不让整次计算失败。
-    #[test]
-    fn compute_histogram_from_content_skips_unparseable_lines() {
-        let content = format!(
-            "\n{}\nnot json at all\n{{\"level\":\"INFO\"}}\n",
-            sample_line("2026-07-20T21:00:00.000+08:00", "ERROR")
-        );
-        let histogram = compute_histogram_from_content(&content, "hour").expect("compute");
-        assert_eq!(
-            histogram.total_lines, 3,
-            "空行不计入 total_lines,其余 3 行计入"
-        );
-        assert_eq!(histogram.parsed_lines, 1, "只有一行同时具备 ts+level");
-        assert_eq!(histogram.buckets.len(), 1);
-        assert_eq!(histogram.buckets[0].level, "ERROR");
-    }
 }

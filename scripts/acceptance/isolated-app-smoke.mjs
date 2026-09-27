@@ -8,7 +8,7 @@
 // (identifier=com.scrollery.app.acceptance,productName=Scrollery Acceptance)。本脚本据此做三件事:
 //   1) 库/缓存/日志/设置全部落在 Windows 解析出的 Roaming 目录下的 com.scrollery.app.acceptance
 //      (硬守卫 + 内容核对,绝不碰用户真实库);
-//   2) 媒体夹具在本脚本的临时根目录生成,不读用户照片;
+//   2) 媒体夹具在临时根生成；仅 representative 阶段只读显式提供的 --sample-dir;
 //   3) 只操作自己拉起的进程 PID,不安装/卸载用户已装应用。
 //
 // 阶段(--stage):
@@ -36,6 +36,7 @@
 //        [--install] [--install-only] [--uninstall-after]
 //        [--report-tag=<tag>]  报告另存为 acceptance-report-<stage>-<tag>.json(负向对照用)
 //        [--record-build] [--probe-build] [--selftest]
+//        [--native-debugger=<cdb.exe>] thumbnails阶段附加自有worker，运行仅供故障诊断
 // 启动前强制三道门(任一不过即拒绝,且都发生在 spawn 之前——普通构建 setup 期就会写用户库):
 //   ① exe 字节内烙有验收 identifier(编译期常量;普通构建烙的是 com.scrollery.app);
 //   ② exe 的版本资源 ProductName 等于验收配置的 productName(独立第二条证据,经 FileVersionInfo 读);
@@ -71,7 +72,7 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const ACCEPTANCE_IDENTIFIER = 'com.scrollery.app.acceptance';
 const USER_IDENTIFIER = 'com.scrollery.app';
 const EOL = '\n';
-const STAGES = ['boot', 'ready', 'chain', 'enhance'];
+const STAGES = ['boot', 'ready', 'chain', 'enhance', 'thumbnails', 'thumbnail-lifecycle', 'thumbnail-crash', 'thumbnail-ui', 'thumbnail-logs', 'thumbnail-video-crash', 'thumbnail-restore', 'thumbnail-interaction', 'thumbnail-live-addition', 'thumbnail-representative', 'thumbnail-manual-focus'];
 // 用户已装应用默认落点(NSIS currentUser):验收脚本绝不触碰;落点经 Windows known folder 解析
 // 得到(userInstallDir),不用环境变量拼路径。
 
@@ -244,6 +245,8 @@ function proofPath() {
 
 export function recordBuildProof(exe, outPath) {
   const { cfg, info } = assertAcceptanceIdentity(exe);
+  const nativeWorkerBytes = fs.readFileSync(path.join(path.dirname(exe), "native-thumbnail-worker.exe"));
+  const nativeWorker = { sha256: sha256Buf(nativeWorkerBytes), bytes: nativeWorkerBytes.length };
   const proof = {
     format: 'scrollery-acceptance-build-proof/1',
     exe: relOrAbs(exe),
@@ -261,9 +264,15 @@ export function recordBuildProof(exe, outPath) {
     // 安装包与包内主程序的指纹。为什么必须一起绑定:target/release 的 exe 是占位符还原版(UNK),
     // 真正装给用户的是包内那份(带 msi/nsis 补丁),二者字节不同。只记 exe hash 回答不了
     // 「装出来的那份是不是这批产物」,故此处把安装包与包内主程序一并钉住。
-    bundle: collectBundleFingerprints(info.exeBytes),
+    nativeWorker,
+    bundle: collectBundleFingerprints(info.exeBytes, nativeWorker.bytes),
     recordedAtUtc: new Date().toISOString(),
   };
+  for (const installer of proof.bundle.installers.filter(item => path.basename(item.path).startsWith(cfg.productName + '_'))) {
+    if (installer.payloadNativeWorker?.sha256 !== nativeWorker.sha256) {
+      throw new Error('Native worker differs from acceptance bundle: ' + installer.path + '; restore the staged native-vpl worker before recording proof');
+    }
+  }
   const target = outPath || proofPath();
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, JSON.stringify(proof, null, 2) + EOL);
@@ -289,6 +298,10 @@ export function assertBuildProof(exe, atPath) {
     problems.push('验收配置在记证之后被改动,须重新构建并 --record-build');
   }
   if (proof.identifier !== ACCEPTANCE_IDENTIFIER) problems.push('证明记录的 identifier 异常:' + String(proof.identifier));
+  const workerPath = path.join(path.dirname(exe), 'native-thumbnail-worker.exe');
+  if (!proof.nativeWorker || !fs.existsSync(workerPath) || sha256Buf(fs.readFileSync(workerPath)) !== proof.nativeWorker.sha256) {
+    problems.push('native worker 缺失或与构建证明不同，须核对包内载荷并重新记证');
+  }
   if (problems.length) throw new Error('验收构建证明校验失败:' + EOL + '  - ' + problems.join(EOL + '  - '));
   return { proof, info, proofPath: p };
 }
@@ -621,7 +634,8 @@ function killOurProcess(child) {
   if (pid) spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
 }
 
-async function attachCdp(port, timeoutMs) {
+async function attachCdp(port, timeoutMs, windowLabel = 'main') {
+  let pageIndex = 0;
   const deadline = Date.now() + timeoutMs;
   let lastErr = '未开始';
   for (;;) {
@@ -629,16 +643,28 @@ async function attachCdp(port, timeoutMs) {
       const res = await fetch('http://127.0.0.1:' + port + '/json/list');
       if (res.ok) {
         const targets = await res.json();
-        const page = targets.find((t) => t.type === 'page');
+        const pages = targets.filter((t) => t.type === 'page');
+        const page = pages[pageIndex++ % pages.length];
         if (page) {
           const ws = new WebSocket(page.webSocketDebuggerUrl);
           await new Promise((resolve, reject) => {
             ws.onopen = resolve;
             ws.onerror = () => reject(new Error('ws 连接失败'));
           });
-          return { cdp: new Cdp(ws), pageUrl: page.url, close: () => ws.close() };
+          const cdp = new Cdp(ws);
+          let ready = false;
+          try {
+            // WebView初始页面早于Tauri桥接出现；这里只读就绪状态，身份核对仍先于所有写IPC。
+            const probe = await evaluate(cdp,
+              '({ ready: document.readyState === "complete" && typeof window.__TAURI_INTERNALS__?.invoke === "function", url: location.href, label: window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label })', 5000);
+            ready = probe?.ready === true && probe.label === windowLabel;
+            if (ready) return { cdp, pageUrl: probe.url, close: () => ws.close() };
+            lastErr = 'page尚未完成Tauri桥接:' + probe?.url;
+          } finally {
+            if (!ready) ws.close();
+          }
         }
-        lastErr = '无 page 目标(现有:' + targets.map((t) => t.type).join(',') + ')';
+        if (!page) lastErr = '无 page 目标(现有:' + targets.map((t) => t.type).join(',') + ')';
       } else {
         lastErr = 'HTTP ' + res.status;
       }
@@ -838,7 +864,7 @@ function countFiles(dir, ext) {
 }
 
 function listPayload(exeDir) {
-  const want = ['raw-worker.exe', 'ai-worker.exe', 'video-worker.exe', 'enhance-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll'];
+  const want = ['native-thumbnail-worker.exe', 'raw-worker.exe', 'ai-worker.exe', 'video-worker.exe', 'enhance-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll'];
   const present = [];
   const missing = [];
   for (const n of want) {
@@ -1000,7 +1026,7 @@ function extractPayloadExe(installer, exeName, expectedSize) {
 }
 
 // 收集 bundle 产物指纹(安装包本身 + 各自包内主程序),供构建证明绑定与安装取证比对。
-function collectBundleFingerprints(expectedPayloadSize) {
+function collectBundleFingerprints(expectedPayloadSize, expectedWorkerSize) {
   const out = { installers: [], note: null, sevenZip: Boolean(find7z()) };
   const bundleRoot = path.join(REPO, 'target', 'release', 'bundle');
   if (!fs.existsSync(bundleRoot)) {
@@ -1025,6 +1051,8 @@ function collectBundleFingerprints(expectedPayloadSize) {
     };
     const payload = extractPayloadExe(installer, 'scrollery.exe', expectedPayloadSize);
     if (payload) rec.payloadExe = { sha256: payload.sha256, bytes: payload.bytes, entry: payload.entry };
+    const nativePayload = extractPayloadExe(installer, 'native-thumbnail-worker.exe', expectedWorkerSize);
+    if (nativePayload) rec.payloadNativeWorker = nativePayload;
     out.installers.push(rec);
   }
   if (!out.sevenZip) out.note = '未找到 7z,安装包内载荷指纹未记录';
@@ -1421,6 +1449,7 @@ async function stageReady(ctx) {
   // session 在 try 之外先置空:attach 失败也必须走 finally 回收**自己 spawn 的**进程
   // (attach 抛错时若只有 try 内的 finally,进程会留在后台继续跑)。
   let session = null;
+  let lifecycleSaved;
   try {
     session = await attachCdp(port, ctx.timeoutMs);
     const cdp = session.cdp;
@@ -1456,7 +1485,54 @@ async function stageReady(ctx) {
         exotFrame, exotTakeFrame,
       });
     }
-    await runStep('ready:clean-exit', async () => {
+    if (ctx.stage === 'thumbnail-manual-focus') {
+      const { verifyThumbnailManualFocus } = await import('./thumbnail-manual-focus.mjs');
+      await verifyThumbnailManualFocus(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel,
+        attachLogs: () => attachCdp(ctx.port, ctx.timeoutMs, 'logs') });
+    }
+    if (ctx.stage === 'thumbnail-representative') {
+      const { startOwnedResourceSampler } = await import('./owned-resource-sampler.mjs');
+      const { verifyThumbnailRepresentative } = await import('./thumbnail-representative.mjs');
+      const sampler = await startOwnedResourceSampler(ctx, child.pid, OWN_CHILDREN);
+      try {
+        await verifyThumbnailRepresentative(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree, ownedPid: child.pid });
+      } finally { await sampler.stop(); }
+    }
+    if (ctx.stage === 'thumbnail-live-addition') {
+      const { verifyThumbnailLiveAddition } = await import('./thumbnail-live-addition.mjs');
+      await verifyThumbnailLiveAddition(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree });
+    }
+    if (ctx.stage === 'thumbnail-interaction') {
+      const { verifyThumbnailInteraction } = await import('./thumbnail-interaction.mjs');
+      await verifyThumbnailInteraction(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree,
+        attachLogs: () => attachCdp(ctx.port, ctx.timeoutMs, 'logs') });
+    }
+    if (ctx.stage === 'thumbnail-logs') {
+      const { verifyThumbnailLogs } = await import('./thumbnail-logs.mjs');
+      await verifyThumbnailLogs(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel,
+        attachLogs: () => attachCdp(ctx.port, ctx.timeoutMs, 'logs') });
+    }
+    if (ctx.stage === 'thumbnails') {
+      const { verifyThumbnails } = await import('./thumbnail-gates.mjs');
+      const nativeDebugger = arg('native-debugger', null);
+      const beforeCancel = nativeDebugger ? async () => {
+        const { attachNativeDebuggers } = await import('./native-debugger.mjs');
+        return attachNativeDebuggers({ ...ctx, nativeDebugger }, child.pid, OWN_CHILDREN);
+      } : null;
+      await verifyThumbnails(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, waitChannelCount, walkDirectoryTree, beforeCancel });
+    }
+    if (ctx.stage === 'thumbnail-lifecycle' || ctx.stage === 'thumbnail-crash' || ctx.stage === 'thumbnail-video-crash' || ctx.stage === 'thumbnail-restore' || ctx.stage === 'thumbnail-ui') {
+      const { verifyThumbnailLifecycle } = await import('./thumbnail-lifecycle.mjs');
+      const saved = await verifyThumbnailLifecycle(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree });
+      if (ctx.stage !== 'thumbnail-ui') lifecycleSaved = saved;
+    }
+    if (ctx.stage === 'thumbnail-crash' || ctx.stage === 'thumbnail-video-crash') {
+      const { interruptThumbnailRun } = await import('./thumbnail-lifecycle.mjs');
+      lifecycleSaved = await interruptThumbnailRun(ctx, cdp, { runStep, ipc }, lifecycleSaved, async () => {
+        killOurProcess(child);
+        await waitExit(child, 10000);
+      });
+    } else await runStep('ready:clean-exit', async () => {
       const code = await requestCleanExit(cdp, child);
       if (code !== 0) throw new Error('exit_app 后退出码 ' + code + '(期望 0:退出路径含 WAL checkpoint)');
       return { exitCode: code };
@@ -1468,6 +1544,44 @@ async function stageReady(ctx) {
     // 这里读日志是补充证据,不是唯一判据。
     await runStep('ready:backend-ready-log', () => {
       const logs = readLogs(path.join(ctx.appDataDir, 'logs'));
+      fs.mkdirSync(ctx.logDir, { recursive: true });
+      fs.writeFileSync(path.join(ctx.logDir, ctx.stage + '-backend.jsonl'), logs);
+      if (ctx.manualFocusRounds) {
+        const summaries = logs.split(/\r?\n/).flatMap((line) => {
+          try { const row = JSON.parse(line); return row.msg === 'thumbnail run summary' ? [row] : []; }
+          catch { return []; }
+        });
+        ctx.manualFocusQos = ctx.manualFocusRounds.map((round) => {
+          const rows = summaries.filter((row) => Date.parse(row.ts) >= round.startTimeMs && Date.parse(row.ts) <= round.endTimeMs);
+          const expected = round.focus.main || round.focus.logs;
+          if (!rows.length || rows.at(-1).attributes.qos_foreground !== expected) {
+            throw new Error('收口焦点与后端 QoS 不一致: ' + JSON.stringify({ focus: round.focus, last: rows.at(-1) }));
+          }
+          const last = rows.at(-1).attributes;
+          const receipt = String(last.qos_native_current);
+          if (!/accepted: [1-9]\d*/.test(receipt) || !receipt.includes('failed: 0') || !receipt.includes('applying: 0')) {
+            throw new Error('原生线程 QoS 未确认: ' + receipt);
+          }
+          return { label: round.focus.label, foreground: last.qos_foreground, revision: last.qos_revision,
+            native: last.qos_native_current, host: last.qos_host_current,
+            observedForegroundStates: [...new Set(rows.map((row) => row.attributes.qos_foreground))] };
+        });
+        const [mainRound, logsRound] = ctx.manualFocusRounds;
+        const internalRequests = logs.split(/\r?\n/).flatMap((line) => {
+          try { const row = JSON.parse(line); return row.msg === 'thumbnail host QoS requested' &&
+            Date.parse(row.ts) >= mainRound.endTimeMs && Date.parse(row.ts) <= logsRound.startTimeMs ? [row] : []; }
+          catch { return []; }
+        });
+        if (internalRequests.some((row) => row.attributes.foreground === false)) {
+          throw new Error('主窗到日志窗误切后台: ' + JSON.stringify(internalRequests));
+        }
+      }
+      if (ctx.thumbnailFilterMarkers) {
+        const { hiddenInfo, visibleWarn, visibleInfo } = ctx.thumbnailFilterMarkers;
+        if (logs.includes(hiddenInfo) || !logs.includes(visibleWarn) || !logs.includes(visibleInfo)) {
+          throw new Error('Backend EnvFilter reload did not filter recorded probes');
+        }
+      }
       if (logs.includes('[FATAL]')) throw new Error('启动日志含致命错误');
       const m = logs.match(/Rust boot[^\n]*Ready[^\n]*/);
       // 🔴 为什么**不**拿「日志里必须有 Ready 行」判失败(2026-09-12 单变量实测查明):
@@ -1481,6 +1595,7 @@ async function stageReady(ctx) {
       return {
         sawReadyLine: Boolean(m),
         logChars: logs.length,
+        manualFocusQos: ctx.manualFocusQos,
         rustLogEnv: process.env.RUST_LOG || null,
         note: m
           ? '日志含 Ready 行'
@@ -1492,6 +1607,26 @@ async function stageReady(ctx) {
     if (session) session.close();
     killOurProcess(child);
   }
+  if (lifecycleSaved) {
+    const restarted = await launchWithCdp(ctx, 'thumbnail-restart');
+    let restartedSession;
+    try {
+      restartedSession = await attachCdp(restarted.port, ctx.timeoutMs);
+      await restartedSession.cdp.send('Runtime.enable');
+      await runStep('thumbnail-lifecycle:restart-identity', () => assertAttachedIdentity(restartedSession.cdp, ctx));
+      const { verifyThumbnailLifecycle } = await import('./thumbnail-lifecycle.mjs');
+      await verifyThumbnailLifecycle(ctx, restartedSession.cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree }, lifecycleSaved);
+      await runStep('thumbnail-lifecycle:restart-exit', async () => {
+        const code = await requestCleanExit(restartedSession.cdp, restarted.child);
+        if (code !== 0) throw new Error('Restarted app exit: ' + code);
+        return { exitCode: code };
+      });
+    } finally {
+      restartedSession?.close();
+      killOurProcess(restarted.child);
+    }
+  }
+
 }
 
 // ── 阶段:chain(首启→扫描→缩略图→查看→标记→导出→备份→重启恢复)────────────────
@@ -2134,6 +2269,27 @@ function makeContext() {
   // 目标根:默认放在验收根内(同卷);给了 --target-root 就用它——真给另一块盘时
   // 本次运行会走跨卷「暂存→发布→删源」路径,见 chain 的卷别判定与说明。
   const targetMediaDir = assertControlledRoot(arg('target-root', path.join(root, 'media-target')));
+  let sampleDir;
+  if (stage === 'thumbnail-representative') {
+    const requested = arg('sample-dir', null);
+    if (!requested) throw new Error('representative 阶段要求显式 --sample-dir');
+    sampleDir = fs.realpathSync(requested);
+    if (!fs.statSync(sampleDir).isDirectory()) throw new Error('sample-dir 必须是目录');
+    const canonicalTarget = (value) => {
+      if (fs.existsSync(value)) return fs.realpathSync(value);
+      return path.join(canonicalTarget(path.dirname(value)), path.basename(value));
+    };
+    const contains = (parent, child) => {
+      const relative = path.relative(parent, child);
+      return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
+    };
+    for (const writable of [root, appDataDir, targetMediaDir]) {
+      const canonical = canonicalTarget(writable);
+      if (contains(sampleDir, canonical) || contains(canonical, sampleDir)) {
+        throw new Error('只读样本不能与验收写入目录重叠: ' + canonical);
+      }
+    }
+  }
   const mediaCount = Number(arg('media', '9'));
   if (!Number.isInteger(mediaCount) || mediaCount < 3) throw new Error('--media 至少 3(N 张图,含子目录与非媒体文件)');
   const ctx = {
@@ -2143,6 +2299,7 @@ function makeContext() {
     root,
     mediaDir: path.join(root, 'media'),
     targetMediaDir,
+    sampleDir,
     exportDir: path.join(root, 'export'),
     backupDir: path.join(root, 'backup'),
     logDir: path.join(root, 'logs'),
@@ -2320,6 +2477,9 @@ async function selftest() {
     // 构建证明门:缺证明 / exe 哈希不符 / 配置漂移三种都必须拦下,匹配的证明必须放行。
     const proofFile = path.join(gateTmp, 'proof.json');
     const cfg = readAcceptanceConfig();
+    const workerFixture = path.join(gateTmp, 'native-thumbnail-worker.exe');
+    fs.writeFileSync(workerFixture, 'expected native worker');
+    const testNative = { sha256: sha256Buf(fs.readFileSync(workerFixture)) };
     const tryProof = () => {
       try {
         assertBuildProof(markerOnly, proofFile);
@@ -2330,13 +2490,17 @@ async function selftest() {
     };
     let proofBlocked = 0;
     if (tryProof()) proofBlocked++;
-    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: 'deadbeef', configSha256: cfg.sha256, identifier: ACCEPTANCE_IDENTIFIER }, null, 2));
+    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: 'deadbeef', configSha256: cfg.sha256, identifier: ACCEPTANCE_IDENTIFIER, nativeWorker: testNative }, null, 2));
     if (tryProof()) proofBlocked++;
-    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: analyzeExe(markerOnly).exeSha256, configSha256: 'stale', identifier: ACCEPTANCE_IDENTIFIER }, null, 2));
+    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: analyzeExe(markerOnly).exeSha256, configSha256: 'stale', identifier: ACCEPTANCE_IDENTIFIER, nativeWorker: testNative }, null, 2));
     if (tryProof()) proofBlocked++;
     expect(proofBlocked === 3, '构建证明门漏放(应拦 3 种,实拦 ' + proofBlocked + ' 种)');
-    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: analyzeExe(markerOnly).exeSha256, configSha256: cfg.sha256, identifier: ACCEPTANCE_IDENTIFIER }, null, 2));
+    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: analyzeExe(markerOnly).exeSha256, configSha256: cfg.sha256, identifier: ACCEPTANCE_IDENTIFIER, nativeWorker: testNative }, null, 2));
     expect(tryProof() === false, '构建证明门对匹配的证明误拦');
+    fs.writeFileSync(workerFixture, 'different native worker');
+    expect(tryProof(), '构建证明门未拦下被替换的 native worker');
+    fs.unlinkSync(workerFixture);
+    expect(tryProof(), '构建证明门未拦下缺失的 native worker');
   } finally {
     fs.rmSync(gateTmp, { recursive: true, force: true });
   }
@@ -2581,8 +2745,8 @@ async function main() {
   }
   const t0 = Date.now();
   if (ctx.stage === 'boot') await stageBoot(ctx);
-  else if (ctx.stage === 'ready' || ctx.stage === 'enhance') await stageReady(ctx);
-  else await stageChain(ctx);
+  else if (ctx.stage === 'chain') await stageChain(ctx);
+  else await stageReady(ctx);
   await runStep('isolation:user-library-top-level-unchanged', () => {
     if (!ctx.verifyUserLibrary) return { skipped: '未加 --verify-user-library-untouched' };
     const after = userLibraryTopLevelFingerprint();

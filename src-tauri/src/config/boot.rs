@@ -15,7 +15,6 @@ pub struct ConfigBoot {
     pub thumb_size: u32,
     pub thumb_skip_max_kb: u64,
     pub thumb_strategy: String,
-    pub gpu_engine: String,
     /// `thumb_cache_dir`;空串已归一为 `None`(= 用内置派生路径)。
     pub custom_cache_dir: Option<String>,
     pub log_level: String,
@@ -72,9 +71,6 @@ pub fn init(app_data_dir: &Path) -> ConfigBoot {
     let strategy: String = config_manager
         .get("thumb_strategy")
         .unwrap_or_else(|| "cpu".to_string());
-    let gpu_eng: String = config_manager
-        .get("gpu_engine")
-        .unwrap_or_else(|| "wic".to_string());
     let cache_dir: Option<String> = config_manager
         .get("thumb_cache_dir")
         .filter(|s| !s.is_empty());
@@ -107,7 +103,6 @@ pub fn init(app_data_dir: &Path) -> ConfigBoot {
         thumb_size: size,
         thumb_skip_max_kb: skip,
         thumb_strategy: strategy,
-        gpu_engine: gpu_eng,
         custom_cache_dir: cache_dir,
         log_level: lvl,
         custom_log_dir: l_dir,

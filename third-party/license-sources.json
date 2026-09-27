@@ -1,5 +1,7 @@
 {
   "version": 1,
+  "vplVersion": "2.17.0",
+  "vplCommit": "d77f9195cf495b937631607333288fd917ae8939",
   "ortVersion": "1.26.0",
   "ffmpegSourceVersion": "2aefd64d48",
   "btbnBuildRevision": "8c736b2",
@@ -34,6 +36,20 @@
     }
   ],
   "sources": [
+    {
+      "id": "libvpl-license",
+      "kind": "libvpl",
+      "target": "libvpl/LICENSE",
+      "url": "https://raw.githubusercontent.com/intel/libvpl/d77f9195cf495b937631607333288fd917ae8939/LICENSE",
+      "sha256": "bf1cfac2e2792b6e1e995ce103d70796aecaf2ec7e4c5fe5474f7acec7b4a677"
+    },
+    {
+      "id": "libvpl-third-party-programs",
+      "kind": "libvpl",
+      "target": "libvpl/third-party-programs.txt",
+      "url": "https://raw.githubusercontent.com/intel/libvpl/d77f9195cf495b937631607333288fd917ae8939/third-party-programs.txt",
+      "sha256": "e3c92992b1df02b467ac086d7d3730f4c1fc2c2a1f2c520657c4c9f2085305a3"
+    },
     {
       "id": "onnxruntime-license",
       "kind": "onnxruntime",

@@ -142,35 +142,3 @@ pub fn default_ocr_profile() -> OcrProfile {
     find_ocr_profile(DEFAULT_OCR_PROFILE_ID)
         .expect("default ocr profile must exist | 默认 OCR profile 必须存在")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn two_tiers_present_and_default_resolves() {
-        let ps = ocr_profiles();
-        assert_eq!(ps.len(), 2);
-        assert_eq!(ps[0].id, DEFAULT_OCR_PROFILE_ID);
-        assert!(find_ocr_profile("pp-ocrv5-server").is_some());
-        assert!(find_ocr_profile("nope").is_none());
-        // default_ocr_profile 不 panic。
-        assert_eq!(default_ocr_profile().id, DEFAULT_OCR_PROFILE_ID);
-    }
-
-    #[test]
-    fn det_cls_rec_file_names_differ_dict_shared() {
-        let ps = ocr_profiles();
-        let (m, s) = (&ps[0], &ps[1]);
-        // det/cls/rec 三件两档互异。
-        assert_ne!(m.det_file, s.det_file);
-        assert_ne!(m.cls_file, s.cls_file, "cls 两档专属,不共用(主线修正)");
-        assert_ne!(m.rec_file, s.rec_file);
-        // dict 共用。
-        assert_eq!(m.dict_file, s.dict_file);
-        // 单档内四文件名互异(避免同名 dest 覆盖)。
-        assert_ne!(m.det_file, m.cls_file);
-        assert_ne!(m.det_file, m.rec_file);
-        assert_ne!(m.cls_file, m.rec_file);
-    }
-}

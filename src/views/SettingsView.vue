@@ -263,9 +263,9 @@
                         })
                       }}</span>
                       <span
-                        v-if="scan.thumbGenProgress.isRunning && scan.thumbGenProgress.phase"
+                        v-if="scan.thumbGenProgress.isRunning && scan.thumbGenPhaseLabel"
                         class="thumb-gen-phase"
-                        >[{{ scan.thumbGenProgress.phase }}]</span
+                        >[{{ scan.thumbGenPhaseLabel }}]</span
                       >
                       <span v-else-if="scan.thumbGenProgress.status === 'completed'">{{
                         $t('settings.genStatusCompleted')
@@ -276,6 +276,8 @@
                       <span v-else-if="scan.thumbGenProgress.status === 'error'">{{
                         $t('settings.genStatusError')
                       }}</span>
+                      <span v-if="scan.thumbGenResultsLabel">{{ scan.thumbGenResultsLabel }}</span>
+                      <ThumbExecutionSummary />
                     </div>
                   </div>
                 </template>
@@ -298,8 +300,7 @@
                   <DynamicSettingControl setting-key="thumbSize" class="thumb-size-full" />
                 </template>
               </SettingRow>
-              <!-- gpuEngine 行仅在解码策略=GPU 时可见(rowVisible,与原 v-if 一致) -->
-              <SettingRow v-else-if="rowVisible(key)" :setting-key="key" />
+              <SettingRow v-else :setting-key="key" />
             </template>
           </CollapsibleCard>
 
@@ -496,6 +497,7 @@
 </template>
 
 <script setup lang="ts">
+import ThumbExecutionSummary from '../components/common/ThumbExecutionSummary.vue'
 import { ref, onMounted, computed, onUnmounted, nextTick, watch } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
@@ -595,7 +597,7 @@ const searchCatalog = computed<SettingsSearchResult[]>(() => SETTINGS_GROUPS
     const base = { section: group.section, sectionLabelKey, groupId: group.id, groupLabel }
     if (!group.keys.length) return [{ ...base, id: group.id, label: groupLabel,
       description: group.id === 'backup' ? bt('backup.searchTerms') : '' }]
-    return group.keys.filter(rowVisible).map(key => {
+    return group.keys.map(key => {
       const spec = getSettingSpec(key)!
       return { ...base, id: key, settingKey: key, label: t(spec.label),
         description: [spec.descKey, spec.summaryKey, spec.searchTermsKey].filter((key): key is string => !!key).map(key => t(key)).join(' ') }
@@ -658,11 +660,6 @@ function onBackupCardToggle(open: boolean) {
   if (!open) return
   // 备份卡片高度较大；展开时明确保持存储分区，避免动态内容改变时导航跳走。
   currentSection.value = 'storage'
-}
-
-// gpuEngine 行仅在解码策略=GPU 时显示(注册式重构前的行级 v-if 原样保留,§8)。
-function rowVisible(key: string): boolean {
-  return key !== 'gpuEngine' || config.thumbStrategy === 'gpu'
 }
 
 // 悬停信息元素多选面板(顺序即渲染顺序;geo 的 i18n key 为历史命名 thumbInfoLocation)。

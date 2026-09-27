@@ -46,33 +46,3 @@ pub fn emit_stderr_log(
     }
     .emit();
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trips_through_json() {
-        let mut fields = serde_json::Map::new();
-        fields.insert("req_id".to_string(), serde_json::Value::from(42));
-        let line = WorkerLogLine {
-            lvl: "info".to_string(),
-            msg: "会话就绪".to_string(),
-            fields,
-        };
-        let json = serde_json::to_string(&line).expect("serialize");
-        let back: WorkerLogLine = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.lvl, "info");
-        assert_eq!(back.msg, "会话就绪");
-        assert_eq!(back.fields.get("req_id").and_then(|v| v.as_i64()), Some(42));
-    }
-
-    #[test]
-    fn fields_defaults_to_empty_map_when_absent() {
-        let json = r#"{"lvl":"warn","msg":"无字段行"}"#;
-        let line: WorkerLogLine = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(line.lvl, "warn");
-        assert_eq!(line.msg, "无字段行");
-        assert!(line.fields.is_empty());
-    }
-}

@@ -313,8 +313,8 @@ pub async fn remove_media_items_hard(ids: Vec<i64>, state: State<'_, Arc<AppStat
             .cache_dir
             .clone();
         for id in ids {
-            // 删除前取路径 + cache_key（行还在；cache_key 决定其全部派生缓存路径）。
-            let (abs, cache_key) = {
+            // 删除前取源路径、cache_key 与指纹产物目录；任务行随后会被 FK 级联删除。
+            let (abs, cache_key, fingerprints) = {
                 let pool = state.db_read_pool.get().map_err(AppError::from)?;
                 let abs = q::get_item_path_info(&pool, id)
                     .ok()
@@ -326,7 +326,8 @@ pub async fn remove_media_items_hard(ids: Vec<i64>, state: State<'_, Arc<AppStat
                         |r| r.get(0),
                     )
                     .ok();
-                (abs, ck)
+                let fingerprints = q::thumbnail_output_fingerprints(&pool, id)?;
+                (abs, ck, fingerprints)
             };
             if let Some(p) = abs {
                 let pb = PathBuf::from(&p);
@@ -353,7 +354,7 @@ pub async fn remove_media_items_hard(ids: Vec<i64>, state: State<'_, Arc<AppStat
             // sprite + motion。在 DB 锁之外、best-effort、失败不阻塞删除。软删（is_deleted）不走此路径
             // （保留缓存供恢复，与「离线≠删除」同理）。
             if let Some(ck) = cache_key {
-                crate::thumbnail::cache::remove_cache_files_for_key(&cache_dir, ck);
+                crate::thumbnail::cache::remove_cache_files_for_key(&cache_dir, ck, &fingerprints);
             }
         }
 

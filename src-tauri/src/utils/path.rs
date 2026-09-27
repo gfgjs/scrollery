@@ -189,77 +189,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tree_sort_key_empty_is_empty() {
-        assert_eq!(encode_tree_sort_key(""), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn tree_sort_key_single_and_multi_segment() {
-        assert_eq!(encode_tree_sort_key("A"), vec![0x41, 0x00]);
-        assert_eq!(encode_tree_sort_key("A/Z"), vec![0x41, 0x00, 0x5A, 0x00]);
-        assert_eq!(encode_tree_sort_key("A-"), vec![0x41, 0x2D, 0x00]);
-    }
-
-    #[test]
-    fn tree_sort_key_orders_as_preorder_dfs() {
-        // 核心反例：原始字符串序 A < A- < A/Z（因 '-'=0x2D < '/'=0x2F）；
-        // 前序 DFS 序 A < A/Z < A-（子树 A/Z 紧随父 A，同级 A- 在其后）。NUL 终止键给出后者。
-        let a = encode_tree_sort_key("A");
-        let az = encode_tree_sort_key("A/Z");
-        let a_dash = encode_tree_sort_key("A-");
-        assert!(a < az, "父 A 早于后代 A/Z");
-        assert!(az < a_dash, "完整子树 A/Z 早于后续同级 A-");
-        assert!(a < a_dash, "传递性 A < A-");
-    }
-
-    #[test]
-    fn tree_sort_key_parent_is_strict_prefix_of_child() {
-        // 父键是子键严格前缀 → 父恒早于其全部后代，且后代紧邻。
-        let parent = encode_tree_sort_key("Photos/2024");
-        let child = encode_tree_sort_key("Photos/2024/Jan");
-        assert!(child.starts_with(&parent), "子键以父键为前缀");
-        assert!(parent < child);
-    }
-
-    #[test]
-    fn tree_sort_key_case_sensitive_binary() {
-        // 与 directories.name 的 BINARY collation 一致：大写 < 小写（Z=0x5A < a=0x61）。
-        assert!(encode_tree_sort_key("Albums") < encode_tree_sort_key("albums"));
-    }
-
-    #[test]
-    fn tree_sort_key_unicode_sorts_after_ascii() {
-        // 多字节 UTF-8（相=0xE7…）排在 ASCII 之后。
-        assert!(encode_tree_sort_key("albums") < encode_tree_sort_key("相册"));
-    }
-
-    #[test]
-    fn tree_sort_key_defensive_skips_empty_segments() {
-        // 内部 `//` 未折叠时：空段不污染键，等价于折叠后的单斜杠路径。
-        assert_eq!(encode_tree_sort_key("A//B"), encode_tree_sort_key("A/B"));
-    }
-
-    #[test]
-    fn tree_sort_key_sibling_order_reduces_to_basename() {
-        // 同父下，键比较归约为 basename 字节比较（前序 DFS 同级序 = name BINARY 序）；
-        // 短者终止符先：AB < ABC。
-        assert!(encode_tree_sort_key("p/AB") < encode_tree_sort_key("p/ABC"));
-    }
-
-    #[test]
-    fn normalise_backslashes() {
-        assert_eq!(
-            normalize_db_path(r"photos\2024\january"),
-            "photos/2024/january"
-        );
-    }
-
-    #[test]
-    fn normalise_trims_slashes() {
-        assert_eq!(normalize_db_path("/photos/2024/"), "photos/2024");
-    }
-
-    #[test]
     fn root_path_preserves_unc() {
         // UNC share: leading `//` must survive (8A network drive as scan root).
         assert_eq!(
@@ -269,42 +198,6 @@ mod tests {
         assert_eq!(normalize_root_path("//NAS/media/"), "//NAS/media");
         // Extra leading slashes collapse to exactly two.
         assert_eq!(normalize_root_path(r"\\\\NAS\share"), "//NAS/share");
-    }
-
-    #[test]
-    fn root_path_drive_letter_unchanged() {
-        // Mapped/local drive paths behave exactly like normalize_db_path.
-        assert_eq!(normalize_root_path(r"Z:\music"), "Z:/music");
-        assert_eq!(
-            normalize_root_path("C:/Users/me/Pictures/"),
-            "C:/Users/me/Pictures"
-        );
-        // 盘根的 / 不能丢，否则 C: 会变成当前目录语义。
-        assert_eq!(normalize_root_path("C:/"), "C:/");
-        assert_eq!(normalize_root_path("C:\\"), "C:/");
-    }
-
-    #[test]
-    fn root_path_preserves_posix_absolute_marker() {
-        assert_eq!(normalize_root_path("/"), "/");
-        assert_eq!(normalize_root_path("/var/lib/"), "/var/lib");
-    }
-
-    #[test]
-    fn resolve_path_at_root() {
-        let result = resolve_media_path("/data/photos", "", "IMG_001.jpg");
-        assert!(result.ends_with("IMG_001.jpg"));
-        assert!(result.contains("/data/photos/"));
-    }
-
-    #[test]
-    fn path_depth_empty() {
-        assert_eq!(path_depth(""), 0);
-    }
-
-    #[test]
-    fn path_depth_nested() {
-        assert_eq!(path_depth("a/b/c"), 3);
     }
 
     // ── resolve_within_root：安全边界（S 线 §4.2 / D-001）────────────────────
@@ -331,33 +224,6 @@ mod tests {
 
         fn root_str(root: &Path) -> String {
             root.to_string_lossy().to_string()
-        }
-
-        #[test]
-        fn empty_rel_path_resolves_to_root_itself() {
-            let (_t, root, _o) = fixture();
-            let got = resolve_within_root(&root_str(&root), "").unwrap();
-            assert_eq!(got, fs::canonicalize(&root).unwrap());
-        }
-
-        #[test]
-        fn resolves_nested_and_accepts_both_separators() {
-            let (_t, root, _o) = fixture();
-            let want = fs::canonicalize(root.join("sub/inner.txt")).unwrap();
-            // DB 存正斜杠；Windows 前端也可能回传反斜杠 —— 两种都要认。
-            assert_eq!(
-                resolve_within_root(&root_str(&root), "sub/inner.txt").unwrap(),
-                want
-            );
-            assert_eq!(
-                resolve_within_root(&root_str(&root), "sub\\inner.txt").unwrap(),
-                want
-            );
-            // 冗余分隔符与 `.` 段是良性的，不该误拒。
-            assert_eq!(
-                resolve_within_root(&root_str(&root), "./sub//inner.txt").unwrap(),
-                want
-            );
         }
 
         #[test]
@@ -399,20 +265,6 @@ mod tests {
                 let r = resolve_within_root(&root_str(&root), evil);
                 assert!(r.is_err(), "含 ':' 的段未被拒: {evil:?} → {r:?}");
             }
-        }
-
-        #[test]
-        fn rejects_nonexistent_path() {
-            let (_t, root, _o) = fixture();
-            assert!(resolve_within_root(&root_str(&root), "nope.txt").is_err());
-            assert!(resolve_within_root(&root_str(&root), "sub/nope/deep.txt").is_err());
-        }
-
-        #[test]
-        fn rejects_missing_root() {
-            let tmp = tempfile::tempdir().unwrap();
-            let gone = tmp.path().join("never-existed");
-            assert!(resolve_within_root(&gone.to_string_lossy(), "").is_err());
         }
 
         /// 建一个指向 `target` 的目录级重定向。

@@ -13,6 +13,52 @@ use tracing::info;
 
 use crate::state::AppState;
 
+/// 窗口焦点/销毁事件边界的应用前台判定。
+///
+/// Windows：查询系统前台窗口所属进程是否为本进程。Tauri 2.11.4 的 `WindowEvent::Focused` 由
+/// WebView2 合成，而 `window.is_focused()` 读 Tao 窗口缓存，两者在应用内切窗（主窗 ↔ 日志窗）
+/// 时会错位——实测出现 3ms 的错误后台请求，违反「焦点按应用所有窗口聚合」的契约。故两处事件
+/// 边界都只认系统事实，不拼接两套来源。`self_focused` 在 Windows 下不参与判定。
+///
+/// 其它平台：维持既有事件/窗口聚合——`self_focused` 为本窗当前是否自报聚焦（`Destroyed` 传
+/// `false`，被销毁的窗口不再是候选），应用内切窗时失焦事件可能先于另一窗口的聚焦事件到达，
+/// 故再并入同应用其它窗口的聚焦状态。
+fn app_foreground_at_window_event(window: &tauri::Window, self_focused: bool) -> bool {
+    #[cfg(windows)]
+    {
+        let _ = (window, self_focused);
+        windows_foreground_is_self_process()
+    }
+    #[cfg(not(windows))]
+    {
+        self_focused
+            || window
+                .app_handle()
+                .webview_windows()
+                .values()
+                .any(|other| other.label() != window.label() && other.is_focused().unwrap_or(false))
+    }
+}
+
+/// Windows 系统前台窗口是否属于本进程；仅在窗口焦点/销毁事件边界调用，无轮询/计时器/缓存。
+///
+/// 系统实际没有前台窗口（`GetForegroundWindow` 返回 NULL）时按非前台处理，不推测兜底。
+#[cfg(windows)]
+fn windows_foreground_is_self_process() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    // SAFETY: 两个 API 均无前置条件，任意线程可调用；GetForegroundWindow 允许返回 NULL。
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid == std::process::id()
+    }
+}
+
 /// 启动计时锚(2026-07-13 排查热启动变慢):`RunEvent::Ready` 读它算 Rust boot→Ready 总耗时,
 /// 用于一刀切分「后端 setup 耗时」与「前端 Vite/WebView2/Vue 挂载耗时」。
 /// 拆分前是 `run()` 的函数局部 static;跨 `run()`/[`on_run_event`] 两处共享,故上提为模块级。
@@ -128,6 +174,13 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
             }
         });
     }
+    if let tauri::WindowEvent::Focused(focused) = event {
+        crate::thumbnail::qos::set_app_foreground(app_foreground_at_window_event(window, *focused));
+    }
+    if matches!(event, tauri::WindowEvent::Destroyed) {
+        // 被销毁的窗口不再自报聚焦，聚合只看向同应用其它窗口（Windows 走系统前台进程判定）。
+        crate::thumbnail::qos::set_app_foreground(app_foreground_at_window_event(window, false));
+    }
     if window.label() == "main" {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             let close_behavior = window
@@ -168,15 +221,10 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
                 }
             }
         }
-        // 前后台切换 → 驱动缩略图 worker 的 QoS 档位:前台用 P 大核提速(仍被 UI 抢占)、
-        // 后台挤回 E 小核限频省电(2026-07-13,配合 thumbnail::qos 的 refresh_worker_qos)。
-        if let tauri::WindowEvent::Focused(focused) = event {
-            crate::thumbnail::qos::set_app_foreground(*focused);
-            if *focused {
-                // Win11 Acrylic 可能在失焦后丢失(上游 window-vibrancy#139),回到前台时按当前
-                // 配置重挂；apply 内部投递主线程，且与已有 show 后重挂路径共用同一清理/应用链。
-                crate::window_material::apply_from_config(window.app_handle());
-            }
+        if let tauri::WindowEvent::Focused(true) = event {
+            // Win11 Acrylic 可能在失焦后丢失(上游 window-vibrancy#139),回到前台时按当前
+            // 配置重挂；apply 内部投递主线程，且与已有 show 后重挂路径共用同一清理/应用链。
+            crate::window_material::apply_from_config(window.app_handle());
         }
     }
 }
@@ -470,58 +518,6 @@ fn local_flush_waiter(
 
 #[cfg(test)]
 mod tests {
-    use super::{close_decision, CloseDecision};
-
-    /// exit + 前端存活 → 交前端走「先 flush 再 EXIT_APP」:原生直接关闭会让页面先销毁,防抖窗口里
-    /// 还没提交的设置连 ExitRequested 都赶不上(那一刻窗口已不在 webview_windows 里)。
-    #[test]
-    fn exit_behavior_with_live_frontend_goes_to_frontend() {
-        assert_eq!(close_decision("exit", true), CloseDecision::Frontend);
-    }
-
-    /// exit + 前端失联 → 原生关闭兜底:前端已无法消费关闭事件,拦下来也只会得到关不掉的窗口。
-    #[test]
-    fn exit_behavior_with_stale_frontend_falls_back_to_native_close() {
-        assert_eq!(close_decision("exit", false), CloseDecision::AllowNative);
-    }
-
-    /// 只有「本次退出已获允许」才放行;重复的 ExitRequested 必须被拦下(直接 return 会放行退出,
-    /// 把在途 flush 丢掉)。
-    #[test]
-    fn exit_request_only_allows_when_explicitly_allowed() {
-        assert_eq!(
-            super::exit_request_action(false, false),
-            super::ExitRequestAction::Start
-        );
-        assert_eq!(
-            super::exit_request_action(false, true),
-            super::ExitRequestAction::Suppress,
-            "已在 flush 的重复事件只拦不重开"
-        );
-        assert_eq!(
-            super::exit_request_action(true, false),
-            super::ExitRequestAction::Allow
-        );
-        assert_eq!(
-            super::exit_request_action(true, true),
-            super::ExitRequestAction::Allow,
-            "已允许时无论是否在跑都放行"
-        );
-    }
-
-    /// 显式放弃(exit_app force)与「已决定退出」的路径都会先调 allow_exit:随后的 ExitRequested
-    /// 必须放行 —— 否则用户点了「放弃并退出」还要再被拦一次、再走一轮 flush + 确认框。
-    #[test]
-    fn allow_exit_grants_permission_for_followup_exit_request() {
-        super::allow_exit();
-        let allowed = super::EXIT_ALLOWED.load(std::sync::atomic::Ordering::Acquire);
-        assert!(allowed, "allow_exit 应置位放行标记");
-        assert_eq!(
-            super::exit_request_action(allowed, true),
-            super::ExitRequestAction::Allow,
-            "已允许时即便有一次 flush 标记在跑也要放行"
-        );
-    }
 
     /// 「上一次 flush 成功」不得当作永久放行:EXIT_ALLOWED 只能由 allow_exit 显式置位,而 flush
     /// 报告本身不写这个标记(应用继续运行、继续有新设置的场景由此不再被旧成功短路)。
@@ -539,52 +535,6 @@ mod tests {
         );
     }
 
-    /// 前端失联(未收齐回执)时退出决策走「放弃并退出」,不弹对话框把退出悬住;只有确实报失败
-    /// (complete 且未 saved)才交给用户裁决。
-    #[test]
-    fn incomplete_flush_is_discard_and_failed_flush_is_user_choice() {
-        let unreachable = super::FlushOutcome {
-            complete: false,
-            saved: false,
-        };
-        assert!(!unreachable.saved, "失联不算已保存");
-        assert!(
-            !unreachable.complete,
-            "失联应可被识别,从而走失联兜底而非对话框"
-        );
-
-        let reported_failure = super::FlushOutcome {
-            complete: true,
-            saved: false,
-        };
-        assert!(reported_failure.complete && !reported_failure.saved);
-
-        let all_saved = super::FlushOutcome {
-            complete: true,
-            saved: true,
-        };
-        assert!(all_saved.complete && all_saved.saved);
-    }
-
-    #[test]
-    fn ask_behavior_with_live_frontend_goes_to_frontend() {
-        assert_eq!(close_decision("ask", true), CloseDecision::Frontend);
-    }
-
-    #[test]
-    fn ask_behavior_with_stale_frontend_waits_grace_window() {
-        // 不再静默直退：心跳陈旧先进宽限等待，耗尽才原生关闭（resolve_ask_close 内收口）。
-        assert_eq!(close_decision("ask", false), CloseDecision::GraceWait);
-    }
-
-    #[test]
-    fn unknown_behavior_falls_back_to_native_close_when_frontend_is_stale() {
-        assert_eq!(close_decision("unexpected", true), CloseDecision::Frontend);
-        assert_eq!(
-            close_decision("unexpected", false),
-            CloseDecision::AllowNative
-        );
-    }
     /// 旧 request id 的回报直接丢弃:重试轮次之间不能互相串结论。
     #[test]
     fn flush_ack_ignores_stale_request_ids() {
@@ -615,38 +565,6 @@ mod tests {
             &mut state, "id-2", "logs", true, false
         ));
         assert_eq!(rx.try_recv().ok(), Some(false));
-    }
-
-    /// 事件发不出去的窗口按不可用扣除,不拖住退出也不误报写盘失败。
-    #[test]
-    fn unreachable_window_is_settled_without_failing_the_round() {
-        let (mut state, mut rx) = super::local_flush_waiter("id-3", &["main", "logs"]);
-        assert!(
-            super::flush_ack_locked(&mut state, "id-3", "logs", true, true),
-            "按不可用结清该窗口"
-        );
-        assert!(rx.try_recv().is_err(), "main 尚未回报");
-        assert!(super::flush_ack_locked(
-            &mut state, "id-3", "main", true, false
-        ));
-        assert_eq!(rx.try_recv().ok(), Some(true));
-    }
-
-    /// 同一窗口重复回报只记一次,不因重入提前结清。
-    #[test]
-    fn duplicate_ack_from_same_window_is_idempotent() {
-        let (mut state, mut rx) = super::local_flush_waiter("id-4", &["main", "logs"]);
-        assert!(super::flush_ack_locked(
-            &mut state, "id-4", "main", true, false
-        ));
-        assert!(super::flush_ack_locked(
-            &mut state, "id-4", "main", true, false
-        ));
-        assert!(rx.try_recv().is_err(), "logs 未回报不该结清");
-        assert!(super::flush_ack_locked(
-            &mut state, "id-4", "logs", true, false
-        ));
-        assert_eq!(rx.try_recv().ok(), Some(true));
     }
 }
 

@@ -38,7 +38,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
   { id: 'thumbnailDisplay', section: 'media', titleKey: 'settings.thumbnailDisplayGroup', keys: ['showDragHandle', 'minimapRenderMode', 'showThumbInfo'] },
   {
     id: 'thumbnails', section: 'media', titleKey: 'settings.thumbnailGenerationGroup',
-    keys: ['thumbDecodeStrategy', 'gpuEngine', 'thumbSize', 'thumbWebpQuality', 'thumbSkipMaxKb', 'fullThumbGen'],
+    keys: ['thumbDecodeStrategy', 'thumbSize', 'thumbWebpQuality', 'thumbSkipMaxKb', 'fullThumbGen'],
   },
   { id: 'thumbnailCache', section: 'media', titleKey: 'settings.thumbnailCacheGroup', keys: ['thumbCacheDir', 'thumbCacheMaxMb', 'cacheStats'] },
   { id: 'video', section: 'media', titleKey: 'settings.video', keys: sectionSettingKeys('video') },

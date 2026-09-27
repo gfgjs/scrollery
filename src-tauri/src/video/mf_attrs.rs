@@ -39,7 +39,7 @@ pub(super) unsafe fn read_duration_ms(reader: &IMFSourceReader) -> u64 {
 
 /// 尽力将视频子类型 GUID 映射为简短编解码标签。
 pub(super) fn codec_label(subtype: GUID) -> Option<String> {
-    let name = if subtype == MFVideoFormat_H264 {
+    let name = if subtype == MFVideoFormat_H264 || subtype == MFVideoFormat_H264_ES {
         "H264"
     } else if subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_HEVC_ES {
         "HEVC"
@@ -51,6 +51,10 @@ pub(super) fn codec_label(subtype: GUID) -> Option<String> {
         "WMV3"
     } else if subtype == MFVideoFormat_WVC1 {
         "VC1"
+    } else if subtype == MFVideoFormat_VP90 {
+        "VP9"
+    } else if subtype == MFVideoFormat_AV1 {
+        "AV1"
     } else {
         return None;
     };

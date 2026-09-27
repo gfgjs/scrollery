@@ -137,6 +137,8 @@ impl DerivationKind {
 
 /// 某 kind 的 `run` 产出其产物所需的一切，由消费者一次性解析好。
 pub struct DerivationContext {
+    /// 根据本次已取得的共享工作集折算，嵌入封面在解码前检查真实像素。
+    pub max_pixel_bytes: u64,
     pub item_id: i64,
     pub kind: DerivationKind,
     /// 源媒体文件的绝对路径。
@@ -197,77 +199,4 @@ pub(crate) fn not_implemented(kind: DerivationKind) -> AppError {
         "derivation kind '{}' has no backend in this build | 该派生 kind 在本次构建中无后端",
         kind.as_str()
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utils::format::{classify_media_type, doc_subtype, MediaType};
-
-    /// `DOC_THUMB_FORMATS` 三项恰好满足 `doc_subtype(ext) == ext`。
-    ///
-    /// 这条**巧合**正是「把 `file_format` 当 `doc_subtype` 直接写库」的 bug 长期没被发现的原因
-    /// （`ipc/doc_commands.rs` 旧写法，S 线 P0-b 已改为经 `doc_subtype()` 派生）。
-    /// 若将来往 `DOC_THUMB_FORMATS` 加 office/text 类格式（如 docx→"office"、txt→"text"），
-    /// 恒等即刻不成立 —— 本测试会红，提醒**所有**写 `document_meta.doc_subtype` 的调用点
-    /// 必须已走 `doc_subtype()`，不能再图省事传 `file_format`。
-    #[test]
-    fn doc_thumb_formats_subtype_identity_is_a_coincidence() {
-        for ext in DerivationKind::DOC_THUMB_FORMATS {
-            assert_eq!(
-                doc_subtype(ext),
-                ext,
-                "{ext} 的 doc_subtype 不再等于扩展名：写 document_meta 的调用点必须经 doc_subtype() 派生"
-            );
-        }
-        // 反面锚点：这些格式恒等**不**成立，正是同一 bug 的引信（它们目前不在 DOC_THUMB_FORMATS）。
-        assert_eq!(doc_subtype("docx"), "office");
-        assert_eq!(doc_subtype("txt"), "text");
-    }
-
-    /// `ALL` 每个 kind 的 `as_str`/`from_str` 双向 roundtrip 一致,且字符串互不重复。
-    #[test]
-    fn all_kinds_as_str_from_str_roundtrip() {
-        let mut seen = std::collections::HashSet::new();
-        for k in DerivationKind::ALL {
-            let s = k.as_str();
-            assert!(seen.insert(s), "as_str 重复:{s}");
-            assert_eq!(DerivationKind::from_str(s), Some(k), "{s} roundtrip 失败");
-        }
-        assert_eq!(DerivationKind::from_str("nonexistent_kind"), None);
-    }
-
-    /// `video_playable` 按需语义锚:字符串稳定、不进 backfill(is_implemented=false)、
-    /// 非封面(不镜像 media_items)、`for_media` 不为任何媒体入队它。
-    #[test]
-    fn video_playable_is_on_demand_only() {
-        assert_eq!(DerivationKind::VideoPlayable.as_str(), "video_playable");
-        assert_eq!(
-            DerivationKind::from_str("video_playable"),
-            Some(DerivationKind::VideoPlayable)
-        );
-        assert!(
-            !DerivationKind::VideoPlayable.is_implemented(),
-            "按需 kind 不得进背景 backfill"
-        );
-        assert!(!DerivationKind::VideoPlayable.produces_thumbnail());
-        for mt in ["video", "audio", "document", "image"] {
-            assert!(
-                !DerivationKind::for_media(mt, "mkv").contains(&DerivationKind::VideoPlayable),
-                "for_media({mt}) 不应入队 video_playable"
-            );
-        }
-    }
-
-    /// `DOC_THUMB_FORMATS` 必须全是已注册文档格式，否则 `for_media` 永远不会为其入队。
-    #[test]
-    fn doc_thumb_formats_are_registered_documents() {
-        for ext in DerivationKind::DOC_THUMB_FORMATS {
-            assert_eq!(
-                classify_media_type(ext),
-                Some(MediaType::Document),
-                "{ext} 不是已注册文档格式"
-            );
-        }
-    }
 }

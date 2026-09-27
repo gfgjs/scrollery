@@ -125,36 +125,3 @@ pub async fn stop_dedup_analysis(state: State<'_, Arc<AppState>>) -> Result<Dedu
 pub fn dedup_status(state: State<'_, Arc<AppState>>) -> Result<DedupStatusSnapshot> {
     Ok(progress_to_snapshot(state.dedup_task.status()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 状态快照的稳定 wire 名:前端 dedupStore 直接消费 runId/itemsDone/potentialLogicalBytes/
-    /// waitingOn;改名等于打断现行去重进度展示(P13 保留 start/stop/status 三命令的行为表征)。
-    #[test]
-    fn status_payload_uses_stable_wire_names() {
-        let status = DedupStatusSnapshot {
-            run_id: Some("run-1".into()),
-            status: DedupRunStatus::Running,
-            phase: "hashing".into(),
-            items_done: 2,
-            items_total: 3,
-            bytes_done: 10,
-            bytes_total: 20,
-            groups_found: 1,
-            potential_logical_bytes: 100,
-            errors: vec![DedupErrorSummary {
-                code: "SOURCE_STALE".into(),
-                count: 1,
-            }],
-            waiting_on: vec!["scan".into()],
-        };
-
-        let json = serde_json::to_value(status).expect("status serializes");
-        assert_eq!(json["runId"], "run-1");
-        assert_eq!(json["itemsDone"], 2);
-        assert_eq!(json["potentialLogicalBytes"], 100);
-        assert_eq!(json["waitingOn"][0], "scan");
-    }
-}

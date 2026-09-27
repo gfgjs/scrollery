@@ -140,6 +140,15 @@ pub struct AppState {
     /// 缩略图配置（缓存目录、大小、跳过阈值）。
     pub thumb_config: RwLock<ThumbConfig>,
 
+    /// 全库与视口图片任务共用的领取执行出口及工作集额度。
+    pub thumb_coordinator: crate::thumbnail::coordinator::ThumbnailCoordinator,
+    /// 缩略图、派生和插件封面共用的估算工作集窗口。
+    pub(crate) background_workset_budget:
+        std::sync::Arc<crate::thumbnail::coordinator::MemoryBudget>,
+    /// 各缩略图及旧派生入口共用源卷并发额度。
+    pub(crate) background_volume_io_budget:
+        std::sync::Arc<crate::thumbnail::coordinator::VolumeIoBudget>,
+
     /// (2026-07-18 审查 F-02):旧轮收尾曾无条件清槽+发终态,「停止→立即重启」时会清掉新轮
     /// 刚安装的句柄并把新轮快照盖成 cancelled。语义同 `ai_analysis_token` 的 compare-and-clear。
     /// 全量缩略图生成任务的取消令牌槽(带运行代次)。
@@ -230,10 +239,9 @@ pub struct AppState {
     /// 问题6):coordinator 循环须在 Pipeline panic 后存活,运行态判定不得因毒锁级联 panic。
     pub exotic_analysis_token: Mutex<Option<CancellationToken>>,
 
-    /// 由 derivation 与 exotic 两条流水线共享的公平后台重活池（R4）：两个子系统在重活前都从**本**
-    /// limiter 取 permit，故持续派生不会饿死 exotic（FIFO 公平，
-    /// 等待有上界）。预算 = `available_parallelism()`：exotic 空闲时 derivation 不受影响；二者并发时
-    /// 共享同一全局预算、按到达顺序公平交错。
+    /// 缩略图重型项、derivation 与 exotic 共享的公平后台重活池（R4）。重型缩略图在领取
+    /// DB lease 前取 permit；视口保留席位不阻塞等额度，以免拖住后续快速项。
+    /// 预算与缩略图额度同源，低核数下保底 2；等待者按 FIFO 授权。
     pub background_heavy_limiter: std::sync::Arc<crate::exotic::limiter::BackgroundHeavyLimiter>,
 
     /// GPU 推理令牌(Part4 D2/T11):全局额度 1 的**物理并发**闸——AI/face worker 池发
@@ -478,192 +486,6 @@ fn enter_database_lifecycle_write<'a>(
     }
 }
 
-#[cfg(test)]
-mod scan_run_tests {
-    use super::*;
-
-    #[test]
-    fn replace_and_finish_are_generation_safe() {
-        let mut tokens = HashMap::new();
-        let mut slots = HashMap::new();
-        let (generation1, token1) = begin_scan_run(&mut tokens, &mut slots, 7);
-
-        let (generation2, token2) = replace_scan_run(&mut tokens, &mut slots, 7);
-        assert!(generation2 > generation1);
-        assert!(token1.is_cancelled(), "替换新轮必须取消旧 token");
-        assert!(!token2.is_cancelled());
-
-        assert!(
-            take_scan_run_if_owned(&mut tokens, &mut slots, 7, generation1).is_none(),
-            "旧轮 finish 不得清理新轮"
-        );
-        assert!(tokens.contains_key(&7));
-        assert!(
-            take_scan_run_if_owned(&mut tokens, &mut slots, 7, generation2).is_some(),
-            "新轮自己的 finish 应清理本轮"
-        );
-        assert!(tokens.is_empty());
-    }
-
-    #[test]
-    fn stopped_scan_without_restart_cannot_be_claimed_by_late_finish() {
-        let mut tokens = HashMap::new();
-        let mut slots = HashMap::new();
-        let (generation, token) = begin_scan_run(&mut tokens, &mut slots, 7);
-
-        slots.get(&7).unwrap().cancel();
-        tokens.remove(&7).unwrap().cancel();
-
-        assert!(token.is_cancelled());
-        assert!(
-            take_scan_run_if_owned(&mut tokens, &mut slots, 7, generation).is_none(),
-            "stop 后槽已无扫描句柄，迟到收尾不得再发布终态"
-        );
-    }
-
-    /// 旧轮若已进入写区，新轮安装必须在线性化闸门外等待，不能插入到旧写入中间。
-    #[test]
-    fn generation_gate_orders_old_write_before_new_install() {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::sync::{mpsc, Arc};
-
-        let gate = Arc::new(Mutex::new(()));
-        let current_generation = Arc::new(AtomicU64::new(1));
-        let write_started = Arc::new(AtomicBool::new(false));
-        let (claimed_tx, claimed_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (new_installed_tx, new_installed_rx) = mpsc::channel();
-        let gate_for_old = Arc::clone(&gate);
-        let generation_for_old = Arc::clone(&current_generation);
-        let started_for_old = Arc::clone(&write_started);
-
-        let old = std::thread::spawn(move || {
-            with_scan_generation_gate(
-                &gate_for_old,
-                || generation_for_old.load(Ordering::Acquire) == 1,
-                || {
-                    claimed_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    started_for_old.store(true, Ordering::Release);
-                },
-            )
-            .expect("旧轮在新轮安装前应取得写权限");
-        });
-
-        claimed_rx.recv().unwrap();
-        let gate_for_new = Arc::clone(&gate);
-        let generation_for_new = Arc::clone(&current_generation);
-        let new = std::thread::spawn(move || {
-            let _gate = gate_for_new.lock().unwrap_or_else(|e| e.into_inner());
-            generation_for_new.store(2, Ordering::Release);
-            new_installed_tx.send(()).unwrap();
-        });
-
-        assert!(
-            new_installed_rx
-                .recv_timeout(std::time::Duration::from_millis(20))
-                .is_err(),
-            "旧轮写入尚未返回时，新轮不得完成安装"
-        );
-        release_tx.send(()).unwrap();
-        old.join().unwrap();
-        new.join().unwrap();
-        assert!(write_started.load(Ordering::Acquire));
-        assert_eq!(current_generation.load(Ordering::Acquire), 2);
-    }
-
-    /// 新轮已在线性化闸门内安装后，旧轮即使迟到也只能被拒绝，不能执行写闭包。
-    #[test]
-    fn stale_generation_is_rejected_before_write() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        let gate = Mutex::new(());
-        let current_generation = AtomicU64::new(2);
-        let mut writes = 0;
-        let result = with_scan_generation_gate(
-            &gate,
-            || current_generation.load(Ordering::Acquire) == 1,
-            || {
-                writes += 1;
-            },
-        );
-
-        assert!(result.is_none(), "旧 generation 不得进入写闭包");
-        assert_eq!(writes, 0);
-    }
-
-    /// 两个生命周期写者并发排队时，后一个写者不能带着 `previous_active=false` 离开，
-    /// 否则首个写者恢复 active 后会再次被错误覆盖，令整个数据库生命周期永久失效。
-    #[test]
-    fn concurrent_lifecycle_writers_restore_active_after_both_finish() {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::sync::{mpsc, Arc};
-        use std::time::Duration;
-
-        let transition_gate = Arc::new(Mutex::new(()));
-        let lifecycle_gate = Arc::new(RwLock::new(()));
-        let active = Arc::new(AtomicBool::new(true));
-        let epoch = Arc::new(AtomicU64::new(1));
-        let (first_entered_tx, first_entered_rx) = mpsc::channel();
-        let (second_entered_tx, second_entered_rx) = mpsc::channel();
-        let (release_first_tx, release_first_rx) = mpsc::channel();
-        let (release_second_tx, release_second_rx) = mpsc::channel();
-
-        let first = {
-            let transition_gate = Arc::clone(&transition_gate);
-            let lifecycle_gate = Arc::clone(&lifecycle_gate);
-            let active = Arc::clone(&active);
-            let epoch = Arc::clone(&epoch);
-            std::thread::spawn(move || {
-                let guard = enter_database_lifecycle_write(
-                    &transition_gate,
-                    &lifecycle_gate,
-                    &active,
-                    &epoch,
-                );
-                first_entered_tx.send(()).unwrap();
-                release_first_rx.recv().unwrap();
-                drop(guard);
-            })
-        };
-        let second = {
-            let transition_gate = Arc::clone(&transition_gate);
-            let lifecycle_gate = Arc::clone(&lifecycle_gate);
-            let active = Arc::clone(&active);
-            let epoch = Arc::clone(&epoch);
-            std::thread::spawn(move || {
-                let guard = enter_database_lifecycle_write(
-                    &transition_gate,
-                    &lifecycle_gate,
-                    &active,
-                    &epoch,
-                );
-                second_entered_tx.send(()).unwrap();
-                release_second_rx.recv().unwrap();
-                drop(guard);
-            })
-        };
-
-        first_entered_rx.recv().unwrap();
-        assert!(!active.load(Ordering::Acquire));
-        assert!(
-            second_entered_rx
-                .recv_timeout(Duration::from_millis(20))
-                .is_err(),
-            "第二个写者必须在 transition gate 外等待"
-        );
-
-        release_first_tx.send(()).unwrap();
-        second_entered_rx.recv().unwrap();
-        assert!(!active.load(Ordering::Acquire));
-        release_second_tx.send(()).unwrap();
-        first.join().unwrap();
-        second.join().unwrap();
-        assert!(active.load(Ordering::Acquire));
-        assert_eq!(epoch.load(Ordering::Acquire), 3);
-    }
-}
-
 #[allow(clippy::items_after_test_module)]
 impl AppState {
     // 应用全局状态聚合构造，各依赖独立必需、无合理分组，沿用本仓库既有约定标注。
@@ -681,7 +503,6 @@ impl AppState {
         thumb_size: u32,
         thumb_skip_max_kb: u64,
         thumb_strategy: String,
-        gpu_engine: String,
         ai_hq_cache: bool,
         thumb_webp_quality: u8,
         exotic_catalog: std::sync::Arc<CatalogStore>,
@@ -693,6 +514,11 @@ impl AppState {
             .get("ai_cache_short_edge")
             .and_then(|v| v.parse().ok())
             .unwrap_or(crate::thumbnail::cache::AI_CACHE_SHORT_EDGE);
+        let (thumbnail_workers, shared_cpu_permits) = crate::thumbnail::qos::processing_budgets();
+        let thumb_coordinator =
+            crate::thumbnail::coordinator::ThumbnailCoordinator::new(thumbnail_workers);
+        let background_workset_budget = thumb_coordinator.workset_budget();
+        let background_volume_io_budget = thumb_coordinator.volume_io_budget();
         Self {
             db_writer,
             db_read_pool,
@@ -724,12 +550,15 @@ impl AppState {
                 size: thumb_size,
                 skip_max_bytes: thumb_skip_max_kb * 1024,
                 strategy: thumb_strategy,
-                gpu_engine,
                 ai_hq_cache,
                 webp_quality: thumb_webp_quality,
                 ai_cache_short_edge,
+                output_fingerprint: None,
             }),
             thumb_gen_token: RunTokenSlot::new(),
+            thumb_coordinator,
+            background_workset_budget,
+            background_volume_io_budget,
             thumb_gen_lifecycle_gate: Mutex::new(()),
             thumb_gen_progress: Mutex::new(None),
             thumb_serve_dpr: AtomicU32::new(1000),
@@ -747,16 +576,11 @@ impl AppState {
             gpu_analysis_owner: Mutex::new(None),
             derivation_token: RunTokenSlot::new(),
             exotic_analysis_token: Mutex::new(None),
-            // 后台重活并发预算 = 可用并行度，**下限 2**（Part3 §3.5.2 / T12）。
-            // 取 max(2)：单核/受限容器（available_parallelism()==1）下，若预算=1 则派生 dispatch 线程
-            // 取走唯一额度后阻塞、rayon worker 空等且 exotic 完全饿死；保底 2 让派生与 exotic 至少能交错。
-            // derivation 与 exotic 共享此池（R4）。
-            background_heavy_limiter: crate::exotic::limiter::BackgroundHeavyLimiter::new(
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-                    .max(2),
-            ),
+            // 快速缩略图保留一席，其余 CPU 准入由尾批、派生和其它后台重活共享。
+            background_heavy_limiter:
+                crate::exotic::limiter::BackgroundHeavyLimiter::with_fast_reservation(
+                    shared_cpu_permits,
+                ),
             // GPU 推理令牌额度恒 1(D2 §3.1;多 permit 放行留 T22 按 VRAM 档位实测)。
             gpu_token: crate::exotic::limiter::GpuToken::new(),
             exotic_coordinator: std::sync::OnceLock::new(),

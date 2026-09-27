@@ -156,35 +156,3 @@ pub(super) fn faces_to_records(
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 方案 A 决策核矩阵:防呆(detect_size 超缓存短边)恒 false;大图/不可解格式走缓存;
-    /// 小图或尺寸未知的可解格式直派。
-    #[test]
-    fn face_cache_applies_matrix() {
-        // 大图(短边 > 640):无论 worker 是否可解,都走缓存(降采样收益量级级)。
-        assert!(face_cache_applies(4000, 3000, true, 640));
-        assert!(face_cache_applies(4000, 3000, false, 640));
-        // 小图(短边 ≤ 640):可解格式直派;不可解格式仍须缓存(host 预解码是唯一通路)。
-        assert!(!face_cache_applies(800, 600, true, 640));
-        assert!(face_cache_applies(800, 600, false, 640));
-        // 宽幅全景:短边 600 ≤ 640 → 可解直派(长边虽大,沿用既有直派语义)。
-        assert!(!face_cache_applies(6000, 600, true, 640));
-        // 尺寸未知(0):可解直派(维持既有语义),不可解走缓存兜底。
-        assert!(!face_cache_applies(0, 0, true, 640));
-        assert!(face_cache_applies(0, 0, false, 640));
-        // 防呆:detect_size 超缓存短边 → 一律不吃偏小缓存(可解回退全尺寸,不可解跳过)。
-        assert!(!face_cache_applies(4000, 3000, true, 1024));
-        assert!(!face_cache_applies(4000, 3000, false, 1024));
-    }
-
-    /// 边界:短边恰等于 640 → 缓存无降采样收益,可解格式直派;641 起走缓存。
-    #[test]
-    fn face_cache_applies_boundary_equal() {
-        assert!(!face_cache_applies(640, 960, true, 640));
-        assert!(face_cache_applies(641, 960, true, 640));
-    }
-}

@@ -41,6 +41,24 @@ const PERMISSION_FILE_NAME: &str = "app-commands.toml";
 const SOURCE_PERMISSIONS_REL_DIR: &str = "permissions";
 
 fn main() {
+    link_vpl_bridge();
+    // 本 crate 的构建事实由 Cargo 在 build script 内提供，显式传给应用日志。
+    for (source, target) in [
+        ("PROFILE", "SCROLLERY_BUILD_PROFILE"),
+        ("OPT_LEVEL", "SCROLLERY_BUILD_OPT_LEVEL"),
+        ("TARGET", "SCROLLERY_BUILD_TARGET"),
+    ] {
+        println!("cargo:rerun-if-env-changed={source}");
+        println!(
+            "cargo:rustc-env={target}={}",
+            env::var(source).unwrap_or_else(|_| "unknown".into())
+        );
+    }
+    println!("cargo:rerun-if-env-changed=SCROLLERY_PACKAGE_KIND");
+    println!(
+        "cargo:rustc-env=SCROLLERY_PACKAGE_KIND={}",
+        env::var("SCROLLERY_PACKAGE_KIND").unwrap_or_else(|_| "unknown".into())
+    );
     // registry.rs 一变就重跑本脚本,保证清单与命令注册同步。
     println!("cargo:rerun-if-changed={REGISTRY_REL_PATH}");
 
@@ -75,6 +93,29 @@ fn main() {
     tauri_build::try_build(attributes).expect("tauri-build 失败");
 
     link_common_controls_manifest();
+}
+
+fn link_vpl_bridge() {
+    if env::var_os("CARGO_FEATURE_NATIVE_VPL").is_none() {
+        return;
+    }
+    assert_eq!(
+        env::var("TARGET").as_deref(),
+        Ok("x86_64-pc-windows-msvc"),
+        "native-vpl currently requires Windows x64 MSVC"
+    );
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let lib = manifest.join("../target/native-vpl/install/lib");
+    for name in ["scrollery_vpl_bridge", "vpl"] {
+        let file = lib.join(format!("{name}.lib"));
+        assert!(file.is_file(), "Prepare VPL with scripts/build-vpl-dispatcher.mjs and scripts/build-vpl-bridge.mjs first: {}", file.display());
+        println!("cargo:rerun-if-changed={}", file.display());
+        println!("cargo:rustc-link-lib=static={name}");
+    }
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    for name in ["d3d11", "dxgi", "advapi32", "ole32"] {
+        println!("cargo:rustc-link-lib={name}");
+    }
 }
 
 /// CommonControls v6 依赖清单,内容与 tauri-build 2.6.3 的 windows-app-manifest.xml 相同。

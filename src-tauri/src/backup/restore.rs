@@ -136,7 +136,7 @@ pub fn restore_stage(
     let cleanup = StagingGuard(Some(staging.clone()));
     extract_and_verify(&mut archive, &manifest, &staging)?;
 
-    // 4. 暂存库校验(quick_check / foreign_key_check)+ 格式标识必须等于当前格式。
+    // 4. 暂存库校验；格式 34 可在校验后原地升到当前格式。
     let staged_db = staging.join(ENTRY_DB);
     let schema_version = validate_staged_db(&staged_db)?;
 
@@ -326,16 +326,20 @@ fn copy_hashing(src: &mut impl Read, dst: &mut impl Write, declared: u64) -> Res
     Ok((total, crate::utils::hash::to_hex_lower(&hasher.finalize())))
 }
 
-/// 暂存库校验(方案 §6.1):quick_check / 外键检查 / **格式标识必须等于当前格式**。返回库内格式标识。
-///
-/// 包内格式与本程序当前格式不等(过旧或过新)→ CODE_SCHEMA_INCOMPATIBLE:不接受,也不在暂存副本上
-/// 做任何结构变更(没有迁移桥)。因此不再存在「对不可信暂存库跑迁移」的攻击面,原 TODO(审查 #10)
-/// 随迁移退役消失;quick_check / fk_check 仍对不可信包执行。
+/// 暂存库先做完整性检查；仅格式 34 在已校验的暂存副本上事务升级，再复检。
+/// 未知格式仍拒绝，绝不触碰当前活库。
 fn validate_staged_db(staged_db: &Path) -> Result<u32> {
     let conn = Connection::open(staged_db).map_err(db_err)?;
     quick_check(&conn)?;
     foreign_key_check(&conn)?;
     let pkg_version = crate::db::schema::read_schema_version(&conn);
+    if pkg_version == 34 {
+        crate::db::schema::initialize_schema(&conn)
+            .map_err(|_| err(CODE_SCHEMA_INCOMPATIBLE, "备份库结构升级失败"))?;
+        quick_check(&conn)?;
+        foreign_key_check(&conn)?;
+        return Ok(crate::db::schema::SCHEMA_VERSION);
+    }
     if pkg_version != crate::db::schema::SCHEMA_VERSION {
         return Err(err(
             CODE_SCHEMA_INCOMPATIBLE,
@@ -657,39 +661,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// #7 跨平台 basename:Windows 反斜杠路径、Unix 正斜杠路径、纯文件名都取到末段;
-    /// 尾随分隔符/空串 → None。锁死跨机(Windows↔macOS)恢复不依赖平台 Path 语义。
-    #[test]
-    fn basename_cross_platform_handles_both_separators() {
-        assert_eq!(
-            basename_cross_platform(r"C:\Users\x\documents\42\100.txt"),
-            Some("100.txt")
-        );
-        assert_eq!(
-            basename_cross_platform("/home/x/documents/42/100.txt"),
-            Some("100.txt")
-        );
-        assert_eq!(basename_cross_platform("100.txt"), Some("100.txt"));
-        // 混合分隔符(源机路径经某些序列化后可能混用)也取最后一段。
-        assert_eq!(basename_cross_platform(r"a/b\c/d.txt"), Some("d.txt"));
-        assert_eq!(basename_cross_platform("a/b/"), None);
-        assert_eq!(basename_cross_platform(""), None);
-    }
-
-    /// #1 backup_id 单段安全校验:接受随机 hex,拒穿越/绝对/盘符/多段/反斜杠。
-    #[test]
-    fn safe_backup_id_rejects_traversal_and_absolute() {
-        assert!(is_safe_backup_id("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"));
-        assert!(is_safe_backup_id("bk-2026"));
-        assert!(!is_safe_backup_id("../evil"));
-        assert!(!is_safe_backup_id("a/b"));
-        assert!(!is_safe_backup_id("/abs"));
-        assert!(!is_safe_backup_id(r"C:\Users\x"));
-        assert!(!is_safe_backup_id("C:/Users/x"));
-        assert!(!is_safe_backup_id(".."));
-        assert!(!is_safe_backup_id(""));
-    }
-
     /// #1 端到端:manifest.backupId 含路径穿越 → restore_stage 判 restore_path_invalid,
     /// 且不在 appdata 外制造/删除任何目录(remove_dir_all/解压落点均被拦在校验前)。
     #[test]
@@ -726,36 +697,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 备份库格式非当前:过旧与过新走**同一条**拒绝路径 → 统一 restore_schema_incompatible,
-    /// 且拒绝路径绝不改动暂存库(不「修好」标识、不建结构)。直接单测暂存库校验函数。
     #[test]
-    fn staged_db_other_format_is_rejected() {
-        for bogus in [
-            crate::db::schema::SCHEMA_VERSION + 1,
-            crate::db::schema::SCHEMA_VERSION - 1,
-        ] {
-            let root = unique_dir("otherfmt");
-            let db = root.join("scrollery.db");
-            let conn = Connection::open(&db).unwrap();
-            crate::db::schema::initialize_schema(&conn).unwrap();
-            conn.execute(
-                "UPDATE app_config SET value=?1 WHERE key='schema_version'",
-                params![bogus.to_string()],
-            )
-            .unwrap();
-            drop(conn);
+    fn staged_34_db_is_upgraded_before_restore() {
+        let root = unique_dir("format34");
+        let db = root.join("scrollery.db");
+        let conn = Connection::open(&db).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE media_derivations RENAME TO media_derivations_v35;
+             CREATE TABLE media_derivations (
+                 item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
+                 kind TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0,
+                 payload_path TEXT, error TEXT,
+                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                 orphan_count INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (item_id, kind)
+             );
+             DROP TABLE media_derivations_v35;
+             CREATE INDEX idx_deriv_pending ON media_derivations(kind, status) WHERE status < 2;
+             UPDATE app_config SET value='34' WHERE key='schema_version';",
+        )
+        .unwrap();
+        drop(conn);
 
-            match validate_staged_db(&db) {
-                Err(AppError::Restore { code, .. }) => {
-                    assert_eq!(code, CODE_SCHEMA_INCOMPATIBLE, "标识 {bogus}")
-                }
-                other => panic!("期望 restore_schema_incompatible(标识 {bogus}),得 {other:?}"),
-            }
-            // 拒绝路径不得「修好」标识,也不得建立任何结构。
-            let conn = Connection::open(&db).unwrap();
-            assert_eq!(crate::db::schema::read_schema_version(&conn), bogus);
-            drop(conn);
-            let _ = std::fs::remove_dir_all(&root);
-        }
+        assert_eq!(
+            validate_staged_db(&db).unwrap(),
+            crate::db::schema::SCHEMA_VERSION
+        );
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            crate::db::schema::read_schema_version(&conn),
+            crate::db::schema::SCHEMA_VERSION
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

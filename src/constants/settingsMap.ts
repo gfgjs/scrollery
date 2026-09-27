@@ -331,15 +331,6 @@ export const SETTINGS_MAP = {
       { value: 'direct', labelKey: 'settings.thumbStrategyDirect' },
     ],
   },
-  gpuEngine: {
-    icon: Monitor,
-    label: 'settings.gpuEngine',
-    descKey: 'settings.gpuEngineDesc',
-    summaryKey: null,
-    section: 'thumbnails',
-    control: 'select',
-    options: [{ value: 'wic', labelKey: 'settings.gpuEngineWic' }],
-  },
   thumbCacheDir: {
     icon: HardDrive,
     label: 'settings.thumbCacheDir',

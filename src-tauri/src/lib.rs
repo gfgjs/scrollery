@@ -230,7 +230,7 @@ pub fn run() {
                 );
             }
 
-            // 启动期 WAL 截断 + 三项自愈:**须在 tracing 就绪后、派生管线拉起前**
+            // 启动期 WAL 截断与自愈:**须在 tracing 就绪后、派生管线拉起前**
             // (§3.1 不变量 4/5),故调用点在此而非 db::boot::init 内。
             db::boot::run_startup_reconciliation(&db_boot.writer, &db_boot.db_path, &cache_dir);
 
@@ -295,7 +295,6 @@ pub fn run() {
                 cfg.thumb_size,
                 cfg.thumb_skip_max_kb,
                 cfg.thumb_strategy,
-                cfg.gpu_engine,
                 cfg.ai_hq_cache,
                 cfg.thumb_webp_quality,
                 exotic_catalog,

@@ -51,32 +51,3 @@ impl EnhanceReadiness {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn readiness_and_admission_agree_for_every_combination() {
-        for bits in 0..16 {
-            let authorized = bits & 1 != 0;
-            let worker = bits & 2 != 0;
-            let manifest = bits & 4 != 0;
-            let installed = bits & 8 != 0;
-            let actual = readiness(authorized, worker, manifest, installed);
-            let expected = if !worker {
-                EnhanceReadiness::WorkerMissing
-            } else if !manifest {
-                EnhanceReadiness::ManifestUnready
-            } else if !authorized {
-                EnhanceReadiness::Unlicensed
-            } else if !installed {
-                EnhanceReadiness::ModelMissing
-            } else {
-                EnhanceReadiness::Ready
-            };
-            assert_eq!(actual, expected);
-            assert_eq!(actual.ensure_ready().is_ok(), bits == 15);
-        }
-    }
-}

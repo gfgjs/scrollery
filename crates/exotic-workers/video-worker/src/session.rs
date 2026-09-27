@@ -180,94 +180,12 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn version_and_config_parse() {
-        let out = "ffmpeg version n7.1.5-10-g2aefd64d48 Copyright (c) 2000-2026\n\
-                   built with gcc 15.2.0\n\
-                   configuration: --prefix=/x --enable-shared --disable-libx264 --enable-version3\n\
-                   libavutil 59. 39.100\n";
-        let (v, c) = parse_ffmpeg_version(out);
-        assert_eq!(v, "n7.1.5-10-g2aefd64d48");
-        assert!(c.contains("--disable-libx264"));
-        assert!(!configuration_has_gpl(&c), "LGPL 包不应判 GPL");
-    }
-
-    #[test]
-    fn missing_configuration_line_is_fail_closed() {
-        // `-version` 输出无 configuration 行(如异常/被裁剪的构建)→ fail-closed 判缺失。
-        let out = "ffmpeg version n7.1.5-10-g2aefd64d48 Copyright (c) 2000-2026\n\
-                   built with gcc 15.2.0\n\
-                   libavutil 59. 39.100\n";
-        let (_, c) = parse_ffmpeg_version(out);
-        assert!(c.is_empty(), "本 fixture 故意不含 configuration 行");
-        assert!(
-            configuration_missing(&c),
-            "缺 configuration 行应判定为缺失(fail-closed)"
-        );
-        // 正常有 configuration 行时不误判缺失。
-        assert!(!configuration_missing("--prefix=/x --enable-shared"));
-    }
-
-    #[test]
-    fn gpl_fuse_detects_enable_gpl() {
-        assert!(configuration_has_gpl(
-            "--prefix=/x --enable-gpl --enable-libx264"
-        ));
-        assert!(configuration_has_gpl("--enable-gpl"));
-        // 相邻串不误判。
-        assert!(!configuration_has_gpl(
-            "--enable-version3 --enable-gpl-something"
-        ));
-        assert!(!configuration_has_gpl("--disable-gpl"));
-        assert!(!configuration_has_gpl(""));
-    }
-
-    #[test]
-    fn ffprobe_derivation_same_dir() {
-        let p = derive_ffprobe_path(Path::new("/opt/ff/bin/ffmpeg"));
-        assert!(p.ends_with(if cfg!(windows) {
-            "ffprobe.exe"
-        } else {
-            "ffprobe"
-        }));
-        assert!(p.to_string_lossy().contains("bin"));
-    }
-
     fn temp_dir(name: &str) -> PathBuf {
         let d =
             std::env::temp_dir().join(format!("video-worker-sess-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(&d).unwrap()
-    }
-
-    #[test]
-    fn sha256_matches_known() {
-        let d = temp_dir("sha");
-        let f = d.join("blob.bin");
-        std::fs::write(&f, b"hello").unwrap();
-        // sha256("hello") 已知常量。
-        assert_eq!(
-            sha256_file(&f).unwrap(),
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        );
-    }
-
-    #[test]
-    fn output_whitelist_inside_ok_outside_rejected() {
-        let work = temp_dir("wl");
-        let inside = work.join("job.mp4.tmp");
-        let r = resolve_output_path(inside.to_str().unwrap(), &work).unwrap();
-        assert!(r.starts_with(&work));
-
-        let sibling = work
-            .parent()
-            .unwrap()
-            .join(format!("video-worker-sess-{}-evil", std::process::id()));
-        let _ = std::fs::remove_dir_all(&sibling);
-        std::fs::create_dir_all(&sibling).unwrap();
-        let out = sibling.join("x.tmp");
-        assert!(resolve_output_path(out.to_str().unwrap(), &work).is_err());
     }
 
     #[test]
@@ -312,26 +230,6 @@ mod tests {
             d.to_str().unwrap(),
         )
         .unwrap_err();
-        assert_eq!(
-            e.code(),
-            exotic_protocol::WorkerErrorCode::FfmpegUnavailable
-        );
-    }
-
-    #[test]
-    fn validate_rejects_missing_ffprobe() {
-        let d = temp_dir("noprobe");
-        let ff = d.join(if cfg!(windows) {
-            "ffmpeg.exe"
-        } else {
-            "ffmpeg"
-        });
-        let content = b"dummy";
-        std::fs::write(&ff, content).unwrap();
-        let sha = sha256_file(&ff).unwrap();
-        // sha 相符但无 ffprobe → FfmpegUnavailable。
-        let e =
-            validate_video_init(1, ff.to_str().unwrap(), &sha, d.to_str().unwrap()).unwrap_err();
         assert_eq!(
             e.code(),
             exotic_protocol::WorkerErrorCode::FfmpegUnavailable

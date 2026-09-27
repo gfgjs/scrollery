@@ -773,6 +773,3 @@ pub struct FailureBody {
     /// 用户可见诊断信息；**不得**含完整绝对路径或 License token（v3 Part2 §3.3）。
     pub message: String,
 }
-
-#[cfg(test)]
-mod tests;

@@ -15,8 +15,8 @@ mod message;
 mod stderr_log;
 
 pub use frame::{
-    read_frame, write_frame, Frame, FrameType, ProtocolError, HEADER_LEN, MAGIC, MAX_BLOB_LEN,
-    MAX_JSON_LEN, PROTOCOL_VERSION,
+    read_frame, read_frame_with_blob_limit, write_frame, Frame, FrameType, ProtocolError,
+    HEADER_LEN, MAGIC, MAX_BLOB_LEN, MAX_JSON_LEN, PROTOCOL_VERSION,
 };
 pub use message::{
     capability, EmbedBatchSuccess, EmbedItem, EmbedResult, EnhanceDone, EnhanceStep, EnhanceTask,

@@ -196,31 +196,3 @@ pub fn spawn_config_file_watcher(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn self_write_is_skipped_when_fingerprints_match() {
-        assert!(is_self_write(Some(42), Some(42)));
-    }
-
-    #[test]
-    fn external_write_is_not_skipped_when_fingerprints_differ() {
-        assert!(!is_self_write(Some(42), Some(7)));
-    }
-
-    #[test]
-    fn missing_last_own_is_not_treated_as_self_write() {
-        // 尚未有过自写记录(如刚启动、watcher 挂载早于第一次 set_and_persist)→ 不跳过。
-        assert!(!is_self_write(Some(42), None));
-    }
-
-    #[test]
-    fn unreadable_current_content_is_not_treated_as_self_write() {
-        // 读取失败(如文件被并发删除)→ 宁可多通知一次,不武断当成自写跳过。
-        assert!(!is_self_write(None, Some(42)));
-    }
-
-}

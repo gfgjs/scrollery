@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use crossbeam_channel::bounded;
 use rusqlite::OptionalExtension;
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::db::models::ThumbResult;
 use crate::error::{AppError, Result};
@@ -14,23 +13,9 @@ use crate::exotic::{ExoticHost, ExoticTaskStatus};
 use crate::scanner::enricher::MediaEnrichedPayload;
 use crate::state::AppState;
 use crate::thumbnail::generator::snap_to_tier;
-use crate::thumbnail::{
-    decode_media_step, process_deferred_cpu, route_thumbnail, DecodeResult, ThumbnailRoute,
-    ThumbnailRouteInput,
-};
+use crate::thumbnail::{route_thumbnail, ThumbnailRoute, ThumbnailRouteInput};
 
-// 【生成引擎终局(2026-07-10 真机 A/B 裁决)】唯一实现 = 多阶段流水线(原「方案二」):
-// 解码(cores×2)/编码(cores)/CPU 兜底(cores/2)各自线程池 + crossbeam channel,IO·GPU·CPU 重叠。
-// 历史:曾与「方案一」(Rayon 直线并发,每项全程一个工作线程)以 USE_PIPELINE 开关并存,注释宣称
-// 方案一「多核性能最好」但从未实测;2026-07-10 公平化(进度同节流/每 id 恰一结果/Phase2 并行)后
-// 用户真机 A/B 定案:**流水线全量生成稳定 7.3s,Rayon 直线 16-20s(慢 2.2~2.7 倍)**——
-// 方案一分支与运行时开关(thumb_use_pipeline)一并删除退役(daab834 引入,本提交裁决移除)。
-// 若未来要复盘旧实现,见 daab834 之前的 git 历史。
-
-// QoS/线程调度块(thumb_cpu_budget/set_app_foreground/refresh_worker_qos/
-// apply_thread_qos 三平台)已下沉 `thumbnail::qos`(U-P4-a):它是线程调度策略而非
-// IPC 语义,被批量/全量两条流水线共用,lib.rs 的窗口事件也直接消费。
-use crate::thumbnail::qos::{refresh_worker_qos, thumb_cpu_budget};
+// 全库与视口普通图片均由 ThumbnailCoordinator 领取并条件提交；冷门格式仍由 exotic 接管。
 
 // 全库生成流水线（run_thumbnail_generation + 进度/开关命令）已拆至 `thumbnail_full_gen.rs`
 // （见超长文件拆分方案 tierB-3）；下方 `pub use *` 转发保持 `ipc::thumbnail_commands::X` 外部路径
@@ -40,106 +25,30 @@ use crate::thumbnail::qos::{refresh_worker_qos, thumb_cpu_budget};
 // "cannot find __cmd__x"。
 pub use super::thumbnail_full_gen::*;
 
-/// 批量写入缩略图结果到 db_writer（锁中毒即恢复,审查 R11):生命周期读锁 → writer 锁 →
-/// 单事务 → 逐条 update_thumb_result_if_current → commit。生命周期锁必须先于 writer 锁，避免和清库
-/// 的反向路径死锁；返回 false 表示 worker epoch 已失效，整批被丢弃。
-/// 抽出以消除 6 处逐字复制的「锁+事务+批写」块,并统一锁中毒策略(收敛 R11 的「静默跳过整批」臂——
-/// 旧 `if let Ok(conn)` 在毒锁下永久丢写而 UI 仍显示)。
-/// 批写尽力而为:update/commit 失败吞掉(下轮生成自愈),与原逐行 `let _ =` 语义一致。
-/// 用 let-else 绑定 tx,避免 `if let` 作块尾表达式时 Transaction 临时值晚于 conn 析构的借用冲突。
-/// `pub(super)`：两条流水线（本文件的批量视口路径 / `thumbnail_full_gen.rs` 的全库生成路径）
-/// 共享的唯一写入助手。
-pub(super) fn flush_thumb_results(state: &AppState, epoch: u64, results: &[ThumbResult]) -> bool {
-    if results.is_empty() {
-        return true;
-    }
-    state
-        .with_database_lifecycle_read(epoch, || {
-            let mut conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-            let Ok(tx) = conn.transaction() else {
-                return false;
-            };
-            let mut accepted = Vec::new();
-            for r in results {
-                let applied = crate::db::queries::update_thumb_result_if_current(
-                    &tx,
-                    r.item_id,
-                    r.source_revision,
-                    r.cache_key,
-                    r.thumb_status,
-                    r.thumb_path.as_deref(),
-                    r.thumbhash.as_deref(),
-                );
-                if matches!(applied, Ok(1)) {
-                    accepted.push(r.clone());
-                }
-            }
-            if tx.commit().is_err() {
-                return false;
-            }
-            // DB CAS 拒绝的旧结果不能再污染常驻布局缓存；否则 DB 已经保住新源，内存
-            // 出口却会在下一次重算前短暂显示旧产物/失败状态。
-            state.apply_thumb_results(&accepted);
-            true
-        })
-        .unwrap_or(false)
+/// 视口请求的逐项回包；pending 表示本次尚无可显示的最终结果。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewportThumbResult {
+    #[serde(flatten)]
+    result: ThumbResult,
+    pending: bool,
 }
 
-/// 为全库生成流水线写入一批结果，并在同一个缩略图代次临界区内更新内存布局缓存。
-///
-/// 全库 worker 的收尾可能晚于 stop→restart；代次、取消令牌和数据库 epoch 必须在同一
-/// 短状态区内检查，不能只复用面向视口请求的 epoch-only helper。该函数不包住文件 IO，
-/// 只持有一个短 DB 事务和内存缓存更新。
-pub(super) fn flush_thumb_results_for_generation(
-    state: &AppState,
-    epoch: u64,
-    generation: u64,
-    cancel_token: &CancellationToken,
-    results: &[ThumbResult],
-) -> bool {
-    if results.is_empty() {
-        return true;
-    }
-    state.with_thumb_generation_gate(|| {
-        if cancel_token.is_cancelled() || !state.thumb_gen_token.is_generation_current(generation) {
-            return false;
+impl ViewportThumbResult {
+    fn from_result(result: ThumbResult) -> Self {
+        Self {
+            pending: result.thumb_status == 0,
+            result,
         }
-        state
-            .with_database_lifecycle_read(epoch, || {
-                let mut conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-                let Ok(tx) = conn.transaction() else {
-                    return false;
-                };
-                let mut accepted = Vec::new();
-                for r in results {
-                    let applied = crate::db::queries::update_thumb_result_if_current(
-                        &tx,
-                        r.item_id,
-                        r.source_revision,
-                        r.cache_key,
-                        r.thumb_status,
-                        r.thumb_path.as_deref(),
-                        r.thumbhash.as_deref(),
-                    );
-                    if matches!(applied, Ok(1)) {
-                        accepted.push(r.clone());
-                    }
-                }
-                if tx.commit().is_err() {
-                    return false;
-                }
-                state.apply_thumb_results(&accepted);
-                true
-            })
-            .unwrap_or(false)
-    })
+    }
 }
 
 #[tauri::command]
 pub async fn batch_request_thumbnails(
     item_ids: Vec<i64>,
     target_size: Option<u32>,
-    on_result: tauri::ipc::Channel<ThumbResult>,
+    request_id: String,
+    on_result: tauri::ipc::Channel<ViewportThumbResult>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
     // span 埋点(W1,D-312 debug 档:视口滚动热路径查询,默认 info 档不刷屏)。
@@ -148,6 +57,9 @@ pub async fn batch_request_thumbnails(
     let Some(database_epoch) = state_arc.current_database_epoch() else {
         return Ok(());
     };
+    let request = state_arc
+        .thumb_coordinator
+        .register_viewport_request(request_id, &item_ids)?;
     let mut config = {
         state_arc
             .thumb_config
@@ -162,15 +74,21 @@ pub async fn batch_request_thumbnails(
     // config.size 可能来自前端 target_size 或库中旧值(如历史默认 480),非档位值会令
     // thumb_path 断言失败/写入无效档位目录。幂等——已是档位则不变。
     config.size = snap_to_tier(config.size);
+    let output_fp = crate::thumbnail::scheduler::OutputFingerprint::for_image(&config);
+    config.output_fingerprint = Some(output_fp);
+    let video_fp = crate::thumbnail::scheduler::OutputFingerprint::for_native_video_cover(&config);
+    let expected_size = config.size;
 
     // R1-3：批量缓存查询走 read_blocking。
     let ids_for_query = item_ids.clone();
-    let (fast_results, route_fmt, route_cache_key) =
+    let (fast_results, route_fmt, route_type, route_cache_key) =
         super::blocking::read_blocking(&state, move |conn| {
             // 批量查缓存
             let mut fast_results = std::collections::HashMap::new();
             // id → file_format（R7：缓存查询前置扩列 file_format，供 Router 判定，避免 N+1）。
             let mut route_fmt: std::collections::HashMap<i64, String> =
+                std::collections::HashMap::new();
+            let mut route_type: std::collections::HashMap<i64, String> =
                 std::collections::HashMap::new();
             // id → cache_key（问题4：done 任务重算期望指纹需要，避免 Router 内回查）。
             let mut route_cache_key: std::collections::HashMap<i64, i64> =
@@ -183,7 +101,7 @@ pub async fn batch_request_thumbnails(
 
             if !placeholders.is_empty() {
                 let sql = format!(
-                    "SELECT id, thumb_status, thumb_path, thumbhash, file_format, cache_key, source_revision FROM media_items WHERE id IN ({})",
+                    "SELECT id, thumb_status, thumb_path, thumbhash, file_format, cache_key, source_revision, media_type FROM media_items WHERE id IN ({})",
                     placeholders
                 );
                 let mut stmt = conn.prepare(&sql).map_err(AppError::Db)?;
@@ -200,30 +118,47 @@ pub async fn batch_request_thumbnails(
                             },
                             row.get::<_, String>(4)?,
                             row.get::<_, i64>(5)?,
+                            row.get::<_, String>(7)?,
                         ))
                     })
                     .map_err(AppError::Db)?;
 
-                for (r, fmt, cache_key) in rows.flatten() {
+                for (r, fmt, cache_key, media_type) in rows.flatten() {
                     route_cache_key.insert(r.item_id, cache_key);
                     route_fmt.insert(r.item_id, fmt);
-                    if r.thumb_status == 1 || r.thumb_status == 3 || r.thumb_status == 2 {
+                    let fp = if media_type == "video" { video_fp } else { output_fp };
+                    route_type.insert(r.item_id, media_type);
+                    let expected = crate::thumbnail::cache::thumb_variant_db_path(
+                        expected_size,
+                        cache_key,
+                        fp,
+                    );
+                    if (r.thumb_status == 1
+                        && r.thumb_path.as_deref() == Some(expected.as_str()))
+                        || r.thumb_status == 3
+                        || r.thumb_status == 2
+                    {
                         fast_results.insert(r.item_id, r);
                     }
                 }
             }
-            Ok((fast_results, route_fmt, route_cache_key))
+            Ok((fast_results, route_fmt, route_type, route_cache_key))
         })
         .await?;
     let mut needs_gen = Vec::new();
 
     for &id in &item_ids {
         if let Some(r) = fast_results.get(&id) {
-            let sent = state_arc
-                .with_database_lifecycle_read(database_epoch, || on_result.send(r.clone()).is_ok());
+            let sent = state_arc.with_database_lifecycle_read(database_epoch, || {
+                request.deliver(id, || {
+                    on_result
+                        .send(ViewportThumbResult::from_result(r.clone()))
+                        .is_ok()
+                })
+            });
             match sent {
-                Some(true) => {}
-                Some(false) => {
+                Some(Some(true)) | Some(None) => {}
+                Some(Some(false)) => {
                     tracing::debug!("Channel disconnected, ignoring thumb result send");
                 }
                 None => return Ok(()),
@@ -259,6 +194,8 @@ pub async fn batch_request_thumbnails(
             // 计算一并下沉 blocking；闭包返回过滤后的 needs_gen（kept）。
             let state_gate = state_arc.clone();
             let on_result_gate = on_result.clone();
+            let request_gate = request.clone();
+            let route_fmt_for_gate = route_fmt.clone();
             needs_gen = tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
                 // 路由仅需 catalog 认领 + 任务态（route_thumbnail 不读 availability）——未授权/未安装的 PSD
                 // 同样不能进主 generator（主解码必失败）。故用 stub Host（无 DB/keyring），避免每项安装/授权
@@ -283,7 +220,10 @@ pub async fn batch_request_thumbnails(
                 // done 但指纹已失效（如用户改档位）→ 须先失效为 pending 再让路重做（Part2 §4.3，问题4）。
                 let mut stale = Vec::new();
                 for &id in &needs_gen {
-                    let fmt = route_fmt.get(&id).map(|s| s.as_str()).unwrap_or("");
+                    let fmt = route_fmt_for_gate
+                        .get(&id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     if snap.resolve_format(fmt).is_none() {
                         kept.push(id); // 常见格式快速路径，不构造 resolution。
                         continue;
@@ -369,13 +309,17 @@ pub async fn batch_request_thumbnails(
                         gated.len()
                     );
                     for id in &gated {
-                        let _ = on_result_gate.send(ThumbResult {
-                            item_id: *id,
-                            thumb_status: 0,
-                            thumb_path: None,
-                            thumbhash: None,
-                            source_revision: 0,
-                            cache_key: 0,
+                        request_gate.deliver(*id, || {
+                            let _ = on_result_gate.send(ViewportThumbResult::from_result(
+                                ThumbResult {
+                                    item_id: *id,
+                                    thumb_status: 0,
+                                    thumb_path: None,
+                                    thumbhash: None,
+                                    source_revision: 0,
+                                    cache_key: 0,
+                                },
+                            ));
                         });
                     }
                 }
@@ -390,245 +334,502 @@ pub async fn batch_request_thumbnails(
         }
     }
 
+    let native_video_enabled = state_arc
+        .config
+        .get("enable_video_cover")
+        .map(|value| value != "false")
+        .unwrap_or(true);
+    let mut image_ids = Vec::new();
+    let mut video_ids = Vec::new();
+    for id in needs_gen {
+        match route_type.get(&id).map(String::as_str) {
+            Some("image") => image_ids.push(id),
+            Some("video")
+                if native_video_enabled
+                    && route_fmt.get(&id).is_some_and(|fmt| {
+                        crate::video::native_cover_formats().contains(&fmt.as_str())
+                    }) =>
+            {
+                video_ids.push(id);
+            }
+            _ => {
+                request.deliver(id, || {
+                    let _ = on_result.send(ViewportThumbResult::from_result(ThumbResult {
+                        item_id: id,
+                        thumb_status: 0,
+                        thumb_path: None,
+                        thumbhash: None,
+                        source_revision: 0,
+                        cache_key: 0,
+                    }));
+                });
+            }
+        }
+    }
     info!(
-        "batch_request_thumbnails: total={} needs_gen={} | 批量请求缩略图: 总计={} 需要生成={}",
-        item_ids.len(),
-        needs_gen.len(),
-        item_ids.len(),
-        needs_gen.len()
+        total = item_ids.len(),
+        images = image_ids.len(),
+        native_videos = video_ids.len(),
+        "viewport thumbnail requests accepted"
     );
 
-    if !needs_gen.is_empty() {
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || {
-            // 多阶段流水线(生成引擎终局,2026-07-10 A/B 实测裁决后唯一实现,见文件头注)。
-            let (decode_tx, decode_rx) = bounded(1024);
-            let (encode_tx, encode_rx) = bounded(1024);
-            let (result_tx, result_rx) = bounded(needs_gen.len().max(1024));
-            // T12(§3.5.1):deferred CPU 专用通道——CPU 密集回退绝不在 decode worker 上
-            // inline 跑(会占住 decode 线程、反让 GPU 提交空等),转投下方独立小池消化。
-            let (deferred_tx, deferred_rx) = bounded(1024);
-
-            let needs_gen_clone = needs_gen.clone();
-            let state_dispatcher = state_arc.clone();
-            let result_tx_dispatch = result_tx.clone();
-            let decode_tx_dispatch = decode_tx.clone();
-            std::thread::spawn(move || {
-                for id in needs_gen_clone {
-                    if !state_dispatcher.is_database_epoch_current(database_epoch) {
-                        break;
-                    }
-                    // 加载项；对任何无法加载的项也发一个失败结果，使每个请求 id 都恰好产出一个结果。
-                    // 静默跳过会让前端在途计数失衡，「处理中 N 项」指示永久卡住（问题9）。
-                    let loaded = state_dispatcher.db_read_pool.get().ok().and_then(|pool| {
-                        let item = crate::db::queries::get_media_item(&pool, id).ok()?;
-                        let (root_path, rel_path, file_name) =
-                            crate::db::queries::get_item_path_info(&pool, id).ok()?;
-                        let abs_path_str = crate::utils::path::resolve_media_path(&root_path, &rel_path, &file_name);
-                        Some((item, std::path::PathBuf::from(abs_path_str)))
-                    });
-                    match loaded {
-                        Some((item, abs_path)) => {
-                            if decode_tx_dispatch.send((item, abs_path)).is_err() {
-                                return;
-                            }
-                        }
-                        None => {
-                            error!("[batch_thumb] could not load item id={id}; emitting failure result | 无法加载项，发送失败结果");
-                            let _ = result_tx_dispatch.send(ThumbResult {
-                                item_id: id,
-                                thumb_status: 2,
-                                thumb_path: None,
-                                thumbhash: None,
-                                source_revision: 0,
-                                cache_key: 0,
-                            });
-                        }
+    // 两类任务独立提交，共用 Coordinator 的持久队列；慢视频不延迟普通图片回传。
+    for (ids, is_video) in [(image_ids, false), (video_ids, true)] {
+        if ids.is_empty() {
+            continue;
+        }
+        let state_for_work = state_arc.clone();
+        let on_result_for_work = on_result.clone();
+        let request_for_work = request.clone();
+        let mut task_config = config.clone();
+        if is_video {
+            task_config.ai_hq_cache = false;
+            task_config.output_fingerprint = Some(video_fp);
+        }
+        let _worker = tokio::task::spawn_blocking(move || {
+            let requested = ids.clone();
+            let result = if is_video {
+                run_viewport_video_covers(
+                    state_for_work.clone(),
+                    database_epoch,
+                    ids,
+                    task_config,
+                    |result| {
+                        request_for_work.deliver(result.item_id, || {
+                            let _ =
+                                on_result_for_work.send(ViewportThumbResult::from_result(result));
+                        });
+                    },
+                    Some(&request_for_work),
+                )
+            } else {
+                run_viewport_images(
+                    state_for_work.clone(),
+                    database_epoch,
+                    ids,
+                    task_config,
+                    on_result_for_work.clone(),
+                    &request_for_work,
+                )
+            };
+            if let Err(error) = result {
+                tracing::warn!(error = %error, "viewport thumbnail batch failed");
+                if state_for_work.is_database_epoch_current(database_epoch) {
+                    for item_id in requested {
+                        request_for_work.deliver(item_id, || {
+                            let _ = on_result_for_work.send(ViewportThumbResult::from_result(
+                                ThumbResult {
+                                    item_id,
+                                    thumb_status: 0,
+                                    thumb_path: None,
+                                    thumbhash: None,
+                                    source_revision: 0,
+                                    cache_key: 0,
+                                },
+                            ));
+                        });
                     }
                 }
-            });
-            // 关闭原始发送端；调度线程的 clone 结束后，decode workers 才能退出，
-            // result_rx 才会收尾，避免批次结果已发完但 invoke 永远不返回。
-            drop(decode_tx);
-
-            let config_decode = config.clone();
-            // CPU 预算限流(2026-07-13):三池均以 thumb_cpu_budget 为上限,不再按逻辑核数铺满。
-            let budget = thumb_cpu_budget();
-            let decode_threads = budget;
-            for _ in 0..decode_threads {
-                let rx = decode_rx.clone();
-                let tx = encode_tx.clone();
-                let res_tx = result_tx.clone();
-                let def_tx = deferred_tx.clone();
-                let cfg = config_decode.clone();
-                let state_worker = state_arc.clone();
-                std::thread::spawn(move || {
-                    let mut qos_state: Option<bool> = None;
-                    while let Ok((item, abs_path)) = rx.recv() {
-                        refresh_worker_qos(&mut qos_state);
-                        let decoded = match state_worker.with_database_lifecycle_read(
-                            database_epoch,
-                            || decode_media_step(&item, &abs_path, &state_worker.engine_arena, &cfg),
-                        ) {
-                            Some(result) => result,
-                            None => break,
-                        };
-                        match decoded {
-                            Ok(DecodeResult::Ready(res)) => {
-                                let _ = res_tx.send(res);
-                            }
-                            Ok(DecodeResult::ToEncode {
-                                item_id,
-                                source_revision,
-                                cache_key,
-                                decoded,
-                            }) => {
-                                let _ = tx.send((item_id, source_revision, cache_key, decoded));
-                            }
-                            Ok(DecodeResult::DeferredToCpu { item, abs_path }) => {
-                                // T12(§3.5.1):不再 inline——CPU 密集回退会占住本 decode worker、
-                                // 反让 GPU decode 空等;转投专用 deferred 小池。通道已关(池退出)
-                                // 时兜底发失败结果,保持「每 id 恰一结果」不变量(问题9)。
-                                if let Err(e) = def_tx.send((item, abs_path)) {
-                                    let (item, _abs) = e.into_inner();
-                                    error!("Deferred channel closed for id={} | deferred 通道已关", item.id);
-                                    let _ = res_tx.send(ThumbResult {
-                                        item_id: item.id,
-                                        thumb_status: 2,
-                                        thumb_path: None,
-                                        thumbhash: None,
-                                        source_revision: item.source_revision,
-                                        cache_key: item.cache_key,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                error!("Decode failed for id={}: {}", item.id, e);
-                                let _ = res_tx.send(ThumbResult {
-                                    item_id: item.id,
-                                    thumb_status: 2,
-                                    thumb_path: None,
-                                    thumbhash: None,
-                                    source_revision: item.source_revision,
-                                    cache_key: item.cache_key,
-                                });
-                            }
-                        }
-                    }
-                });
             }
-            drop(encode_tx);
-            // 主句柄仅供 decode worker 克隆;此处即弃——decode 阶段全部退出后 deferred 池
-            // 随通道关闭收尾(否则其 result_tx 克隆悬活,result_rx 永不结束、invoke 不返回)。
-            drop(deferred_tx);
+        });
+    }
+    Ok(())
+}
 
-            // T12(§3.5.1)deferred CPU 专用小池:与 decode/encode 阶段解耦。池宽 max(1, budget/2)
-            // ——CPU 密集解码本就吃核,池小不损吞吐,却保证 decode 通道永不被 CPU 回退占住。
-            let deferred_threads = (budget / 2).max(1);
-            let config_deferred = config.clone();
-            for _ in 0..deferred_threads {
-                let rx = deferred_rx.clone();
-                let res_tx = result_tx.clone();
-                let cfg = config_deferred.clone();
-                let state_worker = state_arc.clone();
-                std::thread::spawn(move || {
-                    let mut qos_state: Option<bool> = None;
-                    while let Ok((item, abs_path)) = rx.recv() {
-                        refresh_worker_qos(&mut qos_state);
-                        let deferred = match state_worker.with_database_lifecycle_read(
-                            database_epoch,
-                            || process_deferred_cpu(&item, &abs_path, &state_worker.engine_arena, &cfg),
-                        ) {
-                            Some(result) => result,
-                            None => break,
-                        };
-                        match deferred {
-                            Ok(res) => {
-                                let _ = res_tx.send(res);
-                            }
-                            Err(e) => {
-                                error!("Deferred CPU Decode failed for id={}: {}", item.id, e);
-                                    let _ = res_tx.send(ThumbResult {
-                                        item_id: item.id,
-                                        thumb_status: 2,
-                                        thumb_path: None,
-                                        thumbhash: None,
-                                        source_revision: item.source_revision,
-                                        cache_key: item.cache_key,
-                                    });
-                            }
-                        }
-                    }
-                });
+/// 撤销单格视口回传与等待；共享任务仍由 DB lease 和其他请求方管理。
+#[tauri::command]
+pub fn cancel_viewport_thumbnail_request(
+    request_id: String,
+    item_ids: Vec<i64>,
+    state: State<'_, Arc<AppState>>,
+) {
+    state
+        .thumb_coordinator
+        .cancel_viewport_request(&request_id, &item_ids);
+}
+
+fn run_viewport_images(
+    state: Arc<AppState>,
+    epoch: u64,
+    item_ids: Vec<i64>,
+    config: crate::thumbnail::ThumbConfig,
+    on_result: tauri::ipc::Channel<ViewportThumbResult>,
+    request: &Arc<crate::thumbnail::coordinator::ViewportRequest>,
+) -> Result<()> {
+    use crate::db::queries::{self as q, ThumbnailLane, ThumbnailTaskKey, ThumbnailTaskKind};
+    use crate::thumbnail::coordinator::{unique_id, ImageExecution};
+    use crate::thumbnail::scheduler::classify_image_cost;
+
+    let fp = config
+        .output_fingerprint
+        .ok_or_else(|| AppError::Internal("viewport thumbnail fingerprint missing".into()))?;
+    let run_id = unique_id()?;
+    let candidates = {
+        let conn = state.db_read_pool.get().map_err(AppError::from)?;
+        q::image_thumbnail_candidates_for_ids(&conn, &item_ids)?
+    };
+    let by_id: std::collections::HashMap<_, _> =
+        candidates.into_iter().map(|c| (c.item.id, c)).collect();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let deferred = std::sync::Mutex::new(Vec::new());
+    let skipped = std::sync::Mutex::new(Vec::new());
+    let send = |result: ThumbResult| {
+        request.deliver(result.item_id, || {
+            let _ = on_result.send(ViewportThumbResult::from_result(result));
+        });
+    };
+
+    let collect = |outcome: ImageExecution| match outcome {
+        ImageExecution::Published(result, _) => {
+            send(result);
+        }
+        ImageExecution::Unavailable(id) => {
+            if let Some(candidate) = by_id.get(&id) {
+                send(pending_thumbnail_result(candidate));
             }
-
-            let config_encode = config.clone();
-            for _ in 0..budget {
-                let rx = encode_rx.clone();
-                let tx = result_tx.clone();
-                let state_worker = state_arc.clone();
-                let cfg = config_encode.clone();
-                std::thread::spawn(move || {
-                    let mut qos_state: Option<bool> = None;
-                    while let Ok((item_id, source_revision, cache_key, decoded)) = rx.recv() {
-                        refresh_worker_qos(&mut qos_state);
-                        let encoded = match state_worker.with_database_lifecycle_read(
-                            database_epoch,
-                            || crate::thumbnail::encode_media_step_with_snapshot(
-                                item_id,
-                                source_revision,
-                                cache_key,
-                                decoded,
-                                &cfg,
-                            ),
-                        ) {
-                            Some(result) => result,
-                            None => break,
-                        };
-                        match encoded {
-                            Ok(res) => { let _ = tx.send(res); }
-                            Err(e) => {
-                                error!("Encode failed for id={}: {}", item_id, e);
-                                let _ = tx.send(ThumbResult {
-                                    item_id,
-                                    thumb_status: 2,
-                                    thumb_path: None,
-                                    thumbhash: None,
-                                    source_revision,
-                                    cache_key,
-                                });
-                            }
-                        }
-                    }
+        }
+        ImageExecution::Deferred(id) => {
+            deferred.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+        }
+        ImageExecution::Skipped(id) => {
+            skipped.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+        }
+    };
+    state.thumb_coordinator.run_images(
+        &state,
+        epoch,
+        &config,
+        &cancel,
+        |tx| {
+            for &id in &item_ids {
+                if !state.is_database_epoch_current(epoch) {
+                    break;
+                }
+                if !request.is_active(id) {
+                    continue;
+                }
+                let Some(candidate) = by_id.get(&id) else {
+                    send(ThumbResult {
+                        item_id: id,
+                        thumb_status: 0,
+                        thumb_path: None,
+                        thumbhash: None,
+                        source_revision: 0,
+                        cache_key: 0,
+                    });
+                    continue;
+                };
+                let lane = classify_image_cost(
+                    &candidate.item.file_format,
+                    candidate.item.file_size,
+                    candidate.item.width,
+                    candidate.item.height,
+                );
+                let key = ThumbnailTaskKey {
+                    item_id: id,
+                    source_revision: candidate.item.source_revision,
+                    kind: ThumbnailTaskKind::Image,
+                    output_fingerprint: fp.hex(),
+                };
+                let offered = state.with_database_lifecycle_read(epoch, || -> Result<()> {
+                    let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    q::enqueue_thumbnail_task(&conn, &key, lane, lane.as_str(), &run_id)?;
+                    q::promote_thumbnail_task(&conn, &key, lane)?;
+                    Ok(())
                 });
-            }
-            drop(result_tx);
-
-            let mut results = Vec::new();
-            while let Ok(res) = result_rx.recv() {
-                let sent = state_arc.with_database_lifecycle_read(database_epoch, || {
-                    if on_result.send(res.clone()).is_err() {
-                        tracing::debug!("Channel disconnected, ignoring thumb result send");
-                    }
-                    results.push(res);
-                });
-                if sent.is_none() {
+                if offered.transpose()?.is_none() {
+                    break;
+                }
+                let dispatch_lane = match lane {
+                    ThumbnailLane::Fast => ThumbnailLane::ViewportFast,
+                    ThumbnailLane::Heavy => ThumbnailLane::ViewportHeavy,
+                    other => other,
+                };
+                if tx
+                    .send_viewport((candidate.clone(), dispatch_lane), request)
+                    .is_err()
+                {
                     break;
                 }
             }
+            Ok(())
+        },
+        collect,
+    )?;
 
-            if !results.is_empty() {
-                // flush helper 只把通过 source_revision + cache_key CAS 的结果同步到
-                // layout_cache；DB 拒绝的旧结果不能在这里再次无条件 patch 回去。
-                let _ = flush_thumb_results(&state_arc, database_epoch, &results);
-            }
-
-            info!("batch_request_thumbnails: finished pipeline | 批量请求生成完成 (Pipeline Scheme 2)");
-        })
-        .await
-        .map_err(|e| AppError::Io(e.into()))?;
+    let retry_ids = std::mem::take(&mut *deferred.lock().unwrap_or_else(|e| e.into_inner()));
+    if !retry_ids.is_empty() && state.is_database_epoch_current(epoch) {
+        state.thumb_coordinator.run_images(
+            &state,
+            epoch,
+            &config,
+            &cancel,
+            |tx| {
+                for id in retry_ids {
+                    if !request.is_active(id) {
+                        continue;
+                    }
+                    if let Some(candidate) = by_id.get(&id) {
+                        if tx
+                            .send_viewport(
+                                (candidate.clone(), ThumbnailLane::ViewportHeavy),
+                                request,
+                            )
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            },
+            collect,
+        )?;
     }
 
+    let mut waiting = std::mem::take(&mut *skipped.lock().unwrap_or_else(|e| e.into_inner()));
+    waiting.extend(std::mem::take(
+        &mut *deferred.lock().unwrap_or_else(|e| e.into_inner()),
+    ));
+    wait_for_viewport_results(
+        &state,
+        epoch,
+        &config,
+        &by_id,
+        waiting,
+        &send,
+        Some(request),
+    )
+}
+
+fn run_viewport_video_covers<F>(
+    state: Arc<AppState>,
+    epoch: u64,
+    item_ids: Vec<i64>,
+    config: crate::thumbnail::ThumbConfig,
+    on_result: F,
+    request: Option<&Arc<crate::thumbnail::coordinator::ViewportRequest>>,
+) -> Result<()>
+where
+    F: Fn(ThumbResult) + Sync,
+{
+    use crate::db::queries::{self as q, ThumbnailLane, ThumbnailTaskKey, ThumbnailTaskKind};
+    use crate::thumbnail::coordinator::{unique_id, ImageExecution};
+
+    let fp = config
+        .output_fingerprint
+        .ok_or_else(|| AppError::Internal("viewport video fingerprint missing".into()))?;
+    let run_id = unique_id()?;
+    let candidates = {
+        let conn = state.db_read_pool.get().map_err(AppError::from)?;
+        q::native_video_cover_candidates_for_ids(&conn, &item_ids)?
+    };
+    let by_id: std::collections::HashMap<_, _> =
+        candidates.into_iter().map(|c| (c.item.id, c)).collect();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let deferred = std::sync::Mutex::new(Vec::new());
+    let skipped = std::sync::Mutex::new(Vec::new());
+    let collect = |outcome: ImageExecution| match outcome {
+        ImageExecution::Published(result, _) => {
+            on_result(result);
+        }
+        ImageExecution::Unavailable(id) => {
+            if let Some(candidate) = by_id.get(&id) {
+                on_result(pending_thumbnail_result(candidate));
+            }
+        }
+        ImageExecution::Deferred(id) => {
+            deferred.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+        }
+        ImageExecution::Skipped(id) => {
+            skipped.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+        }
+    };
+    state.thumb_coordinator.run_native_video_covers(
+        &state,
+        epoch,
+        &config,
+        &cancel,
+        |tx| {
+            for &id in &item_ids {
+                if !state.is_database_epoch_current(epoch) {
+                    break;
+                }
+                if request.is_some_and(|request| !request.is_active(id)) {
+                    continue;
+                }
+                let Some(candidate) = by_id.get(&id) else {
+                    on_result(ThumbResult {
+                        item_id: id,
+                        thumb_status: 0,
+                        thumb_path: None,
+                        thumbhash: None,
+                        source_revision: 0,
+                        cache_key: 0,
+                    });
+                    continue;
+                };
+                let key = ThumbnailTaskKey {
+                    item_id: id,
+                    source_revision: candidate.item.source_revision,
+                    kind: ThumbnailTaskKind::VideoCover,
+                    output_fingerprint: fp.hex(),
+                };
+                let offered = state.with_database_lifecycle_read(epoch, || -> Result<()> {
+                    let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+                    q::enqueue_thumbnail_task(&conn, &key, ThumbnailLane::Heavy, "video", &run_id)?;
+                    q::promote_thumbnail_task(&conn, &key, ThumbnailLane::Heavy)?;
+                    Ok(())
+                });
+                if offered.transpose()?.is_none() {
+                    break;
+                }
+                let submitted = if let Some(request) = request {
+                    tx.send_viewport((candidate.clone(), ThumbnailLane::ViewportHeavy), request)
+                } else {
+                    tx.send((candidate.clone(), ThumbnailLane::ViewportHeavy))
+                };
+                if submitted.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        },
+        collect,
+    )?;
+
+    let retry_ids = std::mem::take(&mut *deferred.lock().unwrap_or_else(|e| e.into_inner()));
+    if !retry_ids.is_empty() && state.is_database_epoch_current(epoch) {
+        state.thumb_coordinator.run_native_video_covers(
+            &state,
+            epoch,
+            &config,
+            &cancel,
+            |tx| {
+                for id in retry_ids {
+                    if request.is_some_and(|request| !request.is_active(id)) {
+                        continue;
+                    }
+                    if let Some(candidate) = by_id.get(&id) {
+                        let submitted = if let Some(request) = request {
+                            tx.send_viewport(
+                                (candidate.clone(), ThumbnailLane::ViewportHeavy),
+                                request,
+                            )
+                        } else {
+                            tx.send((candidate.clone(), ThumbnailLane::ViewportHeavy))
+                        };
+                        if submitted.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            },
+            collect,
+        )?;
+    }
+    let mut waiting = std::mem::take(&mut *skipped.lock().unwrap_or_else(|e| e.into_inner()));
+    waiting.extend(std::mem::take(
+        &mut *deferred.lock().unwrap_or_else(|e| e.into_inner()),
+    ));
+    wait_for_viewport_results(
+        &state,
+        epoch,
+        &config,
+        &by_id,
+        waiting,
+        &on_result,
+        request.map(Arc::as_ref),
+    )
+}
+
+fn wait_for_viewport_results<F>(
+    state: &AppState,
+    epoch: u64,
+    config: &crate::thumbnail::ThumbConfig,
+    by_id: &std::collections::HashMap<i64, crate::db::queries::ThumbnailCandidate>,
+    mut waiting: Vec<i64>,
+    on_result: &F,
+    request: Option<&crate::thumbnail::coordinator::ViewportRequest>,
+) -> Result<()>
+where
+    F: Fn(ThumbResult),
+{
+    use crate::db::queries as q;
+
+    let fp = config
+        .output_fingerprint
+        .ok_or_else(|| AppError::Internal("viewport thumbnail fingerprint missing".into()))?;
+    // 同键已由全库或另一视口请求持有时等待其条件提交；整批共用截止时间。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    waiting.sort_unstable();
+    waiting.dedup();
+    while !waiting.is_empty() && state.is_database_epoch_current(epoch) {
+        waiting.retain(|id| {
+            by_id.contains_key(id) && request.is_none_or(|request| request.is_active(*id))
+        });
+        if waiting.is_empty() {
+            break;
+        }
+        let current = state
+            .db_read_pool
+            .get()
+            .ok()
+            .and_then(|conn| q::thumbnail_results_for_ids(&conn, &waiting).ok());
+        if !state.is_database_epoch_current(epoch) {
+            break;
+        }
+        let mut epoch_lost = false;
+        waiting.retain(|id| {
+            if request.is_some_and(|request| !request.is_active(*id)) {
+                return false;
+            }
+            let candidate = &by_id[id];
+            let Some(item) = current.as_ref().and_then(|rows| rows.get(id)) else {
+                return true;
+            };
+            let expected =
+                crate::thumbnail::cache::thumb_variant_db_path(config.size, item.cache_key, fp);
+            if item.source_revision != candidate.item.source_revision
+                || item.thumb_status == 0
+                || (item.thumb_status == 1 && item.thumb_path.as_deref() != Some(expected.as_str()))
+            {
+                return true;
+            }
+            if state
+                .with_database_lifecycle_read(epoch, || on_result(item.clone()))
+                .is_none()
+            {
+                epoch_lost = true;
+                return true;
+            }
+            false
+        });
+        if epoch_lost || waiting.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !state.is_database_epoch_current(epoch) {
+        return Ok(());
+    }
+    for id in waiting {
+        if request.is_some_and(|request| !request.is_active(id)) {
+            continue;
+        }
+        let Some(candidate) = by_id.get(&id) else {
+            continue;
+        };
+        if state
+            .with_database_lifecycle_read(epoch, || {
+                on_result(pending_thumbnail_result(candidate));
+            })
+            .is_none()
+        {
+            return Ok(());
+        }
+    }
     Ok(())
 }
 
@@ -641,9 +842,9 @@ pub async fn batch_request_thumbnails(
 /// `thumb_path` 文件已被 LRU 缓存驱逐（`enforce_cache_limit` 删文件不改 `thumb_status`，而
 /// `route_thumbnail` 对 status=1 短路不重生成 → 永久 404）。本命令把该项复位为待重生成：
 /// `media_items` 退回 `thumb_status=0/thumb_path=NULL` + 封面派生行 `2→0`，再发 `db:media_enriched`
-/// —— 既让画廊刷新，又经 `useDerivationAutoStart` kick 派生流水线重跑封面（run_cover 重写文件并
-/// 回填 status=1）。图像类无封面派生：仅退 media_items，滚回视口时主 generator 缺文件 CACHE_MISS
-/// 自愈。
+/// —— 既让画廊刷新，也让旧派生流水线重跑音频/文档/冷门视频封面。原生视频封面直接加入共享
+/// Coordinator，避免派生流水线已在运行时自动启动器跳过唤醒。图像类无封面派生：仅退
+/// media_items，滚回视口时主 generator 缺文件 CACHE_MISS 自愈。
 ///
 /// 防御：**先 stat 确认文件确实缺失**才复位——`img.decode()`/DOM `<img>` 可能因瞬时原因触发
 /// `@error`，若文件其实健在就复位会造成无谓重生成 churn。仅对 `thumb_status=1` 的项动作。
@@ -658,10 +859,10 @@ pub async fn regenerate_missing_thumb(
         return Ok(());
     };
     // 读当前状态 + 路径（读池）。
-    let row: Option<(i64, Option<String>, i64, i64)> =
+    let row: Option<(i64, Option<String>, i64, i64, String, String)> =
         super::blocking::read_blocking(&state, move |conn| {
             conn.query_row(
-                "SELECT thumb_status, thumb_path, source_revision, cache_key
+                "SELECT thumb_status, thumb_path, source_revision, cache_key, media_type, file_format
              FROM media_items WHERE id = ?1 AND is_deleted = 0",
                 [id],
                 |r| {
@@ -670,6 +871,8 @@ pub async fn regenerate_missing_thumb(
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -678,7 +881,9 @@ pub async fn regenerate_missing_thumb(
         })
         .await?;
 
-    let Some((thumb_status, Some(thumb_path), source_revision, cache_key)) = row else {
+    let Some((thumb_status, Some(thumb_path), source_revision, cache_key, media_type, format)) =
+        row
+    else {
         return Ok(()); // 项不存在 / 已软删 / 无路径 —— 无可自愈。
     };
     // 仅处理「DB 说已生成」的项；status=0/2/3 由既有 pending/失败流程管，勿插手。
@@ -744,6 +949,43 @@ pub async fn regenerate_missing_thumb(
     // 派生流水线领取刚复位的封面派生（视频/音频/文档）重跑。空跑幂等，故不惧被多格并发触发。
     let _ = app.emit("db:media_enriched", MediaEnrichedPayload::refresh_signal());
 
+    if media_type == "video"
+        && crate::video::native_cover_formats().contains(&format.as_str())
+        && state_arc
+            .config
+            .get("enable_video_cover")
+            .is_none_or(|value| value != "false")
+    {
+        let mut config = state_arc
+            .thumb_config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        config.size = crate::thumbnail::generator::snap_to_tier(config.size);
+        config.ai_hq_cache = false;
+        config.output_fingerprint =
+            Some(crate::thumbnail::scheduler::OutputFingerprint::for_native_video_cover(&config));
+        let job_state = state_arc.clone();
+        tokio::task::spawn_blocking(move || {
+            let notify_app = app.clone();
+            if let Err(error) = run_viewport_video_covers(
+                job_state,
+                database_epoch,
+                vec![id],
+                config,
+                move |result| {
+                    if result.thumb_status == 1 || result.thumb_status == 2 {
+                        let _ = notify_app
+                            .emit("db:media_enriched", MediaEnrichedPayload::refresh_signal());
+                    }
+                },
+                None,
+            ) {
+                tracing::warn!(item_id = id, error = %error, "native cover self-heal failed");
+            }
+        });
+    }
+
     Ok(())
 }
 
@@ -779,6 +1021,8 @@ pub async fn clear_all_thumbnails(state: State<'_, Arc<AppState>>) -> Result<()>
                     let (deriv_kinds, _) =
                         crate::thumbnail::cache::derivations_to_reset_for_kind("thumbnails");
                     crate::db::queries::reset_derivations_by_kinds(&conn, deriv_kinds)?;
+                    crate::db::queries::reset_image_thumbnail_leases(&conn)?;
+                    crate::db::queries::reset_native_video_cover_leases(&conn)?;
                 }
 
                 // 2. 删除缓存目录。writer 锁已释放，生命周期写锁仍阻止 worker 重建同一目录。
@@ -809,4 +1053,16 @@ pub async fn clear_all_thumbnails(state: State<'_, Arc<AppState>>) -> Result<()>
     state.wake_exotic(crate::exotic::coordinator::WakeReason::ConfigChanged);
 
     Ok(())
+}
+
+/// 暂不可用与等待超时沿同一 pending 契约回包，不把临时状态写回媒体展示行。
+fn pending_thumbnail_result(candidate: &crate::db::queries::ThumbnailCandidate) -> ThumbResult {
+    ThumbResult {
+        item_id: candidate.item.id,
+        thumb_status: 0,
+        thumb_path: None,
+        thumbhash: None,
+        source_revision: candidate.item.source_revision,
+        cache_key: candidate.item.cache_key,
+    }
 }

@@ -55,6 +55,11 @@ license = "AGPL-3.0-only"
 opt-level = 2
 [profile.dev.package.image-webp]
 opt-level = 2
+# 缩略图的缩放与 ThumbHash 也在开发构建热路径上；仅优化对应依赖包。
+[profile.dev.package.fast_image_resize]
+opt-level = 2
+[profile.dev.package.thumbhash]
+opt-level = 2
 # webp/libwebp-sys(903a98f 引入的有损 WebP 编码主路径):libwebp 的 C 源码由 cc 按本包
 # OPT_LEVEL 编译,dev 不覆盖则以 -O0 编译——缩略图编码单张耗时暴涨约一个量级,扫描期
 # 缩略图 worker 占满核拖垮 enrich(「解析元数据」爬行,2026-07-10 真机回归)。

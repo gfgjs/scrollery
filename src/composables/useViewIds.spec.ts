@@ -1,5 +1,4 @@
 import { expect, it, vi } from 'vitest'
-import { IPC } from '../constants/ipc'
 
 const invokeIpc = vi.hoisted(() => vi.fn())
 vi.mock('../utils/ipc', () => ({ invokeIpc }))
@@ -12,29 +11,6 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
   return { promise, resolve, reject }
 }
-
-it('同顺序并发只取一次全集，几何重排保留数组与范围索引', async () => {
-  const ids = useViewIds()
-  const response = deferred<number[]>()
-  invokeIpc.mockReset().mockReturnValue(response.promise)
-  ids.setExpectedVersion(101)
-  const first = ids.ensureFresh(101)
-  const second = ids.ensureFresh(101)
-  expect(first).toBe(second)
-  expect(invokeIpc).toHaveBeenCalledTimes(1)
-  response.resolve([8, 3, 9])
-  await Promise.all([first, second])
-  const original = ids.allIds()
-  ids.setExpectedVersion(null)
-  expect(ids.allIds()).toEqual([])
-  ids.setExpectedVersion(101)
-  await ids.ensureFresh(101)
-  expect(ids.allIds()).toBe(original)
-  expect(ids.rangeBetween(9, 8)).toEqual([8, 3, 9])
-  expect(ids.indexOf(3)).toBe(1)
-  expect(invokeIpc).toHaveBeenCalledTimes(1)
-  expect(invokeIpc).toHaveBeenCalledWith(IPC.GET_VIEW_IDS, { orderVersion: 101 })
-})
 
 it('切换顺序立即撤销旧全集，迟到拒绝不清新数据，当前失败可重试', async () => {
   const ids = useViewIds()

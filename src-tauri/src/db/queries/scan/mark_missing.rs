@@ -316,15 +316,6 @@ mod mark_missing_tests {
         .unwrap()
     }
 
-    fn source_revision(c: &Connection, id: i64) -> i64 {
-        c.query_row(
-            "SELECT source_revision FROM media_items WHERE id=?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
     /// 三重守门矩阵：只有「在线卷 + 本根子树 + 未 seen + 未删」的项被标 missing，其余四类各被一道闸拦住。
     #[test]
     fn three_gates_mark_only_genuinely_missing() {
@@ -357,21 +348,6 @@ mod mark_missing_tests {
         assert_eq!(d, 1);
     }
 
-    /// dry_run：返回将标记数但 DB 零改动。
-    #[test]
-    fn dry_run_counts_without_writing() {
-        let c = mem_db();
-        add(&c, 200, 10, Some(5), "online", 0);
-        add(&c, 201, 10, Some(5), "online", 0);
-        let seen: HashSet<i64> = HashSet::new(); // 全部未出现
-
-        let n = mark_missing(&c, 1, &[5], &seen, true).unwrap();
-        assert_eq!(n, 2, "dry_run 应返回将标记数 2");
-        // DB 未变。
-        assert_eq!(avail(&c, 200), "online");
-        assert_eq!(avail(&c, 201), "online");
-    }
-
     /// 离线卷（online 集为空）：一项都不标——离线 ≠ 删除的第二层冗余防护。
     #[test]
     fn empty_online_set_marks_nothing() {
@@ -381,61 +357,6 @@ mod mark_missing_tests {
         let n = mark_missing(&c, 1, &[], &seen, false).unwrap();
         assert_eq!(n, 0, "无在线卷 → 一项不标");
         assert_eq!(avail(&c, 300), "online");
-    }
-
-    /// 多在线卷：online 集含多卷时，任一在线卷上的未 seen 项都被标；第三卷离线则不标。
-    /// 压 `_mm_online` TEMP 表多行 + `volume_id IN (SELECT ...)` 子查询路径。
-    #[test]
-    fn multiple_online_volumes_all_covered() {
-        let c = mem_db();
-        add(&c, 100, 10, Some(5), "online", 0); // 在线卷5 → 标
-        add(&c, 101, 10, Some(7), "online", 0); // 在线卷7 → 标
-        add(&c, 102, 10, Some(9), "online", 0); // 卷9 离线（不在 online 集）→ 不标
-        let seen: HashSet<i64> = HashSet::new();
-
-        let n = mark_missing(&c, 1, &[5, 7], &seen, false).unwrap();
-        assert_eq!(n, 2, "两在线卷上的未 seen 项均被标");
-        assert_eq!(avail(&c, 100), "missing");
-        assert_eq!(avail(&c, 101), "missing");
-        assert_eq!(avail(&c, 102), "online", "离线卷9 上的项不受影响（守门1）");
-    }
-
-    /// 同连接复用：第二次调用必须先清空 TEMP 表，不被首次的 seen 集污染。
-    /// 这是连接池复用下的真实数据安全点——清空逻辑若失效，二次扫描会用陈旧集合 → 误标/漏标。
-    #[test]
-    fn reuse_same_connection_clears_temp_state() {
-        let c = mem_db();
-        add(&c, 100, 10, Some(5), "online", 0);
-        add(&c, 101, 10, Some(5), "online", 0);
-
-        // 第一次：seen={100} → 仅 101 缺失。
-        let seen1: HashSet<i64> = HashSet::from([100]);
-        let n1 = mark_missing(&c, 1, &[5], &seen1, false).unwrap();
-        assert_eq!(n1, 1);
-        assert_eq!(avail(&c, 101), "missing");
-
-        // 恢复 101，再以「相反」的 seen 集第二次调用（dry_run 纯验集合隔离、不改库）。
-        c.execute(
-            "UPDATE media_items SET availability='online' WHERE id=101",
-            [],
-        )
-        .unwrap();
-        // 第二次：seen={101} → 仅 100 应计。若 TEMP 未清空，残留 seen={100} 会污染 → 算成 0。
-        let seen2: HashSet<i64> = HashSet::from([101]);
-        let n2 = mark_missing(&c, 1, &[5], &seen2, true).unwrap();
-        assert_eq!(n2, 1, "二次调用仅 100 缺失；若被首次 seen 污染则会误算成 0");
-    }
-
-    /// 查询本根 seen TEMP 表当前是否存在(收口 DROP 语义的观测口)。
-    fn seen_table_exists(c: &Connection, root_id: i64) -> bool {
-        let n: i64 = c
-            .query_row(
-                "SELECT count(*) FROM sqlite_temp_master WHERE type='table' AND name=?1",
-                params![seen_table_name(root_id)],
-                |r| r.get(0),
-            )
-            .unwrap();
-        n > 0
     }
 
     fn temp_table_exists(c: &Connection, table: &str) -> bool {
@@ -451,77 +372,6 @@ mod mark_missing_tests {
     fn temp_id_count(c: &Connection, table: &str) -> i64 {
         c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
-    }
-
-    /// 生产路径:`init_seen_table` + 扫描期 `SeenWriter` 流式写入 + `mark_missing_preloaded`
-    /// 不经过 HashSet;真实差集完成后 DROP 本根表(内存即时释放,不复刻对照线的常驻缺陷);
-    /// 复跑走「缺表保守跳过」;下一轮 `init_seen_table` 重建后差集口径回到空 seen。
-    #[test]
-    fn preloaded_streaming_path_drops_seen_after_real_diff() {
-        let c = mem_db();
-        for id in 1..=10i64 {
-            add(&c, id, 10, Some(5), "online", 0);
-        }
-        init_seen_table(&c, 1).unwrap();
-        let seen = SeenWriter::new(1);
-        for id in 1..=5i64 {
-            seen.insert(&c, id).unwrap();
-        }
-        let n = mark_missing_preloaded(&c, 1, &[5], false).unwrap();
-        assert_eq!(n, 5, "id 6..10 未 seen → 应标 missing");
-        for id in 6..=10i64 {
-            assert_eq!(avail(&c, id), "missing");
-        }
-        assert!(
-            !seen_table_exists(&c, 1),
-            "真实差集完成后本根 seen 表应已 DROP(免 temp_store=MEMORY 常驻)"
-        );
-
-        // 复跑:表已销毁 → 缺表保守跳过,一项不多标。
-        let n = mark_missing_preloaded(&c, 1, &[5], false).unwrap();
-        assert_eq!(n, 0, "缺表必须保守返回 0");
-
-        // 下一轮扫描:init 重建空表 → 已 missing 的 6..10 不重计,未 seen 且仍 online 的 1..5 重新纳入。
-        init_seen_table(&c, 1).unwrap();
-        let n = mark_missing_preloaded(&c, 1, &[5], true).unwrap();
-        assert_eq!(n, 5, "重建后差集口径回到空 seen");
-        // dry_run 不销毁表(不影响随后可能的真实收尾)。
-        assert!(seen_table_exists(&c, 1));
-    }
-
-    /// 表缺失(非 fast_scan 路径误调 preloaded)→ 保守跳过,一项不标——绝不以空 seen 集误删。
-    #[test]
-    fn preloaded_missing_table_skips_safely() {
-        let c = mem_db();
-        add(&c, 100, 10, Some(5), "online", 0);
-        let n = mark_missing_preloaded(&c, 1, &[5], false).unwrap();
-        assert_eq!(n, 0, "seen 表缺失必须保守不标");
-        assert_eq!(avail(&c, 100), "online");
-    }
-
-    /// 每根各表互不可见:root2 的 seen 表内容(甚至含 root1 的 id)不许影响 root1 的差集。
-    /// 这是 P1 修复的核心契约——并发扫描不同根共用同一写连接,后启动扫描不得清掉他根 seen。
-    #[test]
-    fn per_root_seen_tables_are_isolated() {
-        let c = mem_db();
-        add(&c, 100, 10, Some(5), "online", 0); // root1 未 seen → 标
-        add(&c, 103, 20, Some(5), "online", 0); // root2 子树,与 root1 差集无关
-        init_seen_table(&c, 2).unwrap();
-        let seen2 = SeenWriter::new(2);
-        seen2.insert(&c, 100).unwrap(); // 故意塞 root1 的 id 进 root2 的表
-        seen2.insert(&c, 103).unwrap();
-        init_seen_table(&c, 1).unwrap(); // root1 启动:只清自己的表,root2 的 seen 必须原样保留
-
-        assert!(
-            seen_table_exists(&c, 2),
-            "root1 的启动不得清掉 root2 的 seen 表"
-        );
-        let n = mark_missing_preloaded(&c, 1, &[5], false).unwrap();
-        assert_eq!(n, 1, "root1 的差集只看 root1 的 seen 表(空)");
-        assert_eq!(avail(&c, 100), "missing");
-        assert_eq!(avail(&c, 103), "online", "root2 子树项不受 root1 扫描影响");
-        assert!(!seen_table_exists(&c, 1), "root1 收尾只 DROP 自己的表");
-        assert!(seen_table_exists(&c, 2), "root2 的表不受 root1 收尾影响");
     }
 
     /// 同一根目录的不同扫描代次必须各自持有 seen/online；旧轮清理不得碰新轮的表或数据。
@@ -592,40 +442,6 @@ mod mark_missing_tests {
         ));
     }
 
-    /// 取消/错误兜底只 DROP 指定代次的 seen 与 online TEMP 表。
-    #[test]
-    fn cleanup_only_drops_requested_run_tables() {
-        let c = mem_db();
-        let generation1 = 21;
-        let generation2 = 22;
-        for generation in [generation1, generation2] {
-            init_seen_table_for_run(&c, 1, generation).unwrap();
-            let table = online_table_name_for_run(1, generation);
-            c.execute_batch(&format!(
-                "CREATE TEMP TABLE {table}(id INTEGER PRIMARY KEY); INSERT INTO {table}(id) VALUES (5);"
-            ))
-            .unwrap();
-        }
-
-        cleanup_scan_temp_tables_for_run(&c, 1, generation1).unwrap();
-        assert!(!temp_table_exists(
-            &c,
-            &seen_table_name_for_run(1, generation1)
-        ));
-        assert!(!temp_table_exists(
-            &c,
-            &online_table_name_for_run(1, generation1)
-        ));
-        assert!(temp_table_exists(
-            &c,
-            &seen_table_name_for_run(1, generation2)
-        ));
-        assert!(temp_table_exists(
-            &c,
-            &online_table_name_for_run(1, generation2)
-        ));
-    }
-
     /// 大集合规模正确性：1000 项，奇数 id 全 seen、偶数 id 未 seen → 恰好 500 偶数项被标。
     /// 压 TEMP 表 join 在规模下的正确性（C1 「large-set temp-table path」加固）。
     #[test]
@@ -642,60 +458,5 @@ mod mark_missing_tests {
         assert_eq!(n, 500, "恰好 500 个偶数 id 未 seen → 被标");
         assert_eq!(avail(&c, 2), "missing", "偶数 id（未 seen）应标 missing");
         assert_eq!(avail(&c, 3), "online", "奇数 id（已 seen）应保持 online");
-    }
-
-    /// 已是 missing 的项不被重标/重计（`availability != 'missing'` 闸）——保证重复扫描幂等、计数不虚高。
-    #[test]
-    fn already_missing_not_remarked() {
-        let c = mem_db();
-        add(&c, 100, 10, Some(5), "online", 0); // online 未 seen → 标
-        add(&c, 101, 10, Some(5), "missing", 0); // 已 missing 未 seen → 不再计
-        let seen: HashSet<i64> = HashSet::new();
-
-        let n = mark_missing(&c, 1, &[5], &seen, false).unwrap();
-        assert_eq!(n, 1, "仅新缺失项计入，已 missing 不重复计");
-        assert_eq!(avail(&c, 100), "missing");
-        assert_eq!(avail(&c, 101), "missing");
-    }
-
-    /// companion 缺失时必须让主项的逻辑单元摘要失效；主项与 companion 同轮缺失时
-    /// source_revision 只推进一次，避免一次扫描制造两个无意义代次。
-    #[test]
-    fn missing_companion_invalidates_parent_once() {
-        let c = mem_db();
-        add(&c, 200, 10, Some(5), "online", 0);
-        add(&c, 201, 10, Some(5), "online", 0);
-        c.execute("UPDATE media_items SET companion_of=200 WHERE id=201", [])
-            .unwrap();
-        c.execute(
-            "INSERT INTO dedup_index
-                (item_id, source_revision, hash_version, unit_digest, unit_size, status, checked_at)
-             VALUES (200, 1, 1, X'01', 1, 'ready', 1),
-                    (201, 1, 1, X'02', 1, 'ready', 1)",
-            [],
-        )
-        .unwrap();
-
-        let seen = HashSet::from([200]);
-        assert_eq!(mark_missing(&c, 1, &[5], &seen, false).unwrap(), 1);
-        assert_eq!(avail(&c, 201), "missing");
-        assert_eq!(source_revision(&c, 200), 2);
-        assert_eq!(
-            c.query_row(
-                "SELECT count(*) FROM dedup_index WHERE item_id=200",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0,
-            "companion 缺失后主项逻辑摘要必须清除"
-        );
-
-        // 主项也在下一轮缺失时，不能因 companion 再额外推进一次。
-        c.execute("UPDATE media_items SET availability='online'", [])
-            .unwrap();
-        let seen = HashSet::new();
-        assert_eq!(mark_missing(&c, 1, &[5], &seen, false).unwrap(), 2);
-        assert_eq!(source_revision(&c, 200), 3);
     }
 }

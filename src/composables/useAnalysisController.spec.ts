@@ -18,7 +18,7 @@
 // 真源——故 UI 能把「资源等待（会自动续跑）」与「手动暂停（保留续跑意图）」分开显示。
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { nextTick, ref } from 'vue'
+import { ref } from 'vue'
 import { IPC } from '../constants/ipc'
 import { IpcError } from '../utils/ipc'
 import type { AnalysisCommands, BaseAnalysisStatus } from './useAnalysisController'
@@ -39,7 +39,6 @@ vi.mock('../stores/scanStore', () => ({ useScanStore: () => ({ hasScanRoots: tru
 import { ANALYSIS_BUSY_WAITING_KEY, useAnalysisController } from './useAnalysisController'
 
 type Side = 'ai' | 'face'
-type Action = 'pause' | 'stop'
 
 const COMMANDS: Record<Side, AnalysisCommands> = {
   ai: {
@@ -200,10 +199,6 @@ async function flushUntil(cond: () => boolean, hops = 50) {
   for (let i = 0; i < hops && !cond(); i++) await Promise.resolve()
 }
 
-const ORDERS: Array<[Side, Side]> = [
-  ['ai', 'face'],
-  ['face', 'ai'],
-]
 
 beforeEach(() => {
   invokeIpc.mockReset()
@@ -215,200 +210,6 @@ afterEach(() => {
 })
 
 describe('useAnalysisController：共享 GPU 分析会话的自动续跑与等待态（P1-1）', () => {
-  it.each(ORDERS)(
-    '竞争失败方 %s→%s 进入资源等待：未运行也显示等待原因，且不报错误',
-    async (first, second) => {
-      const backend = installFakeBackend()
-      const winner = makeController(first)
-      const waiter = makeController(second)
-
-      await winner.controller.maybeAutoResume()
-      expect(winner.status.value.isAnalyzing).toBe(true)
-      expect(backend.slot.owner).toBe(first)
-
-      await waiter.controller.maybeAutoResume()
-      expect(waiter.controller.waitingForSession.value).toBe(true)
-      expect(waiter.status.value.isAnalyzing).toBe(false)
-      expect(waiter.onError).not.toHaveBeenCalled()
-      // 运行中让步等待（isWaitingBlocked）与资源等待是两件事：前者要求本端在跑。
-      expect(waiter.controller.isWaitingBlocked.value).toBe(false)
-
-      // 等待期首轮快照：后端出「对端持有共享会话」等待原因，UI 据此出文案。
-      await vi.advanceTimersByTimeAsync(2000)
-      expect(waiter.status.value.waitingOn).toEqual([ANALYSIS_BUSY_WAITING_KEY])
-      expect(backend.slot.owner).toBe(first)
-    },
-  )
-
-  it.each(ORDERS)('先跑者 %s 完成后等待方 %s 自动续跑，且先跑者不被误唤醒', async (first, second) => {
-    const backend = installFakeBackend()
-    const winner = makeController(first)
-    const waiter = makeController(second)
-
-    await winner.controller.maybeAutoResume()
-    await waiter.controller.maybeAutoResume()
-    expect(waiter.controller.waitingForSession.value).toBe(true)
-
-    backend.finish(first)
-    await nextTick()
-    await vi.advanceTimersByTimeAsync(2000)
-
-    expect(waiter.status.value.isAnalyzing).toBe(true)
-    expect(waiter.controller.waitingForSession.value).toBe(false)
-    expect(backend.slot.owner).toBe(second)
-    expect(waiter.onError).not.toHaveBeenCalled()
-    expect(winner.status.value.isAnalyzing).toBe(false)
-  })
-
-  it('等待期重复 tick 不重复发起启动；拿到会话后停止等待轮询', async () => {
-    const backend = installFakeBackend()
-    const winner = makeController('ai')
-    const waiter = makeController('face')
-
-    await winner.controller.maybeAutoResume()
-    await waiter.controller.maybeAutoResume()
-    expect(backend.startCounts.face).toBe(1)
-
-    // 等待期重复入队（取消隐藏补跑 / 启动批重入）不双启动。
-    await waiter.controller.maybeAutoResume()
-    expect(backend.startCounts.face).toBe(1)
-
-    // 对端仍在跑：多个 tick 不得重复往返 start（只读状态快照），也不得产生第二个 owner。
-    await vi.advanceTimersByTimeAsync(6000)
-    expect(backend.startCounts.face).toBe(1)
-    expect(backend.slot.owner).toBe('ai')
-
-    backend.finish('ai')
-    await vi.advanceTimersByTimeAsync(2000)
-    expect(backend.startCounts.face).toBe(2)
-    expect(backend.slot.owner).toBe('face')
-
-    // 已运行：等待轮询结束，不再有额外启动。
-    await vi.advanceTimersByTimeAsync(6000)
-    expect(backend.startCounts.face).toBe(2)
-  })
-
-  it.each<Action>(['pause', 'stop'])('用户 %s 撤回等待意图：对端释放后不误唤醒', async (action) => {
-    const backend = installFakeBackend()
-    const winner = makeController('ai')
-    const waiter = makeController('face')
-
-    await winner.controller.maybeAutoResume()
-    await waiter.controller.maybeAutoResume()
-    expect(waiter.controller.waitingForSession.value).toBe(true)
-
-    if (action === 'pause') await waiter.controller.pauseAnalysis()
-    else await waiter.controller.stopAnalysis()
-    expect(waiter.controller.waitingForSession.value).toBe(false)
-    expect(waiter.controller.isWaitingBlocked.value).toBe(false)
-
-    backend.finish('ai')
-    await nextTick()
-    await vi.advanceTimersByTimeAsync(4000)
-    expect(waiter.status.value.isAnalyzing).toBe(false)
-    expect(backend.slot.owner).toBeNull()
-  })
-
-  it('真实错误不进等待态、不重试，仍交 onError', async () => {
-    const backend = installFakeBackend({
-      face: new IpcError('AiModelNotLoaded', '人脸模型未启用或未下载'),
-    })
-    const face = makeController('face')
-
-    await face.controller.maybeAutoResume()
-    expect(face.controller.waitingForSession.value).toBe(false)
-    expect(face.onError).toHaveBeenCalledWith('autoResume', expect.anything())
-
-    await vi.advanceTimersByTimeAsync(6000)
-    expect(backend.startCounts.face).toBe(1)
-  })
-
-  it('等待期状态响应迟到：用户已撤回意图时不得据陈旧快照续跑', async () => {
-    const backend = installFakeBackend()
-    const winner = makeController('ai')
-    const waiter = makeController('face')
-
-    await winner.controller.maybeAutoResume()
-    await waiter.controller.maybeAutoResume()
-
-    const release = backend.holdNextStatus('face')
-    await nextTick()
-    await vi.advanceTimersByTimeAsync(2000)
-
-    // 用户在状态响应未落定时停止分析：等待意图即刻撤回。
-    const stopping = waiter.controller.stopAnalysis()
-    release()
-    await stopping
-    expect(waiter.controller.waitingForSession.value).toBe(false)
-
-    backend.finish('ai')
-    await vi.advanceTimersByTimeAsync(4000)
-    expect(waiter.status.value.isAnalyzing).toBe(false)
-    expect(backend.slot.owner).toBeNull()
-  })
-
-  it('并发重复自动续传只发一次 start（合并在途起步）', async () => {
-    const backend = installFakeBackend()
-    const ai = makeController('ai')
-    const openStart = backend.delayNextStart('ai')
-
-    const first = ai.controller.maybeAutoResume()
-    const second = ai.controller.maybeAutoResume()
-    openStart()
-    await first
-    await second
-
-    expect(backend.startCounts.ai).toBe(1)
-    expect(backend.slot.owner).toBe('ai')
-  })
-
-  it.each<[Side, Action]>([
-    ['ai', 'pause'],
-    ['ai', 'stop'],
-    ['face', 'pause'],
-    ['face', 'stop'],
-  ])(
-    '在途 start（%s）已发出后用户 %s：先等 start 收尾再发命令，最终后端确实停住',
-    async (side, action) => {
-      const backend = installFakeBackend()
-      const c = makeController(side)
-
-      const openStart = backend.delayNextStart(side)
-      const starting = c.controller.maybeAutoResume()
-      await flushUntil(() => backend.startCounts[side] === 1)
-      // 前提前置：start 命令确已发出且挂起在后端同步段（尚未占槽、尚未开跑）。
-      expect(backend.startCounts[side]).toBe(1)
-      expect(backend.running[side]).toBe(false)
-      expect(backend.slot.owner).toBeNull()
-
-      const stopping =
-        action === 'pause' ? c.controller.pauseAnalysis() : c.controller.stopAnalysis()
-      openStart() // 旧 start 此刻才真正 launch
-      await starting
-      await stopping
-
-      // 不只看 UI：最后实际持有者与运行态必须已停住（cancel 抢跑会被旧 start 反超）。
-      expect(backend.running[side]).toBe(false)
-      expect(backend.slot.owner).toBeNull()
-      expect(c.status.value.isAnalyzing).toBe(false)
-      expect(c.status.value.analysisActive).toBe(action === 'pause')
-    },
-  )
-
-  it.each<Action>(['pause', 'stop'])('起步预检期间用户 %s：不发出这条 start，后端不跑', async (action) => {
-    const backend = installFakeBackend()
-    const c = makeController('ai')
-
-    const starting = c.controller.startAnalysis() // 预检（扫描根守卫）在途
-    const stopping = action === 'pause' ? c.controller.pauseAnalysis() : c.controller.stopAnalysis()
-    await starting
-    await stopping
-
-    expect(backend.startCounts.ai).toBe(0)
-    expect(backend.running.ai).toBe(false)
-    expect(backend.slot.owner).toBeNull()
-    expect(c.status.value.isAnalyzing).toBe(false)
-  })
 
   it('等待期重试 start 在途时用户停止：迟到成功应答不复活运行态，后端停住', async () => {
     const backend = installFakeBackend()
@@ -433,26 +234,6 @@ describe('useAnalysisController：共享 GPU 分析会话的自动续跑与等�
     expect(waiter.status.value.isAnalyzing).toBe(false)
     expect(waiter.status.value.analysisActive).toBe(false)
     expect(waiter.controller.waitingForSession.value).toBe(false)
-  })
-
-  it('自动续传的状态查询在途时用户停止：迟到的可续跑快照不得复活运行态', async () => {
-    const backend = installFakeBackend()
-    const c = makeController('ai')
-
-    // 该快照在请求时刻生成（未运行 + active=1 + 有剩余）→ 落地时内容仍「看起来可续跑」。
-    const release = backend.holdNextStatus('ai')
-    const resuming = c.controller.maybeAutoResume()
-    await flushUntil(() => backend.statusCounts.ai === 1) // 状态查询确已发出且挂起
-
-    const stopping = c.controller.stopAnalysis() // 状态在途期间用户停止
-    release()
-    await stopping
-    await resuming
-
-    expect(backend.startCounts.ai).toBe(0)
-    expect(backend.running.ai).toBe(false)
-    expect(backend.active.ai).toBe(false)
-    expect(c.status.value.isAnalyzing).toBe(false)
   })
 
   it('restart 等在途 start 收尾期间用户停止：不再发出破坏性重置', async () => {

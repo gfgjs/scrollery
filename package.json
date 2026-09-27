@@ -25,6 +25,8 @@
     "build:enhance-worker:dev": "node scripts/build-enhance-worker.mjs --dev",
     "build:video-worker": "node scripts/build-video-worker.mjs",
     "build:video-worker:dev": "node scripts/build-video-worker.mjs --dev",
+    "build:native-thumbnail-worker": "node scripts/build-native-thumbnail-worker.mjs",
+    "build:native-thumbnail-worker:dev": "node scripts/build-native-thumbnail-worker.mjs --dev",
     "verify:channel": "node scripts/verify-channel-bundle.mjs",
     "check:ipc": "node scripts/check-ipc-commands.mjs",
     "check:tests": "node scripts/check-test-budget.mjs",

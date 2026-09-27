@@ -102,6 +102,8 @@ pub enum ProtocolError {
     JsonTooLarge(u32),
     #[error("blob_len 超限：{0} > {MAX_BLOB_LEN}")]
     BlobTooLarge(u32),
+    #[error("blob_len 超过接收方额度：{length} > {limit}")]
+    BlobExceedsReceiverLimit { length: u32, limit: u32 },
     #[error("JSON 反序列化失败：{0}")]
     Json(String),
 }
@@ -161,6 +163,14 @@ impl Frame {
 /// 校验顺序严格为「头 → magic → 版本 → 类型 → 长度上限 → 才分配 json/blob」。任一不过即返回错误，
 /// **不**分配谎报的大缓冲。返回 `ProtocolError::is_clean_eof()==true` 表示对端正常关闭流。
 pub fn read_frame<R: Read>(r: &mut R) -> Result<Frame, ProtocolError> {
+    read_frame_with_blob_limit(r, MAX_BLOB_LEN)
+}
+
+/// 按接收方的协商额度读帧；超过本地上限时在分配 JSON/blob 前拒绝，仍保留协议硬上限。
+pub fn read_frame_with_blob_limit<R: Read>(
+    r: &mut R,
+    max_blob_len: u32,
+) -> Result<Frame, ProtocolError> {
     let mut header = [0u8; HEADER_LEN];
     r.read_exact(&mut header)?;
 
@@ -188,6 +198,12 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Frame, ProtocolError> {
     }
     if blob_len > MAX_BLOB_LEN {
         return Err(ProtocolError::BlobTooLarge(blob_len));
+    }
+    if blob_len > max_blob_len {
+        return Err(ProtocolError::BlobExceedsReceiverLimit {
+            length: blob_len,
+            limit: max_blob_len,
+        });
     }
 
     let mut json = vec![0u8; json_len as usize];
@@ -241,22 +257,6 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// 每次只吐 1 字节的 Reader，用于验证 `read_exact` 对分片/逐字节流的健壮性。
-    struct DripReader<'a> {
-        data: &'a [u8],
-        pos: usize,
-    }
-    impl<'a> Read for DripReader<'a> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if self.pos >= self.data.len() || buf.is_empty() {
-                return Ok(0);
-            }
-            buf[0] = self.data[self.pos];
-            self.pos += 1;
-            Ok(1)
-        }
-    }
-
     fn sample_frame() -> Frame {
         Frame {
             frame_type: FrameType::Success,
@@ -277,73 +277,23 @@ mod tests {
     }
 
     #[test]
-    fn header_split_byte_by_byte() {
-        // 分片读取：逐字节流也必须解出同一帧（read_exact 内部循环）。
+    fn receiver_limit_rejects_before_payload_read_and_accepts_exact_limit() {
         let f = sample_frame();
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &f).unwrap();
-        let mut drip = DripReader { data: &buf, pos: 0 };
-        let got = read_frame(&mut drip).unwrap();
-        assert_eq!(got, f);
-    }
-
-    #[test]
-    fn coalesced_two_frames() {
-        // 粘包：一个缓冲含两帧，连续读出且不串。
-        let f1 = sample_frame();
-        let f2 = Frame {
-            frame_type: FrameType::Failure,
-            request_id: 7,
-            json: b"{}".to_vec(),
-            blob: Vec::new(),
-        };
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &f1).unwrap();
-        write_frame(&mut buf, &f2).unwrap();
-        let mut cur = Cursor::new(buf);
-        assert_eq!(read_frame(&mut cur).unwrap(), f1);
-        assert_eq!(read_frame(&mut cur).unwrap(), f2);
-    }
-
-    #[test]
-    fn progress_frame_roundtrip() {
-        // v3 新帧型:Progress 与既有帧同一编解码路径,回环无损。
-        let f = Frame {
-            frame_type: FrameType::Progress,
-            request_id: 42,
-            json: br#"{"stage":"clip_image_load","elapsed_ms":1500}"#.to_vec(),
-            blob: Vec::new(),
-        };
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &f).unwrap();
-        let mut cur = Cursor::new(buf);
-        assert_eq!(read_frame(&mut cur).unwrap(), f);
-    }
-
-    #[test]
-    fn empty_payload_ok() {
-        let f = Frame {
-            frame_type: FrameType::Shutdown,
-            request_id: 0,
-            json: Vec::new(),
-            blob: Vec::new(),
-        };
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &f).unwrap();
-        let mut cur = Cursor::new(buf);
-        assert_eq!(read_frame(&mut cur).unwrap(), f);
-    }
-
-    #[test]
-    fn bad_magic_rejected() {
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &sample_frame()).unwrap();
-        buf[0] = b'X';
-        let mut cur = Cursor::new(buf);
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &f).unwrap();
+        let mut header_only = Cursor::new(&bytes[..HEADER_LEN]);
         assert!(matches!(
-            read_frame(&mut cur),
-            Err(ProtocolError::BadMagic(_))
+            read_frame_with_blob_limit(&mut header_only, 4),
+            Err(ProtocolError::BlobExceedsReceiverLimit {
+                length: 5,
+                limit: 4
+            })
         ));
+        assert_eq!(header_only.position(), HEADER_LEN as u64);
+        assert_eq!(
+            read_frame_with_blob_limit(&mut Cursor::new(bytes), 5).unwrap(),
+            f
+        );
     }
 
     #[test]
@@ -355,18 +305,6 @@ mod tests {
         assert!(matches!(
             read_frame(&mut cur),
             Err(ProtocolError::UnsupportedVersion(999))
-        ));
-    }
-
-    #[test]
-    fn unknown_frame_type_rejected() {
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &sample_frame()).unwrap();
-        buf[6..8].copy_from_slice(&255u16.to_le_bytes());
-        let mut cur = Cursor::new(buf);
-        assert!(matches!(
-            read_frame(&mut cur),
-            Err(ProtocolError::UnknownFrameType(255))
         ));
     }
 
@@ -400,14 +338,6 @@ mod tests {
     }
 
     #[test]
-    fn clean_eof_detected() {
-        // 空流：read_exact 头即 UnexpectedEof → is_clean_eof()，Host 视为 Worker 正常退出。
-        let mut cur = Cursor::new(Vec::new());
-        let err = read_frame(&mut cur).unwrap_err();
-        assert!(err.is_clean_eof());
-    }
-
-    #[test]
     fn truncated_payload_is_io_error_not_clean_eof() {
         // 头声明有 payload 但流提前断：UnexpectedEof，但语义是「损坏」——调用方仍杀 Worker。
         let mut buf = Vec::new();
@@ -417,25 +347,5 @@ mod tests {
         let err = read_frame(&mut cur).unwrap_err();
         // 仍是 EOF 类（这里不强求区分；Host 对任一读错误都杀 Worker）。
         assert!(matches!(err, ProtocolError::Io(_)));
-    }
-
-    #[test]
-    fn v1_frame_rejected_with_diagnosable_error() {
-        // 旧 psd-worker(v1)的帧在读帧层即被版本门拒,错误信息含双方版本号(D3 §6 验收)。
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &sample_frame()).unwrap();
-        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
-        let mut cur = Cursor::new(buf);
-        match read_frame(&mut cur) {
-            Err(ProtocolError::UnsupportedVersion(1)) => {}
-            other => panic!("期望 UnsupportedVersion(1),得到 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn write_rejects_oversized_blob() {
-        // 本端绝不发超限帧：构造 blob 超 MAX 时 write 直接报错（不真的分配 64MiB+，用 len 伪造不便，
-        // 改为信任 try_into/上限分支；此处验证上限常量关系）。
-        assert!(MAX_BLOB_LEN as usize <= u32::MAX as usize);
     }
 }

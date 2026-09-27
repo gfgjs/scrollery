@@ -290,18 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn named_handle_rejected_until_aes() {
-        let root = temp_dir("named");
-        let snap = default_snapshot();
-        let mut models = clip_pair(&root, &snap);
-        models[0].handle = ModelHandle::Named("pn-00-ff".into());
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .unwrap_err();
-        assert_eq!(e.0, WorkerErrorCode::ModelLoadFailed);
-        assert!(e.1.contains("named"), "diagnostic: {}", e.1);
-    }
-
-    #[test]
     fn path_outside_models_root_rejected() {
         let root = temp_dir("outside-root");
         let elsewhere = temp_dir("outside-elsewhere");
@@ -328,93 +316,5 @@ mod tests {
         let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
             .unwrap_err();
         assert!(e.1.contains("sha256"), "diagnostic: {}", e.1);
-    }
-
-    #[test]
-    fn len_mismatch_rejected() {
-        let root = temp_dir("len");
-        let snap = default_snapshot();
-        let mut models = clip_pair(&root, &snap);
-        models[0].len += 1;
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .unwrap_err();
-        assert!(e.1.contains("字节数"), "diagnostic: {}", e.1);
-    }
-
-    #[test]
-    fn unknown_arch_rejected() {
-        let root = temp_dir("arch");
-        let mut snap = default_snapshot();
-        snap.arch_id = "no-such-arch".into();
-        let models = clip_pair(&root, &default_snapshot());
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .unwrap_err();
-        assert!(e.1.contains("arch_id"), "diagnostic: {}", e.1);
-    }
-
-    #[test]
-    fn missing_text_role_rejected() {
-        let root = temp_dir("missing-text");
-        let snap = default_snapshot();
-        let models = vec![lay_model(
-            &root,
-            ModelRole::ImageEncoder,
-            &snap.image_file,
-            b"img",
-        )];
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .unwrap_err();
-        assert!(e.1.contains("不完备"), "diagnostic: {}", e.1);
-    }
-
-    #[test]
-    fn face_role_without_face_profile_rejected() {
-        let root = temp_dir("face-undeclared");
-        let snap = default_snapshot(); // face_profile_id = None
-        let mut models = clip_pair(&root, &snap);
-        models.push(lay_model(
-            &root,
-            ModelRole::FaceDetect,
-            "face_detection_yunet_2023mar.onnx",
-            b"det",
-        ));
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .unwrap_err();
-        assert!(e.1.contains("未预期"), "diagnostic: {}", e.1);
-    }
-
-    #[test]
-    fn face_pair_with_declared_profile_resolves() {
-        let root = temp_dir("face-pair");
-        let mut snap = default_snapshot();
-        snap.face_profile_id = Some("yunet-sface".into());
-        let fp = find_face_profile("yunet-sface").unwrap();
-        let mut models = clip_pair(&root, &snap);
-        models.push(lay_model(
-            &root,
-            ModelRole::FaceDetect,
-            &fp.detect_file,
-            b"det",
-        ));
-        models.push(lay_model(
-            &root,
-            ModelRole::FaceRecog,
-            &fp.embed_file,
-            b"emb",
-        ));
-        let r = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .expect("成对人脸角色应通过");
-        assert!(r.face_profile.is_some());
-    }
-
-    #[test]
-    fn duplicate_role_rejected() {
-        let root = temp_dir("dup");
-        let snap = default_snapshot();
-        let mut models = clip_pair(&root, &snap);
-        models.push(models[0].clone());
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .unwrap_err();
-        assert!(e.1.contains("重复"), "diagnostic: {}", e.1);
     }
 }

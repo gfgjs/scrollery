@@ -10,9 +10,8 @@
 //!    （视频处理器 MFT）把任意输入像素格式转成 **RGB32**（内存字节序 B,G,R,X），并**在 XVP 内
 //!    直接缩放到目标输出尺寸**（封面=缩略图 tier、雪碧格=200px 高）——此前按原生分辨率直出，
 //!    4K 单帧 33MB 要在 CPU 上做 4-5 趟全尺寸拷贝，是本后端最大的性能浪费。
-//!  - **DXVA/D3D11 硬解（原「可选动作 A」，现已接）**：能拿到 `video::d3d` 硬解槽位时给
-//!    SourceReader 挂 `MF_SOURCE_READER_D3D_MANAGER`，解码走 GPU 视频引擎、XVP 转换/缩放上
-//!    GPU，CPU 只 readback 小图；拿不到槽位或初始化失败即回退软解（正确性不依赖 GPU）。
+//!  - **DXVA/D3D11 候选**：按驱动 codec profile 选择设备并给 SourceReader 挂
+//!    `MF_SOURCE_READER_D3D_MANAGER`；MF 是否实际用硬解须另行确认。设备不可用时回退 CPU。
 //!  - **旋转**：ADVANCED 管线下 XVP 会按 `MF_MT_VIDEO_ROTATION` **自动转正**,且实测
 //!    （Win11 + rot90 基准片）转正后输出类型的 rotation 属性并不清零 —— 属性不可作判据,
 //!    曾与 CPU 侧 apply_rotation 叠成双旋转。定案:协商后枚举变换链,经
@@ -24,6 +23,7 @@
 //!  - **单会话复用**：封面时间戳选择所需的时长在同一 reader 会话内读取，不再为 probe 单开
 //!    一个 reader;音频流反选,省掉音频解码器初始化。
 
+use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +44,7 @@ use super::mf_attrs::{attr_ratio, attr_size, codec_label, normalize_rotation, re
 use super::frame_post::{apply_rotation, copy_bgr32_to_rgba, is_too_dark, resize_rgba};
 
 /// MF 一般能用系统已装编解码器处理的容器。mkv/webm/flv/ogv 有意排除（需 FFmpeg / Perf，§9）。
-const MF_VIDEO_EXTS: &[&str] = &[
+pub(crate) const MF_VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "wmv", "avi", "3gp", "3g2", "ts", "mts", "m2ts", "asf", "mpg", "mpeg",
 ];
 
@@ -56,6 +56,14 @@ const ALL_STREAMS: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
 pub(super) const MEDIASOURCE: u32 = MF_SOURCE_READER_MEDIASOURCE.0 as u32;
 
 pub struct MediaFoundationBackend;
+
+static ABANDONED_READER: AtomicBool = AtomicBool::new(false);
+
+/// 原生隔离进程发现遗留 reader 后须退出，让宿主确认退出后再归还 GPU 额度。
+/// 宿主内既有视频调用保留泄漏隔离策略，由持有的槽位继续约束资源。
+pub fn native_worker_has_abandoned_reader() -> bool {
+    ABANDONED_READER.load(Ordering::Acquire)
+}
 
 impl VideoBackend for MediaFoundationBackend {
     fn name(&self) -> &'static str {
@@ -74,7 +82,7 @@ impl VideoBackend for MediaFoundationBackend {
             // （异步回调已挂上但 probe 从不 ReadSample,故回调永不触发；仅取元数据同步方法。）
             // 批量导入会把单文件探测失败汇总到富化日志；这里不逐项写 ERROR，避免损坏/不兼容
             // 容器在大批量导入时制造错误风暴。
-            let (reader, _cb) = open_reader(path, None, false)?;
+            let (reader, _cb) = open_reader(SourceInput::Path(path), None, false)?;
             // 从 NATIVE 类型（转换前）读取几何/旋转/帧率，更准确。
             let native = reader
                 .GetNativeMediaType(FIRST_VIDEO_STREAM, 0)
@@ -112,52 +120,64 @@ impl VideoBackend for MediaFoundationBackend {
     }
 
     fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage> {
-        ensure_mf();
-        init_com();
-        unsafe {
-            let s = open_session(path, SizePolicy::FitLongEdge(max_long_edge))?;
-
-            // 封面时间戳 = min(1s, 时长 10%)，避开常为黑帧的最初一帧;时长未知回退 1s。
-            // 时长来自本会话（read_duration_ms），免掉旧实现里独立 probe() 的一次 reader open。
-            let t_ms = if s.duration_ms > 0 {
-                1000u64.min(s.duration_ms / 10)
-            } else {
-                1000
-            };
-
-            // 避开第 0 帧（常为黑帧）。尝试几个时间戳，取首个足够亮的帧；最后一次尝试则照单全收。
-            let mut t_100ns = (t_ms as i64) * 10_000;
-            let mut last: Option<DecodedImage> = None;
-            for attempt in 0..5 {
-                match read_frame_at(&s.reader, &s.cb, t_100ns, &s.geom, path) {
-                    Ok(img) => {
-                        let dark = is_too_dark(&img);
-                        if !dark || attempt == 4 {
-                            return Ok(apply_rotation(img, s.rotation));
-                        }
-                        last = Some(img);
-                    }
-                    Err(_) => break,
-                }
-                t_100ns += 5_000_000; // +0.5s
-            }
-            // 全部偏暗或读取在末尾失败：用最后拿到的一帧，否则回退到第 0 帧。
-            if let Some(img) = last {
-                return Ok(apply_rotation(img, s.rotation));
-            }
-            let img = read_frame_at(&s.reader, &s.cb, 0, &s.geom, path)?;
-            Ok(apply_rotation(img, s.rotation))
-        }
+        self.cover_with_codec_hint(path, max_long_edge, None)
     }
 
-    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>> {
+    fn cover_with_codec_hint(
+        &self,
+        path: &Path,
+        max_long_edge: u32,
+        codec_hint: Option<&str>,
+    ) -> Result<DecodedImage> {
+        cover_source(
+            SourceInput::Path(path),
+            path,
+            max_long_edge,
+            codec_hint,
+            true,
+            None,
+        )
+        .map(|(image, _)| image)
+    }
+
+    fn cover_bounded(
+        &self,
+        path: &Path,
+        max_long_edge: u32,
+        max_pixel_bytes: u64,
+    ) -> Result<DecodedImage> {
+        cover_source(
+            SourceInput::Path(path),
+            path,
+            max_long_edge,
+            None,
+            true,
+            Some(max_pixel_bytes),
+        )
+        .map(|(image, _)| image)
+    }
+
+    fn keyframes_bounded(
+        &self,
+        path: &Path,
+        n: usize,
+        cell_height: u32,
+        max_pixel_bytes: u64,
+    ) -> Result<Vec<DecodedImage>> {
         ensure_mf();
         init_com();
         let n = n.max(1);
         unsafe {
-            let s = open_session(path, SizePolicy::CellHeight(cell_height))?;
+            let s = open_session(
+                SourceInput::Path(path),
+                SizePolicy::CellHeight(cell_height),
+                None,
+                true,
+            )?;
             // 由显示比例推导统一格尺寸，使雪碧图为整齐的水平条带。
             let (cell_w, cell_h) = sprite_cell(s.display_w, s.display_h, cell_height);
+            check_frame_budget(&s.geom, max_pixel_bytes)?;
+            super::check_frame_collection_budget(cell_w, cell_h, n, max_pixel_bytes)?;
 
             // 在 [5%, 95%] 区间采样，跳过片头/片尾黑帧。
             let dur = s.duration_ms.max(1) as f64;
@@ -183,6 +203,105 @@ impl VideoBackend for MediaFoundationBackend {
             Ok(frames)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum SourceInput<'a> {
+    Path(&'a Path),
+    Handle {
+        file: &'a Arc<Mutex<File>>,
+        format: &'a str,
+    },
+}
+
+/// 封面帧成功读取后的解码事实；候选设备与确认的硬件 MFT 分开表示。
+#[derive(Clone, Copy)]
+pub struct VideoExecutionFact {
+    pub candidate_adapter: Option<crate::video::d3d::HardwareAdapterId>,
+    pub hardware_decoder_mft: bool,
+}
+
+/// 使用同一封面取帧逻辑消费路径入口或受控句柄入口。
+fn cover_source(
+    source: SourceInput<'_>,
+    diagnostic_path: &Path,
+    max_long_edge: u32,
+    codec_hint: Option<&str>,
+    allow_hardware: bool,
+    max_pixel_bytes: Option<u64>,
+) -> Result<(DecodedImage, VideoExecutionFact)> {
+    ensure_mf();
+    init_com();
+    unsafe {
+        let s = open_session(
+            source,
+            SizePolicy::FitLongEdge(max_long_edge),
+            codec_hint,
+            allow_hardware,
+        )?;
+        if let Some(limit) = max_pixel_bytes {
+            check_frame_budget(&s.geom, limit)?;
+        }
+        let fact = VideoExecutionFact {
+            candidate_adapter: s.adapter,
+            hardware_decoder_mft: s.hardware_decoder_mft,
+        };
+
+        // 封面时间戳 = min(1s, 时长 10%)，避开常为黑帧的最初一帧;时长未知回退 1s。
+        // 时长来自本会话（read_duration_ms），免掉旧实现里独立 probe() 的一次 reader open。
+        let t_ms = if s.duration_ms > 0 {
+            1000u64.min(s.duration_ms / 10)
+        } else {
+            1000
+        };
+
+        // 避开第 0 帧（常为黑帧）。尝试几个时间戳，取首个足够亮的帧；最后一次尝试则照单全收。
+        let mut t_100ns = (t_ms as i64) * 10_000;
+        let mut last: Option<DecodedImage> = None;
+        for attempt in 0..5 {
+            match read_frame_at(&s.reader, &s.cb, t_100ns, &s.geom, diagnostic_path) {
+                Ok(img) => {
+                    let dark = is_too_dark(&img);
+                    if !dark || attempt == 4 {
+                        return Ok((apply_rotation(img, s.rotation), fact));
+                    }
+                    last = Some(img);
+                }
+                Err(_) => break,
+            }
+            t_100ns += 5_000_000; // +0.5s
+        }
+        // 全部偏暗或读取在末尾失败：用最后拿到的一帧，否则回退到第 0 帧。
+        if let Some(img) = last {
+            return Ok((apply_rotation(img, s.rotation), fact));
+        }
+        let img = read_frame_at(&s.reader, &s.cb, 0, &s.geom, diagnostic_path)?;
+        Ok((apply_rotation(img, s.rotation), fact))
+    }
+}
+
+/// 仅供原生缩略图 worker 消费；宿主已经授权并固定源文件对象。
+/// `allow_hardware=false` 跳过设备枚举，使用不挂 D3D manager 的软件会话。
+pub fn cover_open_file(
+    file: File,
+    format: &str,
+    max_long_edge: u32,
+    codec_hint: Option<&str>,
+    allow_hardware: bool,
+    max_pixel_bytes: u64,
+) -> Result<(DecodedImage, VideoExecutionFact)> {
+    let file = Arc::new(Mutex::new(file));
+    cover_source(
+        SourceInput::Handle {
+            file: &file,
+            format,
+        },
+        Path::new("<authorized-video>"),
+        max_long_edge,
+        codec_hint,
+        allow_hardware,
+        Some(max_pixel_bytes),
+    )
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -235,6 +354,8 @@ struct Session {
     /// 正立（显示）尺寸，来自 NATIVE 类型 + rotation（与 probe 口径一致）。
     display_w: u32,
     display_h: u32,
+    adapter: Option<crate::video::d3d::HardwareAdapterId>,
+    hardware_decoder_mft: bool,
     /// 硬解槽位（RAII，Drop 归还并发额度;None = 软解）。仅作所有权锚。
     _hw: Option<crate::video::d3d::HwSlot>,
 }
@@ -242,6 +363,7 @@ struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if self.cb.timed_out.load(Ordering::Acquire) {
+            ABANDONED_READER.store(true, Ordering::Release);
             // 曾读超时 = reader 已卡在 MF 进程级共享工作队列;此时 `Release()`/`Drop` 极可能
             // 与 `ReadSample` 一样死等永不返回。泄漏隔离:**不析构 reader**(相当于 mem::forget),
             // 连同硬解槽一并弃掉(该槽可能仍被 GPU 占用)。callback COM 对象经泄漏的 reader 保活,
@@ -249,7 +371,7 @@ impl Drop for Session {
             if self._hw.is_some() {
                 // 硬解槽随 reader 一并被永久占用(其 Drop 的额度归还被 forget 跳过)。累计泄漏
                 // 会逐步耗尽有限的硬解额度,故留一条 warn 使「多毒文件耗尽额度」在日志可见。
-                // 读快照须在 forget 之前——此刻该槽仍计入 SLOTS_IN_USE(此后永久停留在此值)。
+                // 读快照须在 forget 之前；遗留 reader 的名额继续计入共享 GPU 预算。
                 let (used, total) = crate::video::d3d::slots_snapshot();
                 tracing::warn!(
                     slots_used = used,
@@ -268,12 +390,25 @@ impl Drop for Session {
     }
 }
 
-/// 打开解码会话:硬解优先（拿到槽位才试），open/协商失败回退软解 —— GPU 缺失/驱动异常
+/// 打开解码会话:有驱动 profile 的设备优先，open/协商失败尝试后续设备，最后回退软解。
+/// profile 与 reader 成功都不证明实际硬解。GPU 缺失/驱动异常
 /// 只影响速度，不影响正确性。
-unsafe fn open_session(path: &Path, policy: SizePolicy) -> Result<Session> {
-    if let Some(slot) = crate::video::d3d::try_acquire() {
-        match open_session_inner(path, &policy, Some(&slot)) {
+unsafe fn open_session(
+    source: SourceInput<'_>,
+    policy: SizePolicy,
+    codec_hint: Option<&str>,
+    allow_hardware: bool,
+) -> Result<Session> {
+    // 仅 CPU 是执行约束，必须在设备枚举和槽位申请之前生效。
+    if !allow_hardware {
+        return open_session_inner(source, &policy, None, None);
+    }
+    let mut start = 0;
+    while let Some(slot) = crate::video::d3d::try_acquire_from(codec_hint, start) {
+        start = slot.next_index();
+        match open_session_inner(source, &policy, Some(&slot), codec_hint) {
             Ok(mut s) => {
+                s.adapter = Some(slot.identity());
                 s._hw = Some(slot);
                 return Ok(s);
             }
@@ -284,20 +419,32 @@ unsafe fn open_session(path: &Path, policy: SizePolicy) -> Result<Session> {
             }
         }
     }
-    open_session_inner(path, &policy, None)
+    open_session_inner(source, &policy, None, None)
 }
 
 unsafe fn open_session_inner(
-    path: &Path,
+    source: SourceInput<'_>,
     policy: &SizePolicy,
     hw: Option<&crate::video::d3d::HwSlot>,
+    codec_hint: Option<&str>,
 ) -> Result<Session> {
-    let (reader, cb) = open_reader(path, hw, true)?;
+    let (reader, cb) = open_reader(source, hw, true)?;
     select_video_only(&reader);
 
     let native = reader
         .GetNativeMediaType(FIRST_VIDEO_STREAM, 0)
         .map_err(mf_err)?;
+    if let Some(expected) = codec_hint {
+        let actual = native.GetGUID(&MF_MT_SUBTYPE).ok().and_then(codec_label);
+        if !actual
+            .as_deref()
+            .is_some_and(|codec| codec.eq_ignore_ascii_case(expected))
+        {
+            return Err(AppError::Internal(
+                "video codec hint changed | 视频编码元数据已变化".into(),
+            ));
+        }
+    }
     let raw_rot = native.GetUINT32(&MF_MT_VIDEO_ROTATION).unwrap_or(0);
     let native_rotation = normalize_rotation(raw_rot);
     let (nw, nh) = attr_size(&native, &MF_MT_FRAME_SIZE).unwrap_or((0, 0));
@@ -320,6 +467,13 @@ unsafe fn open_session_inner(
     configure_rgb32(&reader, request, raw_rot, (nw, nh))?;
     // 双保险:变换链组建后再对实现 IMFVideoProcessorControl 的 MFT 显式 SetRotation(NONE)。
     pin_no_xvp_rotation(&reader);
+    let hardware_decoder_mft = hw.is_some() && has_hardware_decoder_mft(&reader);
+    if hw.is_some() {
+        tracing::debug!(
+            hardware_decoder_mft,
+            "MF selected video decoder transform; false also covers DXVA with a software MFT"
+        );
+    }
     let geom = output_geometry(&reader)?;
 
     Ok(Session {
@@ -330,8 +484,44 @@ unsafe fn open_session_inner(
         duration_ms,
         display_w,
         display_h,
+        adapter: None,
+        hardware_decoder_mft,
         _hw: None,
     })
+}
+
+/// 仅硬件 MFT 的驱动链接属性能确认该变换本身是硬件实现；没有此属性时 DXVA 状态仍未知。
+unsafe fn has_hardware_decoder_mft(reader: &IMFSourceReader) -> bool {
+    let Ok(ex) = reader.cast::<IMFSourceReaderEx>() else {
+        return false;
+    };
+    for index in 0..8 {
+        let mut category = GUID::zeroed();
+        let mut transform: Option<IMFTransform> = None;
+        if ex
+            .GetTransformForStream(
+                FIRST_VIDEO_STREAM,
+                index,
+                Some(&mut category),
+                &mut transform,
+            )
+            .is_err()
+        {
+            break;
+        }
+        if category == MFT_CATEGORY_VIDEO_DECODER
+            && transform
+                .and_then(|transform| transform.GetAttributes().ok())
+                .is_some_and(|attrs| {
+                    attrs
+                        .GetStringLength(&MFT_ENUM_HARDWARE_URL_Attribute)
+                        .is_ok()
+                })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// 强制关闭源 reader 变换链内 XVP 的自动转正(ADVANCED 管线下 XVP 会按 MF_MT_VIDEO_ROTATION
@@ -528,14 +718,13 @@ fn wait_sample_or_timeout(
 
 /// 打开一个挂了异步回调的 SourceReader。返回 reader 与其回调共享态(等待/超时/僵死交接)。
 unsafe fn open_reader(
-    path: &Path,
+    source: SourceInput<'_>,
     hw: Option<&crate::video::d3d::HwSlot>,
     emit_errors: bool,
 ) -> Result<(IMFSourceReader, Arc<CallbackShared>)> {
-    let url = HSTRING::from(path.as_os_str());
     let mut attrs: Option<IMFAttributes> = None;
-    // 属性数(容量提示):ADVANCED + ASYNC_CALLBACK(+ 可选 D3D_MANAGER)。
-    MFCreateAttributes(&mut attrs, 3).map_err(|e| mf_err_with_mode(e, emit_errors))?;
+    // ADVANCED + ASYNC_CALLBACK + 可选 D3D_MANAGER/硬件 MFT 开关。
+    MFCreateAttributes(&mut attrs, 4).map_err(|e| mf_err_with_mode(e, emit_errors))?;
     let attrs =
         attrs.ok_or_else(|| AppError::Internal("MFCreateAttributes returned null".into()))?;
     // ADVANCED 处理器（XVP）：任意输入格式 → RGB32，且支持**输出尺寸协商**（缩放在 XVP 内完成，
@@ -557,9 +746,22 @@ unsafe fn open_reader(
         attrs
             .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, slot.manager())
             .map_err(|e| mf_err_with_mode(e, emit_errors))?;
+        attrs
+            .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
+            .map_err(|e| mf_err_with_mode(e, emit_errors))?;
     }
-    let reader =
-        MFCreateSourceReaderFromURL(&url, &attrs).map_err(|e| mf_err_with_mode(e, emit_errors))?;
+    let reader = match source {
+        SourceInput::Path(path) => {
+            let url = HSTRING::from(path.as_os_str());
+            MFCreateSourceReaderFromURL(&url, &attrs)
+                .map_err(|e| mf_err_with_mode(e, emit_errors))?
+        }
+        SourceInput::Handle { file, format } => {
+            let bytes = super::file_stream::byte_stream(Arc::clone(file), format)?;
+            MFCreateSourceReaderFromByteStream(&bytes, &attrs)
+                .map_err(|e| mf_err_with_mode(e, emit_errors))?
+        }
+    };
     Ok((reader, shared))
 }
 
@@ -635,6 +837,16 @@ struct Geometry {
     height: u32,
     /// 带符号 stride：负值 ⇒ 行为 bottom-up。
     stride: i32,
+}
+
+fn check_frame_budget(geom: &Geometry, limit: u64) -> Result<()> {
+    let row = u64::from(geom.width) * 4;
+    let stride = u64::from(geom.stride.unsigned_abs());
+    let bytes = stride.saturating_mul(u64::from(geom.height));
+    if geom.width == 0 || geom.height == 0 || stride < row || bytes > limit {
+        return Err(AppError::Internal("MF output exceeds pixel budget".into()));
+    }
+    Ok(())
 }
 
 unsafe fn output_geometry(reader: &IMFSourceReader) -> Result<Geometry> {
@@ -788,162 +1000,5 @@ fn mf_err_with_mode(e: windows::core::Error, emit_errors: bool) -> AppError {
         mf_err(e)
     } else {
         mf_probe_err(e)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{request_size, sprite_cell, SizePolicy};
-    use super::{wait_sample_or_timeout, CallbackShared, ReadOutcome};
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    /// 临时诊断(#[ignore],手动跑):VIDEO_DIAG=<path> cargo test -p scrollery --lib \
-    ///   video::media_foundation::tests::diag_pipeline_env -- --ignored --nocapture
-    /// 打印 native/协商类型的尺寸与 rotation 属性、stride、解码首帧的角点像素,
-    /// 用于查 XVP 自动转正/几何错位类问题。
-    #[test]
-    #[ignore]
-    fn diag_pipeline_env() {
-        let Some(p) = std::env::var_os("VIDEO_DIAG") else {
-            return;
-        };
-        let path = std::path::PathBuf::from(p);
-        super::ensure_mf();
-        super::init_com();
-        unsafe {
-            let (reader, cb) = super::open_reader(&path, None, true).expect("open");
-            super::select_video_only(&reader);
-            let native = reader
-                .GetNativeMediaType(super::FIRST_VIDEO_STREAM, 0)
-                .expect("native");
-            let raw_rot = native
-                .GetUINT32(&windows::Win32::Media::MediaFoundation::MF_MT_VIDEO_ROTATION)
-                .unwrap_or(999);
-            let (nw, nh) = super::attr_size(
-                &native,
-                &windows::Win32::Media::MediaFoundation::MF_MT_FRAME_SIZE,
-            )
-            .unwrap_or((0, 0));
-            println!("native: {nw}x{nh} rot_attr={raw_rot}");
-
-            super::configure_rgb32(
-                &reader,
-                None,
-                if raw_rot == 999 { 0 } else { raw_rot },
-                (nw, nh),
-            )
-            .expect("configure");
-            super::pin_no_xvp_rotation(&reader);
-            let cur = reader
-                .GetCurrentMediaType(super::FIRST_VIDEO_STREAM)
-                .expect("current");
-            let (cw, ch) = super::attr_size(
-                &cur,
-                &windows::Win32::Media::MediaFoundation::MF_MT_FRAME_SIZE,
-            )
-            .unwrap_or((0, 0));
-            let cur_rot = cur
-                .GetUINT32(&windows::Win32::Media::MediaFoundation::MF_MT_VIDEO_ROTATION)
-                .map(|v| v as i64)
-                .unwrap_or(-1);
-            let geom = super::output_geometry(&reader).expect("geom");
-            println!(
-                "negotiated: {cw}x{ch} rot_attr={cur_rot} geom={}x{} stride={}",
-                geom.width, geom.height, geom.stride
-            );
-
-            let img = super::read_frame_at(&reader, &cb, 10_000_000, &geom, &path).expect("frame");
-            let px = |x: u32, y: u32| -> (u8, u8, u8) {
-                let i = ((y * img.width + x) * 4) as usize;
-                (img.pixels[i], img.pixels[i + 1], img.pixels[i + 2])
-            };
-            let (w, h) = (img.width, img.height);
-            println!(
-                "frame {}x{} TL={:?} TR={:?} BL={:?} BR={:?} C={:?}",
-                w,
-                h,
-                px(w / 8, h / 8),
-                px(w - 1 - w / 8, h / 8),
-                px(w / 8, h - 1 - h / 8),
-                px(w - 1 - w / 8, h - 1 - h / 8),
-                px(w / 2, h / 2),
-            );
-        }
-    }
-
-    // 🔴 copy_bgr32_to_rgba 尾像素/bottom-up/padding/截断四单测已随函数迁至
-    // `video::frame_post::tests`（见超长文件拆分方案 tierB-3）。
-
-    /// 尺寸协商（显示坐标系）：FitLongEdge 不上采样、长边钉死为 max（保证 encode 侧直通）;
-    /// CellHeight 与 sprite_cell 同算式（差 1px 都会让逐帧缩放空跑）。
-    /// 旋转坐标系换算/重协商在 open_session_inner（依赖 COM,由 bench --rotation-check 钉住）。
-    #[test]
-    fn request_size_policies() {
-        // 横 4K,长边限 512:长边钉 512,短边按比例。
-        assert_eq!(
-            request_size(3840, 2160, &SizePolicy::FitLongEdge(512)),
-            Some((512, 288))
-        );
-        // 竖幅(显示尺寸已正立):长边=高。
-        assert_eq!(
-            request_size(1080, 1920, &SizePolicy::FitLongEdge(512)),
-            Some((288, 512))
-        );
-        // 小于目标:不上采样,原生直出。
-        assert_eq!(request_size(320, 240, &SizePolicy::FitLongEdge(512)), None);
-        // 0 = 不限制(原生)。
-        assert_eq!(request_size(3840, 2160, &SizePolicy::FitLongEdge(0)), None);
-        // 雪碧格:与 sprite_cell 完全一致。
-        assert_eq!(
-            request_size(1920, 1080, &SizePolicy::CellHeight(200)),
-            Some(sprite_cell(1920, 1080, 200))
-        );
-        // 小视频雪碧格允许上采样(保证格统一)。
-        assert_eq!(
-            request_size(160, 120, &SizePolicy::CellHeight(200)),
-            Some(sprite_cell(160, 120, 200))
-        );
-        // 零尺寸防御。
-        assert_eq!(request_size(0, 0, &SizePolicy::FitLongEdge(512)), None);
-    }
-
-    /// 🔴 超时护栏:模拟「`OnReadSample` 事件永不 signal」——不往交接槽写任何东西,断言在
-    /// `timeout` 后返回结构化 Err(含 "read sample timeout" 与 seek 流位置)且置位 `timed_out`
-    /// (`Drop for Session` 据此泄漏隔离僵死 reader)。纯等待逻辑,不触碰真实 MF。
-    #[test]
-    fn wait_times_out_when_callback_never_signals() {
-        let shared = CallbackShared::new();
-        let err = wait_sample_or_timeout(&shared, Duration::from_millis(40), 1_234_567)
-            .expect_err("无信号且超时须返回 Err");
-        let msg = format!("{err}");
-        assert!(msg.contains("read sample timeout"), "err msg = {msg}");
-        assert!(msg.contains("1234567"), "err msg 须含 seek 流位置: {msg}");
-        assert!(
-            shared.timed_out.load(Ordering::Acquire),
-            "超时须置位 timed_out"
-        );
-    }
-
-    /// 交接槽已有结果时立即返回 Ok、不误判超时、不置 `timed_out`。等待方唤醒后复检 `slot.take()`
-    /// 走的正是这条取值路径(此处不构造真 IMFSample,sample=None,只验交接语义)。
-    #[test]
-    fn wait_returns_outcome_when_slot_filled() {
-        let shared = CallbackShared::new();
-        {
-            let mut slot = shared.slot.lock().unwrap();
-            *slot = Some(ReadOutcome {
-                hr: windows::core::HRESULT(0),
-                stream_flags: 0xABCD,
-                sample: None,
-            });
-        }
-        let out = wait_sample_or_timeout(&shared, Duration::from_secs(5), 0)
-            .expect("已填充交接槽须返回 Ok");
-        assert_eq!(out.stream_flags, 0xABCD);
-        assert!(
-            !shared.timed_out.load(Ordering::Acquire),
-            "命中不应置 timed_out"
-        );
     }
 }

@@ -19,6 +19,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VPL_COMMIT, VPL_LICENSE_SOURCES, VPL_VERSION } from './lib/vpl-version.mjs';
 import {
   GRAPHVIZ_VERSION,
   LUTE_VERSION,
@@ -49,6 +50,7 @@ const SPDX_IDS = [
 ];
 
 const SOURCES = [
+  ...VPL_LICENSE_SOURCES,
   {
     id: 'onnxruntime-license',
     kind: 'onnxruntime',
@@ -162,6 +164,8 @@ async function main() {
   // 清单条目/版本字段/磁盘字节三者须一致，否则本次固定出的清单连同 NOTICE 都不可信。
   const manifest = {
     version: 1,
+    vplVersion: VPL_VERSION,
+    vplCommit: VPL_COMMIT,
     ortVersion: ORT_VERSION,
     ffmpegSourceVersion: FFMPEG_SOURCE_VERSION,
     btbnBuildRevision: BTBN_BUILD_REVISION,

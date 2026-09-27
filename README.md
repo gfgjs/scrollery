@@ -67,6 +67,17 @@ After cloning the repository:
 
 ```bash
 npm install
+```
+
+On Windows x64, prepare the pinned Intel VPL dispatcher before the first development run or release build. This downloads and compiles third-party source using Visual Studio's C++ and CMake tools. Repeat after removing `target/native-vpl` or changing the pinned VPL version:
+
+```bash
+node scripts/build-vpl-dispatcher.mjs
+```
+
+Start development:
+
+```bash
 npm run tauri dev
 ```
 

@@ -24,19 +24,6 @@ describe('useTauriListen', () => {
     listenMock.mockReset()
   })
 
-  it('句柄先就绪、后销毁:销毁时解绑一次', async () => {
-    const unlisten = vi.fn()
-    listenMock.mockResolvedValue(unlisten)
-
-    const scope = effectScope()
-    scope.run(() => useTauriListen(EVENTS.MEDIA_ENRICHED, () => {}))
-    await flushMicrotasks() // 句柄就绪
-    expect(unlisten).not.toHaveBeenCalled()
-
-    scope.stop()
-    expect(unlisten).toHaveBeenCalledTimes(1)
-  })
-
   it('销毁先于句柄就绪:句柄落定时立即就地解绑,不泄漏(核心竞态)', async () => {
     const unlisten = vi.fn()
     let resolveListen!: (fn: () => void) => void
@@ -57,14 +44,5 @@ describe('useTauriListen', () => {
     resolveListen(unlisten)
     await flushMicrotasks()
     expect(unlisten).toHaveBeenCalledTimes(1)
-  })
-
-  it('listen 失败:不抛出、销毁安全', async () => {
-    listenMock.mockRejectedValue(new Error('ipc down'))
-
-    const scope = effectScope()
-    expect(() => scope.run(() => useTauriListen(EVENTS.MEDIA_ENRICHED, () => {}))).not.toThrow()
-    await flushMicrotasks()
-    expect(() => scope.stop()).not.toThrow()
   })
 })

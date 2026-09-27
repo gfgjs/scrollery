@@ -23,9 +23,9 @@ pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
     // resize → WebP → write to thumb cache (by cache_key) → thumbhash. Identical to video cover.
     // 解码内嵌图片（jpeg/png/…）→ RGBA，再复用缩略图编码器：缩放 → WebP → 按 cache_key 写缓存 → thumbhash。
     // 与视频封面完全一致。
-    let dynimg = image::load_from_memory(&bytes)
-        .map_err(|e| AppError::AudioMetadata(format!("cover decode failed | 封面解码失败: {e}")))?;
-    let rgba = dynimg.to_rgba8();
+    let dynimg = crate::engine::image_rs::decode_image_bytes_bounded(&bytes, ctx.max_pixel_bytes)?;
+    let rgba = dynimg.into_rgba8();
+    drop(bytes);
     let (w, h) = (rgba.width(), rgba.height());
     let decoded = DecodedImage {
         pixels: rgba.into_raw(),
@@ -39,10 +39,10 @@ pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
         size: snap_to_tier(ctx.thumb_size),
         skip_max_bytes: 0,
         strategy: String::new(),
-        gpu_engine: String::new(),
         ai_hq_cache: false, // 音频封面非 CLIP 分析对象，不产 AI 缓存
         webp_quality: ctx.webp_quality,
         ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
+        output_fingerprint: None,
     };
     let res = encode_media_step_with_snapshot(
         ctx.item_id,

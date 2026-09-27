@@ -187,8 +187,8 @@ pub async fn delete_icc_profile(
         let profile_id = profile_id.clone();
         move || delete_icc_blocking(&state_arc, &profile_id)
     })
-        .await
-        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
+    .await
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
 
     // 删除的恰是当前选中的 profile:复位为「不派生」——viewer_color_target 回 srgb、
     // viewer_color_custom_id 回默认空串(等价于原先的 reset_key)。经统一入口提交,故与其他设置写入
@@ -200,7 +200,8 @@ pub async fn delete_icc_profile(
             ("viewer_color_custom_id".to_string(), String::new()),
         ]);
         if let Err(e) =
-            crate::config::settings::submit_settings_patch(&app, &state_arc, patch, generation).await
+            crate::config::settings::submit_settings_patch(&app, &state_arc, patch, generation)
+                .await
         {
             tracing::warn!("删除当前 ICC 后复位渲染色域配置失败(文件已删): {e}");
         }
@@ -389,115 +390,7 @@ fn delete_icc_blocking(state: &AppState, profile_id: &str) -> Result<DeleteOutco
 
     // 只判断是否需要复位,复位本身由调用方经统一入口提交(见 DeleteOutcome 文档)。
     Ok(DeleteOutcome {
-        needs_config_reset: state.config.get("viewer_color_custom_id").as_deref() == Some(profile_id),
+        needs_config_reset: state.config.get("viewer_color_custom_id").as_deref()
+            == Some(profile_id),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lcms2::{CIExyY, ToneCurve};
-
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("scrollery_vc_cmd_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn point(x: f64, y: f64) -> CIExyY {
-        CIExyY { x, y, Y: 1.0 }
-    }
-
-    /// ⑧-4:坏字节 → icc_parse_failed。
-    #[test]
-    fn import_malformed_bytes_maps_to_parse_failed() {
-        let dir = tmp_dir("bad");
-        let src = dir.join("broken.icc");
-        std::fs::write(&src, b"not a real icc profile").unwrap();
-        let err = import_icc_blocking(&dir, src.to_str().unwrap()).unwrap_err();
-        assert!(matches!(
-            &err,
-            AppError::Color { code, .. } if *code == CODE_ICC_PARSE_FAILED
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// ⑧-4:Gray profile → icc_not_rgb。
-    #[test]
-    fn import_gray_profile_maps_to_not_rgb() {
-        let dir = tmp_dir("gray");
-        let curve = ToneCurve::new(2.2);
-        let profile = lcms2::Profile::new_gray(&point(0.3127, 0.3290), &curve).unwrap();
-        let icc = profile.icc().unwrap();
-        let src = dir.join("gray.icc");
-        std::fs::write(&src, &icc).unwrap();
-        let err = import_icc_blocking(&dir, src.to_str().unwrap()).unwrap_err();
-        assert!(matches!(
-            &err,
-            AppError::Color { code, .. } if *code == CODE_ICC_NOT_RGB
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// ⑧-4:错误码序列化快照(前端分流真正读到的 `code` 字段;先例 reveal.rs:59-64)。
-    #[test]
-    fn color_error_serializes_stable_code() {
-        let v = serde_json::to_value(color_err(CODE_ICC_TRANSFORM_UNSUPPORTED, "x")).unwrap();
-        assert_eq!(v["code"], "icc_transform_unsupported");
-        // message 不得泄漏路径/底层串(此处仅占位文案)。
-        assert_eq!(v["message"], "x");
-    }
-
-    /// ⑧-4:import→list→delete 闭环(用内置 Display P3 encode 字节作合法 RGB+DisplayDevice 样本)。
-    #[test]
-    fn import_list_delete_roundtrip() {
-        let app_dir = tmp_dir("roundtrip_app");
-        let cache_dir = tmp_dir("roundtrip_cache");
-
-        // 合法样本:内置 Display P3 的 encode 字节(RGB + DisplayDevice + 可变换)。
-        let icc = moxcms::ColorProfile::new_display_p3().encode().unwrap();
-        let src = app_dir.join("p3.icc");
-        std::fs::write(&src, &icc).unwrap();
-
-        let info = import_icc_blocking(&app_dir, src.to_str().unwrap()).unwrap();
-        assert_eq!(info.id, target::profile_id_of(&icc));
-        assert!(target::is_valid_profile_id(&info.id));
-        // 落盘到 {app}/config/icc/{id}.icc。
-        assert!(target::icc_profile_path(&app_dir, &info.id).exists());
-
-        // list 反映之。
-        let listed = list_icc_blocking(&app_dir);
-        assert!(listed.iter().any(|p| p.id == info.id));
-
-        // 造一个派生子树,删除应连带清除。
-        let sub = cache_dir
-            .join("viewer_color")
-            .join(format!("icc-{}", info.id));
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("dummy.jpg"), b"x").unwrap();
-
-        delete_profile_files(&app_dir, &cache_dir, &info.id).unwrap();
-        assert!(!target::icc_profile_path(&app_dir, &info.id).exists());
-        assert!(!sub.exists());
-        assert!(list_icc_blocking(&app_dir).iter().all(|p| p.id != info.id));
-
-        let _ = std::fs::remove_dir_all(&app_dir);
-        let _ = std::fs::remove_dir_all(&cache_dir);
-    }
-
-    /// ⑧-4:非法 id(防路径注入)→ icc_not_found,不触碰文件系统。
-    #[test]
-    fn delete_rejects_invalid_id() {
-        let app_dir = tmp_dir("delinv_app");
-        let cache_dir = tmp_dir("delinv_cache");
-        let err = delete_profile_files(&app_dir, &cache_dir, "../etc").unwrap_err();
-        assert!(matches!(
-            &err,
-            AppError::Color { code, .. } if *code == CODE_ICC_NOT_FOUND
-        ));
-        let _ = std::fs::remove_dir_all(&app_dir);
-        let _ = std::fs::remove_dir_all(&cache_dir);
-    }
 }

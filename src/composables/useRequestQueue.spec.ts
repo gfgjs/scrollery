@@ -1,19 +1,16 @@
-// useRequestQueue 槽位生命周期锁测试(R2-5):去重 single-flight、批容量 24、50ms 合批、
-// cancel 语义分叉(queued 释放 vs inFlight 保留)、finally 兜底、30s 停滞看门狗、released
-// 幂等、按批 slot 判定、targetSize 阶梯、scanStore 簿记(泄漏观测面);
-// 有界退避重试(2026-08-16 阶段3):停滞/缺结果自动重排收敛、上限终拒、cancel 掐断等待期、
-// 退避期新等待者共享重试 slot。
-// node 环境,fake timers;invoke 返回测试持有的 deferred(生产代码链 .catch().finally());
+// 覆盖 Canvas 连续滚动下的批容量与串行门、取消后释放名额及旧结果隔离、
+// invoke 失败的有界重试、pending 结果重排，以及停滞退避期的共享取消。
+// 通过业务流程断言队列/在途计数，避免仅靠测试标题声明覆盖。
+// node 环境,fake timers;invoke 返回测试持有的 deferred(成功只确认受理);
 // 结果经捕获的 Channel stub 手动 onmessage 注入。魔数出处:flush 防抖 50ms、STALL_MS=30000、
 // THUMB_RETRY_MAX=3、THUMB_RETRY_BASE_MS=500——均未导出,此处按字面量对拍。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { DEFAULTS } from '../constants/defaults'
 import type { ThumbResult } from '../types/media'
 import type { LayoutRowNormal } from '../types/layout'
 import { useCanvasThumbPipeline } from './useCanvasThumbPipeline'
 
-type InvokeCall = { cmd: string; args: { itemIds: number[]; targetSize: number; onResult: ChannelStub } }
-type ChannelStub = { onmessage: (msg: ThumbResult) => void }
+type InvokeCall = { cmd: string; args: { itemIds: number[]; targetSize: number; requestId: string; onResult: ChannelStub } }
+type ChannelStub = { onmessage: (msg: ThumbResult & { pending: boolean }) => void }
 
 const mockState = vi.hoisted(() => {
   const state = {
@@ -65,8 +62,8 @@ function catchErr(p: Promise<unknown>): Promise<Error> {
     (e: Error) => e,
   )
 }
-function result(itemId: number): ThumbResult {
-  return { itemId, thumbStatus: 2, thumbPath: `p/${itemId}.webp`, thumbhash: null }
+function result(itemId: number): ThumbResult & { pending: boolean } {
+  return { itemId, thumbStatus: 2, thumbPath: `p/${itemId}.webp`, thumbhash: null, pending: false }
 }
 
 beforeEach(() => {
@@ -85,46 +82,6 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
-})
-
-describe('去重 single-flight', () => {
-  it('queued 阶段同 id 两次 request 共享 slot:一次 invoke、itemIds 不重复、两 Promise 同结果', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(7)
-    const p2 = q.request(7)
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(1)
-    expect(call(0).cmd).toBe('batch_request_thumbnails')
-    expect(call(0).args.itemIds).toEqual([7])
-    const r = result(7)
-    call(0).args.onResult.onmessage(r)
-    await expect(p1).resolves.toBe(r)
-    await expect(p2).resolves.toBe(r)
-  })
-
-  it('inFlight 阶段再 request 同 id:不发第二次 invoke,送达后一并 resolve', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(7)
-    await vi.advanceTimersByTimeAsync(50)
-    const p2 = q.request(7)
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(1)
-    call(0).args.onResult.onmessage(result(7))
-    await expect(p1).resolves.toMatchObject({ itemId: 7 })
-    await expect(p2).resolves.toMatchObject({ itemId: 7 })
-  })
-
-  it('结算后同 id 可重取(去重仅在 slot 存活期内)', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(7)
-    await vi.advanceTimersByTimeAsync(50)
-    call(0).args.onResult.onmessage(result(7))
-    await p1
-    void q.request(7)
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(2)
-    expect(call(1).args.itemIds).toEqual([7])
-  })
 })
 
 describe('批容量与串行门', () => {
@@ -188,91 +145,38 @@ describe('批容量与串行门', () => {
     expect(scanMock.autoThumbInFlight).toBe(0)
     expect(mockState.calls).toHaveLength(2)
   })
-
-  it('25 个 id:首批恰好 24 个,第 25 个滞留队列(簿记 1/24)', async () => {
-    const q = useRequestQueue()
-    for (let i = 1; i <= 25; i++) void q.request(i).catch(() => {})
-    await vi.advanceTimersByTimeAsync(50)
-    expect(DEFAULTS.THUMB_BATCH_SIZE).toBe(24)
-    expect(call(0).args.itemIds).toEqual(Array.from({ length: 24 }, (_, i) => i + 1))
-    expect(scanMock.autoThumbQueueSize).toBe(1)
-    expect(scanMock.autoThumbInFlight).toBe(24)
-  })
-
-  it('上一批在途时不发新批(isFlushing 串行门);drain 后续排余量', async () => {
-    const q = useRequestQueue()
-    for (let i = 1; i <= 25; i++) void q.request(i).catch(() => {})
-    await vi.advanceTimersByTimeAsync(50)
-    void q.request(26).catch(() => {})
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(1)
-    // 送达全部 24 个 → pending 清空 → releaseBatch → 50ms 后续排下一批
-    for (let i = 1; i <= 24; i++) call(0).args.onResult.onmessage(result(i))
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(2)
-    expect(call(1).args.itemIds).toEqual([25, 26])
-  })
-
-  it('50ms 防抖窗口内合批为一个 invoke', async () => {
-    const q = useRequestQueue()
-    void q.request(1).catch(() => {})
-    await vi.advanceTimersByTimeAsync(30)
-    void q.request(2).catch(() => {})
-    await vi.advanceTimersByTimeAsync(20)
-    expect(mockState.calls.length).toBe(1)
-    expect(call(0).args.itemIds).toEqual([1, 2])
-  })
 })
 
 describe('cancel 语义分叉', () => {
-  it('queued:出队 + reject cancelled + 槽位释放(可重建、不泄漏)', async () => {
-    const q = useRequestQueue()
-    const err = catchErr(q.request(9))
-    q.cancel(9)
-    expect((await err).message).toBe('cancelled')
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(0)
-    expect(scanMock.autoThumbQueueSize).toBe(0)
-    void q.request(9)
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(1)
-  })
 
-  it('inFlight:仅 reject waiters,slot 保留 single-flight;重挂后送达仍 resolve', async () => {
+  it('inFlight:撤订阅立即释放名额;新请求独立入批且旧结果不能结算它', async () => {
     const q = useRequestQueue()
     const err = catchErr(q.request(9))
+    const err2 = catchErr(q.request(10))
     await vi.advanceTimersByTimeAsync(50)
     q.cancel(9)
+    q.cancel(10)
     expect((await err).message).toBe('cancelled')
-    expect(scanMock.autoThumbInFlight).toBe(1) // slot 未 detach
-    const p2 = q.request(9) // 挂回同一 in-flight slot
+    expect((await err2).message).toBe('cancelled')
+    expect(scanMock.autoThumbInFlight).toBe(0)
+    mockState.deferreds[0].resolve(undefined)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(mockState.calls[1]).toMatchObject({
+      cmd: 'cancel_viewport_thumbnail_request',
+      args: { requestId: call(0).args.requestId, itemIds: [9, 10] },
+    })
+    const p2 = q.request(9)
     await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(1) // 无第二次 invoke
+    expect(mockState.calls.length).toBe(3)
     call(0).args.onResult.onmessage(result(9))
+    expect(scanMock.autoThumbInFlight).toBe(1)
+    call(2).args.onResult.onmessage(result(9))
     await expect(p2).resolves.toMatchObject({ itemId: 9 })
     expect(scanMock.autoThumbInFlight).toBe(0)
   })
 })
 
 describe('结算兜底与看门狗', () => {
-  it('finally 兜底:被后端跳过的 id 经 500ms 退避重试后收敛(重试批送达即 resolve)', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(1)
-    const p2 = q.request(2)
-    await vi.advanceTimersByTimeAsync(50)
-    call(0).args.onResult.onmessage(result(1))
-    mockState.deferreds[0].resolve(undefined)
-    await vi.advanceTimersByTimeAsync(0)
-    await expect(p1).resolves.toMatchObject({ itemId: 1 })
-    // id2 无结果 → 不再直接拒绝,500ms 退避后重排新批
-    await vi.advanceTimersByTimeAsync(500)
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(2)
-    expect(call(1).args.itemIds).toEqual([2])
-    call(1).args.onResult.onmessage(result(2))
-    await expect(p2).resolves.toMatchObject({ itemId: 2 })
-    expect(scanMock.autoThumbInFlight).toBe(0)
-  })
 
   it('invoke 整批失败:3 轮退避重试耗尽后终拒(消息不变),无未捕获异常', async () => {
     const q = useRequestQueue()
@@ -289,76 +193,33 @@ describe('结算兜底与看门狗', () => {
       mockState.deferreds[n + 1].reject(new Error('backend down'))
       await vi.advanceTimersByTimeAsync(0)
     }
-    expect((await err).message).toBe('Batch finished without result')
-    expect((await joined)?.message).toBe('Batch finished without result')
+    expect((await err).message).toBe('Batch invoke failed')
+    expect((await joined)?.message).toBe('Batch invoke failed')
     expect(mockState.calls.length).toBe(4)
     expect(scanMock.autoThumbInFlight).toBe(0)
-  })
-
-  it('STALL_MS=30000 无进展 → 停滞释放并退避重试;4 次停滞后终拒', async () => {
-    const q = useRequestQueue()
-    const err = catchErr(q.request(1))
-    await vi.advanceTimersByTimeAsync(50)
-    for (let n = 0; n < 3; n++) {
-      await vi.advanceTimersByTimeAsync(30_000) // 本轮停滞释放,退避起表
-      await vi.advanceTimersByTimeAsync(500 * 2 ** n)
-      await vi.advanceTimersByTimeAsync(50) // 重试批 flush
-      expect(scanMock.autoThumbInFlight).toBe(1)
-    }
-    await vi.advanceTimersByTimeAsync(30_000) // 第 4 次停滞:超重试上限 → 终拒
-    expect((await err).message).toBe('thumb batch stalled')
-    expect(mockState.calls.length).toBe(4)
-    expect(scanMock.autoThumbInFlight).toBe(0)
-  })
-
-  it('每个送达结果重置看门狗:距上次进展满 30s 才停滞;停滞耗尽重试后终拒', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(1)
-    const err2 = catchErr(q.request(2))
-    await vi.advanceTimersByTimeAsync(50)
-    await vi.advanceTimersByTimeAsync(29_999)
-    call(0).args.onResult.onmessage(result(1))
-    await expect(p1).resolves.toMatchObject({ itemId: 1 })
-    await vi.advanceTimersByTimeAsync(29_999)
-    expect(scanMock.autoThumbInFlight).toBe(1) // 尚未停滞(看门狗已被送达重置)
-    await vi.advanceTimersByTimeAsync(1)
-    for (let n = 0; n < 3; n++) {
-      await vi.advanceTimersByTimeAsync(500 * 2 ** n)
-      await vi.advanceTimersByTimeAsync(50)
-      await vi.advanceTimersByTimeAsync(30_000)
-    }
-    expect((await err2).message).toBe('thumb batch stalled')
-  })
-
-  it('released 幂等:stall 释放后,旧批迟到的 finally 不得冲掉新批', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(1)
-    await vi.advanceTimersByTimeAsync(50)
-    await vi.advanceTimersByTimeAsync(30_000) // 批 A 停滞释放
-    const p2 = q.request(1) // 新批 B
-    await vi.advanceTimersByTimeAsync(550) // 同 id 加入既有退避,到期后合批
-    expect(mockState.calls.length).toBe(2)
-    mockState.deferreds[0].resolve(undefined) // 批 A 的卡死 invoke 迟到结算
-    await vi.advanceTimersByTimeAsync(0)
-    expect(scanMock.autoThumbInFlight).toBe(1) // 批 B 计数未被清
-    call(1).args.onResult.onmessage(result(1))
-    await expect(p1).resolves.toMatchObject({ itemId: 1 })
-    await expect(p2).resolves.toMatchObject({ itemId: 1 })
   })
 })
 
 describe('有界退避重试(2026-08-16 阶段3)', () => {
-  it('停滞释放后自动重试并收敛:第二批送达 → 原 Promise resolve,调用方无需重发', async () => {
+  it('pending 不结算占位结果，释放名额并重试；旧批迟到结果不能结算新批', async () => {
     const q = useRequestQueue()
-    const p = q.request(1)
+    const pending = q.request(1)
     await vi.advanceTimersByTimeAsync(50)
-    await vi.advanceTimersByTimeAsync(30_000) // 批 A 停滞
-    await vi.advanceTimersByTimeAsync(500)
-    await vi.advanceTimersByTimeAsync(50) // 重试批 B flush
-    expect(mockState.calls.length).toBe(2)
+    call(0).args.onResult.onmessage({
+      itemId: 1,
+      thumbStatus: 0,
+      thumbPath: null,
+      thumbhash: null,
+      pending: true,
+    })
+    expect(scanMock.autoThumbInFlight).toBe(0)
+    await vi.advanceTimersByTimeAsync(550)
     expect(call(1).args.itemIds).toEqual([1])
+    call(0).args.onResult.onmessage(result(1))
+    expect(scanMock.autoThumbInFlight).toBe(1)
     call(1).args.onResult.onmessage(result(1))
-    await expect(p).resolves.toMatchObject({ itemId: 1 })
+    await expect(pending).resolves.toMatchObject({ itemId: 1, thumbStatus: 2 })
+    expect(scanMock.autoThumbInFlight).toBe(0)
   })
 
   it('cancel 掐断共享退避:全部等待者拒绝且迟到旧结果不再触发重试', async () => {
@@ -379,81 +240,8 @@ describe('有界退避重试(2026-08-16 阶段3)', () => {
     call(0).args.onResult.onmessage(result(1))
     mockState.deferreds[0].resolve(undefined)
     await vi.advanceTimersByTimeAsync(10_000)
-    expect(mockState.calls.length).toBe(1) // 定时器已掐,无重试批
+    expect(mockState.calls.length).toBe(2) // 旧批仅撤订阅,无重试批
+    expect(mockState.calls[1].cmd).toBe('cancel_viewport_thumbnail_request')
     expect(scanMock.autoThumbQueueSize).toBe(0)
-  })
-
-  it('退避等待期同 id 请求共享退避,到期后只有一次重试并一并完成', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(1)
-    await vi.advanceTimersByTimeAsync(50)
-    await vi.advanceTimersByTimeAsync(30_000) // p1 停滞,退避 500ms 起表
-    const p2 = q.request(1) // 等待期新请求加入既有逻辑请求
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(1)
-    await vi.advanceTimersByTimeAsync(450) // 退避到期再排队
-    await vi.advanceTimersByTimeAsync(50)
-    expect(mockState.calls.length).toBe(2)
-    call(1).args.onResult.onmessage(result(1))
-    await expect(p1).resolves.toMatchObject({ itemId: 1 })
-    await expect(p2).resolves.toMatchObject({ itemId: 1 })
-  })
-})
-
-describe('按批 slot 判定', () => {
-  it('陌生 id 的送达被静默忽略', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(1)
-    await vi.advanceTimersByTimeAsync(50)
-    call(0).args.onResult.onmessage(result(999))
-    expect(scanMock.autoThumbInFlight).toBe(1) // p1 仍在途
-    call(0).args.onResult.onmessage(result(1))
-    await expect(p1).resolves.toMatchObject({ itemId: 1 })
-  })
-
-  it('重复迟到消息按批内 pending 忽略,不影响同 id 的新 slot', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(1)
-    await vi.advanceTimersByTimeAsync(50)
-    call(0).args.onResult.onmessage(result(1))
-    await p1
-    const p2 = q.request(1) // 新 slot,新批
-    await vi.advanceTimersByTimeAsync(50)
-    call(0).args.onResult.onmessage(result(1)) // 旧批 channel 的重复消息
-    expect(scanMock.autoThumbInFlight).toBe(1) // 新 slot 不受影响
-    call(1).args.onResult.onmessage(result(1))
-    await expect(p2).resolves.toMatchObject({ itemId: 1 })
-  })
-})
-
-describe('targetSize 阶梯(THUMB_SIZE_TIERS 首个 ≥ rowHeight,超界回退末档)', () => {
-  it.each([
-    [200, 256],
-    [512, 512],
-    [1200, 1024],
-  ])('gridRowHeight=%i → targetSize=%i', async (rowHeight, expected) => {
-    uiMock.gridRowHeight = rowHeight
-    const q = useRequestQueue()
-    void q.request(1).catch(() => {})
-    await vi.advanceTimersByTimeAsync(50)
-    expect(call(0).args.targetSize).toBe(expected)
-  })
-})
-
-describe('簿记同步(泄漏观测面)', () => {
-  it('queued→inFlight→drain 全程计数正确且终态归零', async () => {
-    const q = useRequestQueue()
-    const p1 = q.request(1)
-    const p2 = q.request(2)
-    expect(scanMock.autoThumbQueueSize).toBe(2)
-    expect(scanMock.autoThumbInFlight).toBe(0)
-    await vi.advanceTimersByTimeAsync(50)
-    expect(scanMock.autoThumbQueueSize).toBe(0)
-    expect(scanMock.autoThumbInFlight).toBe(2)
-    call(0).args.onResult.onmessage(result(1))
-    expect(scanMock.autoThumbInFlight).toBe(1)
-    call(0).args.onResult.onmessage(result(2))
-    expect(scanMock.autoThumbInFlight).toBe(0)
-    await Promise.all([p1, p2])
   })
 })

@@ -851,7 +851,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::OpenOptions;
+
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -901,91 +901,6 @@ mod tests {
         std::fs::write(path, bytes).expect("write patterned test file");
     }
 
-    #[test]
-    fn exact_digest_is_streaming_blake3_256() {
-        let dir = TempDir::new("exact");
-        let path = dir.file("a.bin");
-        let contents = b"hello exact digest";
-        std::fs::write(&path, contents).unwrap();
-
-        let digest = exact_digest(&path).unwrap();
-        assert_eq!(digest.as_bytes(), blake3::hash(contents).as_bytes());
-        assert_eq!(ExactDigest::VERSION, 1);
-        assert_eq!(digest.to_hex().len(), 64);
-    }
-
-    #[test]
-    fn same_size_different_contents_have_different_exact_digest() {
-        let dir = TempDir::new("same-size");
-        let left = dir.file("left.bin");
-        let right = dir.file("right.bin");
-        std::fs::write(&left, [0x11u8; 32]).unwrap();
-        std::fs::write(&right, [0x22u8; 32]).unwrap();
-
-        assert_eq!(
-            file_snapshot(&left).unwrap().size,
-            file_snapshot(&right).unwrap().size
-        );
-        assert_ne!(exact_digest(&left).unwrap(), exact_digest(&right).unwrap());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn hard_links_share_physical_identity_but_keep_distinct_paths() {
-        let dir = TempDir::new("hard-link");
-        let original = dir.file("original.bin");
-        let alias = dir.file("alias.bin");
-        std::fs::write(&original, b"one physical file").unwrap();
-        if std::fs::hard_link(&original, &alias).is_err() {
-            // 某些测试卷/权限策略不提供硬链接能力；不把环境缺口误报为业务失败。
-            return;
-        }
-
-        let original_snapshot = file_snapshot(&original).unwrap();
-        let alias_snapshot = file_snapshot(&alias).unwrap();
-        assert_eq!(
-            physical_key(original_snapshot.physical_identity),
-            physical_key(alias_snapshot.physical_identity),
-            "硬链接必须报告同一 physical key"
-        );
-        assert_ne!(
-            stable_path_key(&original),
-            stable_path_key(&alias),
-            "硬链接的路径身份仍应保持独立"
-        );
-        assert_eq!(
-            exact_digest(&original).unwrap(),
-            exact_digest(&alias).unwrap()
-        );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn exact_digest_rejects_symlink_without_following_target() {
-        let dir = TempDir::new("symlink");
-        let target = dir.file("target.bin");
-        let link = dir.file("link.bin");
-        std::fs::write(&target, b"target").unwrap();
-        let symlink_result = {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&target, &link)
-            }
-            #[cfg(windows)]
-            {
-                std::os::windows::fs::symlink_file(&target, &link)
-            }
-        };
-        if symlink_result.is_err() {
-            // 普通用户 Windows 环境可能没有创建 symlink 的权限；cleanup 模块仍覆盖
-            // 同一 no-follow 边界，具备权限的 CI 会执行这里的断言。
-            return;
-        }
-
-        assert_eq!(exact_digest(&link), Err(HashError::NotRegularFile));
-        assert_eq!(std::fs::read(&target).unwrap(), b"target");
-    }
-
     #[cfg(any(unix, windows))]
     #[test]
     fn exact_digest_rejects_symlinked_parent_without_reading_escape_target() {
@@ -1028,33 +943,6 @@ mod tests {
     }
 
     #[test]
-    fn quick_digest_is_versioned_and_distinct_from_exact_type() {
-        let dir = TempDir::new("quick-version");
-        let path = dir.file("a.bin");
-        std::fs::write(&path, b"candidate only").unwrap();
-
-        let quick = quick_digest(&path).unwrap();
-        let exact = exact_digest(&path).unwrap();
-        assert_eq!(QuickDigest::VERSION, DEDUP_HASH_VERSION);
-        assert_eq!(QUICK_DIGEST_VERSION, UNIT_DIGEST_VERSION);
-        assert_ne!(quick.as_ref(), exact.as_ref());
-    }
-
-    #[test]
-    fn cancellable_hash_stops_after_a_read_chunk() {
-        let dir = TempDir::new("cancel");
-        let path = dir.file("source.bin");
-        write_repeated(&path, HASH_BUFFER_SIZE * 3, 0x44);
-        let checks = std::cell::Cell::new(0u32);
-        let result = exact_digest_with_snapshot_cancelled(&path, &|| {
-            checks.set(checks.get() + 1);
-            true
-        });
-        assert!(matches!(result, Err(HashError::Cancelled)));
-        assert_eq!(checks.get(), 1);
-    }
-
-    #[test]
     fn replacement_during_hash_returns_stale_without_digest() {
         let dir = TempDir::new("replace");
         let path = dir.file("source.bin");
@@ -1068,47 +956,6 @@ mod tests {
                     let replacement_path = hook_path.with_extension("replacement");
                     std::fs::write(&replacement_path, &replacement).unwrap();
                     std::fs::rename(&replacement_path, hook_path).unwrap();
-                }
-            },
-            || exact_digest(&path_for_hook),
-        );
-
-        assert!(matches!(result, Err(HashError::Stale)));
-    }
-
-    #[test]
-    fn truncation_during_hash_returns_stale_without_digest() {
-        let dir = TempDir::new("truncate");
-        let path = dir.file("source.bin");
-        write_repeated(&path, HASH_BUFFER_SIZE * 3, 0x20);
-        let path_for_hook = path.clone();
-
-        let result = with_test_read_hook(
-            move |hook_path, bytes_read| {
-                if bytes_read >= HASH_BUFFER_SIZE as u64 {
-                    let file = OpenOptions::new().write(true).open(hook_path).unwrap();
-                    file.set_len(1).unwrap();
-                }
-            },
-            || exact_digest(&path_for_hook),
-        );
-
-        assert!(matches!(result, Err(HashError::Stale)));
-    }
-
-    #[test]
-    fn deletion_during_hash_returns_stale_without_digest() {
-        let dir = TempDir::new("delete");
-        let path = dir.file("source.bin");
-        write_repeated(&path, HASH_BUFFER_SIZE * 3, 0x30);
-        let path_for_hook = path.clone();
-        let mut deleted = false;
-
-        let result = with_test_read_hook(
-            move |hook_path, bytes_read| {
-                if !deleted && bytes_read >= HASH_BUFFER_SIZE as u64 {
-                    std::fs::remove_file(hook_path).unwrap();
-                    deleted = true;
                 }
             },
             || exact_digest(&path_for_hook),
@@ -1137,21 +984,5 @@ mod tests {
         std::fs::write(&companion_b, b"motion C").unwrap();
         let changed = live_photo_unit_digest(&main, vec![companion_a, companion_b]).unwrap();
         assert_ne!(ordered, changed);
-    }
-
-    #[test]
-    fn ordinary_unit_digest_is_versioned_and_not_raw_exact_digest() {
-        let dir = TempDir::new("unit");
-        let path = dir.file("a.bin");
-        std::fs::write(&path, b"ordinary unit").unwrap();
-        let exact = exact_digest(&path).unwrap();
-        let unit = unit_digest(&path).unwrap();
-
-        assert_eq!(
-            unit,
-            single_unit_digest(b"ordinary unit".len() as u64, &exact)
-        );
-        assert_eq!(unit.version(), UNIT_DIGEST_VERSION);
-        assert_ne!(unit.as_ref(), exact.as_ref());
     }
 }

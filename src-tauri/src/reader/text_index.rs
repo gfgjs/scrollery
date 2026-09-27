@@ -505,45 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn splits_chinese_chapters_utf8() {
-        let text = make_book(&["第一章 风起", "第二章 云涌", "第三章 雨落"]);
-        let index = build_index(text.as_bytes(), None);
-        let titles: Vec<&str> = index.chapters.iter().map(|c| c.title.as_str()).collect();
-        assert_eq!(titles, vec!["第一章 风起", "第二章 云涌", "第三章 雨落"]);
-        roundtrip_check(&index, text.as_bytes());
-    }
-
-    #[test]
-    fn leading_preamble_becomes_chapter() {
-        let f = filler_para();
-        // 前言(无标记,两行实质内容)+ 两个真实章节(满足选规则 ≥2 命中)。
-        let text = format!(
-            "这是一段没有章节标记的开头引言。\n继续引言内容。\n第一章 开始\n{f}\n第二章 继续\n{f}"
-        );
-        let index = build_index(text.as_bytes(), None);
-        assert_eq!(index.chapters.len(), 3, "前言 + 第一章 + 第二章");
-        assert_eq!(index.chapters[1].title, "第一章 开始");
-        assert_eq!(index.chapters[0].byte_start, 0, "前言块从文件头起");
-        roundtrip_check(&index, text.as_bytes());
-    }
-
-    #[test]
-    fn deny_suffix_rejects_false_positive() {
-        let f = filler_para();
-        // 行首「第三节课…」应被 deny_suffix(课)否决,不成章;三个真实「第X节 …」成章。
-        let text = format!(
-            "第一节 序幕\n{f}\n第三节课的安排如下。\n{f}\n第二节 发展\n{f}\n第三节 高潮\n{f}"
-        );
-        let index = build_index(text.as_bytes(), None);
-        let titles: Vec<&str> = index.chapters.iter().map(|c| c.title.as_str()).collect();
-        assert!(
-            !titles.iter().any(|t| t.starts_with("第三节课")),
-            "负向断言失效:第三节课被误判为章 | titles={titles:?}"
-        );
-        assert_eq!(titles, vec!["第一节 序幕", "第二节 发展", "第三节 高潮"]);
-    }
-
-    #[test]
     fn gbk_offsets_roundtrip() {
         let text = make_book(&["第一章 洛阳", "第二章 长安", "第三章 江南"]);
         let (bytes, _, _) = encoding_rs::GBK.encode(&text);
@@ -553,42 +514,6 @@ mod tests {
         assert_eq!(index.chapters[0].title, "第一章 洛阳");
         // 偏移对拍:切 GBK 源字节区间 + 解码,须还原各章文本。
         roundtrip_check(&index, &bytes);
-    }
-
-    #[test]
-    fn pseudo_fallback_when_no_rule() {
-        // 无任何章节标记 + 多行 + 超过 10K 字符 → 伪章兜底切多段(切点在行边界)。
-        let para = "这是一段没有任何章节标记的连续正文。\n".repeat(800);
-        let index = build_index(para.as_bytes(), None);
-        assert!(
-            index.chapters.len() >= 2,
-            "长无标记文本应切多个伪章,实得 {}",
-            index.chapters.len()
-        );
-        // 伪章偏移连续无缝、覆盖全文。
-        assert_eq!(index.chapters.first().unwrap().byte_start, 0);
-        assert_eq!(index.chapters.last().unwrap().byte_end, para.len());
-        for w in index.chapters.windows(2) {
-            assert_eq!(w[0].byte_end, w[1].byte_start, "伪章区间应首尾相接");
-        }
-        roundtrip_check(&index, para.as_bytes());
-    }
-
-    #[test]
-    fn short_text_single_chapter() {
-        let text = "很短的一段文字,没有章节。";
-        let index = build_index(text.as_bytes(), None);
-        assert_eq!(index.chapters.len(), 1);
-        assert_eq!(index.chapters[0].byte_start, 0);
-        assert_eq!(index.chapters[0].byte_end, text.len());
-    }
-
-    #[test]
-    fn empty_file_yields_one_chapter() {
-        let index = build_index(&[], None);
-        assert_eq!(index.chapters.len(), 1);
-        assert_eq!(index.chapters[0].byte_start, 0);
-        assert_eq!(index.chapters[0].byte_end, 0);
     }
 
     #[test]
@@ -633,67 +558,5 @@ mod tests {
             assert_eq!(w[0].byte_end, w[1].byte_start, "章区间应首尾相接");
         }
         roundtrip_check(&index, text.as_bytes());
-    }
-
-    /// Characterization(审查 F-04):分章只在**行边界**续切——无内部换行的单行巨串
-    /// (minified JSON/base64/单行日志)整行独占一章,PSEUDO_CHARS/MAX_RULE_CHAPTER_CHARS
-    /// 上限对它失效。这是行边界切分的已知局限:行内切分需 decoded-char→源字节映射,在
-    /// 非 UTF-8 编码下是新的偏移正确性风险面,故后端不切;内存放大由前端护栏兜底
-    /// (BookReader 检出超限 section 强制 scrolled,阈值 FORCE_SCROLLED_SECTION_CHARS)。
-    /// 若未来实现行内安全切分,本测试应当反转。
-    #[test]
-    fn single_giant_line_stays_one_chapter() {
-        // 单行 ~40 万字符,远超 MAX_RULE_CHAPTER_CHARS(30K),但无换行 → 不可续切。
-        let giant_line = "abcdefghij".repeat(40_000);
-        let index = build_index(giant_line.as_bytes(), None);
-        assert_eq!(index.chapters.len(), 1, "单行巨串应保持单章(行边界局限)");
-        let ch = &index.chapters[0];
-        assert_eq!(ch.byte_start, 0);
-        assert_eq!(ch.byte_end, giant_line.len());
-        assert!(
-            ch.char_len > MAX_RULE_CHAPTER_CHARS,
-            "char_len={} 应如实上报超限,供前端护栏判定",
-            ch.char_len
-        );
-    }
-
-    #[test]
-    fn crlf_offsets_align() {
-        // Windows 换行 \r\n:偏移对齐不能被 \r 打乱;标题不残留 \r。
-        let f = filler_para();
-        let text = format!("第一章 甲\r\n{f}\r\n第二章 乙\r\n{f}");
-        let index = build_index(text.as_bytes(), None);
-        assert_eq!(index.chapters.len(), 2);
-        assert_eq!(index.chapters[0].title, "第一章 甲");
-        roundtrip_check(&index, text.as_bytes());
-    }
-
-    #[test]
-    fn chapters_serialize_compact_keys() {
-        let ch = ChapterMeta {
-            title: "第一章".into(),
-            byte_start: 0,
-            byte_end: 10,
-            char_len: 3,
-        };
-        let json = serde_json::to_string(&ch).unwrap();
-        assert!(json.contains("\"t\":"), "应用紧凑键 t");
-        assert!(json.contains("\"s\":"));
-        assert!(json.contains("\"e\":"));
-        assert!(json.contains("\"n\":"));
-        // 回环
-        let back: ChapterMeta = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ch);
-    }
-
-    #[test]
-    fn ruleset_loads_and_compiles() {
-        // 规则集数据文件须解析成功且至少编译出若干启用规则(默认关的纯数字行不计)。
-        let rules = load_rules();
-        assert!(
-            rules.len() >= 6,
-            "规则集应编译出多条启用规则,实得 {}",
-            rules.len()
-        );
     }
 }

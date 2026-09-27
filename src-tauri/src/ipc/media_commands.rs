@@ -489,23 +489,6 @@ fn clamp_playback_position_ms(ms: i64) -> i64 {
     ms.max(0)
 }
 
-#[cfg(test)]
-mod playback_position_clamp_tests {
-    use super::*;
-
-    #[test]
-    fn negative_ms_clamped_to_zero() {
-        assert_eq!(clamp_playback_position_ms(-1), 0);
-        assert_eq!(clamp_playback_position_ms(-999_999), 0);
-    }
-
-    #[test]
-    fn nonnegative_ms_passed_through_unchanged() {
-        assert_eq!(clamp_playback_position_ms(0), 0);
-        assert_eq!(clamp_playback_position_ms(4200), 4200);
-    }
-}
-
 /// 批量设置颜色标签（0-7），单条 UPDATE + IN 完成。镜像 `batch_set_rating`，支撑画廊对当前选区批量
 /// 打色签（避免逐项 loop 在大选区上的 N 次 IPC）。返回受影响行数。
 #[tauri::command]

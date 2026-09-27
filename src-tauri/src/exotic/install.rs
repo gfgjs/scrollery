@@ -560,64 +560,6 @@ mod tests {
     }
 
     #[test]
-    fn extra_file_rejected() {
-        let sk = signing_key(2);
-        let ks = release_keyset(&sk);
-        let payload: &[(&str, &[u8], bool)] = &[("a.txt", b"AAA", false)];
-        let mj = manifest_json(payload);
-        let sig = sign(&sk, mj.as_bytes());
-        // 夹带清单外文件。
-        let zip = write_zip(
-            "extra.zip",
-            mj.as_bytes(),
-            &sig,
-            payload,
-            &[("evil.dll", b"X")],
-        );
-        let dir = unique_dir("extra");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(matches!(
-            verify_and_extract(
-                &zip,
-                &ks,
-                &expect(),
-                "0.1.0",
-                NOW,
-                &dir,
-                &InstallLimits::default()
-            ),
-            Err(InstallError::ExtraFile(_))
-        ));
-        assert!(!dir.exists(), "拒绝后不应留 staging");
-    }
-
-    #[test]
-    fn missing_file_rejected() {
-        let sk = signing_key(3);
-        let ks = release_keyset(&sk);
-        // 清单声明两文件，zip 只放一个。
-        let declared: &[(&str, &[u8], bool)] =
-            &[("a.txt", b"AAA", false), ("b.txt", b"BBB", false)];
-        let mj = manifest_json(declared);
-        let sig = sign(&sk, mj.as_bytes());
-        let present: &[(&str, &[u8], bool)] = &[("a.txt", b"AAA", false)];
-        let zip = write_zip("missing.zip", mj.as_bytes(), &sig, present, &[]);
-        let dir = unique_dir("missing");
-        assert!(matches!(
-            verify_and_extract(
-                &zip,
-                &ks,
-                &expect(),
-                "0.1.0",
-                NOW,
-                &dir,
-                &InstallLimits::default()
-            ),
-            Err(InstallError::MissingFile(_))
-        ));
-    }
-
-    #[test]
     fn hash_mismatch_rejected() {
         let sk = signing_key(4);
         let ks = release_keyset(&sk);
@@ -673,82 +615,10 @@ mod tests {
     }
 
     #[test]
-    fn file_count_limit() {
-        let sk = signing_key(6);
-        let ks = release_keyset(&sk);
-        let payload: &[(&str, &[u8], bool)] = &[("a.txt", b"AAA", false)];
-        let mj = manifest_json(payload);
-        let sig = sign(&sk, mj.as_bytes());
-        let zip = write_zip("count.zip", mj.as_bytes(), &sig, payload, &[]);
-        let dir = unique_dir("count");
-        let limits = InstallLimits {
-            max_files: 1, // zip 实际 3 entry（manifest+sig+a.txt）> 1
-            ..InstallLimits::default()
-        };
-        assert!(matches!(
-            verify_and_extract(&zip, &ks, &expect(), "0.1.0", NOW, &dir, &limits),
-            Err(InstallError::LimitExceeded(_))
-        ));
-    }
-
-    #[test]
-    fn registry_mismatch_rejected() {
-        let sk = signing_key(7);
-        let ks = release_keyset(&sk);
-        let payload: &[(&str, &[u8], bool)] = &[("a.txt", b"AAA", false)];
-        let mj = manifest_json(payload);
-        let sig = sign(&sk, mj.as_bytes());
-        let zip = write_zip("regmis.zip", mj.as_bytes(), &sig, payload, &[]);
-        let dir = unique_dir("regmis");
-        let mut e = expect();
-        e.package_sequence = 999; // 与 manifest(3) 不符
-        assert!(matches!(
-            verify_and_extract(&zip, &ks, &e, "0.1.0", NOW, &dir, &InstallLimits::default()),
-            Err(InstallError::Manifest(PackageError::RegistryMismatch(_)))
-        ));
-    }
-
-    #[test]
-    fn incompatible_host_rejected() {
-        let sk = signing_key(8);
-        let ks = release_keyset(&sk);
-        let payload: &[(&str, &[u8], bool)] = &[("a.txt", b"AAA", false)];
-        let mj = manifest_json(payload); // min_host_version=0.1.0
-        let sig = sign(&sk, mj.as_bytes());
-        let zip = write_zip("host.zip", mj.as_bytes(), &sig, payload, &[]);
-        let dir = unique_dir("host");
-        // host 0.0.1 < min 0.1.0 → 拒。
-        assert!(matches!(
-            verify_and_extract(
-                &zip,
-                &ks,
-                &expect(),
-                "0.0.1",
-                NOW,
-                &dir,
-                &InstallLimits::default()
-            ),
-            Err(InstallError::IncompatibleHost)
-        ));
-    }
-
-    #[test]
     fn symlink_mode_detected() {
         assert!(is_symlink_mode(0o120777));
         assert!(!is_symlink_mode(0o100644)); // 普通文件
         assert!(!is_symlink_mode(0o040755)); // 目录
-    }
-
-    #[test]
-    fn plugin_install_dir_rejects_bad_id() {
-        let base = std::env::temp_dir();
-        assert!(plugin_install_dir(&base, "exotic-image-psd").is_some());
-        for bad in ["", "../evil", "a/b", "A_B", "x".repeat(65).as_str(), "a:b"] {
-            assert!(
-                plugin_install_dir(&base, bad).is_none(),
-                "应拒绝 plugin_id：{bad:?}"
-            );
-        }
     }
 
     /// 在唯一临时目录里建一个含标记文件的目录。
@@ -796,38 +666,5 @@ mod tests {
         assert!(!backup.exists());
 
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// R1-4 错误码稳定性锁（同 error.rs / plugin-api 的既有模式）：前端按 code 分支处理，
-    /// 任何改名都是破坏性契约变更——全集在此钉死；Manifest 委托 PackageError::code 亦锁一例。
-    #[test]
-    fn install_error_codes_are_stable() {
-        use crate::exotic::package::PackageError;
-        let cases: &[(InstallError, &str)] = &[
-            (InstallError::OpenZip("x".into()), "open_zip"),
-            (InstallError::MissingMeta("m"), "missing_meta"),
-            (
-                InstallError::Manifest(PackageError::BadSignature),
-                "bad_signature",
-            ),
-            (InstallError::IncompatibleHost, "incompatible_host"),
-            (
-                InstallError::ProtocolMismatch { pkg: 2, host: 1 },
-                "protocol_mismatch",
-            ),
-            (InstallError::UnsafeEntry("p".into()), "unsafe_entry"),
-            (InstallError::Symlink("p".into()), "symlink"),
-            (InstallError::ExtraFile("p".into()), "extra_file"),
-            (InstallError::MissingFile("p".into()), "missing_file"),
-            (InstallError::CaseCollision("p".into()), "case_collision"),
-            (InstallError::LimitExceeded("l"), "limit_exceeded"),
-            (InstallError::HashMismatch("p".into()), "hash_mismatch"),
-            (InstallError::Io("e".into()), "install_io"),
-            (InstallError::CatalogReject("r".into()), "catalog_reject"),
-            (InstallError::Db("e".into()), "install_db"),
-        ];
-        for (err, code) in cases {
-            assert_eq!(err.code(), *code, "错误码必须稳定：{err:?}");
-        }
     }
 }

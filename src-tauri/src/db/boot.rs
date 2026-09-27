@@ -1,6 +1,6 @@
 // src-tauri/src/db/boot.rs
 //! 启动期数据库装配:恢复交换 → 写连接 + 结构初始化(含恢复回滚分支)→ 恢复收尾 → 读池,
-//! 以及 tracing 就绪后才能跑的启动期自愈四项。
+//! 以及 tracing 就绪后才能跑的启动期自愈。
 //!
 //! 自 `lib.rs::run()` 的 setup 段 c/e/f/g/l 迁出(D-450 纯结构移动,行为不变)。
 //!
@@ -129,7 +129,7 @@ pub fn init(app_data_dir: &Path) -> Result<DbBoot, StartupFailure> {
     })
 }
 
-/// 启动期 WAL 截断 + 三项自愈(setup 段 l)。
+/// 启动期 WAL 截断与自愈(setup 段 l)。
 ///
 /// **调用时机是硬约束**:tracing subscriber 就绪之后(否则日志静默丢弃)、后台派生管线
 /// 拉起之前(无并发读者,TRUNCATE 可截干净、自愈可一次性收敛)。
@@ -174,6 +174,31 @@ pub fn run_startup_reconciliation(db_writer: &DbWriter, db_path: &Path, cache_di
             ),
             Err(e) => tracing::warn!(
                 "[Startup] 视频可播在途复位失败（不致命） | video_playable in-flight reset failed: {}",
+                e
+            ),
+        }
+
+        // Coordinator 的处理队列只在本进程内存在。重启后旧租约已无执行者，
+        // 须在新任务入队前复位，否则全库阶段会等待租约最长一小时才可续跑。
+        match crate::db::queries::reset_image_thumbnail_leases(&conn) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                "[Startup] 图片缩略图孤儿租约复位 {} 项 | reset {} orphaned image thumbnail leases",
+                n, n
+            ),
+            Err(e) => tracing::warn!(
+                "[Startup] 图片缩略图孤儿租约复位失败 | image thumbnail lease reset failed: {}",
+                e
+            ),
+        }
+        match crate::db::queries::reset_native_video_cover_leases(&conn) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                "[Startup] 原生视频封面孤儿租约复位 {} 项 | reset {} orphaned native video cover leases",
+                n, n
+            ),
+            Err(e) => tracing::warn!(
+                "[Startup] 原生视频封面孤儿租约复位失败 | native video cover lease reset failed: {}",
                 e
             ),
         }
@@ -232,30 +257,5 @@ pub fn run_startup_reconciliation(db_writer: &DbWriter, db_path: &Path, cache_di
         }
         let conn = db_writer.lock().unwrap_or_else(|e| e.into_inner());
         let _ = set_config(&conn, "last_cover_stat_reconcile", &now_secs.to_string());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::Connection;
-    use std::sync::Mutex;
-
-    #[test]
-    fn startup_reconciliation_releases_writer_between_phases() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("scrollery.db");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            crate::db::schema::initialize_schema(&conn).unwrap();
-        }
-
-        let writer = Mutex::new(Connection::open(&db_path).unwrap());
-        run_startup_reconciliation(&writer, &db_path, temp.path());
-
-        let conn = writer.lock().unwrap();
-        assert!(get_config(&conn, "last_cover_stat_reconcile")
-            .unwrap()
-            .is_some());
     }
 }

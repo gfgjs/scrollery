@@ -79,12 +79,36 @@ export interface ComputeLayoutParams {
   gap: number
 }
 
+export interface ThumbResultCounts {
+  available: number
+  direct: number
+  failed: number
+  newlyGenerated: number
+  cacheHit: number
+  temporarilyUnavailable: number
+}
+
+/** 本轮新发布产物的实际后端；null 表示宿主尚未提供阶段事实。 */
+export interface ThumbExecutionCount {
+  native: {
+    backend: 'embeddedJpeg' | 'imageD2d' | 'imageWic' | 'imageRs' | 'videoMf' | 'videoMfHardwareMft' | 'imageVpl'
+    vendorId: number
+    deviceId: number
+    luidHigh: number
+    luidLow: number
+    adapterKind: 'unknown' | 'integrated' | 'discrete'
+  } | null
+  count: number
+}
+
 export interface FullThumbProgressPayload {
   generated: number
   total: number
-  status: 'running' | 'completed' | 'cancelled'
+  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error'
   currentItem?: string
   phase?: string
+  results: ThumbResultCounts
+  executions: ThumbExecutionCount[]
 }
 
 // ── 精确内容去重 ─────────────────────────────────────────────────────────
