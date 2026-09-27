@@ -9,6 +9,7 @@ pub mod native_protocol;
 #[cfg(windows)]
 pub mod native_worker;
 pub mod qos;
+pub mod route_diagnostics;
 pub mod router;
 pub mod scheduler;
 pub mod serve;

@@ -22,15 +22,18 @@ pub fn try_exif_thumb(
         target_size,
         webp_quality,
         max_pixel_bytes,
+        || {},
     )
 }
 
 /// 受控文件句柄上的 JPEG 内嵌图快速路径，不重新按路径打开源。
+/// `on_decoded` 在源读/变换完成、编码前调用；调用后若返回 None，调用方须终结失败而非重新读源。
 pub fn try_exif_thumb_file(
     file: &mut File,
     target_size: u32,
     webp_quality: u8,
     max_pixel_bytes: u64,
+    on_decoded: impl FnOnce(),
 ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     let embedded =
         crate::engine::image_rs::ImageRsEngine::extract_embedded_thumb_file(file).ok()??;
@@ -41,6 +44,7 @@ pub fn try_exif_thumb_file(
         target_size,
         webp_quality,
         max_pixel_bytes,
+        on_decoded,
     )
 }
 
@@ -50,6 +54,7 @@ fn encode_embedded_thumb(
     target_size: u32,
     webp_quality: u8,
     max_pixel_bytes: u64,
+    on_decoded: impl FnOnce(),
 ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     // 解码内嵌的 JPEG
     use image::ImageDecoder;
@@ -106,6 +111,7 @@ fn encode_embedded_thumb(
     let resized = img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
     let rgba = resized.to_rgba8();
 
+    on_decoded();
     let hash = generate_thumbhash_rgba(rgba.as_raw(), new_w, new_h).ok();
 
     let webp_bytes = encode_as_webp(&rgba, webp_quality).ok()?;

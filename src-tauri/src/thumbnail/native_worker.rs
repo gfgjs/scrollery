@@ -32,7 +32,7 @@ use super::coordinator::{LatencyStats, NativeCounters};
 use super::generator::EncodedThumbPayload;
 use super::native_protocol::{
     read_response, write_request, NativeBackend, NativeExecution, NativeQosAck, NativeRequest,
-    NativeResponse, NativeTimings, WORKER_HELLO,
+    NativeResponse, NativeStage, NativeTimings, WORKER_HELLO,
 };
 
 use super::qos::{native_timeout, SourceMedia};
@@ -207,6 +207,12 @@ pub(super) struct NativePending {
     completed: bool,
 }
 
+impl NativePending {
+    pub(super) fn source_done(&self) -> bool {
+        self.reply.source_done
+    }
+}
+
 impl Drop for NativePending {
     fn drop(&mut self) {
         // 宿主退出或放弃在途项时，先终止并确认退出，再归还域额度。
@@ -217,6 +223,8 @@ impl Drop for NativePending {
 }
 
 struct PendingReply {
+    gpu_done: bool,
+    source_done: bool,
     receiver: crossbeam_channel::Receiver<Reply>,
     id: u64,
     qos_revision: u64,
@@ -232,49 +240,70 @@ impl PendingReply {
         }
     }
 
-    fn poll(&self) -> Option<io::Result<(NativeReply, NativeQosAck)>> {
-        let response = match self.receiver.try_recv() {
-            Ok(response) => response,
-            Err(crossbeam_channel::TryRecvError::Empty) if Instant::now() < self.deadline => {
-                return None
-            }
-            Err(crossbeam_channel::TryRecvError::Empty) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "native thumbnail deadline",
-            )),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "native thumbnail worker exited",
-            )),
-        };
-        Some(response.and_then(|(arrived, response)| {
-            if arrived > self.deadline {
-                return Err(io::Error::new(
+    fn poll(&mut self) -> Option<io::Result<(NativeReply, NativeQosAck)>> {
+        loop {
+            let response = match self.receiver.try_recv() {
+                Ok(response) => response,
+                Err(crossbeam_channel::TryRecvError::Empty) if Instant::now() < self.deadline => {
+                    return None
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "native thumbnail deadline",
-                ));
-            }
-            match response {
-                NativeResponse::Ok {
-                    id,
-                    payload,
-                    execution,
-                    timings,
-                    qos,
-                } if id == self.id && qos.revision == self.qos_revision => {
-                    Ok((Ok((payload, execution, timings)), qos))
-                }
-                NativeResponse::Failed { id, code, qos }
-                    if id == self.id && qos.revision == self.qos_revision =>
-                {
-                    Ok((Err(code), qos))
-                }
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "native thumbnail reply identity mismatch",
                 )),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "native thumbnail worker exited",
+                )),
+            };
+            if let Ok((arrived, NativeResponse::Stage { id, stage })) = &response {
+                let valid = *id == self.id
+                    && *arrived <= self.deadline
+                    && match stage {
+                        NativeStage::GpuDone => !self.gpu_done && !self.source_done,
+                        NativeStage::SourceDone => self.gpu_done && !self.source_done,
+                    };
+                if !valid {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid native stage order",
+                    )));
+                }
+                match stage {
+                    NativeStage::GpuDone => self.gpu_done = true,
+                    NativeStage::SourceDone => self.source_done = true,
+                }
+                continue;
             }
-        }))
+            return Some(response.and_then(|(arrived, response)| {
+                if arrived > self.deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "native thumbnail deadline",
+                    ));
+                }
+                match response {
+                    NativeResponse::Ok {
+                        id,
+                        payload,
+                        execution,
+                        timings,
+                        qos,
+                    } if id == self.id && qos.revision == self.qos_revision => {
+                        Ok((Ok((payload, execution, timings)), qos))
+                    }
+                    NativeResponse::Failed { id, code, qos }
+                        if id == self.id && qos.revision == self.qos_revision =>
+                    {
+                        Ok((Err(code), qos))
+                    }
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native thumbnail reply identity mismatch",
+                    )),
+                }
+            }));
+        }
     }
 }
 
@@ -508,7 +537,11 @@ impl NativeWorkers {
         pending
             .reply
             .apply_qos_revision(super::qos::native_worker_qos_request().1);
-        let response = pending.reply.poll()?;
+        let response = pending.reply.poll();
+        if pending.reply.gpu_done {
+            drop(pending._gpu.take());
+        }
+        let response = response?;
         pending.completed = true;
         Some(self.finish_response(pending, response))
     }
@@ -638,7 +671,7 @@ impl NativeWorkers {
                 let exit_code = process.terminate_with_exit_code();
                 tracing::warn!(target: "scrollery::thumb_perf",
                     item_id, lane = lane.as_str(), ?exit_code,
-                    mf_reader_timeout_exit = exit_code == Some(70),
+                    abandoned_gpu_work_exit = exit_code == Some(70),
                     "native thumbnail worker exit confirmed");
                 domain.forget(process);
                 Err(AppError::ThumbnailUnavailable(
@@ -820,14 +853,22 @@ impl WorkerProcess {
             }
             while let Ok(response) = read_response(&mut stdout) {
                 let id = match &response {
-                    NativeResponse::Ok { id, .. } | NativeResponse::Failed { id, .. } => *id,
+                    NativeResponse::Ok { id, .. }
+                    | NativeResponse::Failed { id, .. }
+                    | NativeResponse::Stage { id, .. } => *id,
                 };
-                let waiter = reader_pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
+                let waiter = {
+                    let mut pending = reader_pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(response, NativeResponse::Stage { .. }) {
+                        pending.get(&id).cloned()
+                    } else {
+                        pending.remove(&id)
+                    }
+                };
                 if let Some((waiter, wake)) = waiter {
-                    let _ = waiter.send(Ok((Instant::now(), response)));
+                    if waiter.try_send(Ok((Instant::now(), response))).is_err() {
+                        break;
+                    }
                     wake.notify_all();
                 } else {
                     break; // 未请求的响应说明协议状态已失配。
@@ -887,7 +928,7 @@ impl WorkerProcess {
             }
         }
         request.file_handle = transferred.0 as usize as u64;
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(3);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -906,6 +947,8 @@ impl WorkerProcess {
         }
         let sent = Instant::now();
         Ok(PendingReply {
+            gpu_done: false,
+            source_done: false,
             receiver: reply_rx,
             id,
             qos_revision: request.qos_revision,
@@ -921,7 +964,7 @@ impl WorkerProcess {
     fn terminate_with_exit_code(&self) -> Option<i32> {
         self.alive.store(false, Ordering::Release);
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        // 已自行退出时保留真实状态；MF弃用超时reader使用70，不能只留下管道失联。
+        // 已自行退出时保留真实状态；MF/VPL 未完成硬件工作使用70，不能只留下管道失联。
         let status = match child.try_wait() {
             Ok(Some(status)) => Some(status),
             _ => {
@@ -937,7 +980,7 @@ impl WorkerProcess {
 fn fail_pending(pending: &Pending) {
     let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
     for (_, (waiter, wake)) in pending.drain() {
-        let _ = waiter.send(Err(io::Error::new(
+        let _ = waiter.try_send(Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "native thumbnail worker stopped",
         )));
@@ -960,7 +1003,7 @@ mod tests {
         use std::os::windows::process::CommandExt;
         // 故障子进程使用同一握手、Job、reader及终止出口；读取触发字节后挂起或写非法回包。
         let script = format!(
-            r#"$out=[Console]::OpenStandardOutput();$out.Write([byte[]](78,84,72,68),0,4);$out.Flush();$null=[Console]::OpenStandardInput().ReadByte();{};Start-Sleep -Seconds 15"#,
+            r#"$out=[Console]::OpenStandardOutput();$out.Write([byte[]](78,84,72,69),0,4);$out.Flush();$null=[Console]::OpenStandardInput().ReadByte();{};Start-Sleep -Seconds 15"#,
             if malformed {
                 "$out.Write((New-Object byte[] 27),0,27);$out.Flush()"
             } else {
@@ -989,6 +1032,8 @@ mod tests {
             _gpu: None,
             process: Arc::clone(&process),
             reply: PendingReply {
+                gpu_done: false,
+                source_done: false,
                 receiver,
                 id: 1,
                 qos_revision: super::super::qos::native_worker_qos_request().1,
@@ -1053,6 +1098,8 @@ mod tests {
     fn pending_reply_enforces_deadline_and_identity() {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let mut reply = PendingReply {
+            gpu_done: false,
+            source_done: false,
             receiver: rx,
             id: 1,
             qos_revision: 3,
@@ -1064,6 +1111,43 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         reply.deadline = Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        super::super::native_protocol::write_response(
+            &mut bytes,
+            &NativeResponse::Stage {
+                id: 1,
+                stage: NativeStage::GpuDone,
+            },
+        )
+        .unwrap();
+        let stage = read_response(&bytes[..]).unwrap();
+        tx.send(Ok((Instant::now(), stage))).unwrap();
+        assert!(reply.poll().is_none());
+        assert!(reply.gpu_done && !reply.source_done);
+        tx.send(Ok((
+            Instant::now(),
+            NativeResponse::Stage {
+                id: 1,
+                stage: NativeStage::SourceDone,
+            },
+        )))
+        .unwrap();
+        assert!(reply.poll().is_none());
+        assert!(reply.source_done);
+        // 重复阶段不能伪装成正常完成。
+        tx.send(Ok((
+            Instant::now(),
+            NativeResponse::Stage {
+                id: 1,
+                stage: NativeStage::SourceDone,
+            },
+        )))
+        .unwrap();
+        assert_eq!(
+            reply.poll().unwrap().err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
         tx.send(Ok((
             Instant::now(),
             NativeResponse::Failed {

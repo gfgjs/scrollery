@@ -246,6 +246,21 @@ fn decode_media_step_inner(
     match item.media_type.as_str() {
         "image" => {
             if config.strategy == "gpu" {
+                if let Some(engine) = arena.engine_for(&item.file_format) {
+                    if let Some((webp, thumbhash)) = crate::thumbnail::exif_thumb::try_exif_thumb(
+                        engine.as_ref(),
+                        abs_path,
+                        config.size,
+                        config.webp_quality,
+                        max_pixel_bytes,
+                    ) {
+                        return Ok(DecodeResult::Encoded(EncodedThumbPayload {
+                            webp,
+                            thumbhash,
+                            ai_cache: None,
+                        }));
+                    }
+                }
                 match try_native_decode(item, abs_path, config, max_pixel_bytes) {
                     Some(Ok(res)) => Ok(res),
                     Some(Err(e)) => {
@@ -389,7 +404,7 @@ fn try_native_decode(
     let decoded = native.decode_bounded(
         abs_path,
         Some(crate::engine::traits::ResizeHint::LongEdge(
-            decode_long_edge(config, item),
+            decode_long_edge(config, item, needs_ai_cache(config, item.cache_key)),
         )),
         max_pixel_bytes,
     );
@@ -405,10 +420,18 @@ fn try_native_decode(
 /// （其缩略图短边会低于 AI 缓存短边）时，把解码长边略放大，使同一缓冲既能产出缩略图（降采样到
 /// `size`）又能产出 AI 缓存（降采样到短边 `AI_CACHE_SHORT_EDGE`），免去 `ai_thumb` 派生再做一次
 /// 全分辨率源解码。绝不上采样（WIC LongEdge 仅下采样）。
-pub(crate) fn decode_long_edge(config: &ThumbConfig, item: &crate::db::models::MediaItem) -> u32 {
+pub(crate) fn needs_ai_cache(config: &ThumbConfig, cache_key: i64) -> bool {
+    config.ai_hq_cache && !ai_cache_path(&config.cache_dir, cache_key).exists()
+}
+
+pub(crate) fn decode_long_edge(
+    config: &ThumbConfig,
+    item: &crate::db::models::MediaItem,
+    need_ai_cache: bool,
+) -> u32 {
     let (w, h) = (item.width as u32, item.height as u32);
     let (long, short) = (w.max(h), w.min(h));
-    if !config.ai_hq_cache || long == 0 || short == 0 {
+    if !need_ai_cache || long == 0 || short == 0 {
         return config.size;
     }
     let thumb_short = (short as f32 * config.size as f32 / long as f32).round() as u32;
@@ -446,7 +469,7 @@ fn try_cpu_decode(
         }));
     }
 
-    // Full decode fallback —— 解码期即降采样到目标档位（Part3 Q1 / §3.1.1）。
+    // 完整源解码后缩到目标档位；具体后端可提供解码期降采样。
     // 复用 GPU 路径同一 `decode_long_edge`（而非裸 `snap_to_tier`）：AI 高清缓存开启且宽幅图时
     // 解码略大，使 encode 阶段同一缓冲既出缩略图又出 AI 缓存（一次解码两份产物），否则即 config.size。
     // image crate 的 LongEdge 仅下采样不上采样（image_rs.rs:57）→ 小图不被放大；常见情形下
@@ -454,7 +477,7 @@ fn try_cpu_decode(
     let decoded = engine.decode_bounded(
         abs_path,
         Some(crate::engine::traits::ResizeHint::LongEdge(
-            decode_long_edge(config, item),
+            decode_long_edge(config, item, needs_ai_cache(config, item.cache_key)),
         )),
         max_pixel_bytes,
     )?;
@@ -624,7 +647,7 @@ fn encode_media_step_inner(
     decoded: crate::engine::traits::DecodedImage,
     config: &ThumbConfig,
 ) -> Result<ThumbResult> {
-    let emit_ai_cache = config.ai_hq_cache && !ai_cache_path(&config.cache_dir, cache_key).exists();
+    let emit_ai_cache = needs_ai_cache(config, cache_key);
     let payload = encode_media_payload_inner(item_id, decoded, config, emit_ai_cache)?;
     write_encoded_media_payload(item_id, source_revision, cache_key, payload, config)
 }
@@ -733,4 +756,100 @@ fn resize_short_edge_rgba(
 
     image::RgbaImage::from_raw(new_w, new_h, dst.into_vec())
         .ok_or_else(|| AppError::Internal("ai cache buffer mismatch".into()))
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn image_variants_keep_task_identity_and_serve_smaller_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = ThumbConfig {
+            cache_dir: directory.path().to_path_buf(),
+            size: 512,
+            skip_max_bytes: 0,
+            strategy: "cpu".into(),
+            ai_hq_cache: false,
+            webp_quality: 80,
+            ai_cache_short_edge: 336,
+            output_fingerprint: None,
+        };
+        config.output_fingerprint = Some(OutputFingerprint::for_image(&config));
+        let large_fp = config.output_fingerprint;
+        let (_, large) = output_paths(&config, 91);
+        config.size = 256;
+        config.output_fingerprint = Some(OutputFingerprint::for_image(&config));
+        let (_, small) = output_paths(&config, 91);
+        assert_ne!(large_fp, config.output_fingerprint);
+        let write = |config: &ThumbConfig| {
+            write_encoded_media_payload(
+                1,
+                1,
+                91,
+                EncodedThumbPayload {
+                    webp: vec![1, 2, 3],
+                    thumbhash: None,
+                    ai_cache: None,
+                },
+                config,
+            )
+            .unwrap()
+        };
+        assert_eq!(write(&config).thumb_path.as_deref(), Some(small.as_str()));
+        let mut large_config = config.clone();
+        large_config.size = 512;
+        large_config.output_fingerprint = large_fp;
+        assert_eq!(
+            write(&large_config).thumb_path.as_deref(),
+            Some(large.as_str())
+        );
+        let probes = crate::thumbnail::serve::ThumbProbeCache::new(std::time::Duration::ZERO);
+        let serve = crate::thumbnail::serve::ThumbServe::prepare_with(
+            &crate::thumbnail::serve::RealServeIo,
+            &probes,
+            directory.path(),
+            1.0,
+            &[crate::thumbnail::serve::ServeRequest {
+                cache_key: 91,
+                need_px: 128,
+                db_path: large.clone(),
+            }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(serve.rewrite_path(&large, 128.0, 128.0, 91), Some(small));
+        config.webp_quality = 90;
+        config.output_fingerprint = Some(OutputFingerprint::for_image(&config));
+        let (_, other) = output_paths(&config, 91);
+        assert_eq!(serve.rewrite_path(&other, 128.0, 128.0, 91), None);
+        assert_eq!(
+            OutputFingerprint::from_hex(&large_fp.unwrap().hex()),
+            large_fp
+        );
+        config.webp_quality = 80;
+        config.size = 512;
+        config.output_fingerprint = Some(OutputFingerprint::for_native_video_cover(&config));
+        let video_large = write(&config).thumb_path.unwrap();
+        config.size = 256;
+        config.output_fingerprint = Some(OutputFingerprint::for_native_video_cover(&config));
+        let video_small = write(&config).thumb_path.unwrap();
+        let serve = crate::thumbnail::serve::ThumbServe::prepare_with(
+            &crate::thumbnail::serve::RealServeIo,
+            &probes,
+            directory.path(),
+            1.0,
+            &[crate::thumbnail::serve::ServeRequest {
+                cache_key: 91,
+                need_px: 128,
+                db_path: video_large.clone(),
+            }],
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            serve.rewrite_path(&video_large, 128.0, 128.0, 91),
+            Some(video_small)
+        );
+        let legacy = crate::thumbnail::cache::thumb_db_path(512, 91);
+        assert_eq!(serve.rewrite_path(&legacy, 128.0, 128.0, 91), None);
+    }
 }

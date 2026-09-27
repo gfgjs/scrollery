@@ -1,3 +1,4 @@
+#include <chrono>
 #include "bridge.h"
 #include <vpl/mfxdispatcher.h>
 #include <vpl/mfxjpeg.h>
@@ -132,6 +133,10 @@ extern "C" void* scrollery_vpl_create(uint32_t low, int32_t high, uint32_t vendo
     return nullptr;
 }
 
+extern "C" int32_t scrollery_vpl_healthy(void* session) {
+    return session && static_cast<Session*>(session)->healthy ? 1 : 0;
+}
+
 extern "C" void scrollery_vpl_destroy(void* session) {
     delete static_cast<Session*>(session);
 }
@@ -140,11 +145,26 @@ extern "C" int32_t scrollery_vpl_decode(void* opaque, uint8_t* jpeg, uint32_t le
                                        uint32_t edge, uint8_t* rgba, uint32_t capacity,
                                        ScrolleryVplResult* result) {
     if (!result) return failed;
-    *result = {0, 0, 0, 0, not_called, not_called, not_called, not_called};
+    *result = {0, 0, 0, 0, not_called, not_called, not_called, not_called, not_called, 0, 0, 0, 0};
+    const auto timed = [](uint64_t& elapsed, auto&& operation) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto status = operation();
+        elapsed += std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        return status;
+    };
     if (!opaque || !jpeg || !rgba || length < 32 || length > 32u * 1024 * 1024 ||
         edge == 0 || edge > 2048) return unavailable;
     auto& owned = *static_cast<Session*>(opaque);
     if (!owned.healthy) return unavailable;
+    struct HealthGuard {
+        Session& session;
+        ScrolleryVplResult& result;
+        ~HealthGuard() {
+            for (auto status : {result.header_status, result.query_status, result.init_status, result.decode_status}) {
+                if (status == MFX_ERR_DEVICE_LOST || status == MFX_ERR_DEVICE_FAILED) session.healthy = false;
+            }
+        }
+    } health{owned, *result};
     try {
         mfxBitstream bits{};
         bits.Data = jpeg;
@@ -218,26 +238,26 @@ extern "C" int32_t scrollery_vpl_decode(void* opaque, uint8_t* jpeg, uint32_t le
         result->query_status = status;
         if (status != MFX_ERR_NONE) return classify(status);
         Pipeline pipeline{owned.session};
-        status = MFXVideoDECODE_Init(owned.session, &params);
+        status = timed(result->init_us, [&] { return MFXVideoDECODE_Init(owned.session, &params); });
         result->init_status = status;
         if (status != MFX_ERR_NONE) return classify(status);
-        status = MFXVideoVPP_Init(owned.session, &vpp);
+        status = timed(result->init_us, [&] { return MFXVideoVPP_Init(owned.session, &vpp); });
         result->init_status = status;
         if (status != MFX_ERR_NONE) return classify(status);
         bits.DataOffset = 0;
         bits.DataLength = length;
         Surface decoded;
         mfxSyncPoint sync = nullptr;
-        status = MFXVideoDECODE_DecodeFrameAsync(owned.session, &bits, nullptr, &decoded.frame, &sync);
+        status = timed(result->decode_us, [&] { return MFXVideoDECODE_DecodeFrameAsync(owned.session, &bits, nullptr, &decoded.frame, &sync); });
         if (status == MFX_ERR_MORE_DATA && !decoded.frame)
-            status = MFXVideoDECODE_DecodeFrameAsync(owned.session, nullptr, nullptr, &decoded.frame, &sync);
+            status = timed(result->decode_us, [&] { return MFXVideoDECODE_DecodeFrameAsync(owned.session, nullptr, nullptr, &decoded.frame, &sync); });
         result->decode_status = status;
         if (status != MFX_ERR_NONE || !decoded.frame) {
             if (status == MFX_ERR_DEVICE_LOST || status == MFX_ERR_DEVICE_FAILED) owned.healthy = false;
             return classify(status);
         }
         Surface output;
-        status = MFXVideoVPP_ProcessFrameAsync(owned.session, decoded.frame, &output.frame);
+        status = timed(result->vpp_us, [&] { return MFXVideoVPP_ProcessFrameAsync(owned.session, decoded.frame, &output.frame); });
         result->decode_status = status;
         if (status != MFX_ERR_NONE || !output.frame) {
             if (status == MFX_ERR_DEVICE_LOST || status == MFX_ERR_DEVICE_FAILED) owned.healthy = false;
@@ -248,8 +268,9 @@ extern "C" int32_t scrollery_vpl_decode(void* opaque, uint8_t* jpeg, uint32_t le
             // 仅目标通道可 Map；原尺寸解码面全程留在设备内。
             if (frame->Info.FourCC != MFX_FOURCC_RGB4 || frame->Info.CropX || frame->Info.CropY ||
                 frame->Info.CropW != result->width || frame->Info.CropH != result->height) return failed;
-            status = frame->FrameInterface->Synchronize(frame, 1500);
+            status = timed(result->sync_us, [&] { return frame->FrameInterface->Synchronize(frame, 1500); });
             result->decode_status = status;
+            result->sync_status = status;
             if (status != MFX_ERR_NONE) { owned.healthy = false; return classify(status); }
             status = frame->FrameInterface->Map(frame, MFX_MAP_READ);
             result->decode_status = status;
