@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::generator::{EncodedThumbPayload, MAX_ENCODED_ARTIFACT_BYTES};
 
-pub const WORKER_HELLO: [u8; 4] = *b"NTHD";
+pub const WORKER_HELLO: [u8; 4] = *b"NTHE";
 /// 两份最终产物及小型任务数据的预留；剩余工作集供解码/变换的同时存活缓冲共享。
 pub const RESULT_RESERVATION_BYTES: u64 = 36 * 1024 * 1024;
 
@@ -34,7 +34,8 @@ pub struct NativeRequest {
     pub codec_hint: Option<String>,
     /// 图片允许 GPU 变换；视频允许硬件会话。false 时视频不枚举或绑定 D3D 设备。
     pub prefer_gpu: bool,
-    pub prefer_system_codec: bool,
+    /// 原始 GPU 策略，仅控制会话保留；准入失败不改变快捷路径与 CPU 后端。
+    pub gpu_policy: bool,
     pub decode_long_edge: u32,
     /// 宿主根据已取得的共享工作集发放；worker 按真实尺寸检查，不信任数据库尺寸。
     pub max_pixel_bytes: u64,
@@ -142,7 +143,18 @@ pub struct NativeQosAck {
     pub attempted: bool,
 }
 
+/// 只报告已经结束的资源阶段；顺序为 GPU、源读取，随后才编码回包。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeStage {
+    GpuDone = 1,
+    SourceDone = 2,
+}
+
 pub enum NativeResponse {
+    Stage {
+        id: u64,
+        stage: NativeStage,
+    },
     Ok {
         id: u64,
         payload: EncodedThumbPayload,
@@ -190,6 +202,11 @@ pub fn read_request(mut reader: impl Read) -> io::Result<Option<NativeRequest>> 
 
 pub fn write_response(mut writer: impl Write, response: &NativeResponse) -> io::Result<()> {
     match response {
+        NativeResponse::Stage { id, stage } => {
+            writer.write_all(&[250])?;
+            writer.write_all(&id.to_le_bytes())?;
+            writer.write_all(&[*stage as u8])?;
+        }
         NativeResponse::Ok {
             id,
             payload,
@@ -245,6 +262,16 @@ pub fn read_response(mut reader: impl Read) -> io::Result<NativeResponse> {
     let mut id = [0u8; 8];
     reader.read_exact(&mut id)?;
     let id = u64::from_le_bytes(id);
+    if status[0] == 250 {
+        let mut stage = [0u8; 1];
+        reader.read_exact(&mut stage)?;
+        let stage = match stage[0] {
+            1 => NativeStage::GpuDone,
+            2 => NativeStage::SourceDone,
+            _ => return Err(invalid_data("invalid native stage")),
+        };
+        return Ok(NativeResponse::Stage { id, stage });
+    }
     let mut qos_bytes = [0u8; 18];
     reader.read_exact(&mut qos_bytes)?;
     if qos_bytes[8] > 3 || !(1..=4).contains(&qos_bytes[9]) {

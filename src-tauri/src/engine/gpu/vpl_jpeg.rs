@@ -1,11 +1,12 @@
 //! worker 内的 VPL JPEG 路由；官方 packed ABI 仅在 C++ 薄桥内使用。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek};
 use std::ptr::NonNull;
 
+use crate::thumbnail::route_diagnostics::{record, Attempt, Reason, Stage};
 use image::ImageDecoder;
 
 use super::d2d_resize::{acquire_image_slot, GpuAdapter};
@@ -29,6 +30,11 @@ struct BridgeResult {
     query_status: i32,
     init_status: i32,
     decode_status: i32,
+    sync_status: i32,
+    init_us: u64,
+    decode_us: u64,
+    vpp_us: u64,
+    sync_us: u64,
 }
 
 #[repr(C)]
@@ -47,6 +53,7 @@ extern "C" {
         result: *mut OpenResult,
     ) -> *mut c_void;
     fn scrollery_vpl_destroy(session: *mut c_void);
+    fn scrollery_vpl_healthy(session: *mut c_void) -> i32;
     fn scrollery_vpl_decode(
         session: *mut c_void,
         jpeg: *mut u8,
@@ -72,7 +79,13 @@ impl Drop for Session {
 }
 
 thread_local! {
+    static ABANDONED_WORK: Cell<bool> = const { Cell::new(false) };
     static SESSIONS: RefCell<Option<Vec<Session>>> = const { RefCell::new(None) };
+}
+
+/// 同步未完成时，worker 必须退出，由宿主确认退出后释放 GPU 名额。
+pub fn has_abandoned_work() -> bool {
+    ABANDONED_WORK.get()
 }
 
 pub(crate) fn clear_thread_sessions() {
@@ -121,45 +134,71 @@ pub fn decode_open_file(
     max_pixel_bytes: u64,
 ) -> Result<Option<(DecodedImage, GpuAdapter)>> {
     let input_limit = MAX_INPUT_BYTES.min(max_pixel_bytes);
+    let mut attempt = Attempt::new(Stage::Vpl);
     let input_len = file.metadata().map_err(AppError::Io)?.len();
     if !(1..=2048).contains(&long_edge)
         || input_len > input_limit
         || u64::from(long_edge) * u64::from(long_edge) * 4 > max_pixel_bytes
     {
+        attempt.reason = Reason::TargetLimit;
         return Ok(None);
     }
-    let orientation = read_jpeg_orientation_file(&mut file);
-    file.rewind().map_err(AppError::Io)?;
-    // 按受限长度一次分配，避免 read_to_end 扩容时临时保留双份压缩源。
-    let mut bytes = vec![0; input_len as usize];
-    file.read_exact(&mut bytes).map_err(AppError::Io)?;
-    // 只读成熟 JPEG decoder 的头/ICC，不产生 CPU 全图像素。
-    let mut decoder =
-        image::codecs::jpeg::JpegDecoder::new(Cursor::new(&bytes)).map_err(AppError::Engine)?;
-    let (width, height) = decoder.dimensions();
-    if width.max(height) <= long_edge
-        || width.max(height) > 8192
-        || u64::from(width) * u64::from(height) * 4 > MAX_PIXELS_BYTES.min(max_pixel_bytes)
-    {
-        return Ok(None);
-    }
-    let icc = decoder.icc_profile().map_err(AppError::Engine)?;
-    drop(decoder);
     with_wic_factory(|_| {
         SESSIONS.with_borrow_mut(|stored| {
         let sessions = stored.get_or_insert_with(sessions);
-        // 空能力结果也缓存到当前 worker 生命周期，缺 runtime 不逐图重新枚举。
-        for session in sessions.iter_mut().filter(|session| session.healthy) {
-            let Some(_slot) = acquire_image_slot(session.adapter) else { continue; };
+        // 能力/健康和槽位均在读源前检查；繁忙不写入负能力缓存。
+        if !sessions.iter().any(|session| session.healthy) { attempt.reason = Reason::NoSession; return Ok(None); }
+        let mut candidates = sessions.iter_mut().filter(|session| session.healthy)
+            .filter_map(|session| acquire_image_slot(session.adapter).map(|slot| (session, slot)));
+        let Some(first) = candidates.next() else { attempt.reason = Reason::Busy; return Ok(None); };
+        let probe_started = std::time::Instant::now();
+        file.rewind().map_err(AppError::Io)?;
+        // 头部探测最多读取 256 KiB；超长元数据或不适用源交给常规解码。
+        let mut header = Vec::new();
+        (&mut file).take(256 * 1024).read_to_end(&mut header).map_err(AppError::Io)?;
+        let Ok(mut decoder) = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&header)) else {
+            record(Stage::Probe, Reason::Header, probe_started.elapsed());
+            attempt.reason = Reason::Header;
+            return Ok(None);
+        };
+        let (width, height) = decoder.dimensions();
+        if width.max(height) <= long_edge || width.max(height) > 8192
+            || u64::from(width) * u64::from(height) * 4 > MAX_PIXELS_BYTES.min(max_pixel_bytes) {
+            record(Stage::Probe, Reason::SourceLimit, probe_started.elapsed());
+            attempt.reason = Reason::SourceLimit;
+            return Ok(None);
+        }
+        let icc = decoder.icc_profile().map_err(AppError::Engine)?;
+        drop(decoder);
+        drop(header);
+        record(Stage::Probe, Reason::Success, probe_started.elapsed());
+        let orientation = read_jpeg_orientation_file(&mut file);
+        file.rewind().map_err(AppError::Io)?;
+        let read_started = std::time::Instant::now();
+        let mut bytes = vec![0; input_len as usize];
+        file.read_exact(&mut bytes).map_err(AppError::Io)?;
+        record(Stage::Read, Reason::Success, read_started.elapsed());
+        for (session, _slot) in std::iter::once(first).chain(candidates) {
             let mut pixels = vec![0; long_edge as usize * long_edge as usize * 4];
             let mut result = BridgeResult::default();
             // SAFETY: 输入/输出都是独占且长度有界的连续缓冲；薄桥不留存指针。
             let status = unsafe { scrollery_vpl_decode(session.handle.as_ptr(), bytes.as_mut_ptr(),
                 bytes.len() as u32, long_edge, pixels.as_mut_ptr(), pixels.len() as u32, &mut result) };
+            // SAFETY: 与 decode 同一线程上的存活会话，读取桥的最终健康事实。
+            session.healthy = unsafe { scrollery_vpl_healthy(session.handle.as_ptr()) } != 0;
+            for (stage, micros) in [(Stage::Init, result.init_us), (Stage::Decode, result.decode_us),
+                (Stage::Vpp, result.vpp_us), (Stage::Sync, result.sync_us)] {
+                if micros > 0 { record(stage, if status == 0 { Reason::Success } else { Reason::Failed }, std::time::Duration::from_micros(micros)); }
+            }
+            if result.sync_us > 0 && result.sync_status != 0 {
+                ABANDONED_WORK.set(true);
+                attempt.reason = Reason::SyncFailed;
+                return Ok(None);
+            }
             if status != 0 {
+                attempt.reason = if result.sync_us > 0 && result.sync_status != 0 { Reason::SyncFailed }
+                    else if !session.healthy { Reason::DeviceLost } else { Reason::Unsupported };
                 tracing::debug!(target: "scrollery::thumb_perf", status, ?result, "VPL JPEG route declined");
-                if [result.header_status, result.query_status, result.init_status, result.decode_status]
-                    .iter().any(|status| matches!(status, -13 | -17)) { session.healthy = false; }
                 continue;
             }
             if result.source_width != width || result.source_height != height || result.width == 0 ||
@@ -171,10 +210,34 @@ pub fn decode_open_file(
             let image = image::RgbaImage::from_raw(result.width, result.height, pixels)
                 .ok_or_else(|| AppError::Internal("VPL JPEG RGBA buffer mismatch".into()))?;
             let image = apply_exif_orientation(image::DynamicImage::ImageRgba8(image), orientation);
+            attempt.reason = Reason::Success;
             return Ok(Some((DecodedImage { width: image.width(), height: image.height(),
                 pixels: image.into_rgba8().into_raw(), icc }, session.adapter)));
         }
         Ok(None)
     })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_unavailable_skips_source_reads() {
+        let mut source = tempfile::tempfile().unwrap();
+        source.set_len(1024 * 1024).unwrap();
+        let previous = SESSIONS.replace(Some(Vec::new()));
+        with_wic_factory(|_| {
+            for _ in 0..32 {
+                assert!(
+                    decode_open_file(source.try_clone().unwrap(), 256, MAX_PIXELS_BYTES)?.is_none()
+                );
+                assert_eq!(source.stream_position().unwrap(), 0);
+            }
+            Ok(())
+        })
+        .unwrap();
+        SESSIONS.replace(previous);
+    }
 }

@@ -11,7 +11,11 @@ fn main() -> std::io::Result<()> {
 
     // stdout 专供二进制协议；原生 API 的错误仅写 stderr，供宿主诊断捕获。
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::ERROR)
+        .with_env_filter(if scrollery_lib::thumbnail::route_diagnostics::enabled() {
+            "error,scrollery::thumb_routes=info"
+        } else {
+            "error"
+        })
         .with_ansi(false)
         .with_writer(io::stderr)
         .init();
@@ -74,7 +78,12 @@ fn main() -> std::io::Result<()> {
                                 }
                             }
                         };
-                        let response = match process(request) {
+                        let response = match process(request, |stage| {
+                            let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
+                            if write_response(&mut *output, &NativeResponse::Stage { id, stage }).is_err() {
+                                std::process::exit(71);
+                            }
+                        }) {
                             Ok((payload, execution, timings)) => NativeResponse::Ok {
                                 id,
                                 payload,
@@ -108,6 +117,7 @@ fn main() -> std::io::Result<()> {
 #[cfg(windows)]
 fn process(
     request: scrollery_lib::thumbnail::native_protocol::NativeRequest,
+    mut stage: impl FnMut(scrollery_lib::thumbnail::native_protocol::NativeStage),
 ) -> Result<
     (
         scrollery_lib::thumbnail::generator::EncodedThumbPayload,
@@ -127,7 +137,7 @@ fn process(
     use scrollery_lib::engine::traits::ResizeHint;
     use scrollery_lib::thumbnail::generator::{encode_media_payload, ThumbConfig};
     use scrollery_lib::thumbnail::native_protocol::{
-        NativeBackend, NativeExecution, NativeTimings,
+        NativeBackend, NativeExecution, NativeStage, NativeTimings,
     };
 
     let elapsed_us = |start: std::time::Instant| {
@@ -159,17 +169,23 @@ fn process(
         request.kind,
         scrollery_lib::thumbnail::native_protocol::NativeKind::VideoCover
     );
-    if !video && !request.prefer_gpu && !request.prefer_system_codec {
+    if !video && !request.prefer_gpu && !request.gpu_policy {
         // 显式 CPU 图片策略不再使用旧 GPU 会话；GPU 名额临时不足仍保留原生缓存。
         scrollery_lib::engine::native::wic_engine::release_image_gpu_sessions();
     }
-    if !video && !request.prefer_system_codec && matches!(format.as_str(), "jpg" | "jpeg") {
+    if !video && matches!(format.as_str(), "jpg" | "jpeg") {
         let embedded_started = std::time::Instant::now();
+        let mut embedded_released = false;
         if let Some((webp, thumbhash)) = scrollery_lib::thumbnail::exif_thumb::try_exif_thumb_file(
             &mut file,
             request.output_size,
             request.webp_quality,
             request.max_pixel_bytes,
+            || {
+                stage(NativeStage::GpuDone);
+                stage(NativeStage::SourceDone);
+                embedded_released = true;
+            },
         ) {
             return Ok((
                 scrollery_lib::thumbnail::generator::EncodedThumbPayload {
@@ -183,6 +199,10 @@ fn process(
                     ..NativeTimings::default()
                 },
             ));
+        }
+        // 进入编码前已释放源许可时，编码失败不能重新读主图。
+        if embedded_released {
+            return Err(5);
         }
     }
     let decode_started = std::time::Instant::now();
@@ -217,9 +237,17 @@ fn process(
         }
         #[cfg(not(feature = "native-vpl"))]
         {
+            if !video && request.prefer_gpu {
+                use scrollery_lib::thumbnail::route_diagnostics::{record, Reason, Stage};
+                record(Stage::Vpl, Reason::NotCompiled, std::time::Duration::ZERO);
+            }
             None
         }
     };
+    #[cfg(feature = "native-vpl")]
+    if scrollery_lib::engine::gpu::vpl_jpeg::has_abandoned_work() {
+        std::process::exit(70);
+    }
     let gpu_decoded = if vpl_decoded.is_some() {
         vpl_decoded
     } else if !video && request.prefer_gpu {
@@ -247,6 +275,9 @@ fn process(
     } else {
         None
     };
+    if !video {
+        stage(NativeStage::GpuDone);
+    }
     let decoded = if video {
         execution = NativeExecution::cpu(NativeBackend::VideoMf);
         if !scrollery_lib::video::native_cover_formats().contains(&format.as_str()) {
@@ -281,33 +312,7 @@ fn process(
     } else {
         match format.as_str() {
             "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" | "tif" | "tiff" => {
-                if request.prefer_system_codec {
-                    let fallback = file.try_clone().map_err(|_| 4u8)?;
-                    match WicEngine::decode_open_file_bounded(
-                        file,
-                        &format,
-                        hint,
-                        max_wic_output_bytes,
-                    ) {
-                        Ok(decoded) => {
-                            execution = NativeExecution::cpu(NativeBackend::ImageWic);
-                            Ok(decoded)
-                        }
-                        Err(_) => ImageRsEngine::decode_open_file_bounded(
-                            fallback,
-                            &format,
-                            hint,
-                            max_cpu_decode_bytes,
-                        ),
-                    }
-                } else {
-                    ImageRsEngine::decode_open_file_bounded(
-                        file,
-                        &format,
-                        hint,
-                        max_cpu_decode_bytes,
-                    )
-                }
+                ImageRsEngine::decode_open_file_bounded(file, &format, hint, max_cpu_decode_bytes)
             }
             "heic" | "heif" | "avif" | "ico" => {
                 execution = NativeExecution::cpu(NativeBackend::ImageWic);
@@ -321,6 +326,13 @@ fn process(
             max_pixel_bytes = request.max_pixel_bytes, %error, "native thumbnail decode failed");
         4u8
     })?;
+    if scrollery_lib::video::media_foundation::native_worker_has_abandoned_reader() {
+        std::process::exit(70);
+    }
+    if video {
+        stage(NativeStage::GpuDone);
+    }
+    stage(NativeStage::SourceDone);
     let decode_transform_us = elapsed_us(decode_started);
     let config = ThumbConfig {
         cache_dir: std::path::PathBuf::new(),
@@ -334,8 +346,12 @@ fn process(
     };
     execution.resolve_adapter_kind();
     let encode_started = std::time::Instant::now();
+    let mut encode_attempt = scrollery_lib::thumbnail::route_diagnostics::Attempt::new(
+        scrollery_lib::thumbnail::route_diagnostics::Stage::Encode,
+    );
     encode_media_payload(0, decoded, &config, request.emit_ai_cache)
         .map(|payload| {
+            encode_attempt.reason = scrollery_lib::thumbnail::route_diagnostics::Reason::Success;
             (
                 payload,
                 execution,
@@ -351,3 +367,86 @@ fn process(
 
 #[cfg(not(windows))]
 fn main() {}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use scrollery_lib::thumbnail::native_protocol::{
+        NativeBackend, NativeKind, NativeRequest, NativeStage,
+    };
+    use std::io::Write;
+    use std::os::windows::io::IntoRawHandle;
+
+    #[test]
+    fn embedded_route_is_independent_of_gpu_admission() {
+        let mut embedded = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut embedded)
+            .encode_image(&image::RgbImage::new(160, 120))
+            .unwrap();
+        // IFD0 带方向 6；IFD1 指向同一 APP1 内的缩略图，覆盖探测后复用句柄。
+        let mut exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0".to_vec();
+        exif.extend_from_slice(&[18, 1, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0]);
+        exif.extend_from_slice(&26u32.to_le_bytes());
+        exif.extend_from_slice(&2u16.to_le_bytes());
+        exif.extend_from_slice(&[1, 2, 4, 0, 1, 0, 0, 0]);
+        exif.extend_from_slice(&56u32.to_le_bytes());
+        exif.extend_from_slice(&[2, 2, 4, 0, 1, 0, 0, 0]);
+        exif.extend_from_slice(&(embedded.len() as u32).to_le_bytes());
+        exif.extend_from_slice(&[0; 4]);
+        exif.extend_from_slice(&embedded);
+        let mut main = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut main)
+            .encode_image(&image::RgbImage::new(600, 400))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("embedded.jpg");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&main[..2]).unwrap();
+        file.write_all(&[255, 225]).unwrap();
+        file.write_all(&((exif.len() + 2) as u16).to_be_bytes())
+            .unwrap();
+        file.write_all(&exif).unwrap();
+        file.write_all(&main[2..]).unwrap();
+        drop(file);
+        let run = |gpu_policy, prefer_gpu, size| {
+            let mut stages = Vec::new();
+            let request = NativeRequest {
+                id: 1,
+                file_handle: std::fs::File::open(&path).unwrap().into_raw_handle() as usize as u64,
+                kind: NativeKind::Image,
+                format: "jpg".into(),
+                codec_hint: None,
+                gpu_policy,
+                prefer_gpu,
+                decode_long_edge: size,
+                output_size: size,
+                max_pixel_bytes: 64 * 1024 * 1024,
+                webp_quality: 80,
+                ai_cache_short_edge: 336,
+                emit_ai_cache: false,
+                qos_foreground: true,
+                qos_revision: 1,
+            };
+            let result = process(request, |stage| stages.push(stage)).unwrap();
+            assert_eq!(stages, [NativeStage::GpuDone, NativeStage::SourceDone]);
+            result
+        };
+        let cpu = run(false, false, 256);
+        let gpu = run(true, true, 256);
+        let denied = run(true, false, 256);
+        assert_eq!(cpu.1.backend, NativeBackend::EmbeddedJpeg);
+        assert_eq!(gpu.1.backend, NativeBackend::EmbeddedJpeg);
+        assert_eq!(denied.1.backend, NativeBackend::EmbeddedJpeg);
+        assert_eq!(cpu.0.webp, gpu.0.webp);
+        assert_eq!(cpu.0.webp, denied.0.webp);
+        let embedded_image = image::load_from_memory(&cpu.0.webp).unwrap();
+        assert_eq!(
+            (embedded_image.width(), embedded_image.height()),
+            (192, 256)
+        );
+        let full = run(true, false, 512);
+        assert_eq!(full.1.backend, NativeBackend::ImageRs);
+        let full_image = image::load_from_memory(&full.0.webp).unwrap();
+        assert_eq!((full_image.width(), full_image.height()), (341, 512));
+    }
+}

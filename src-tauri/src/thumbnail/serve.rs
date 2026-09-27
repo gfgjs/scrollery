@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::cache::{thumb_db_path, thumb_variant_db_path};
+use super::cache::thumb_db_path;
 use super::generator::THUMB_TIERS;
 use super::scheduler::OutputFingerprint;
 
@@ -159,7 +159,7 @@ fn candidate_rels<'a>(
     cache_key: i64,
     nonempty_tiers: &'a [u32],
 ) -> impl Iterator<Item = String> + 'a {
-    // 新产物从 DB 路径继承配置指纹；旧三段路径照旧探旧档。无效路径不探测别的配置，
+    // 新产物只继承尺寸无关的家族；旧三段路径照旧探旧档。旧尺寸摘要不能反推其他档，
     // 避免给同源但不同质量的缩略图错误选档。
     let mut parts = db_path.split('/');
     let style = match (
@@ -170,9 +170,10 @@ fn candidate_rels<'a>(
         parts.next(),
     ) {
         (Some(_), Some(_), Some(_), None, None) => Some(None),
-        (Some(_), Some(fingerprint), Some(_), Some(_), None) => {
-            OutputFingerprint::from_hex(fingerprint).map(Some)
-        }
+        (Some(_), Some(fingerprint), Some(_), Some(_), None) => fingerprint
+            .strip_prefix("family-")
+            .filter(|hex| hex.len() == 32 && OutputFingerprint::from_hex(hex).is_some())
+            .map(|_| Some(fingerprint)),
         _ => None,
     };
     THUMB_TIERS
@@ -184,7 +185,11 @@ fn candidate_rels<'a>(
                 return None;
             }
             let rel = match style.expect("invalid paths were filtered") {
-                Some(fingerprint) => thumb_variant_db_path(tier, cache_key, fingerprint),
+                Some(family) => {
+                    let legacy = thumb_db_path(tier, cache_key);
+                    let (_, suffix) = legacy.split_once('/').expect("tier path");
+                    format!("{tier}/{family}/{suffix}")
+                }
                 None => thumb_db_path(tier, cache_key),
             };
             if rel == db_path {

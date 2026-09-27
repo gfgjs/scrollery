@@ -128,6 +128,10 @@ fn read_orientation_inner(path: &Path) -> Option<u32> {
 /// 从已授权打开的句柄读取 JPEG 方向；返回前恢复文件游标，供同句柄继续解码。
 pub fn read_jpeg_orientation_file(file: &mut std::fs::File) -> u32 {
     use std::io::{Seek, SeekFrom};
+    // EXIF 快捷探测和后端回退共用句柄，调用前的游标不一定在文件起点。
+    if file.rewind().is_err() {
+        return 1;
+    }
     let orientation = {
         let mut reader = BufReader::new(&mut *file);
         exif::Reader::new()

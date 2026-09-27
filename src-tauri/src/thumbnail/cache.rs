@@ -2,7 +2,7 @@
 //! 尺寸分桶的缩略图缓存管理。
 //!
 //! 缓存布局（§ 8.2）：旧产物为 `{size}/{prefix}/{cache_key_hex}.webp`；
-//! Coordinator 新产物为 `{size}/{output_fingerprint}/{prefix}/{cache_key_hex}.webp`。
+//! Coordinator 新产物为 `{size}/family-{family_fingerprint}/{prefix}/{cache_key_hex}.webp`。
 //! e.g. `cache/thumbnails/300/a3/a3f4b2c1d0e9f7a1.webp`
 //! 例如 `cache/thumbnails/300/a3/a3f4b2c1d0e9f7a1.webp`
 
@@ -60,7 +60,7 @@ pub fn thumb_variant_path(
     cache_dir
         .join("thumbnails")
         .join(size.to_string())
-        .join(fingerprint.hex())
+        .join(fingerprint.cache_namespace())
         .join(&hex[..2])
         .join(format!("{hex}.webp"))
 }
@@ -69,7 +69,12 @@ pub fn thumb_variant_path(
 pub fn thumb_variant_db_path(size: u32, cache_key: i64, fingerprint: OutputFingerprint) -> String {
     debug_assert!(crate::thumbnail::generator::THUMB_TIERS.contains(&size));
     let hex = cache_key_to_hex(cache_key);
-    format!("{size}/{}/{}/{}.webp", fingerprint.hex(), &hex[..2], hex)
+    format!(
+        "{size}/{}/{}/{}.webp",
+        fingerprint.cache_namespace(),
+        &hex[..2],
+        hex
+    )
 }
 
 /// Short edge (px) of the AI-analysis cache. Covers every built-in CLIP model since analysis

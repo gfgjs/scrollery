@@ -285,6 +285,7 @@ struct ImageJob {
     config: ThumbConfig,
     epoch: u64,
     lane: ThumbnailLane,
+    exception_budget: bool,
     cancel: CancellationToken,
     viewport_request: Option<Weak<ViewportRequest>>,
     response: crossbeam_channel::Sender<Result<ImageExecution>>,
@@ -663,7 +664,17 @@ fn estimated_decode_bytes(job: &ImageJob) -> u64 {
     if super::generator::direct_display_reason(item, &job.config).is_some() {
         return 1024 * 1024;
     }
-    if job.lane == ThumbnailLane::Exception {
+    if job.exception_budget
+        || job.lane == ThumbnailLane::Exception
+        || job.shared.as_ref().is_some_and(|shared| {
+            shared
+                .subscribers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|subscriber| subscriber.lane == ThumbnailLane::Exception)
+        })
+    {
         // 元数据低估导致首次超额时，有限异常补救使用最大单项额度。
         return UNCERTAIN_RESERVATION_BYTES;
     }
@@ -954,6 +965,7 @@ impl JobQueues {
             .or_else(|| take(&mut self.viewport_fast))
             .or_else(|| take(&mut self.viewport_heavy));
         if let Some(mut job) = queued {
+            job.exception_budget |= job.lane == ThumbnailLane::Exception;
             job.lane = shared.preferred_lane(job.lane);
             self.push(job);
         }
@@ -1222,7 +1234,12 @@ impl ImageSubmitter {
             candidate,
             config: self.config.clone(),
             epoch: self.epoch,
-            lane,
+            lane: if viewport_request.is_some() && lane == ThumbnailLane::Exception {
+                ThumbnailLane::ViewportHeavy
+            } else {
+                lane
+            },
+            exception_budget: lane == ThumbnailLane::Exception,
             cancel: self.cancel.clone(),
             viewport_request,
             response: self.response.clone(),
@@ -1748,11 +1765,14 @@ impl ThumbnailCoordinator {
     ) {
         let mut index = 0;
         while index < pending.len() {
-            let Some(result) = state
+            let result = state
                 .thumb_coordinator
                 .native
-                .poll(&mut pending[index].request)
-            else {
+                .poll(&mut pending[index].request);
+            if pending[index].request.source_done() {
+                drop(pending[index]._volume_permit.take());
+            }
+            let Some(result) = result else {
                 index += 1;
                 continue;
             };
@@ -2322,6 +2342,8 @@ impl ThumbnailCoordinator {
                     ) {
                         Ok((DecodeResult::Ready(ready), false))
                     } else {
+                        let need_ai_cache =
+                            super::generator::needs_ai_cache(config, candidate.item.cache_key);
                         let request = super::native_protocol::NativeRequest {
                             id: 0,
                             file_handle: 0,
@@ -2329,22 +2351,18 @@ impl ThumbnailCoordinator {
                             format: candidate.item.file_format.clone(),
                             codec_hint: None,
                             prefer_gpu: config.strategy == "gpu",
-                            prefer_system_codec: config.strategy == "gpu",
+                            gpu_policy: config.strategy == "gpu",
                             decode_long_edge: super::generator::decode_long_edge(
                                 config,
                                 &candidate.item,
+                                need_ai_cache,
                             )
                             .min(8192),
                             max_pixel_bytes: _memory_permit.pixel_limit(),
                             output_size: config.size,
                             webp_quality: config.webp_quality,
                             ai_cache_short_edge: config.ai_cache_short_edge,
-                            emit_ai_cache: config.ai_hq_cache
-                                && !super::cache::ai_cache_path(
-                                    &config.cache_dir,
-                                    candidate.item.cache_key,
-                                )
-                                .exists(),
+                            emit_ai_cache: need_ai_cache,
                             qos_foreground,
                             qos_revision,
                         };
@@ -2411,7 +2429,7 @@ impl ThumbnailCoordinator {
                             .clone()
                             .filter(|hint| hint.len() <= 64),
                         prefer_gpu: config.strategy != "cpu",
-                        prefer_system_codec: false,
+                        gpu_policy: false,
                         decode_long_edge: config.size,
                         max_pixel_bytes: _memory_permit.pixel_limit(),
                         output_size: config.size,
@@ -2692,6 +2710,58 @@ mod tests {
     }
 
     #[test]
+    fn viewport_exception_keeps_recovery_budget() {
+        let (mut candidate, config) = image_candidate_and_config();
+        candidate.item.width = 64;
+        candidate.item.height = 64;
+        let (response, _) = crossbeam_channel::unbounded();
+        let mut job = ImageJob {
+            queued_at: Instant::now(),
+            kind: ThumbnailTaskKind::Image,
+            candidate,
+            config,
+            epoch: 1,
+            lane: ThumbnailLane::Exception,
+            exception_budget: true,
+            cancel: CancellationToken::new(),
+            viewport_request: None,
+            response,
+            shared: None,
+        };
+        assert_eq!(estimated_decode_bytes(&job), UNCERTAIN_RESERVATION_BYTES);
+        job.lane = ThumbnailLane::ViewportHeavy;
+        assert_eq!(estimated_decode_bytes(&job), UNCERTAIN_RESERVATION_BYTES);
+        job.exception_budget = false;
+        assert!(estimated_decode_bytes(&job) < UNCERTAIN_RESERVATION_BYTES);
+    }
+
+    #[test]
+    fn existing_ai_cache_keeps_display_decode_size() {
+        let (mut candidate, mut config) = image_candidate_and_config();
+        let cache = tempfile::tempdir().unwrap();
+        config.cache_dir = cache.path().to_path_buf();
+        config.size = 512;
+        config.ai_hq_cache = true;
+        candidate.item.width = 6000;
+        candidate.item.height = 500;
+        let need = super::super::generator::needs_ai_cache(&config, candidate.item.cache_key);
+        assert!(need);
+        assert_eq!(
+            super::super::generator::decode_long_edge(&config, &candidate.item, need),
+            4032
+        );
+        let path = super::super::cache::ai_cache_path(&config.cache_dir, candidate.item.cache_key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"existing cache").unwrap();
+        let need = super::super::generator::needs_ai_cache(&config, candidate.item.cache_key);
+        assert!(!need);
+        assert_eq!(
+            super::super::generator::decode_long_edge(&config, &candidate.item, need),
+            512
+        );
+    }
+
+    #[test]
     fn domain_backpressure_preserves_other_domain_and_direct_progress() {
         let (candidate, config) = image_candidate_and_config();
         let (response, _replies) = crossbeam_channel::unbounded();
@@ -2702,6 +2772,7 @@ mod tests {
             config: config.clone(),
             epoch: 1,
             lane,
+            exception_budget: lane == ThumbnailLane::Exception,
             cancel: CancellationToken::new(),
             viewport_request: None,
             response: response.clone(),

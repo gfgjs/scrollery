@@ -3,9 +3,9 @@
 use super::generator::ThumbConfig;
 use crate::db::queries::ThumbnailLane;
 
-/// 新缩略图产物的 128 位配置摘要；编码为固定小写 hex，安全用作目录名。
+/// 任务配置摘要及尺寸无关的缓存家族摘要；各为 128 位，持久化为小写 hex。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OutputFingerprint([u8; 16]);
+pub struct OutputFingerprint([u8; 16], Option<[u8; 16]>);
 
 impl OutputFingerprint {
     /// 只对真正影响缩略图产物和直显选择的配置求摘要；源版本单独属于任务键。
@@ -23,7 +23,11 @@ impl OutputFingerprint {
         let hash = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&hash.as_ref()[..16]);
-        Self(bytes)
+        let family_canonical = canonical.replacen(&format!("size={}", config.size), "size=0", 1);
+        let family_hash = ring::digest::digest(&ring::digest::SHA256, family_canonical.as_bytes());
+        let mut family = [0u8; 16];
+        family.copy_from_slice(&family_hash.as_ref()[..16]);
+        Self(bytes, Some(family))
     }
 
     /// 视频第一帧封面只依赖输出尺寸、质量与原生后端政策。
@@ -35,24 +39,43 @@ impl OutputFingerprint {
         let hash = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes());
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&hash.as_ref()[..16]);
-        Self(bytes)
+        let family_canonical = canonical.replacen(&format!("size={}", config.size), "size=0", 1);
+        let family_hash = ring::digest::digest(&ring::digest::SHA256, family_canonical.as_bytes());
+        let mut family = [0u8; 16];
+        family.copy_from_slice(&family_hash.as_ref()[..16]);
+        Self(bytes, Some(family))
     }
 
-    /// 仅接受本类型生成的固定长度小写 hex；DB/路径输入无法注入路径组件。
+    /// 接受新任务摘要及旧 128 位摘要；DB/路径输入无法注入路径组件。
     pub fn from_hex(hex: &str) -> Option<Self> {
-        if hex.len() != 32
+        if !matches!(hex.len(), 32 | 64)
             || !hex
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return None;
         }
-        Some(Self(u128::from_str_radix(hex, 16).ok()?.to_be_bytes()))
+        Some(Self(
+            u128::from_str_radix(&hex[..32], 16).ok()?.to_be_bytes(),
+            if hex.len() == 64 {
+                Some(u128::from_str_radix(&hex[32..], 16).ok()?.to_be_bytes())
+            } else {
+                None
+            },
+        ))
+    }
+
+    /// 缓存家族不含尺寸；旧摘要继续使用旧命名空间。
+    pub fn cache_namespace(self) -> String {
+        match self.1 {
+            Some(family) => format!("family-{}", Self(family, None).hex()),
+            None => self.hex(),
+        }
     }
 
     pub fn hex(self) -> String {
-        let mut out = String::with_capacity(32);
-        for byte in self.0 {
+        let mut out = String::with_capacity(if self.1.is_some() { 64 } else { 32 });
+        for byte in self.0.into_iter().chain(self.1.into_iter().flatten()) {
             use std::fmt::Write;
             write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
         }

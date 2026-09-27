@@ -571,10 +571,7 @@ fn run_viewport_images(
                     }
                     if let Some(candidate) = by_id.get(&id) {
                         if tx
-                            .send_viewport(
-                                (candidate.clone(), ThumbnailLane::ViewportHeavy),
-                                request,
-                            )
+                            .send_viewport((candidate.clone(), ThumbnailLane::Exception), request)
                             .is_err()
                         {
                             break;

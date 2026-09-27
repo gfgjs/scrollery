@@ -15,6 +15,11 @@ typedef struct ScrolleryVplResult {
     int32_t query_status;
     int32_t init_status;
     int32_t decode_status;
+    int32_t sync_status;
+    uint64_t init_us;
+    uint64_t decode_us;
+    uint64_t vpp_us;
+    uint64_t sync_us;
 } ScrolleryVplResult;
 
 typedef struct ScrolleryVplOpenResult {
@@ -27,6 +32,8 @@ typedef struct ScrolleryVplOpenResult {
 void* scrollery_vpl_create(uint32_t luid_low, int32_t luid_high,
                           uint32_t vendor_id, uint32_t device_id, ScrolleryVplOpenResult* result);
 void scrollery_vpl_destroy(void* session);
+// 同步失败/设备失效后由调用方立即剔除，避免两层负能力缓存分歧。
+int32_t scrollery_vpl_healthy(void* session);
 
 // 0=完整硬件路径成功，1=不适用/不支持，2=部分加速，3=执行失败。
 // 输入为受控文件读出的完整 JPEG；输出为调用方提供的有界 RGBA 小图缓冲。

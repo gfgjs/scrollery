@@ -359,7 +359,10 @@ pub fn decode_open_file(
     long_edge: u32,
     max_pixel_bytes: u64,
 ) -> Result<GpuImageOutcome> {
+    use crate::thumbnail::route_diagnostics::{Attempt, Reason, Stage};
+    let mut attempt = Attempt::new(Stage::D2d);
     if long_edge == 0 || long_edge > 2048 {
+        attempt.reason = Reason::TargetLimit;
         return Ok(GpuImageOutcome::Unavailable);
     }
     let orientation = if matches!(format, "jpg" | "jpeg" | "heic" | "heif") {
@@ -393,6 +396,7 @@ pub fn decode_open_file(
             || width.max(height) > 8192
             || width.max(height) <= long_edge
         {
+            attempt.reason = Reason::SourceLimit;
             return Ok(GpuImageOutcome::Unavailable);
         }
         let mut color_contexts = 0u32;
@@ -404,9 +408,11 @@ pub fn decode_open_file(
             &mut color_contexts,
         );
         if color_contexts > 0 || color_query.is_err() {
+            attempt.reason = Reason::Icc;
             return Ok(GpuImageOutcome::NeedsIccCpu);
         }
         if !has_healthy_session() {
+            attempt.reason = Reason::NoSession;
             return Ok(GpuImageOutcome::Unavailable);
         }
         let (target_width, target_height) = if width >= height {
@@ -441,6 +447,7 @@ pub fn decode_open_file(
             .cast()
             .map_err(|e| AppError::os("WIC 图像处理失败 | WIC source failed", e))?;
 
+        let mut device_failed = false;
         let scaled = SESSIONS.with_borrow_mut(|sessions| -> Result<Option<(Vec<u8>, GpuAdapter)>> {
             for shared in sessions.as_ref().expect("sessions initialized") {
                 // 忙碌设备继续尝试后续 adapter，不阻塞另一个图像处理线程。
@@ -458,6 +465,7 @@ pub fn decode_open_file(
                         })));
                     }
                     Err(error) => {
+                        device_failed = true;
                         session.healthy = false;
                         tracing::warn!(target: "scrollery::thumb_perf", vendor_id = session.desc.VendorId, device_id = session.desc.DeviceId, %error, "image GPU adapter disabled for this worker");
                     }
@@ -466,6 +474,11 @@ pub fn decode_open_file(
             Ok(None)
         })?;
         let Some((pixels, adapter)) = scaled else {
+            attempt.reason = if device_failed {
+                Reason::DeviceLost
+            } else {
+                Reason::Busy
+            };
             return Ok(GpuImageOutcome::Unavailable);
         };
         let rgba = image::RgbaImage::from_raw(target_width, target_height, pixels)
@@ -481,6 +494,7 @@ pub fn decode_open_file(
             8 => image.rotate270(),
             _ => image,
         };
+        attempt.reason = Reason::Success;
         Ok(GpuImageOutcome::Scaled(
             DecodedImage {
                 width: image.width(),
