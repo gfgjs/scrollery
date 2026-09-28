@@ -37,6 +37,17 @@ struct BridgeResult {
     sync_us: u64,
 }
 
+impl BridgeResult {
+    fn matches_dimensions(&self, width: u32, height: u32, long_edge: u32) -> bool {
+        self.source_width == width
+            && self.source_height == height
+            && self.width > 0
+            && self.height > 0
+            && self.width <= long_edge
+            && self.height <= long_edge
+    }
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct OpenResult {
@@ -201,10 +212,12 @@ pub fn decode_open_file(
                 tracing::debug!(target: "scrollery::thumb_perf", status, ?result, "VPL JPEG route declined");
                 continue;
             }
-            if result.source_width != width || result.source_height != height || result.width == 0 ||
-                result.height == 0 || result.width > long_edge || result.height > long_edge {
-                session.healthy = false;
-                return Err(AppError::Internal("VPL JPEG output dimensions mismatch".into()));
+            if !result.matches_dimensions(width, height, long_edge) {
+                // 单图尺寸不适用不代表设备损坏；健康状态只采用薄桥报告的事实。
+                attempt.reason = Reason::Unsupported;
+                tracing::debug!(target: "scrollery::thumb_perf", width, height, long_edge, ?result,
+                    "VPL JPEG output dimensions mismatch");
+                continue;
             }
             pixels.truncate(result.width as usize * result.height as usize * 4);
             let image = image::RgbaImage::from_raw(result.width, result.height, pixels)
@@ -222,6 +235,29 @@ pub fn decode_open_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dimensions_reject_mismatch_and_out_of_bounds() {
+        let mut result = BridgeResult {
+            source_width: 1280,
+            source_height: 1707,
+            width: 383,
+            height: 512,
+            ..Default::default()
+        };
+        assert!(result.matches_dimensions(1280, 1707, 512));
+        assert!(!result.matches_dimensions(1280, 1708, 512));
+        assert!(!result.matches_dimensions(1281, 1707, 512));
+        result.width = 0;
+        assert!(!result.matches_dimensions(1280, 1707, 512));
+        result.width = 513;
+        assert!(!result.matches_dimensions(1280, 1707, 512));
+        result.width = 383;
+        result.height = 0;
+        assert!(!result.matches_dimensions(1280, 1707, 512));
+        result.height = 513;
+        assert!(!result.matches_dimensions(1280, 1707, 512));
+    }
 
     #[test]
     fn cached_unavailable_skips_source_reads() {

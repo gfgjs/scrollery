@@ -20,6 +20,7 @@ export interface SettingsGroup {
   keys: readonly SettingKey[]
   defaultOpen?: boolean
   desktopOnly?: boolean
+  windowsOnly?: boolean
 }
 
 export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
@@ -39,6 +40,11 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
   {
     id: 'thumbnails', section: 'media', titleKey: 'settings.thumbnailGenerationGroup',
     keys: ['thumbDecodeStrategy', 'thumbSize', 'thumbWebpQuality', 'thumbSkipMaxKb', 'fullThumbGen'],
+  },
+  {
+    id: 'thumbnailPerformance', section: 'media', titleKey: 'settings.thumbnailPerformanceGroup',
+    keys: ['thumbFastThreads', 'thumbTailThreads', 'thumbGpuInflight', 'thumbGpuPerAdapter', 'thumbProcessMemoryMb', 'thumbTotalMemoryMb', 'thumbWorksetMb'],
+    windowsOnly: true, defaultOpen: false,
   },
   { id: 'thumbnailCache', section: 'media', titleKey: 'settings.thumbnailCacheGroup', keys: ['thumbCacheDir', 'thumbCacheMaxMb', 'cacheStats'] },
   { id: 'video', section: 'media', titleKey: 'settings.video', keys: sectionSettingKeys('video') },

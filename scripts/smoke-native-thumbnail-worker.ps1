@@ -81,7 +81,7 @@ public static class NativeThumbnailSmoke {
             using (var reader = new BinaryReader(process.StandardOutput.BaseStream))
             using (var writer = new BinaryWriter(process.StandardInput.BaseStream)) {
                 try {
-                    Require(Encoding.ASCII.GetString(Read(reader,4)) == "NTHE", "Worker protocol version");
+                    Require(Encoding.ASCII.GetString(Read(reader,4)) == "NTHH", "Worker protocol version");
                     for (int index = 0; index < 3; ++index) {
                         using (var input = File.OpenRead(sample)) {
                             IntPtr copied;
@@ -90,7 +90,7 @@ public static class NativeThumbnailSmoke {
                             string json = "{\"id\":" + (index+1) + ",\"file_handle\":" + copied.ToInt64() +
                                 ",\"kind\":\"Image\",\"format\":\"jpg\",\"codec_hint\":null,\"prefer_gpu\":" +
                                 (index == 1 ? "true" : "false") +
-                                ",\"gpu_policy\":true,\"decode_long_edge\":64,\"max_pixel_bytes\":11534336,\"output_size\":64,\"webp_quality\":90," +
+                                ",\"gpu_policy\":true,\"image_route\":\"Automatic\",\"decode_long_edge\":64,\"max_pixel_bytes\":11534336,\"output_size\":64,\"webp_quality\":90," +
                                 "\"ai_cache_short_edge\":336,\"emit_ai_cache\":false,\"qos_foreground\":true,\"qos_revision\":1}";
                             if (video) json = json.Replace("\"kind\":\"Image\"", "\"kind\":\"VideoCover\"")
                                 .Replace("\"format\":\"jpg\"", "\"format\":\"mp4\"");
@@ -106,7 +106,7 @@ public static class NativeThumbnailSmoke {
                                 Require(reader.ReadUInt64() == (ulong)(index+1), "Response identity");
                                 if (status == 250) {
                                     byte stage = reader.ReadByte();
-                                    Require(stage == completedStage + 1 && stage <= 2, "Resource stage order");
+                                    Require(stage == completedStage + 1 && stage <= 3, "Resource stage order");
                                     completedStage = stage;
                                 }
                             } while (status == 250);
@@ -121,10 +121,10 @@ public static class NativeThumbnailSmoke {
                                 continue;
                             }
                             Require(status == 0, "Worker failed with code " + status);
-                            Require(completedStage == 2, "Source/GPU completed before encoded reply");
+                            Require(completedStage == 3, "Source/GPU completed and bounded encoding ready before reply");
                             byte backend = reader.ReadByte();
                             uint vendor = reader.ReadUInt32(); uint device = reader.ReadUInt32();
-                            Read(reader, 8); byte adapterKind = reader.ReadByte(); Read(reader, 24);
+                            Read(reader, 8); byte adapterKind = reader.ReadByte(); Read(reader, 64);
                             Require(adapterKind <= 2, "Adapter kind enum");
                             uint webpSize = reader.ReadUInt32(); ushort hashSize = reader.ReadUInt16(); uint aiSize = reader.ReadUInt32();
                             Require(webpSize <= 1048576 && hashSize <= 1024 && aiSize == 0, "Bounded payload");

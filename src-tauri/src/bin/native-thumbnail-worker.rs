@@ -20,13 +20,20 @@ fn main() -> std::io::Result<()> {
         .with_writer(io::stderr)
         .init();
 
+    if let Some(json) =
+        std::env::args().find_map(|arg| arg.strip_prefix("--thumbnail-limits=").map(str::to_owned))
+    {
+        let limits = serde_json::from_str(&json).map_err(io::Error::other)?;
+        scrollery_lib::thumbnail::limits::install(limits)?;
+    }
     let parallelism = std::env::args()
         .find_map(|arg| {
-            arg.strip_prefix("--fast=")
+            arg.strip_prefix("--threads=")
+                .or_else(|| arg.strip_prefix("--fast="))
                 .and_then(|n| n.parse::<usize>().ok())
         })
         .unwrap_or(1)
-        .clamp(1, 4);
+        .clamp(1, 64);
     let mut input = io::stdin().lock();
     let output = Arc::new(Mutex::new(io::stdout()));
     {
@@ -37,16 +44,32 @@ fn main() -> std::io::Result<()> {
     let (send, receive) = crossbeam_channel::bounded::<
         scrollery_lib::thumbnail::native_protocol::NativeRequest,
     >(parallelism);
+    let (gpu_send, gpu_receive) = crossbeam_channel::bounded::<
+        scrollery_lib::thumbnail::native_protocol::NativeRequest,
+    >(parallelism);
+    let gpu_threads = scrollery_lib::thumbnail::limits::get().gpu_threads_for(parallelism);
     // scope 闭包拥有发送端：协议读取出错时也先关闭队列，再等待消费线程退出。
     std::thread::scope(move |scope| -> io::Result<()> {
         for worker_slot in 1..=parallelism {
             let receive = receive.clone();
+            let gpu_receive = gpu_receive.clone();
+            let gpu_thread = worker_slot <= gpu_threads;
             let output = Arc::clone(&output);
             scope.spawn(move || {
                 scrollery_lib::engine::native::wic_engine::with_image_worker_session(|| {
                     let mut applied_qos: Option<(bool, u64, bool)> = None;
                     let mut sequence = 0u64;
-                    while let Ok(request) = receive.recv() {
+                    loop {
+                        // GPU 会话只驻留在固定线程；这些线程空闲时也处理 CPU 请求。
+                        let next = if gpu_thread {
+                            crossbeam_channel::select_biased! {
+                                recv(gpu_receive) -> request => request.or_else(|_| receive.recv()),
+                                recv(receive) -> request => request.or_else(|_| gpu_receive.recv()),
+                            }
+                        } else {
+                            receive.recv()
+                        };
+                        let Ok(request) = next else { break };
                         let id = request.id;
                         sequence += 1;
                         let qos = match applied_qos {
@@ -106,10 +129,13 @@ fn main() -> std::io::Result<()> {
             });
         }
         while let Some(request) = read_request(&mut input)? {
-            send.send(request)
+            let sender = if request.prefer_gpu { &gpu_send } else { &send };
+            sender
+                .send(request)
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker stopped"))?;
         }
         drop(send);
+        drop(gpu_send);
         Ok(())
     })
 }
@@ -135,9 +161,11 @@ fn process(
     use scrollery_lib::engine::image_rs::ImageRsEngine;
     use scrollery_lib::engine::native::wic_engine::WicEngine;
     use scrollery_lib::engine::traits::ResizeHint;
-    use scrollery_lib::thumbnail::generator::{encode_media_payload, ThumbConfig};
+    use scrollery_lib::error::AppError;
+    use scrollery_lib::thumbnail::generator::{encode_media_payload_with_timings, ThumbConfig};
     use scrollery_lib::thumbnail::native_protocol::{
-        NativeBackend, NativeExecution, NativeStage, NativeTimings,
+        NativeBackend, NativeExecution, NativeImageRoute, NativeStage, NativeTimings,
+        IMAGE_RS_DEFERRED,
     };
 
     let elapsed_us = |start: std::time::Instant| {
@@ -165,6 +193,7 @@ fn process(
     // SAFETY:此数值只由宿主 DuplicateHandle 到当前进程后传入；本分支接管并关闭句柄。
     let mut file = unsafe { File::from_raw_handle(request.file_handle as usize as RawHandle) };
     let format = request.format.to_ascii_lowercase();
+    let image_rs_only = request.image_route == NativeImageRoute::ImageRsOnly;
     let video = matches!(
         request.kind,
         scrollery_lib::thumbnail::native_protocol::NativeKind::VideoCover
@@ -173,7 +202,7 @@ fn process(
         // 显式 CPU 图片策略不再使用旧 GPU 会话；GPU 名额临时不足仍保留原生缓存。
         scrollery_lib::engine::native::wic_engine::release_image_gpu_sessions();
     }
-    if !video && matches!(format.as_str(), "jpg" | "jpeg") {
+    if !video && !image_rs_only && matches!(format.as_str(), "jpg" | "jpeg") {
         let embedded_started = std::time::Instant::now();
         let mut embedded_released = false;
         if let Some((webp, thumbhash)) = scrollery_lib::thumbnail::exif_thumb::try_exif_thumb_file(
@@ -214,7 +243,11 @@ fn process(
     let vpl_decoded = {
         #[cfg(feature = "native-vpl")]
         {
-            if !video && request.prefer_gpu && matches!(format.as_str(), "jpg" | "jpeg") {
+            if !video
+                && !image_rs_only
+                && request.prefer_gpu
+                && matches!(format.as_str(), "jpg" | "jpeg")
+            {
                 file.try_clone().ok().and_then(|source| {
                     match scrollery_lib::engine::gpu::vpl_jpeg::decode_open_file(source, request.decode_long_edge, request.max_pixel_bytes) {
                         Ok(Some((decoded, adapter))) => {
@@ -250,7 +283,7 @@ fn process(
     }
     let gpu_decoded = if vpl_decoded.is_some() {
         vpl_decoded
-    } else if !video && request.prefer_gpu {
+    } else if !video && !image_rs_only && request.prefer_gpu {
         file.try_clone().ok().and_then(|source| {
             match d2d_resize::decode_open_file(source, &format, request.decode_long_edge, request.max_pixel_bytes) {
                 Ok(GpuImageOutcome::Scaled(decoded, adapter)) => {
@@ -278,6 +311,7 @@ fn process(
     if !video {
         stage(NativeStage::GpuDone);
     }
+    let mut source_done = false;
     let decoded = if video {
         execution = NativeExecution::cpu(NativeBackend::VideoMf);
         if !scrollery_lib::video::native_cover_formats().contains(&format.as_str()) {
@@ -312,7 +346,21 @@ fn process(
     } else {
         match format.as_str() {
             "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" | "tif" | "tiff" => {
-                ImageRsEngine::decode_open_file_bounded(file, &format, hint, max_cpu_decode_bytes)
+                if request.image_route == NativeImageRoute::DeferImageRs {
+                    // 不读软件像素、不编码，释放文件后由宿主lease把该项移至最后一批。
+                    stage(NativeStage::SourceDone);
+                    return Err(IMAGE_RS_DEFERRED);
+                }
+                ImageRsEngine::decode_open_file_bounded_with_source_done(
+                    file,
+                    &format,
+                    hint,
+                    max_cpu_decode_bytes,
+                    || {
+                        stage(NativeStage::SourceDone);
+                        source_done = true;
+                    },
+                )
             }
             "heic" | "heif" | "avif" | "ico" => {
                 execution = NativeExecution::cpu(NativeBackend::ImageWic);
@@ -324,7 +372,15 @@ fn process(
     .map_err(|error| {
         tracing::error!(request_id = request.id, video, prefer_gpu = request.prefer_gpu,
             max_pixel_bytes = request.max_pixel_bytes, %error, "native thumbnail decode failed");
-        4u8
+        if matches!(
+            error,
+            AppError::Engine(image::ImageError::Limits(_))
+                | AppError::ThumbnailUnavailable("pixel_limit")
+        ) {
+            6u8
+        } else {
+            4u8
+        }
     })?;
     if scrollery_lib::video::media_foundation::native_worker_has_abandoned_reader() {
         std::process::exit(70);
@@ -332,7 +388,14 @@ fn process(
     if video {
         stage(NativeStage::GpuDone);
     }
-    stage(NativeStage::SourceDone);
+    if !source_done {
+        stage(NativeStage::SourceDone);
+    }
+    // 解码及变换已结束；仅在剩余像素、ICC 和产物能容纳于普通额度时归还大图预留。
+    // 大尺寸 AI 中间图仍持有原额度，不能借阶段消息绕过像素上限。
+    if encoding_fits_reservation(&decoded, request.output_size) {
+        stage(NativeStage::EncodingReady);
+    }
     let decode_transform_us = elapsed_us(decode_started);
     let config = ThumbConfig {
         cache_dir: std::path::PathBuf::new(),
@@ -349,8 +412,8 @@ fn process(
     let mut encode_attempt = scrollery_lib::thumbnail::route_diagnostics::Attempt::new(
         scrollery_lib::thumbnail::route_diagnostics::Stage::Encode,
     );
-    encode_media_payload(0, decoded, &config, request.emit_ai_cache)
-        .map(|payload| {
+    encode_media_payload_with_timings(0, decoded, &config, request.emit_ai_cache)
+        .map(|(payload, encode_stages_us)| {
             encode_attempt.reason = scrollery_lib::thumbnail::route_diagnostics::Reason::Success;
             (
                 payload,
@@ -359,10 +422,27 @@ fn process(
                     decode_transform_us,
                     encode_hash_us: elapsed_us(encode_started),
                     embedded_jpeg_combined_us: 0,
+                    encode_stages_us,
                 },
             )
         })
         .map_err(|_| 5)
+}
+
+#[cfg(windows)]
+fn encoding_fits_reservation(
+    decoded: &scrollery_lib::engine::traits::DecodedImage,
+    output_size: u32,
+) -> bool {
+    use scrollery_lib::thumbnail::native_protocol::{
+        ENCODING_RESERVATION_BYTES, RESULT_RESERVATION_BYTES,
+    };
+    let pixels = (decoded.pixels.capacity() as u64).max(u64::from(output_size).pow(2) * 4);
+    pixels
+        .saturating_mul(4)
+        .saturating_add(decoded.icc.as_ref().map_or(0, |icc| icc.capacity() as u64))
+        .saturating_add(RESULT_RESERVATION_BYTES)
+        <= ENCODING_RESERVATION_BYTES
 }
 
 #[cfg(not(windows))]
@@ -408,12 +488,13 @@ mod tests {
         file.write_all(&exif).unwrap();
         file.write_all(&main[2..]).unwrap();
         drop(file);
-        let run = |gpu_policy, prefer_gpu, size| {
+        let run = |gpu_policy, prefer_gpu, size, image_route| {
             let mut stages = Vec::new();
             let request = NativeRequest {
                 id: 1,
                 file_handle: std::fs::File::open(&path).unwrap().into_raw_handle() as usize as u64,
                 kind: NativeKind::Image,
+                image_route,
                 format: "jpg".into(),
                 codec_hint: None,
                 gpu_policy,
@@ -427,13 +508,34 @@ mod tests {
                 qos_foreground: true,
                 qos_revision: 1,
             };
-            let result = process(request, |stage| stages.push(stage)).unwrap();
-            assert_eq!(stages, [NativeStage::GpuDone, NativeStage::SourceDone]);
-            result
+            let result = process(request, |stage| stages.push(stage));
+            if result.as_ref().is_err_and(|code| {
+                *code == scrollery_lib::thumbnail::native_protocol::IMAGE_RS_DEFERRED
+            }) {
+                assert_eq!(stages, [NativeStage::GpuDone, NativeStage::SourceDone]);
+                return result;
+            }
+            let result = result.unwrap();
+            if result.1.backend == NativeBackend::EmbeddedJpeg {
+                assert_eq!(stages, [NativeStage::GpuDone, NativeStage::SourceDone]);
+            } else {
+                assert_eq!(
+                    stages,
+                    [
+                        NativeStage::GpuDone,
+                        NativeStage::SourceDone,
+                        NativeStage::EncodingReady
+                    ]
+                );
+            }
+            Ok(result)
         };
-        let cpu = run(false, false, 256);
-        let gpu = run(true, true, 256);
-        let denied = run(true, false, 256);
+        use scrollery_lib::thumbnail::native_protocol::NativeImageRoute::{
+            Automatic, DeferImageRs, ImageRsOnly,
+        };
+        let cpu = run(false, false, 256, Automatic).unwrap();
+        let gpu = run(true, true, 256, DeferImageRs).unwrap();
+        let denied = run(true, false, 256, DeferImageRs).unwrap();
         assert_eq!(cpu.1.backend, NativeBackend::EmbeddedJpeg);
         assert_eq!(gpu.1.backend, NativeBackend::EmbeddedJpeg);
         assert_eq!(denied.1.backend, NativeBackend::EmbeddedJpeg);
@@ -444,9 +546,35 @@ mod tests {
             (embedded_image.width(), embedded_image.height()),
             (192, 256)
         );
-        let full = run(true, false, 512);
+        let full = run(true, false, 512, Automatic).unwrap();
         assert_eq!(full.1.backend, NativeBackend::ImageRs);
+        assert!(matches!(
+            run(true, false, 512, DeferImageRs),
+            Err(scrollery_lib::thumbnail::native_protocol::IMAGE_RS_DEFERRED)
+        ));
+        let tail = run(true, false, 512, ImageRsOnly).unwrap();
+        assert_eq!(tail.1.backend, NativeBackend::ImageRs);
+        assert_eq!(tail.0.webp, full.0.webp);
+        assert_eq!(tail.0.thumbhash, full.0.thumbhash);
+
         let full_image = image::load_from_memory(&full.0.webp).unwrap();
         assert_eq!((full_image.width(), full_image.height()), (341, 512));
+    }
+
+    #[test]
+    fn encoding_reservation_covers_pixel_capacity_and_icc() {
+        let mut decoded = scrollery_lib::engine::traits::DecodedImage {
+            pixels: Vec::with_capacity(11 * 1024 * 1024),
+            width: 1,
+            height: 1,
+            icc: None,
+        };
+        assert!(encoding_fits_reservation(&decoded, 1024));
+        // 不能只按宽高或 len 计算：容量和 ICC 仍被编码阶段持有。
+        decoded.icc = Some(vec![1]);
+        assert!(!encoding_fits_reservation(&decoded, 1024));
+        decoded.icc = None;
+        decoded.pixels.reserve_exact(12 * 1024 * 1024);
+        assert!(!encoding_fits_reservation(&decoded, 1024));
     }
 }

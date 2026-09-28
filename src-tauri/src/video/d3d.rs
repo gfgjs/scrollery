@@ -296,6 +296,6 @@ pub fn hw_available() -> bool {
 pub(crate) fn slots_snapshot() -> (usize, usize) {
     (
         crate::engine::gpu::budget::snapshot().0,
-        crate::engine::gpu::budget::GPU_INFLIGHT_LIMIT,
+        crate::thumbnail::limits::get().gpu_inflight,
     )
 }

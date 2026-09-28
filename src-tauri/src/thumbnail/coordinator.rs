@@ -66,6 +66,7 @@ pub(crate) struct NativeCounters {
     pub(crate) request_wall: LatencySummary,
     pub(crate) decode_transform: LatencySummary,
     pub(crate) encode_hash: LatencySummary,
+    pub(crate) encode_stages: [LatencySummary; super::generator::ENCODE_STAGE_COUNT],
     pub(crate) embedded_jpeg_combined: LatencySummary,
     pub(crate) host_working_set_bytes: Option<u64>,
     pub(crate) host_private_bytes: Option<u64>,
@@ -84,6 +85,7 @@ pub(crate) struct NativeCounters {
 #[derive(Debug, Default)]
 pub(crate) struct LatencySummary {
     pub(crate) count: u64,
+    pub(crate) sum_us: u64,
     pub(crate) sum_ms: u64,
     pub(crate) max_ms: u64,
     pub(crate) p50_ms_upper: u64,
@@ -93,7 +95,7 @@ pub(crate) struct LatencySummary {
 const LATENCY_BUCKETS: usize = 17;
 
 pub(crate) struct LatencyStats {
-    sum_ms: AtomicU64,
+    sum_us: AtomicU64,
     max_ms: AtomicU64,
     buckets: [AtomicU64; LATENCY_BUCKETS],
 }
@@ -101,7 +103,7 @@ pub(crate) struct LatencyStats {
 impl LatencyStats {
     pub(crate) fn new() -> Self {
         Self {
-            sum_ms: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
             max_ms: AtomicU64::new(0),
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -115,7 +117,9 @@ impl LatencyStats {
             (u64::BITS - (millis - 1).leading_zeros()) as usize
         }
         .min(LATENCY_BUCKETS - 1);
-        self.sum_ms.fetch_add(millis, Ordering::Relaxed);
+        // 先累计微秒再换算，避免大量短阶段逐项截断后总耗时失真。
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.sum_us.fetch_add(micros, Ordering::Relaxed);
         self.max_ms.fetch_max(millis, Ordering::Relaxed);
         self.buckets[index].fetch_add(1, Ordering::Relaxed);
     }
@@ -127,9 +131,11 @@ impl LatencyStats {
             .map(|count| count.load(Ordering::Relaxed));
         let count: u64 = buckets.iter().sum();
         let max_ms = self.max_ms.load(Ordering::Relaxed);
+        let sum_us = self.sum_us.load(Ordering::Relaxed);
         LatencySummary {
             count,
-            sum_ms: self.sum_ms.load(Ordering::Relaxed),
+            sum_us,
+            sum_ms: sum_us / 1000,
             max_ms,
             p50_ms_upper: latency_percentile_upper(&buckets, count, 50, max_ms),
             p95_ms_upper: latency_percentile_upper(&buckets, count, 95, max_ms),
@@ -285,7 +291,8 @@ struct ImageJob {
     config: ThumbConfig,
     epoch: u64,
     lane: ThumbnailLane,
-    exception_budget: bool,
+    large_decode_budget: bool,
+    worker_retries: u8,
     cancel: CancellationToken,
     viewport_request: Option<Weak<ViewportRequest>>,
     response: crossbeam_channel::Sender<Result<ImageExecution>>,
@@ -307,6 +314,11 @@ enum TaskPreparation {
     #[cfg(windows)]
     Pending(Box<super::native_worker::NativePending>, PreparedResult),
     Immediate(ImageExecution),
+    Retry {
+        key: ThumbnailTaskKey,
+        lease_id: String,
+        error: AppError,
+    },
     Ready(PreparedResult),
     ToEncode(EncodePreparation),
 }
@@ -345,11 +357,13 @@ struct CommitWork {
 
 const COMMIT_BATCH_SIZE: usize = 50;
 const COMMIT_BATCH_WAIT: Duration = Duration::from_millis(100);
+#[cfg(test)]
 const MAX_INFLIGHT_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SINGLE_RESERVATION_BYTES: u64 = 256 * 1024 * 1024;
 const UNCERTAIN_RESERVATION_BYTES: u64 = 432 * 1024 * 1024;
-const MIN_ENCODED_RESERVATION_BYTES: u64 = 80 * 1024 * 1024;
-const SSD_VOLUME_IO_LIMIT: usize = 4;
+const MIN_ENCODED_RESERVATION_BYTES: u64 = super::native_protocol::ENCODING_RESERVATION_BYTES;
+// SSD 不再另设解码槽；计算线程、工作集和进程内存共同限流。
+const SSD_VOLUME_IO_LIMIT: usize = usize::MAX;
 const HDD_VOLUME_IO_LIMIT: usize = 1;
 const UNKNOWN_VOLUME_IO_LIMIT: usize = 1;
 
@@ -468,7 +482,7 @@ impl VolumeIoBudget {
             current: state.current,
             peak: state.peak,
             denied_attempts: state.denied_attempts,
-            ssd_limit: SSD_VOLUME_IO_LIMIT,
+            ssd_limit: 0, // 0 表示不额外限制 SSD 解码并发。
             hdd_limit: HDD_VOLUME_IO_LIMIT,
             unknown_limit: UNKNOWN_VOLUME_IO_LIMIT,
         }
@@ -532,6 +546,7 @@ impl Drop for VolumeIoPermit {
 }
 
 pub(crate) struct MemoryBudget {
+    limit: u64,
     reserved: Mutex<u64>,
     changed: Condvar,
     peak: std::sync::atomic::AtomicU64,
@@ -540,6 +555,7 @@ pub(crate) struct MemoryBudget {
 impl MemoryBudget {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
+            limit: super::limits::get().workset_bytes(),
             reserved: Mutex::new(0),
             changed: Condvar::new(),
             peak: AtomicU64::new(0),
@@ -548,7 +564,7 @@ impl MemoryBudget {
 
     fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<MemoryPermit> {
         let mut reserved = self.reserved.lock().unwrap_or_else(|e| e.into_inner());
-        if reserved.saturating_add(bytes) > MAX_INFLIGHT_DECODE_BYTES {
+        if reserved.saturating_add(bytes) > self.limit {
             return None;
         }
         *reserved += bytes;
@@ -567,7 +583,7 @@ impl MemoryBudget {
         bytes: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> Option<(crate::exotic::limiter::HeavyPermit, MemoryPermit)> {
-        if bytes > MAX_INFLIGHT_DECODE_BYTES {
+        if bytes > self.limit {
             return None;
         }
         loop {
@@ -588,7 +604,7 @@ impl MemoryBudget {
                 return false;
             }
             let reserved = self.reserved.lock().unwrap_or_else(|e| e.into_inner());
-            if reserved.saturating_add(bytes) <= MAX_INFLIGHT_DECODE_BYTES {
+            if reserved.saturating_add(bytes) <= self.limit {
                 return true;
             }
             let (reserved, _) = self
@@ -664,17 +680,7 @@ fn estimated_decode_bytes(job: &ImageJob) -> u64 {
     if super::generator::direct_display_reason(item, &job.config).is_some() {
         return 1024 * 1024;
     }
-    if job.exception_budget
-        || job.lane == ThumbnailLane::Exception
-        || job.shared.as_ref().is_some_and(|shared| {
-            shared
-                .subscribers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .any(|subscriber| subscriber.lane == ThumbnailLane::Exception)
-        })
-    {
+    if job.large_decode_budget {
         // 元数据低估导致首次超额时，有限异常补救使用最大单项额度。
         return UNCERTAIN_RESERVATION_BYTES;
     }
@@ -865,6 +871,7 @@ struct JobQueues {
     background_fast: VecDeque<ImageJob>,
     background_heavy: VecDeque<ImageJob>,
     background_exception: VecDeque<ImageJob>,
+    background_image_rs: VecDeque<ImageJob>,
     viewport_streak: u8,
     locality_epoch: Option<u64>,
     hdd_locality: HashMap<u32, DirectoryLocality>,
@@ -906,6 +913,7 @@ impl JobQueues {
             ThumbnailLane::Fast => &mut self.background_fast,
             ThumbnailLane::Heavy => &mut self.background_heavy,
             ThumbnailLane::Exception => &mut self.background_exception,
+            ThumbnailLane::ImageRs => &mut self.background_image_rs,
         };
         let index = lane.iter().position(|other| {
             other.epoch == job.epoch
@@ -962,10 +970,10 @@ impl JobQueues {
         let queued = take(&mut self.background_fast)
             .or_else(|| take(&mut self.background_heavy))
             .or_else(|| take(&mut self.background_exception))
+            .or_else(|| take(&mut self.background_image_rs))
             .or_else(|| take(&mut self.viewport_fast))
             .or_else(|| take(&mut self.viewport_heavy));
         if let Some(mut job) = queued {
-            job.exception_budget |= job.lane == ThumbnailLane::Exception;
             job.lane = shared.preferred_lane(job.lane);
             self.push(job);
         }
@@ -995,6 +1003,7 @@ impl JobQueues {
             + self.background_fast.len()
             + self.background_heavy.len()
             + self.background_exception.len()
+            + self.background_image_rs.len()
     }
 
     fn push(&mut self, job: ImageJob) {
@@ -1004,6 +1013,7 @@ impl JobQueues {
             ThumbnailLane::Fast => self.background_fast.push_back(job),
             ThumbnailLane::Heavy => self.background_heavy.push_back(job),
             ThumbnailLane::Exception => self.background_exception.push_back(job),
+            ThumbnailLane::ImageRs => self.background_image_rs.push_back(job),
         }
     }
 
@@ -1014,6 +1024,7 @@ impl JobQueues {
             ThumbnailLane::Fast => self.background_fast.push_front(job),
             ThumbnailLane::Heavy => self.background_heavy.push_front(job),
             ThumbnailLane::Exception => self.background_exception.push_front(job),
+            ThumbnailLane::ImageRs => self.background_image_rs.push_front(job),
         }
     }
 
@@ -1027,10 +1038,14 @@ impl JobQueues {
         }
         match lane {
             ThumbnailLane::ViewportFast | ThumbnailLane::ViewportHeavy => true,
-            ThumbnailLane::Fast | ThumbnailLane::Heavy | ThumbnailLane::Exception => {
+            ThumbnailLane::Fast
+            | ThumbnailLane::Heavy
+            | ThumbnailLane::Exception
+            | ThumbnailLane::ImageRs => {
                 self.background_fast.len()
                     + self.background_heavy.len()
                     + self.background_exception.len()
+                    + self.background_image_rs.len()
                     < QUEUE_CAPACITY - VIEWPORT_RESERVED_CAPACITY
             }
         }
@@ -1045,6 +1060,7 @@ impl JobQueues {
     fn pop_background(&mut self, fast: bool, tail: bool) -> Option<ImageJob> {
         fast.then(|| self.background_fast.pop_front())
             .flatten()
+            .or_else(|| fast.then(|| self.background_image_rs.pop_front()).flatten())
             .or_else(|| tail.then(|| self.background_heavy.pop_front()).flatten())
             .or_else(|| {
                 tail.then(|| self.background_exception.pop_front())
@@ -1094,7 +1110,8 @@ impl JobQueues {
         }
         let viewport_ready =
             (fast && !self.viewport_fast.is_empty()) || (tail && !self.viewport_heavy.is_empty());
-        let background_ready = (fast && !self.background_fast.is_empty())
+        let background_ready = (fast
+            && (!self.background_fast.is_empty() || !self.background_image_rs.is_empty()))
             || (tail
                 && (!self.background_heavy.is_empty() || !self.background_exception.is_empty()));
         if super::scheduler::choose_viewport_dispatch(
@@ -1239,7 +1256,8 @@ impl ImageSubmitter {
             } else {
                 lane
             },
-            exception_budget: lane == ThumbnailLane::Exception,
+            large_decode_budget: false,
+            worker_retries: 0,
             cancel: self.cancel.clone(),
             viewport_request,
             response: self.response.clone(),
@@ -1270,10 +1288,8 @@ impl ThumbnailCoordinator {
     pub fn new(capacity: usize) -> Self {
         #[cfg(windows)]
         let (capacity, native_fast_capacity) = {
-            // host 解码/编码/提交与两个原生域合计使用同一处理线程额度。
-            let total = capacity.max(4);
-            let native_fast = ((total - 2) / 3).clamp(1, 4);
-            (total - native_fast - 1, native_fast)
+            // 像素计算在原生域完成，tail 留一席；宿主两条派发和一条提交不扣计算额度。
+            (3, super::limits::get().fast_threads_for(capacity))
         };
         #[cfg(not(windows))]
         let capacity = capacity.max(2);
@@ -1444,8 +1460,11 @@ impl ThumbnailCoordinator {
     fn start_workers(&self, state: &Arc<AppState>) {
         self.started.get_or_init(|| {
             let (commit_tx, commit_rx) = crossbeam_channel::bounded(COMMIT_BATCH_SIZE);
-            // 两个小后段允许编码/写盘与解码重叠，队列只容纳两张已解码图。
-            // 提交器与编码线程均从原处理额度中划出，不额外增加常驻处理线程。
+            // Windows 原生回包已完成编码，宿主只派发与提交，不创建空闲编码线程。
+            #[cfg(windows)]
+            let encode_count = 0;
+            // 其它平台在宿主完成像素计算，后段线程仍从处理额度划出。
+            #[cfg(not(windows))]
             let encode_count = if self.capacity >= 5 {
                 2
             } else if self.capacity >= 3 {
@@ -1536,44 +1555,65 @@ impl ThumbnailCoordinator {
                 }
             };
             let state = active_state;
-            let direct = job.kind == ThumbnailTaskKind::Image
-                && super::generator::direct_display_reason(&job.candidate.item, &job.config)
-                    .is_some();
-            #[cfg(windows)]
-            let native_ticket = if direct {
-                None
-            } else {
-                match state.thumb_coordinator.native.try_reserve(job.lane) {
-                    Some(ticket) => Some(ticket),
-                    None => {
-                        queue
-                            .jobs
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .requeue_front(job);
-                        continue;
-                    }
-                }
-            };
             if job.cancelled_before_claim() {
                 let item_id = job.candidate.item.id;
                 queue.finish_job(job, Ok(ImageExecution::Skipped(item_id)));
                 continue;
             }
+            let direct = job.kind == ThumbnailTaskKind::Image
+                && super::generator::direct_display_reason(&job.candidate.item, &job.config)
+                    .is_some();
+            #[cfg(windows)]
+            let native_ticket = if direct {
+                Ok(None)
+            } else {
+                match state.thumb_coordinator.native.try_admit(
+                    job.lane,
+                    estimated_decode_bytes(&job),
+                    job.config.strategy == "gpu" && job.lane != ThumbnailLane::ImageRs,
+                ) {
+                    Ok(Some(ticket)) => Ok(Some(ticket)),
+                    Err(error @ AppError::ThumbnailUnavailable("worker_memory_limit")) => {
+                        Err(error)
+                    }
+                    Err(error) => {
+                        queue.finish_job(job, Err(error));
+                        continue;
+                    }
+                    Ok(None) => {
+                        let mut jobs = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        jobs.requeue_front(job);
+                        let _ = queue
+                            .changed
+                            .wait_timeout(jobs, Duration::from_millis(5))
+                            .unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    }
+                }
+            };
+            #[cfg(windows)]
+            let admission_failed = native_ticket.is_err();
+            #[cfg(not(windows))]
+            let admission_failed = false;
             // 像素计算共享 CPU 准入，快速项保留名额；先取额度再领取 DB lease。
             // 视口保留线程不阻塞等额度：让它继续服务后续快速项。
             let heavy_permit = match job.lane {
-                _ if direct => None,
+                _ if direct || admission_failed => None,
                 lane if cfg!(windows)
                     || reserved_viewport
-                    || matches!(lane, ThumbnailLane::Fast | ThumbnailLane::ViewportFast) =>
+                    || matches!(
+                        lane,
+                        ThumbnailLane::Fast | ThumbnailLane::ViewportFast | ThumbnailLane::ImageRs
+                    ) =>
                 {
-                    let permit =
-                        if matches!(lane, ThumbnailLane::Fast | ThumbnailLane::ViewportFast) {
-                            state.background_heavy_limiter.try_acquire_fast()
-                        } else {
-                            state.background_heavy_limiter.try_acquire()
-                        };
+                    let permit = if matches!(
+                        lane,
+                        ThumbnailLane::Fast | ThumbnailLane::ViewportFast | ThumbnailLane::ImageRs
+                    ) {
+                        state.background_heavy_limiter.try_acquire_fast()
+                    } else {
+                        state.background_heavy_limiter.try_acquire()
+                    };
                     match permit {
                         Some(permit) => Some(permit),
                         None => {
@@ -1615,8 +1655,13 @@ impl ThumbnailCoordinator {
                 }
             };
             // 先取得共享工作集额度，再领取 DB lease；不足时退回队列，让快速项有机会前进。
-            let Some(memory_permit) = memory_budget.try_reserve(estimated_decode_bytes(&job))
-            else {
+            // 准入已拒绝的项只领取租约并提交暂不可用，不占像素、CPU或源卷额度。
+            let decode_bytes = if admission_failed {
+                0
+            } else {
+                estimated_decode_bytes(&job)
+            };
+            let Some(memory_permit) = memory_budget.try_reserve(decode_bytes) else {
                 #[cfg(windows)]
                 drop(native_ticket);
                 drop(heavy_permit);
@@ -1629,7 +1674,7 @@ impl ThumbnailCoordinator {
                 continue;
             };
             // 仅准入源卷读取/解码阶段；提交后段写缓存不占源卷名额。
-            let volume_admission = if direct {
+            let volume_admission = if direct || admission_failed {
                 Some(None)
             } else {
                 state
@@ -1652,7 +1697,7 @@ impl ThumbnailCoordinator {
                     .unwrap_or_else(|e| e.into_inner());
                 continue;
             };
-            if !direct {
+            if !direct && !admission_failed {
                 queue
                     .jobs
                     .lock()
@@ -1751,6 +1796,13 @@ impl ThumbnailCoordinator {
                         );
                     }
                 }
+                Ok(TaskPreparation::Retry {
+                    key,
+                    lease_id,
+                    error,
+                }) => {
+                    Self::recover_native_job(&queue, &state, job, &key, &lease_id, error);
+                }
                 Err(error) => queue.finish_job(job, Err(error)),
             }
         }
@@ -1769,8 +1821,17 @@ impl ThumbnailCoordinator {
                 .thumb_coordinator
                 .native
                 .poll(&mut pending[index].request);
-            if pending[index].request.source_done() {
-                drop(pending[index]._volume_permit.take());
+            if pending[index].request.source_done()
+                && pending[index]._volume_permit.take().is_some()
+            {
+                queue.changed.notify_all();
+            }
+            if pending[index].request.encoding_ready() {
+                let permit = &mut pending[index].memory_permit;
+                if permit.bytes > super::native_protocol::ENCODING_RESERVATION_BYTES {
+                    permit.shrink_to(super::native_protocol::ENCODING_RESERVATION_BYTES);
+                    queue.changed.notify_all();
+                }
             }
             let Some(result) = result else {
                 index += 1;
@@ -1802,6 +1863,17 @@ impl ThumbnailCoordinator {
                         native: Some(execution),
                     };
                 }
+                Err(error) if retry_or_stop(&error, &job) => {
+                    Self::recover_native_job(
+                        queue,
+                        state,
+                        job,
+                        &prepared.key,
+                        &prepared.lease_id,
+                        error,
+                    );
+                    continue;
+                }
                 Err(error) => {
                     prepared.unavailable_reason = unavailable_reason(&error);
                     prepared.result = Some(failed_result(&prepared.key, &job, &error));
@@ -1821,6 +1893,47 @@ impl ThumbnailCoordinator {
                 );
             }
         }
+    }
+
+    fn recover_native_job(
+        queue: &WorkQueue,
+        state: &AppState,
+        mut job: ImageJob,
+        key: &ThumbnailTaskKey,
+        lease_id: &str,
+        error: AppError,
+    ) {
+        if let Err(error) = release_owned_lease(state, job.epoch, key, lease_id) {
+            queue.finish_job(job, Err(error));
+            return;
+        }
+        match &error {
+            _ if unavailable_reason(&error) == Some("pixel_limit") && !job.large_decode_budget => {
+                // 只有真实像素超额才升级单项预算，进程故障和普通解码失败不升级。
+                job.large_decode_budget = true;
+                job.lane = if job.viewport_request.is_some() {
+                    ThumbnailLane::ViewportHeavy
+                } else if job.lane == ThumbnailLane::ImageRs {
+                    ThumbnailLane::ImageRs
+                } else {
+                    ThumbnailLane::Heavy
+                };
+            }
+            AppError::ThumbnailUnavailable("worker_lost") if job.worker_retries == 0 => {
+                // 进程退出会牵连正常图片；在原队列有界重试，不污染异常分类。
+                job.worker_retries += 1;
+            }
+            _ => {
+                queue.finish_job(job, Err(error));
+                return;
+            }
+        }
+        queue
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .requeue_front(job);
+        queue.changed.notify_all();
     }
 
     fn encode_loop(
@@ -1968,9 +2081,21 @@ impl ThumbnailCoordinator {
                         .result
                         .as_ref()
                         .expect("active thumbnail result must be finalized before DB commit");
+                    if prepared.unavailable_reason == Some("image_rs_deferred") {
+                        outcomes.push(if queries::defer_thumbnail_image_rs(&tx, key, lease_id)? {
+                            ImageExecution::Deferred(item_id)
+                        } else {
+                            ImageExecution::Skipped(item_id)
+                        });
+                        continue;
+                    }
                     if result.thumb_status == 2
-                        && job.lane != ThumbnailLane::Exception
+                        && !matches!(job.lane, ThumbnailLane::Exception | ThumbnailLane::ImageRs)
                         && !exception_lane
+                        && !matches!(
+                            prepared.unavailable_reason,
+                            Some("pixel_limit" | "worker_memory_limit")
+                        )
                     {
                         let deferred = queries::defer_thumbnail_failure(
                             &tx,
@@ -2277,7 +2402,7 @@ impl ThumbnailCoordinator {
         state: &AppState,
         job: &ImageJob,
         _memory_permit: &MemoryPermit,
-        #[cfg(windows)] native_ticket: Option<super::native_worker::DomainTicket>,
+        #[cfg(windows)] native_ticket: Result<Option<super::native_worker::DomainTicket>>,
     ) -> Result<TaskPreparation> {
         let ImageJob {
             candidate,
@@ -2328,6 +2453,24 @@ impl ThumbnailCoordinator {
             )));
         }
 
+        #[cfg(windows)]
+        let native_ticket = match native_ticket {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                // 与其它暂不可用结果共用租约提交，结束本轮成员，避免后台分页再次领取。
+                return Ok(TaskPreparation::Ready(PreparedResult {
+                    result: Some(failed_result(&key, job, &error)),
+                    unavailable_reason: unavailable_reason(&error),
+                    payload: None,
+                    execution: ExecutionFacts::default(),
+                    write_size: config.size,
+                    key,
+                    lease_id,
+                    exception_lane,
+                }));
+            }
+        };
+
         // 原生同步操作由子进程截止终止；切库锁只用于租约和结果身份检查。
         #[cfg(windows)]
         let (qos_foreground, qos_revision) = super::qos::native_worker_qos_request();
@@ -2348,9 +2491,11 @@ impl ThumbnailCoordinator {
                             id: 0,
                             file_handle: 0,
                             kind: super::native_protocol::NativeKind::Image,
+                            image_route: native_image_route(job.lane),
                             format: candidate.item.file_format.clone(),
                             codec_hint: None,
-                            prefer_gpu: config.strategy == "gpu",
+                            prefer_gpu: config.strategy == "gpu"
+                                && job.lane != ThumbnailLane::ImageRs,
                             gpu_policy: config.strategy == "gpu",
                             decode_long_edge: super::generator::decode_long_edge(
                                 config,
@@ -2423,6 +2568,7 @@ impl ThumbnailCoordinator {
                         id: 0,
                         file_handle: 0,
                         kind: super::native_protocol::NativeKind::VideoCover,
+                        image_route: super::native_protocol::NativeImageRoute::Automatic,
                         format: candidate.item.file_format.clone(),
                         codec_hint: candidate
                             .video_codec
@@ -2545,6 +2691,11 @@ impl ThumbnailCoordinator {
                 }))
             }
             Ok((DecodeResult::DeferredToCpu { .. }, _)) => unreachable!("CPU fallback must decode"),
+            Err(error) if retry_or_stop(&error, job) => Ok(TaskPreparation::Retry {
+                key,
+                lease_id,
+                error,
+            }),
             Err(error) => Ok(TaskPreparation::Ready(PreparedResult {
                 result: Some(failed_result(&key, job, &error)),
                 unavailable_reason: unavailable_reason(&error),
@@ -2559,9 +2710,29 @@ impl ThumbnailCoordinator {
     }
 }
 
+#[cfg(windows)]
+fn native_image_route(lane: ThumbnailLane) -> super::native_protocol::NativeImageRoute {
+    use super::native_protocol::NativeImageRoute;
+    match lane {
+        ThumbnailLane::ImageRs => NativeImageRoute::ImageRsOnly,
+        ThumbnailLane::ViewportFast | ThumbnailLane::ViewportHeavy => NativeImageRoute::Automatic,
+        _ => NativeImageRoute::DeferImageRs,
+    }
+}
+
+fn retry_or_stop(error: &AppError, job: &ImageJob) -> bool {
+    matches!(
+        error,
+        AppError::ThumbnailUnavailable(
+            "worker_lost" | "worker_unavailable" | "worker_memory_limit"
+        )
+    ) || unavailable_reason(error) == Some("pixel_limit") && !job.large_decode_budget
+}
+
 fn unavailable_reason(error: &AppError) -> Option<&'static str> {
     match error {
         AppError::ThumbnailUnavailable(reason) => Some(reason),
+        AppError::Engine(image::ImageError::Limits(_)) => Some("pixel_limit"),
         _ => None,
     }
 }
@@ -2623,6 +2794,10 @@ mod tests {
         assert!(budget.try_acquire(1, Some(8)).is_none());
         assert!(budget.try_acquire(1, Some(9)).is_some());
         let unknown = budget.try_acquire(1, Some(10)).unwrap();
+        let ssd_work: Vec<_> = (0..12)
+            .map(|_| budget.try_acquire(1, Some(9)).unwrap())
+            .collect();
+        drop(ssd_work);
         assert!(budget.try_acquire(1, Some(11)).is_none());
         assert!(budget.try_acquire(1, None).is_none());
         drop(held);
@@ -2633,7 +2808,74 @@ mod tests {
 
     #[test]
     fn decoded_workset_budget_recovers_after_encoder_releases_result() {
-        let budget = MemoryBudget::new();
+        #[cfg(windows)]
+        {
+            let mib = 1024 * 1024;
+            let limits = super::super::limits::ThumbnailLimits {
+                process_memory_mb: 384,
+                total_memory_mb: 512,
+                ..Default::default()
+            };
+            let admits = super::super::native_worker::memory_admits;
+            assert!(admits([80 * mib, 0], [80 * mib, 0], 0, 80 * mib, &limits));
+            assert!(!admits([200 * mib, 0], [80 * mib, 0], 0, 80 * mib, &limits));
+            assert!(!admits(
+                [80 * mib, 240 * mib],
+                [80 * mib, 0],
+                0,
+                80 * mib,
+                &limits
+            ));
+            assert!(admits([80 * mib, 0], [0, 0], 0, 80 * mib, &limits));
+            let field_limits = super::super::limits::ThumbnailLimits::default();
+            // 真实现场：空闲进程的常驻内存让单个496MiB请求无法准入；新进程应可容纳。
+            assert!(!admits(
+                [621_944_832, 0],
+                [0, 0],
+                0,
+                496 * mib,
+                &field_limits
+            ));
+            assert!(admits([64 * mib, 0], [0, 0], 0, 496 * mib, &field_limits));
+            use super::super::native_worker::{memory_admission, MemoryAdmission};
+            assert_eq!(
+                memory_admission(
+                    [621_944_832, 0],
+                    [80 * mib, 0],
+                    0,
+                    496 * mib,
+                    &field_limits,
+                    false
+                ),
+                MemoryAdmission::Wait
+            );
+            assert_eq!(
+                memory_admission([621_944_832, 0], [0, 0], 0, 496 * mib, &field_limits, false),
+                MemoryAdmission::RecycleIdle
+            );
+            assert_eq!(
+                memory_admission([64 * mib, 0], [0, 0], 0, 496 * mib, &field_limits, true),
+                MemoryAdmission::Admit
+            );
+            assert_eq!(
+                memory_admission([621_944_832, 0], [0, 0], 0, 496 * mib, &field_limits, true),
+                MemoryAdmission::Unavailable
+            );
+            // 另一域仍在途也只等待，不能因本域空闲而终止其它请求。
+            assert_eq!(
+                memory_admission(
+                    [621_944_832, 0],
+                    [0, 80 * mib],
+                    0,
+                    496 * mib,
+                    &field_limits,
+                    false
+                ),
+                MemoryAdmission::Wait
+            );
+        }
+        let mut budget = MemoryBudget::new();
+        Arc::get_mut(&mut budget).unwrap().limit = MAX_INFLIGHT_DECODE_BYTES;
         let mut first = budget.try_reserve(MAX_SINGLE_RESERVATION_BYTES).unwrap();
         let second = budget.try_reserve(MAX_SINGLE_RESERVATION_BYTES).unwrap();
         assert!(budget.try_reserve(4 * 1024 * 1024).is_none());
@@ -2657,11 +2899,25 @@ mod tests {
         );
         drop(second);
         assert_eq!(*budget.reserved.lock().unwrap(), 0);
+        // 大图尚在解码时下一张不能进入；变换结束后保留编码额度，允许下一张并行。
+        let mut encoding = budget.try_reserve(UNCERTAIN_RESERVATION_BYTES).unwrap();
+        assert!(budget.try_reserve(UNCERTAIN_RESERVATION_BYTES).is_none());
+        encoding.shrink_to(super::super::native_protocol::ENCODING_RESERVATION_BYTES);
+        let decoding = budget.try_reserve(UNCERTAIN_RESERVATION_BYTES).unwrap();
+        assert_eq!(*budget.reserved.lock().unwrap(), MAX_INFLIGHT_DECODE_BYTES);
+        drop(encoding);
+        assert_eq!(
+            *budget.reserved.lock().unwrap(),
+            UNCERTAIN_RESERVATION_BYTES
+        );
+        drop(decoding);
+        assert_eq!(*budget.reserved.lock().unwrap(), 0);
     }
 
     #[test]
     fn shared_workset_wait_does_not_hold_heavy_permit() {
-        let budget = MemoryBudget::new();
+        let mut budget = MemoryBudget::new();
+        Arc::get_mut(&mut budget).unwrap().limit = MAX_INFLIGHT_DECODE_BYTES;
         let held = budget.try_reserve(MAX_INFLIGHT_DECODE_BYTES).unwrap();
         let heavy = crate::exotic::limiter::BackgroundHeavyLimiter::new(1);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
@@ -2710,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    fn viewport_exception_keeps_recovery_budget() {
+    fn retry_budget_distinguishes_pixels_from_worker_failure() {
         let (mut candidate, config) = image_candidate_and_config();
         candidate.item.width = 64;
         candidate.item.height = 64;
@@ -2722,7 +2978,8 @@ mod tests {
             config,
             epoch: 1,
             lane: ThumbnailLane::Exception,
-            exception_budget: true,
+            large_decode_budget: true,
+            worker_retries: 0,
             cancel: CancellationToken::new(),
             viewport_request: None,
             response,
@@ -2731,8 +2988,31 @@ mod tests {
         assert_eq!(estimated_decode_bytes(&job), UNCERTAIN_RESERVATION_BYTES);
         job.lane = ThumbnailLane::ViewportHeavy;
         assert_eq!(estimated_decode_bytes(&job), UNCERTAIN_RESERVATION_BYTES);
-        job.exception_budget = false;
+        job.large_decode_budget = false;
         assert!(estimated_decode_bytes(&job) < UNCERTAIN_RESERVATION_BYTES);
+        job.lane = ThumbnailLane::Exception;
+        assert!(estimated_decode_bytes(&job) < UNCERTAIN_RESERVATION_BYTES);
+        assert!(retry_or_stop(
+            &AppError::ThumbnailUnavailable("worker_lost"),
+            &job
+        ));
+        assert!(retry_or_stop(
+            &AppError::ThumbnailUnavailable("worker_unavailable"),
+            &job
+        ));
+        assert!(retry_or_stop(
+            &AppError::ThumbnailUnavailable("pixel_limit"),
+            &job
+        ));
+        assert!(!retry_or_stop(
+            &AppError::Internal("decode failed".into()),
+            &job
+        ));
+        job.large_decode_budget = true;
+        assert!(!retry_or_stop(
+            &AppError::ThumbnailUnavailable("pixel_limit"),
+            &job
+        ));
     }
 
     #[test]
@@ -2763,6 +3043,84 @@ mod tests {
 
     #[test]
     fn domain_backpressure_preserves_other_domain_and_direct_progress() {
+        use super::super::scheduler::{advance_run_phase, ThumbnailRunPhase as Phase};
+        assert_eq!(advance_run_phase(Phase::Fast, false, [0; 4]), Phase::Fast);
+        assert_eq!(
+            advance_run_phase(Phase::Fast, true, [0, 1, 1, 1]),
+            Phase::Heavy
+        );
+        assert_eq!(
+            advance_run_phase(Phase::Heavy, true, [0, 0, 1, 1]),
+            Phase::Exception
+        );
+        assert_eq!(
+            advance_run_phase(Phase::Exception, true, [0, 0, 0, 1]),
+            Phase::ImageRs
+        );
+        assert_eq!(
+            advance_run_phase(Phase::ImageRs, true, [0, 0, 0, 1]),
+            Phase::ImageRs
+        );
+        assert_eq!(
+            advance_run_phase(Phase::ImageRs, true, [0; 4]),
+            Phase::Video
+        );
+        #[cfg(windows)]
+        {
+            use super::super::native_protocol::NativeImageRoute;
+            assert_eq!(
+                native_image_route(ThumbnailLane::Fast),
+                NativeImageRoute::DeferImageRs
+            );
+            assert_eq!(
+                native_image_route(ThumbnailLane::Exception),
+                NativeImageRoute::DeferImageRs
+            );
+            assert_eq!(
+                native_image_route(ThumbnailLane::ImageRs),
+                NativeImageRoute::ImageRsOnly
+            );
+            assert_eq!(
+                native_image_route(ThumbnailLane::ViewportFast),
+                NativeImageRoute::Automatic
+            );
+        }
+        #[cfg(windows)]
+        {
+            let coordinator = ThumbnailCoordinator::new(10);
+            assert_eq!(coordinator.capacity, 3);
+            let tickets: Vec<_> = (0..super::super::limits::get().fast_threads_for(10))
+                .map(|_| coordinator.native.try_reserve(ThumbnailLane::Fast).unwrap())
+                .collect();
+            assert!(coordinator
+                .native
+                .try_reserve(ThumbnailLane::Fast)
+                .is_none());
+            assert!(coordinator
+                .native
+                .try_reserve(ThumbnailLane::Heavy)
+                .is_some());
+            drop(tickets);
+            assert_eq!(coordinator.native.available(), (true, true));
+            let low_core = ThumbnailCoordinator::new(1);
+            let tail: Vec<_> = (0..super::super::limits::get().tail_threads)
+                .map(|_| low_core.native.try_reserve(ThumbnailLane::Heavy).unwrap())
+                .collect();
+            assert!(low_core
+                .native
+                .try_reserve(ThumbnailLane::ViewportHeavy)
+                .is_none());
+            let fast = low_core
+                .native
+                .try_reserve(ThumbnailLane::ViewportFast)
+                .unwrap();
+            assert!(low_core.native.try_reserve(ThumbnailLane::Fast).is_none());
+            assert_eq!(low_core.native.available(), (false, false));
+            drop(fast);
+            assert_eq!(low_core.native.available(), (true, false));
+            drop(tail);
+            assert_eq!(low_core.native.available(), (true, true));
+        }
         let (candidate, config) = image_candidate_and_config();
         let (response, _replies) = crossbeam_channel::unbounded();
         let job = |lane| ImageJob {
@@ -2772,13 +3130,23 @@ mod tests {
             config: config.clone(),
             epoch: 1,
             lane,
-            exception_budget: lane == ThumbnailLane::Exception,
+            large_decode_budget: false,
+            worker_retries: 0,
             cancel: CancellationToken::new(),
             viewport_request: None,
             response: response.clone(),
             shared: None,
         };
         let mut queues = JobQueues::default();
+        queues.push(job(ThumbnailLane::ImageRs));
+        assert!(
+            queues.pop_ready(false, false, true).is_none(),
+            "软件批使用普通计算席位"
+        );
+        assert_eq!(
+            queues.pop_ready(false, true, false).unwrap().lane,
+            ThumbnailLane::ImageRs
+        );
         queues.push(job(ThumbnailLane::ViewportHeavy));
         queues.push(job(ThumbnailLane::Fast));
         assert_eq!(

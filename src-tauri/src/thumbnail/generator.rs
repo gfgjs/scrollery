@@ -528,6 +528,9 @@ pub struct EncodedThumbPayload {
 /// 隔离进程回包和宿主有界提交队列共用的单产物上限。
 pub const MAX_ENCODED_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 
+/// CPU 后处理分项数；顺序为 AI 缓存、缩放、色彩、ThumbHash、图片编码。
+pub const ENCODE_STAGE_COUNT: usize = 5;
+
 /// 编码目标缩略图和可选 AI 小图，不执行文件操作。
 pub fn encode_media_payload(
     item_id: i64,
@@ -535,6 +538,18 @@ pub fn encode_media_payload(
     config: &ThumbConfig,
     emit_ai_cache: bool,
 ) -> Result<EncodedThumbPayload> {
+    encode_media_payload_with_timings(item_id, decoded, config, emit_ai_cache)
+        .map(|(payload, _)| payload)
+}
+
+/// 返回相同编码产物及 CPU 后处理各阶段的微秒耗时，顺序见 ENCODE_STAGE_COUNT。
+/// AI 阶段包含按需生成的检查；图片编码包含既有失败回退。失败时不返回计时。
+pub fn encode_media_payload_with_timings(
+    item_id: i64,
+    decoded: crate::engine::traits::DecodedImage,
+    config: &ThumbConfig,
+    emit_ai_cache: bool,
+) -> Result<(EncodedThumbPayload, [u64; ENCODE_STAGE_COUNT])> {
     panic_guard("encode_media_payload", move || {
         encode_media_payload_inner(item_id, decoded, config, emit_ai_cache)
     })
@@ -545,7 +560,11 @@ fn encode_media_payload_inner(
     decoded: crate::engine::traits::DecodedImage,
     config: &ThumbConfig,
     emit_ai_cache: bool,
-) -> Result<EncodedThumbPayload> {
+) -> Result<(EncodedThumbPayload, [u64; ENCODE_STAGE_COUNT])> {
+    let mut timings = [0; ENCODE_STAGE_COUNT];
+    let micros =
+        |start: std::time::Instant| u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let started = std::time::Instant::now();
     // 次要产物失败不影响封面；文件存在性由宿主决定，编码域只消费像素。
     let mut ai_cache = if emit_ai_cache {
         match maybe_encode_ai_cache(&decoded, config) {
@@ -559,13 +578,24 @@ fn encode_media_payload_inner(
     } else {
         None
     };
+    if emit_ai_cache {
+        timings[0] = micros(started);
+    }
+    let started = std::time::Instant::now();
     let rgba_img = resize_to_rgba(decoded.pixels, decoded.width, decoded.height, config.size)?;
+    timings[1] = micros(started);
+    let started = std::time::Instant::now();
     let rgba_img = crate::editing::color::project_rgba8_to_srgb(rgba_img, decoded.icc.as_deref());
+    timings[2] = micros(started);
+    let started = std::time::Instant::now();
     let thumbhash =
         generate_thumbhash_rgba(rgba_img.as_raw(), rgba_img.width(), rgba_img.height()).ok();
+    timings[3] = micros(started);
+    let started = std::time::Instant::now();
     let webp = crate::thumbnail::exif_thumb::encode_as_webp(&rgba_img, config.webp_quality)
         .or_else(|_| crate::thumbnail::exif_thumb::encode_as_jpeg(&rgba_img))
         .map_err(|_| AppError::Internal("WebP encode failed".into()))?;
+    timings[4] = micros(started);
     if webp.len() > MAX_ENCODED_ARTIFACT_BYTES {
         return Err(AppError::Internal(
             "encoded thumbnail exceeds result limit".into(),
@@ -579,11 +609,14 @@ fn encode_media_payload_inner(
             "AI cache exceeds result limit (best-effort)");
         ai_cache = None;
     }
-    Ok(EncodedThumbPayload {
-        webp,
-        thumbhash,
-        ai_cache,
-    })
+    Ok((
+        EncodedThumbPayload {
+            webp,
+            thumbhash,
+            ai_cache,
+        },
+        timings,
+    ))
 }
 
 /// 宿主按可信配置确定路径，并将编码结果原子写入缓存。
@@ -648,7 +681,7 @@ fn encode_media_step_inner(
     config: &ThumbConfig,
 ) -> Result<ThumbResult> {
     let emit_ai_cache = needs_ai_cache(config, cache_key);
-    let payload = encode_media_payload_inner(item_id, decoded, config, emit_ai_cache)?;
+    let (payload, _) = encode_media_payload_inner(item_id, decoded, config, emit_ai_cache)?;
     write_encoded_media_payload(item_id, source_revision, cache_key, payload, config)
 }
 
@@ -761,9 +794,68 @@ fn resize_short_edge_rgba(
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    use fast_image_resize::{
+        images::{Image as FirImage, ImageRef},
+        pixels::PixelType,
+        ResizeOptions, Resizer,
+    };
 
     #[test]
     fn image_variants_keep_task_identity_and_serve_smaller_output() {
+        // 同一缩略图产物流程锁住占位图比例、颜色和透明度；参考为原先的Lanczos3降采样。
+        let rgba = image::RgbaImage::from_fn(512, 256, |x, y| {
+            image::Rgba([
+                (x / 2) as u8,
+                y as u8,
+                ((x + y) / 3) as u8,
+                if x < 128 { 0 } else { 255 },
+            ])
+        });
+        let source = ImageRef::new(512, 256, rgba.as_raw(), PixelType::U8x4).unwrap();
+        let mut reference = FirImage::new(100, 50, PixelType::U8x4);
+        let started = std::time::Instant::now();
+        Resizer::new()
+            .resize(&source, &mut reference, &ResizeOptions::default())
+            .unwrap();
+        let resize_us = started.elapsed().as_micros();
+        let started = std::time::Instant::now();
+        let reference_hash = thumbhash::rgba_to_thumb_hash(100, 50, reference.buffer());
+        let hash_us = started.elapsed().as_micros();
+        let started = std::time::Instant::now();
+        let actual_hash = generate_thumbhash_rgba(rgba.as_raw(), 512, 256).unwrap();
+        eprintln!(
+            "synthetic_thumbhash legacy_resize_us={resize_us} hash_us={hash_us} actual_us={}",
+            started.elapsed().as_micros()
+        );
+        assert_eq!(actual_hash, reference_hash, "透明输入保持原占位图字节");
+        let mut opaque = rgba.clone();
+        for pixel in opaque.pixels_mut() {
+            pixel.0[3] = 255;
+        }
+        let opaque_source = ImageRef::new(512, 256, opaque.as_raw(), PixelType::U8x4).unwrap();
+        let started = std::time::Instant::now();
+        Resizer::new()
+            .resize(&opaque_source, &mut reference, &ResizeOptions::default())
+            .unwrap();
+        let opaque_reference = thumbhash::rgba_to_thumb_hash(100, 50, reference.buffer());
+        let legacy_us = started.elapsed().as_micros();
+        let started = std::time::Instant::now();
+        let opaque_hash = generate_thumbhash_rgba(opaque.as_raw(), 512, 256).unwrap();
+        eprintln!(
+            "opaque_thumbhash legacy_us={legacy_us} actual_us={}",
+            started.elapsed().as_micros()
+        );
+        assert_eq!(
+            opaque_hash, opaque_reference,
+            "跳过恒等alpha乘除不改变占位图字节"
+        );
+        let average = thumbhash::thumb_hash_to_average_rgba(&actual_hash).unwrap();
+        assert!((0.70..0.80).contains(&average.3));
+        assert!(average.0 > 0.55 && average.1 > 0.4 && average.2 > 0.4);
+        assert!(thumbhash::thumb_hash_to_approximate_aspect_ratio(&actual_hash).unwrap() > 1.5);
+        let narrow = image::RgbaImage::from_pixel(1, 512, image::Rgba([0, 80, 200, 255]));
+        let narrow_hash = generate_thumbhash_rgba(narrow.as_raw(), 1, 512).unwrap();
+        assert!(thumbhash::thumb_hash_to_approximate_aspect_ratio(&narrow_hash).unwrap() < 0.2);
         let directory = tempfile::tempdir().unwrap();
         let mut config = ThumbConfig {
             cache_dir: directory.path().to_path_buf(),

@@ -13,8 +13,8 @@ if (process.platform !== 'win32') {
 const isDev = process.argv.includes('--dev');
 const profile = isDev ? 'debug' : 'release';
 if (process.arch === 'x64') {
-  // 不自动获取第三方源码；dispatcher 须由维护者显式准备，薄桥随本项目源码重编。
-  const bridge = spawnSync(process.execPath, [path.join(repo, 'scripts/build-vpl-bridge.mjs')], {
+  // 开发启动允许按需准备 dispatcher，薄桥随本项目源码重编。
+  const bridge = spawnSync(process.execPath, [path.join(repo, 'scripts/build-vpl-bridge.mjs'), ...(isDev ? ['--dev'] : [])], {
     cwd: repo, stdio: 'inherit', shell: false, windowsHide: true,
   });
   if (bridge.status !== 0) process.exit(bridge.status ?? 1);

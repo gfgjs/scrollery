@@ -55,7 +55,7 @@ export interface SettingSpec {
   /** 改名后仍可检索的原术语。 */
   searchTermsKey?: string
   /** 数字控件旁的单位。 */
-  unit?: 'px' | '%' | 'KB' | 'MB'
+  unit?: 'px' | '%' | 'KB' | 'MB' | 'MiB'
   section: SettingsSection
   /** 控件形态:toggle/select/number 走 DynamicSettingControl 通用分派;
    *  button=动作按钮;segmented/custom=特例控件。 */
@@ -348,6 +348,72 @@ export const SETTINGS_MAP = {
     control: 'segmented',
   },
   // WebP 编码质量:1..=99 有损,100=无损(encode_as_webp 契约);变更即复位存量重生成。
+  thumbFastThreads: {
+    icon: Gauge,
+    label: 'settings.thumbFastThreads',
+    descKey: 'settings.thumbFastThreadsDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 0,
+    max: 64,
+  },
+  thumbTailThreads: {
+    icon: Gauge,
+    label: 'settings.thumbTailThreads',
+    descKey: 'settings.thumbTailThreadsDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 1,
+    max: 16,
+  },
+  thumbGpuInflight: {
+    icon: Gauge,
+    label: 'settings.thumbGpuInflight',
+    descKey: 'settings.thumbGpuInflightDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 1,
+    max: 64,
+  },
+  thumbGpuPerAdapter: {
+    icon: Gauge,
+    label: 'settings.thumbGpuPerAdapter',
+    descKey: 'settings.thumbGpuPerAdapterDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 1,
+    max: 64,
+  },
+  thumbProcessMemoryMb: {
+    icon: Gauge,
+    label: 'settings.thumbProcessMemoryMb',
+    descKey: 'settings.thumbProcessMemoryMbDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 128,
+    max: 16384,
+    unit: 'MiB',
+  },
+  thumbTotalMemoryMb: {
+    icon: Gauge,
+    label: 'settings.thumbTotalMemoryMb',
+    descKey: 'settings.thumbTotalMemoryMbDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 128,
+    max: 32768,
+    unit: 'MiB',
+  },
+  thumbWorksetMb: {
+    icon: Gauge,
+    label: 'settings.thumbWorksetMb',
+    descKey: 'settings.thumbWorksetMbDesc',
+    section: 'thumbnails',
+    control: 'number',
+    min: 512,
+    max: 16384,
+    unit: 'MiB',
+  },
   thumbWebpQuality: {
     icon: Image,
     label: 'settings.thumbWebpQuality',

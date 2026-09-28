@@ -23,8 +23,8 @@ pub fn generate_thumbhash_rgba(rgba: &[u8], width: u32, height: u32) -> Result<V
     // 如果需要则缩小
     let (pixels, width, height) = if width > HASH_MAX_DIM || height > HASH_MAX_DIM {
         let ratio = (HASH_MAX_DIM as f32) / (width.max(height) as f32);
-        let new_w = ((width as f32) * ratio).round() as u32;
-        let new_h = ((height as f32) * ratio).round() as u32;
+        let new_w = (((width as f32) * ratio).round() as u32).max(1);
+        let new_h = (((height as f32) * ratio).round() as u32).max(1);
 
         // 使用 fast_image_resize v4 进行降采样（缩小）
         use fast_image_resize::pixels::PixelType;
@@ -36,11 +36,14 @@ pub fn generate_thumbhash_rgba(rgba: &[u8], width: u32, height: u32) -> Result<V
         let src = ImageRef::new(width.max(1), height.max(1), rgba, PixelType::U8x4)
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
-        let mut dst = FirImage::new(new_w.max(1), new_h.max(1), PixelType::U8x4);
+        let mut dst = FirImage::new(new_w, new_h, PixelType::U8x4);
 
         let mut resizer = Resizer::new();
+        // JPEG等不透明输入无需乘除alpha，也无需整幅中间缓冲；保留原Lanczos3滤镜。
+        let has_transparency = rgba.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255);
+        let options = ResizeOptions::new().use_alpha(has_transparency);
         resizer
-            .resize(&src, &mut dst, &ResizeOptions::default())
+            .resize(&src, &mut dst, &options)
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
         (Cow::Owned(dst.into_vec()), new_w, new_h)

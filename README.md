@@ -69,7 +69,9 @@ After cloning the repository:
 npm install
 ```
 
-On Windows x64, prepare the pinned Intel VPL dispatcher before the first development run or release build. This downloads and compiles third-party source using Visual Studio's C++ and CMake tools. Repeat after removing `target/native-vpl` or changing the pinned VPL version:
+On Windows x64, `npm run tauri dev` automatically prepares the pinned Intel VPL dispatcher when its source or installed static library is missing, including after removing `target/native-vpl`. The first run downloads and compiles third-party source using Visual Studio's C++ and CMake tools; subsequent runs reuse it. An existing source checkout must match the pinned commit.
+
+Before a release build, prepare the dispatcher explicitly if it is missing:
 
 ```bash
 node scripts/build-vpl-dispatcher.mjs

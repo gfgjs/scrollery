@@ -3,6 +3,7 @@ pub mod cache;
 pub mod coordinator;
 pub mod exif_thumb;
 pub mod generator;
+pub mod limits;
 #[cfg(windows)]
 mod native_adapter;
 pub mod native_protocol;

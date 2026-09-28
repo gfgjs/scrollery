@@ -281,6 +281,13 @@ const numberBindings: Record<string, { get: () => number; set: (v: number) => vo
     set: (v) => void config.setThumbCacheMaxMb(v),
   },
   // 编码质量(100=无损):后端复位存量项后 data_version 已 bump,布局出口自会取到新状态。
+  thumbFastThreads: { get: () => config.thumbFastThreads, set: (v) => void config.setThumbFastThreads(v) },
+  thumbTailThreads: { get: () => config.thumbTailThreads, set: (v) => void config.setThumbTailThreads(v) },
+  thumbGpuInflight: { get: () => config.thumbGpuInflight, set: (v) => void config.setThumbGpuInflight(v) },
+  thumbGpuPerAdapter: { get: () => config.thumbGpuPerAdapter, set: (v) => void config.setThumbGpuPerAdapter(v) },
+  thumbProcessMemoryMb: { get: () => config.thumbProcessMemoryMb, set: (v) => void config.setThumbProcessMemoryMb(v) },
+  thumbTotalMemoryMb: { get: () => config.thumbTotalMemoryMb, set: (v) => void config.setThumbTotalMemoryMb(v) },
+  thumbWorksetMb: { get: () => config.thumbWorksetMb, set: (v) => void config.setThumbWorksetMb(v) },
   thumbWebpQuality: {
     get: () => config.thumbWebpQuality,
     set: (v) => void config.setThumbWebpQuality(v),

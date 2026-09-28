@@ -2,11 +2,9 @@
 
 use std::sync::Mutex;
 
-pub(crate) const GPU_INFLIGHT_LIMIT: usize = 2;
-
 #[derive(Default)]
 struct State {
-    occupied: [bool; GPU_INFLIGHT_LIMIT],
+    occupied: Vec<bool>,
     peak: usize,
     denied: u64,
 }
@@ -17,9 +15,11 @@ struct GpuBudget(Mutex<State>);
 impl GpuBudget {
     fn try_acquire(&self, fast: bool) -> Option<GpuPermit<'_>> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        // 0 号留给快速域；快速域可借空闲的 1 号，尾批/宿主重型视频只取 1 号。
-        let index =
-            (if fast { 0 } else { 1 }..GPU_INFLIGHT_LIMIT).find(|index| !state.occupied[*index]);
+        let limit = crate::thumbnail::limits::get().gpu_inflight;
+        state.occupied.resize(limit, false);
+        // 多槽时为快速域留一席；单槽时两类任务共享。
+        let index = (if fast { 0 } else { usize::from(limit > 1) }..limit)
+            .find(|index| !state.occupied[*index]);
         let Some(index) = index else {
             state.denied = state.denied.saturating_add(1);
             return None;
@@ -51,7 +51,7 @@ impl Drop for GpuPermit<'_> {
 }
 
 static BUDGET: GpuBudget = GpuBudget(Mutex::new(State {
-    occupied: [false; GPU_INFLIGHT_LIMIT],
+    occupied: Vec::new(),
     peak: 0,
     denied: 0,
 }));

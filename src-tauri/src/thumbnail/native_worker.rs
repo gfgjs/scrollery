@@ -1,4 +1,4 @@
-//! Windows 原生缩略图执行域：fast 有限并行、tail 串行；超时终止并确认子进程退出。
+//! Windows 原生缩略图执行域：fast/tail 有界并行；超时终止并确认子进程退出。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -37,13 +37,12 @@ use super::native_protocol::{
 
 use super::qos::{native_timeout, SourceMedia};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const WORKER_JOB_MEMORY_BYTES: usize = 512 * 1024 * 1024;
-const WORKER_PROCESS_MEMORY_BYTES: usize = 384 * 1024 * 1024;
 
 type ReportedDevice = (NativeBackend, u32, u32, i32, u32);
 type NativeReply = std::result::Result<(EncodedThumbPayload, NativeExecution, NativeTimings), u8>;
 
 pub struct NativeWorkers {
+    memory: Arc<Mutex<[u64; 2]>>,
     fast: Domain,
     tail: Domain,
     reported_devices: Mutex<HashSet<ReportedDevice>>,
@@ -59,6 +58,7 @@ pub struct NativeWorkers {
     request_wall: LatencyStats,
     decode_transform: LatencyStats,
     encode_hash: LatencyStats,
+    encode_stages: [LatencyStats; super::generator::ENCODE_STAGE_COUNT],
     embedded_jpeg_combined: LatencyStats,
 }
 
@@ -135,8 +135,8 @@ impl WorkerJob {
                 | JOB_OBJECT_LIMIT_PROCESS_MEMORY.0
                 | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.0,
         );
-        limits.JobMemoryLimit = WORKER_JOB_MEMORY_BYTES;
-        limits.ProcessMemoryLimit = WORKER_PROCESS_MEMORY_BYTES;
+        limits.JobMemoryLimit = super::limits::get().total_memory_bytes();
+        limits.ProcessMemoryLimit = super::limits::get().process_memory_bytes();
         // SAFETY: 传入完整的 ExtendedLimitInformation，调用结束前结构始终有效。
         let set = unsafe {
             SetInformationJobObject(
@@ -193,6 +193,83 @@ struct Domain {
 pub(super) struct DomainTicket {
     release: crossbeam_channel::Sender<()>,
     fast: bool,
+    memory: Option<NativeMemoryPermit>,
+}
+
+// 像素预算之外预留进程运行库与原生后端增长空间；Job 硬限仍是最后边界。
+const PROCESS_HEADROOM: u64 = 64 * 1024 * 1024;
+const GPU_REQUEST_HEADROOM: u64 = 64 * 1024 * 1024;
+
+struct NativeMemoryPermit {
+    reserved: Arc<Mutex<[u64; 2]>>,
+    domain: usize,
+    bytes: u64,
+    pixels: u64,
+}
+
+impl NativeMemoryPermit {
+    fn shrink_to(&mut self, bytes: u64) {
+        if bytes < self.bytes {
+            self.reserved.lock().unwrap_or_else(|e| e.into_inner())[self.domain] -=
+                self.bytes - bytes;
+            self.bytes = bytes;
+        }
+    }
+}
+
+impl Drop for NativeMemoryPermit {
+    fn drop(&mut self) {
+        self.shrink_to(0);
+    }
+}
+
+pub(super) fn memory_admits(
+    private: [u64; 2],
+    reserved: [u64; 2],
+    domain: usize,
+    bytes: u64,
+    limits: &super::limits::ThumbnailLimits,
+) -> bool {
+    // 已用内存与未完成请求的最坏增长同时计入，避免“软预算通过、Job 分配失败”。
+    private[domain]
+        .saturating_add(reserved[domain])
+        .saturating_add(bytes)
+        .saturating_add(PROCESS_HEADROOM)
+        <= limits.process_memory_bytes() as u64
+        && private
+            .iter()
+            .sum::<u64>()
+            .saturating_add(reserved.iter().sum::<u64>())
+            .saturating_add(bytes)
+            .saturating_add(PROCESS_HEADROOM)
+            <= limits.total_memory_bytes() as u64
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MemoryAdmission {
+    Admit,
+    Wait,
+    RecycleIdle,
+    Unavailable,
+}
+
+pub(super) fn memory_admission(
+    private: [u64; 2],
+    reserved: [u64; 2],
+    domain: usize,
+    bytes: u64,
+    limits: &super::limits::ThumbnailLimits,
+    recycled: bool,
+) -> MemoryAdmission {
+    if memory_admits(private, reserved, domain, bytes, limits) {
+        MemoryAdmission::Admit
+    } else if reserved.iter().any(|bytes| *bytes != 0) {
+        MemoryAdmission::Wait
+    } else if !recycled {
+        MemoryAdmission::RecycleIdle
+    } else {
+        MemoryAdmission::Unavailable
+    }
 }
 
 pub(super) struct NativePending {
@@ -211,6 +288,10 @@ impl NativePending {
     pub(super) fn source_done(&self) -> bool {
         self.reply.source_done
     }
+
+    pub(super) fn encoding_ready(&self) -> bool {
+        self.reply.encoding_ready
+    }
 }
 
 impl Drop for NativePending {
@@ -225,6 +306,7 @@ impl Drop for NativePending {
 struct PendingReply {
     gpu_done: bool,
     source_done: bool,
+    encoding_ready: bool,
     receiver: crossbeam_channel::Receiver<Reply>,
     id: u64,
     qos_revision: u64,
@@ -262,6 +344,7 @@ impl PendingReply {
                     && match stage {
                         NativeStage::GpuDone => !self.gpu_done && !self.source_done,
                         NativeStage::SourceDone => self.gpu_done && !self.source_done,
+                        NativeStage::EncodingReady => self.source_done && !self.encoding_ready,
                     };
                 if !valid {
                     return Some(Err(io::Error::new(
@@ -272,6 +355,7 @@ impl PendingReply {
                 match stage {
                     NativeStage::GpuDone => self.gpu_done = true,
                     NativeStage::SourceDone => self.source_done = true,
+                    NativeStage::EncodingReady => self.encoding_ready = true,
                 }
                 continue;
             }
@@ -336,8 +420,9 @@ impl NativeWorkers {
     pub fn new(fast_capacity: usize) -> Self {
         let job = Arc::new(Mutex::new(None));
         Self {
-            fast: Domain::new(true, fast_capacity.clamp(1, 4), Arc::clone(&job)),
-            tail: Domain::new(false, 1, job),
+            memory: Arc::new(Mutex::new([0; 2])),
+            fast: Domain::new(true, fast_capacity.max(1), Arc::clone(&job)),
+            tail: Domain::new(false, super::limits::get().tail_threads, job),
             reported_devices: Mutex::new(HashSet::new()),
             reported_deadlines: Mutex::new(HashSet::new()),
             backend_completed: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -351,6 +436,7 @@ impl NativeWorkers {
             request_wall: LatencyStats::new(),
             decode_transform: LatencyStats::new(),
             encode_hash: LatencyStats::new(),
+            encode_stages: std::array::from_fn(|_| LatencyStats::new()),
             embedded_jpeg_combined: LatencyStats::new(),
         }
     }
@@ -412,7 +498,7 @@ impl NativeWorkers {
             gpu_inflight,
             gpu_peak,
             gpu_denied,
-            gpu_limit: crate::engine::gpu::budget::GPU_INFLIGHT_LIMIT,
+            gpu_limit: super::limits::get().gpu_inflight,
             embedded_jpeg: counts[0],
             image_d2d: counts[1],
             image_wic: counts[2],
@@ -430,6 +516,7 @@ impl NativeWorkers {
             request_wall: self.request_wall.snapshot(),
             decode_transform: self.decode_transform.snapshot(),
             encode_hash: self.encode_hash.snapshot(),
+            encode_stages: self.encode_stages.each_ref().map(LatencyStats::snapshot),
             embedded_jpeg_combined: self.embedded_jpeg_combined.snapshot(),
             host_working_set_bytes: host_memory.map(|memory| memory.working_set_bytes),
             host_private_bytes: host_memory.map(|memory| memory.private_bytes),
@@ -446,7 +533,10 @@ impl NativeWorkers {
     }
 
     fn domain(&self, lane: ThumbnailLane) -> &Domain {
-        if matches!(lane, ThumbnailLane::Fast | ThumbnailLane::ViewportFast) {
+        if matches!(
+            lane,
+            ThumbnailLane::Fast | ThumbnailLane::ViewportFast | ThumbnailLane::ImageRs
+        ) {
             &self.fast
         } else {
             &self.tail
@@ -467,6 +557,72 @@ impl NativeWorkers {
         Some(ticket)
     }
 
+    /// 领取计算槽前检查整个原生进程及合计内存；繁忙时回到宿主队列等待。
+    pub(super) fn try_admit(
+        &self,
+        lane: ThumbnailLane,
+        bytes: u64,
+        gpu: bool,
+    ) -> Result<Option<DomainTicket>> {
+        let Some(mut ticket) = self.try_reserve(lane) else {
+            return Ok(None);
+        };
+        let domain = self.domain(lane);
+        let mut reserved = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        let index = usize::from(!ticket.fast);
+        let limits = super::limits::get();
+        let gpu_bytes = if gpu { GPU_REQUEST_HEADROOM } else { 0 };
+        // 单张超大图也不能获得超过进程硬限的像素额度；worker 按真实尺寸拒绝超额。
+        let pixels = bytes.min(
+            (limits.process_memory_bytes() as u64).saturating_sub(PROCESS_HEADROOM * 2 + gpu_bytes),
+        );
+        let charge = pixels.saturating_add(gpu_bytes);
+        let mut recycled = false;
+        loop {
+            domain.process().map_err(|error| {
+                tracing::error!(target: "scrollery::thumb_perf", %error,
+                    "native thumbnail execution domain unavailable");
+                AppError::ThumbnailUnavailable("worker_unavailable")
+            })?;
+            let mut private = [0; 2];
+            for (index, domain) in [&self.fast, &self.tail].into_iter().enumerate() {
+                if let Some(process) = domain.current_process() {
+                    // 日志可跳过采样，准入不能把采样失败解释为零内存。
+                    let child = process.child.lock().unwrap_or_else(|e| e.into_inner());
+                    private[index] = process_memory(HANDLE(child.as_raw_handle()))
+                        .ok_or(AppError::ThumbnailUnavailable("worker_memory_limit"))?
+                        .private_bytes;
+                }
+            }
+            match memory_admission(private, *reserved, index, charge, limits, recycled) {
+                MemoryAdmission::Admit => break,
+                MemoryAdmission::Wait => return Ok(None),
+                MemoryAdmission::RecycleIdle => {
+                    // 准入锁阻止新预留，两域已无在途项；回收原生缓存后只重查一次。
+                    tracing::info!(target: "scrollery::thumb_perf", ?private, charge,
+                        "recycling idle native thumbnail workers for memory admission");
+                    self.fast.recycle_idle()?;
+                    self.tail.recycle_idle()?;
+                    recycled = true;
+                }
+                MemoryAdmission::Unavailable => {
+                    tracing::warn!(target: "scrollery::thumb_perf", ?private, charge,
+                        process_limit = limits.process_memory_bytes(), total_limit = limits.total_memory_bytes(),
+                        "native thumbnail memory limit cannot admit one request after idle recycle");
+                    return Err(AppError::ThumbnailUnavailable("worker_memory_limit"));
+                }
+            }
+        }
+        reserved[index] += charge;
+        ticket.memory = Some(NativeMemoryPermit {
+            reserved: Arc::clone(&self.memory),
+            domain: index,
+            bytes: charge,
+            pixels,
+        });
+        Ok(Some(ticket))
+    }
+
     pub(super) fn start(
         &self,
         ticket: DomainTicket,
@@ -477,6 +633,14 @@ impl NativeWorkers {
         media: SourceMedia,
     ) -> Result<NativePending> {
         let domain = if ticket.fast { &self.fast } else { &self.tail };
+        if let Some(memory) = &ticket.memory {
+            request.max_pixel_bytes =
+                request
+                    .max_pixel_bytes
+                    .min(super::native_protocol::pixel_limit_for_reservation(
+                        memory.pixels,
+                    ));
+        }
         let process = domain.process().map_err(|error| {
             tracing::debug!(target: "scrollery::thumb_perf", %error, "native worker unavailable");
             AppError::ThumbnailUnavailable("worker_unavailable")
@@ -494,8 +658,10 @@ impl NativeWorkers {
             request.prefer_gpu = false;
         }
         (request.qos_foreground, request.qos_revision) = super::qos::native_worker_qos_request();
-        let timeout = native_timeout(domain.fast, media, request.qos_foreground);
-        let background_timeout = native_timeout(domain.fast, media, false);
+        // 软件尾批共用普通计算槽，但其中仍可能包含大图，使用既有重型截止。
+        let fast_deadline = domain.fast && lane != ThumbnailLane::ImageRs;
+        let timeout = native_timeout(fast_deadline, media, request.qos_foreground);
+        let background_timeout = native_timeout(fast_deadline, media, false);
         if self
             .reported_deadlines
             .lock()
@@ -538,6 +704,11 @@ impl NativeWorkers {
             .reply
             .apply_qos_revision(super::qos::native_worker_qos_request().1);
         let response = pending.reply.poll();
+        if pending.reply.encoding_ready {
+            if let Some(memory) = &mut pending._ticket.memory {
+                memory.shrink_to(super::native_protocol::ENCODING_RESERVATION_BYTES);
+            }
+        }
         if pending.reply.gpu_done {
             drop(pending._gpu.take());
         }
@@ -588,6 +759,10 @@ impl NativeWorkers {
                 if timings.encode_hash_us > 0 {
                     self.encode_hash
                         .record(Duration::from_micros(timings.encode_hash_us));
+                    // 零耗时也计入同一批成功请求；AI 未请求或空操作不会抬高分项均值。
+                    for (stats, micros) in self.encode_stages.iter().zip(timings.encode_stages_us) {
+                        stats.record(Duration::from_micros(micros));
+                    }
                 }
                 if timings.embedded_jpeg_combined_us > 0 {
                     self.embedded_jpeg_combined
@@ -648,7 +823,13 @@ impl NativeWorkers {
                 Ok((payload, execution))
             }
             Ok(Err(code)) => {
+                if code == super::native_protocol::IMAGE_RS_DEFERRED {
+                    return Err(AppError::ThumbnailUnavailable("image_rs_deferred"));
+                }
                 self.failed_responses.fetch_add(1, Ordering::Relaxed);
+                if code == 6 {
+                    return Err(AppError::ThumbnailUnavailable("pixel_limit"));
+                }
                 Err(AppError::Internal(format!(
                     "native thumbnail decode failed: {code}"
                 )))
@@ -714,6 +895,24 @@ impl Domain {
         );
     }
 
+    // 调用方必须持有共享准入锁并确认两域预留均为零，不能终止任何在途任务。
+    fn recycle_idle(&self) -> Result<()> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(process) = slot.process.as_ref() {
+            let was_alive = process.alive.load(Ordering::Acquire);
+            // 确认退出后才释放槽位，否则不能假定旧进程占用的内存已归还。
+            process
+                .terminate_with_exit_code()
+                .ok_or(AppError::ThumbnailUnavailable("worker_unavailable"))?;
+            slot.process = None;
+            if was_alive {
+                // 受控回收只替换健康进程，不归零既有故障重启计数。
+                slot.starts = slot.starts.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
     fn current_process(&self) -> Option<Arc<WorkerProcess>> {
         self.slot
             .lock()
@@ -729,6 +928,7 @@ impl Domain {
         Some(DomainTicket {
             release: self.release.clone(),
             fast: self.fast,
+            memory: None,
         })
     }
 
@@ -763,8 +963,9 @@ impl Domain {
             target: "scrollery::thumb_perf",
             domain = if self.fast { "fast" } else { "tail" },
             parallelism = self.capacity,
-            job_memory_limit_bytes = WORKER_JOB_MEMORY_BYTES,
-            process_memory_limit_bytes = WORKER_PROCESS_MEMORY_BYTES,
+            resource_settings = ?super::limits::get(),
+            job_memory_limit_bytes = super::limits::get().total_memory_bytes(),
+            process_memory_limit_bytes = super::limits::get().process_memory_bytes(),
             "native thumbnail worker ready"
         );
         slot.process = Some(Arc::clone(&process));
@@ -806,6 +1007,11 @@ impl WorkerProcess {
     fn spawn(fast: bool, capacity: usize, job: Arc<WorkerJob>) -> Result<Arc<Self>> {
         let exe = std::env::current_exe()?.with_file_name("native-thumbnail-worker.exe");
         let mut command = Command::new(exe);
+        command.arg(format!("--threads={capacity}"));
+        command.arg(format!(
+            "--thumbnail-limits={}",
+            serde_json::to_string(super::limits::get()).expect("thumbnail limits")
+        ));
         command.arg(if fast {
             format!("--fast={capacity}")
         } else {
@@ -851,7 +1057,18 @@ impl WorkerProcess {
             if hello_tx.send(handshake).is_err() {
                 return;
             }
-            while let Ok(response) = read_response(&mut stdout) {
+            loop {
+                let response = match read_response(&mut stdout) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        // 协议错误必须保留原始原因，不能只在上层表现为批量 BrokenPipe。
+                        if reader_alive.load(Ordering::Acquire) {
+                            tracing::warn!(target: "scrollery::thumb_perf", %error, capacity,
+                                "native thumbnail response read failed");
+                        }
+                        break;
+                    }
+                };
                 let id = match &response {
                     NativeResponse::Ok { id, .. }
                     | NativeResponse::Failed { id, .. }
@@ -928,7 +1145,8 @@ impl WorkerProcess {
             }
         }
         request.file_handle = transferred.0 as usize as u64;
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded(3);
+        // 三个标量阶段加最终回包，reader 不因宿主尚未轮询而丢失完成消息。
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(4);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -949,6 +1167,7 @@ impl WorkerProcess {
         Ok(PendingReply {
             gpu_done: false,
             source_done: false,
+            encoding_ready: false,
             receiver: reply_rx,
             id,
             qos_revision: request.qos_revision,
@@ -1003,7 +1222,7 @@ mod tests {
         use std::os::windows::process::CommandExt;
         // 故障子进程使用同一握手、Job、reader及终止出口；读取触发字节后挂起或写非法回包。
         let script = format!(
-            r#"$out=[Console]::OpenStandardOutput();$out.Write([byte[]](78,84,72,69),0,4);$out.Flush();$null=[Console]::OpenStandardInput().ReadByte();{};Start-Sleep -Seconds 15"#,
+            r#"$out=[Console]::OpenStandardOutput();$out.Write([byte[]](78,84,72,70),0,4);$out.Flush();$null=[Console]::OpenStandardInput().ReadByte();{};Start-Sleep -Seconds 15"#,
             if malformed {
                 "$out.Write((New-Object byte[] 27),0,27);$out.Flush()"
             } else {
@@ -1034,6 +1253,7 @@ mod tests {
             reply: PendingReply {
                 gpu_done: false,
                 source_done: false,
+                encoding_ready: false,
                 receiver,
                 id: 1,
                 qos_revision: super::super::qos::native_worker_qos_request().1,
@@ -1096,10 +1316,105 @@ mod tests {
 
     #[test]
     fn pending_reply_enforces_deadline_and_identity() {
+        use super::super::native_protocol::{write_response, NativeTimings};
+
+        // 回包槽号随实际进程容量变化；成功与格式失败都必须穿过真实编解包和 QoS 记账。
+        let mut receipts = vec![None; 9];
+        for worker_slot in 1..=9 {
+            let qos = NativeQosAck {
+                worker_slot,
+                sequence: 1,
+                revision: 3,
+                applied: true,
+                attempted: true,
+            };
+            let responses = [
+                NativeResponse::Ok {
+                    id: 1,
+                    payload: EncodedThumbPayload {
+                        webp: vec![1],
+                        thumbhash: None,
+                        ai_cache: None,
+                    },
+                    execution: NativeExecution::cpu(NativeBackend::ImageRs),
+                    timings: NativeTimings {
+                        decode_transform_us: 10_000,
+                        encode_hash_us: 12_000,
+                        embedded_jpeg_combined_us: 0,
+                        encode_stages_us: [300, 400, 500, 600, 700],
+                    },
+                    qos,
+                },
+                NativeResponse::Failed {
+                    id: 1,
+                    code: 3,
+                    qos,
+                },
+            ];
+            for response in responses {
+                let mut bytes = Vec::new();
+                write_response(&mut bytes, &response).unwrap();
+                let ack = match read_response(&bytes[..]).unwrap() {
+                    NativeResponse::Ok { qos, timings, .. } => {
+                        assert_eq!(timings.decode_transform_us, 10_000);
+                        assert_eq!(timings.encode_hash_us, 12_000);
+                        assert_eq!(timings.encode_stages_us, [300, 400, 500, 600, 700]);
+                        // 计时字段必须完整且有界，不能把错误的扩展头当成产物长度读取。
+                        let stages_offset = 1 + 8 + 18 + 18 + 24;
+                        let mut malformed = bytes.clone();
+                        malformed[stages_offset..stages_offset + 8]
+                            .copy_from_slice(&u64::MAX.to_le_bytes());
+                        assert_eq!(
+                            read_response(&malformed[..]).err().unwrap().kind(),
+                            io::ErrorKind::InvalidData
+                        );
+                        assert_eq!(
+                            read_response(&bytes[..stages_offset + 39])
+                                .err()
+                                .unwrap()
+                                .kind(),
+                            io::ErrorKind::UnexpectedEof
+                        );
+                        qos
+                    }
+                    NativeResponse::Failed { qos, .. } => qos,
+                    _ => panic!("expected final response"),
+                };
+                assert_eq!(ack.worker_slot, worker_slot);
+                record_qos_receipt(&mut receipts, ack).unwrap();
+                bytes[18] = 0;
+                assert_eq!(
+                    read_response(&bytes[..]).err().unwrap().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+        }
+        assert!(receipts.iter().all(Option::is_some));
+        let stats = LatencyStats::new();
+        stats.record(Duration::from_micros(700));
+        stats.record(Duration::from_micros(700));
+        stats.record(Duration::ZERO);
+        let summary = stats.snapshot();
+        assert_eq!(summary.count, 3);
+        assert_eq!(summary.sum_us, 1400);
+        assert_eq!(summary.sum_ms, 1);
+        let mut ack = receipts[8].unwrap();
+        ack.sequence = 2;
+        record_qos_receipt(&mut receipts, ack).unwrap();
+        ack.sequence = 1;
+        record_qos_receipt(&mut receipts, ack).unwrap();
+        assert_eq!(receipts[8].unwrap().sequence, 2);
+        ack.worker_slot = 10;
+        assert_eq!(
+            record_qos_receipt(&mut receipts, ack).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
         let (tx, rx) = crossbeam_channel::bounded(1);
         let mut reply = PendingReply {
             gpu_done: false,
             source_done: false,
+            encoding_ready: false,
             receiver: rx,
             id: 1,
             qos_revision: 3,
@@ -1111,6 +1426,20 @@ mod tests {
             io::ErrorKind::TimedOut
         );
         reply.deadline = Instant::now() + Duration::from_secs(2);
+        // 编码就绪不能越过仍在读取/变换的阶段而提前让出工作集。
+        tx.send(Ok((
+            Instant::now(),
+            NativeResponse::Stage {
+                id: 1,
+                stage: NativeStage::EncodingReady,
+            },
+        )))
+        .unwrap();
+        assert_eq!(
+            reply.poll().unwrap().err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!reply.encoding_ready);
         let mut bytes = Vec::new();
         super::super::native_protocol::write_response(
             &mut bytes,
@@ -1134,6 +1463,32 @@ mod tests {
         .unwrap();
         assert!(reply.poll().is_none());
         assert!(reply.source_done);
+        assert!(!reply.encoding_ready, "源文件已读完不等于大图缩放已完成");
+        bytes.clear();
+        super::super::native_protocol::write_response(
+            &mut bytes,
+            &NativeResponse::Stage {
+                id: 1,
+                stage: NativeStage::EncodingReady,
+            },
+        )
+        .unwrap();
+        tx.send(Ok((Instant::now(), read_response(&bytes[..]).unwrap())))
+            .unwrap();
+        assert!(reply.poll().is_none());
+        assert!(reply.encoding_ready);
+        tx.send(Ok((
+            Instant::now(),
+            NativeResponse::Stage {
+                id: 1,
+                stage: NativeStage::EncodingReady,
+            },
+        )))
+        .unwrap();
+        assert_eq!(
+            reply.poll().unwrap().err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
         // 重复阶段不能伪装成正常完成。
         tx.send(Ok((
             Instant::now(),
@@ -1170,15 +1525,143 @@ mod tests {
     }
 
     #[test]
-    fn domain_reservations_are_independent_and_release() {
-        let workers = NativeWorkers::new(1);
-        let tail = workers.try_reserve(ThumbnailLane::Heavy).unwrap();
-        assert!(workers.try_reserve(ThumbnailLane::ViewportHeavy).is_none());
-        let fast = workers.try_reserve(ThumbnailLane::ViewportFast).unwrap();
-        assert_eq!(workers.available(), (false, false));
-        drop(fast);
-        assert_eq!(workers.available(), (true, false));
-        drop(tail);
-        assert_eq!(workers.available(), (true, true));
+    #[ignore = "requires SCROLLERY_TEST_NATIVE_WORKER and at least five fast slots"]
+    fn real_worker_multislot_replies_keep_reader_alive() {
+        use super::super::native_protocol::NativeKind;
+        use std::os::windows::process::CommandExt;
+
+        if let Ok(json) = std::env::var("SCROLLERY_TEST_THUMB_LIMITS") {
+            super::super::limits::install(serde_json::from_str(&json).unwrap()).unwrap();
+        }
+        let capacity = super::super::qos::native_fast_parallelism().min(9);
+        assert!(
+            capacity >= 5,
+            "requires a machine supporting slots above four"
+        );
+        let exe = std::env::var_os("SCROLLERY_TEST_NATIVE_WORKER")
+            .expect("set the explicit native worker executable path");
+        let mut command = Command::new(exe);
+        command
+            .arg(format!("--fast={capacity}"))
+            .arg(format!(
+                "--thumbnail-limits={}",
+                serde_json::to_string(super::super::limits::get()).unwrap()
+            ))
+            .creation_flags(0x08000000);
+        let process =
+            WorkerProcess::spawn_command(command, capacity, Arc::new(WorkerJob::new(8).unwrap()))
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let sample = std::env::var_os("SCROLLERY_TEST_NATIVE_SAMPLE");
+        let gpu_stress = sample.is_some();
+        let path = sample.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            let path = temp.path().join("sample.jpg");
+            image::DynamicImage::new_rgb8(128, 256).save(&path).unwrap();
+            path
+        });
+        let output_size = if gpu_stress { 512 } else { 64 };
+        let batch_size = if gpu_stress {
+            capacity.min(6)
+        } else {
+            capacity
+        };
+        let wake = Arc::new(Condvar::new());
+        let mut receipts = vec![None; capacity];
+        // 同一真实进程分别覆盖每个槽的成功和格式失败回包，经过生产 reader / pending / QoS 出口。
+        for format in ["jpg", "protocol_probe"] {
+            let mut seen = HashSet::new();
+            let mut completed = 0;
+            let mut vpl_completed = 0;
+            let mut peak_private = 0;
+            let started = Instant::now();
+            for _ in 0..32 {
+                let mut replies: Vec<_> = (0..batch_size)
+                    .map(|_| {
+                        // DuplicateHandle 共享文件游标；每项独立打开，保持与生产派发一致。
+                        let file = File::open(&path).unwrap();
+                        let gpu = gpu_stress
+                            .then(|| crate::engine::gpu::budget::try_acquire(true))
+                            .flatten();
+                        let reply = process
+                            .request(
+                                &file,
+                                NativeRequest {
+                                    id: 0,
+                                    file_handle: 0,
+                                    kind: NativeKind::Image,
+                                    image_route:
+                                        super::super::native_protocol::NativeImageRoute::Automatic,
+                                    format: format.into(),
+                                    codec_hint: None,
+                                    prefer_gpu: gpu.is_some(),
+                                    gpu_policy: gpu_stress,
+                                    decode_long_edge: output_size,
+                                    max_pixel_bytes: 16 * 1024 * 1024,
+                                    output_size,
+                                    webp_quality: 80,
+                                    ai_cache_short_edge: 336,
+                                    emit_ai_cache: false,
+                                    qos_foreground: true,
+                                    qos_revision: 1,
+                                },
+                                Duration::from_secs(10),
+                                Duration::from_secs(10),
+                                Arc::clone(&wake),
+                            )
+                            .unwrap();
+                        (reply, gpu)
+                    })
+                    .collect();
+                for (reply, gpu) in &mut replies {
+                    let (outcome, qos) = loop {
+                        if let Some(memory) = process.memory_snapshot() {
+                            peak_private = peak_private.max(memory.private_bytes);
+                        }
+                        if let Some(result) = reply.poll() {
+                            if let Err(error) = &result {
+                                panic!("real worker failed: {error}; peak_private={peak_private}; exit={:?}", process.child.lock().unwrap().try_wait().unwrap());
+                            }
+                            break result.unwrap();
+                        }
+                        if reply.gpu_done {
+                            drop(gpu.take());
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    };
+                    drop(gpu.take());
+                    record_qos_receipt(&mut receipts, qos).unwrap();
+                    seen.insert(qos.worker_slot);
+                    if format == "jpg" {
+                        let (payload, execution, _) = outcome.unwrap();
+                        if gpu_stress {
+                            vpl_completed +=
+                                usize::from(execution.backend == NativeBackend::ImageVpl);
+                        } else {
+                            assert_eq!(execution.backend, NativeBackend::ImageRs);
+                        }
+                        let decoded = image::load_from_memory(&payload.webp).unwrap();
+                        if gpu_stress {
+                            assert_eq!(decoded.width().max(decoded.height()), output_size);
+                        } else {
+                            assert_eq!((decoded.width(), decoded.height()), (32, 64));
+                        }
+                    } else {
+                        assert!(matches!(outcome, Err(3)));
+                    }
+                    completed += 1;
+                }
+                assert!(process.alive.load(Ordering::Acquire));
+                if seen.len() == capacity && !gpu_stress {
+                    break;
+                }
+            }
+            assert_eq!(seen.len(), capacity, "all slots must reply for {format}");
+            if gpu_stress && format == "jpg" {
+                assert!(vpl_completed > 0, "real VPL route required");
+            }
+            eprintln!("real worker format={format} slots={seen:?} reader_alive=true completed={completed} vpl={vpl_completed} elapsed_ms={} peak_private={peak_private}", started.elapsed().as_millis());
+        }
+        assert!(process.pending.lock().unwrap().is_empty());
+        assert!(receipts.iter().all(Option::is_some));
     }
 }

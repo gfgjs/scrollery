@@ -56,8 +56,14 @@ export const useConfigStore = defineStore('config', () => {
   // 与后端 DEFAULT_THUMB_CACHE_MAX_MB 同值)。
   const thumbCacheMaxMb = computed(() => readSettingNumber('thumb_cache_max_mb', 10240))
   const thumbSize = computed(() => readSettingNumber('thumb_size', 512))
-  // 缩略图 WebP 编码质量:1..=99 有损(默认 80),100=无损。变更后后端会把存量已生成项
-  // 与封面派生一并复位,按需以新质量重生成。
+  const thumbFastThreads = computed(() => readSettingNumber('thumb_fast_threads', 0))
+  const thumbTailThreads = computed(() => readSettingNumber('thumb_tail_threads', 2))
+  const thumbGpuInflight = computed(() => readSettingNumber('thumb_gpu_inflight', 2))
+  const thumbGpuPerAdapter = computed(() => readSettingNumber('thumb_gpu_per_adapter', 1))
+  const thumbProcessMemoryMb = computed(() => readSettingNumber('thumb_process_memory_mb', 1024))
+  const thumbTotalMemoryMb = computed(() => readSettingNumber('thumb_total_memory_mb', 2048))
+  const thumbWorksetMb = computed(() => readSettingNumber('thumb_workset_mb', 1024))
+  // 缩略图 WebP 编码质量:1..=99 有损(默认 80),100=无损。变更后后端复位存量项。
   const thumbWebpQuality = computed(() => readSettingNumber('thumb_webp_quality', 80))
   const timelineScrollWidth = computed(() => readSettingNumber('timeline_scroll_width', 8))
   const timelineAxisWidth = computed(() => readSettingNumber('timeline_axis_width', 44))
@@ -171,6 +177,27 @@ export const useConfigStore = defineStore('config', () => {
   function setThumbSize(val: number) {
     return writeSettings({ thumb_size: val.toString() })
   }
+  function setThumbFastThreads(val: number) {
+    return writeSettings({ thumb_fast_threads: val.toString() })
+  }
+  function setThumbTailThreads(val: number) {
+    return writeSettings({ thumb_tail_threads: val.toString() })
+  }
+  function setThumbGpuInflight(val: number) {
+    return writeSettings({ thumb_gpu_inflight: val.toString() })
+  }
+  function setThumbGpuPerAdapter(val: number) {
+    return writeSettings({ thumb_gpu_per_adapter: val.toString() })
+  }
+  function setThumbProcessMemoryMb(val: number) {
+    return writeSettings({ thumb_process_memory_mb: val.toString() })
+  }
+  function setThumbTotalMemoryMb(val: number) {
+    return writeSettings({ thumb_total_memory_mb: val.toString() })
+  }
+  function setThumbWorksetMb(val: number) {
+    return writeSettings({ thumb_workset_mb: val.toString() })
+  }
   /** 编码质量(1-100,100=无损):先收敛再提交。 */
   function setThumbWebpQuality(val: number) {
     const clamped = Math.min(100, Math.max(1, Math.round(val)))
@@ -246,6 +273,13 @@ export const useConfigStore = defineStore('config', () => {
     thumbSkipMaxKb,
     thumbCacheMaxMb,
     thumbSize,
+    thumbFastThreads,
+    thumbTailThreads,
+    thumbGpuInflight,
+    thumbGpuPerAdapter,
+    thumbProcessMemoryMb,
+    thumbTotalMemoryMb,
+    thumbWorksetMb,
     thumbWebpQuality,
     timelineScrollWidth,
     timelineAxisWidth,
@@ -272,6 +306,13 @@ export const useConfigStore = defineStore('config', () => {
     setThumbSkipMaxKb,
     setThumbCacheMaxMb,
     setThumbSize,
+    setThumbFastThreads,
+    setThumbTailThreads,
+    setThumbGpuInflight,
+    setThumbGpuPerAdapter,
+    setThumbProcessMemoryMb,
+    setThumbTotalMemoryMb,
+    setThumbWorksetMb,
     setThumbWebpQuality,
     setTimelineScrollWidth,
     setTimelineAxisWidth,

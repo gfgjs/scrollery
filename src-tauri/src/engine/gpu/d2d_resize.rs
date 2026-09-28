@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Seek;
 use std::os::windows::io::AsRawHandle;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -39,7 +39,14 @@ use crate::error::{AppError, Result};
 use crate::scanner::metadata::read_jpeg_orientation_file;
 
 const MAX_GPU_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-static GPU_SLOTS: GpuSlots = GpuSlots(Mutex::new(Vec::new()));
+static GPU_SLOTS: OnceLock<GpuSlots> = OnceLock::new();
+
+fn image_slots() -> &'static GpuSlots {
+    GPU_SLOTS.get_or_init(|| {
+        let limits = crate::thumbnail::limits::get();
+        GpuSlots::new(limits.gpu_inflight, limits.gpu_per_adapter)
+    })
+}
 
 /// 图像硬件缩放的结果；未执行时保留明确的 CPU 回退原因。
 pub enum GpuImageOutcome {
@@ -60,13 +67,27 @@ pub struct GpuAdapter {
     pub luid_low: u32,
 }
 
-// 每进程最多两张源图，每设备一张；忙碌设备让后续适配器接手独立任务。
-struct GpuSlots(Mutex<Vec<(i32, u32)>>);
+// VPL 会话归各线程独占；按设置限制同设备在途数，D2D 仍由共享 context 锁保护。
+struct GpuSlots {
+    active: Mutex<Vec<(i32, u32)>>,
+    total: usize,
+    per_adapter: usize,
+}
 
 impl GpuSlots {
+    fn new(total: usize, per_adapter: usize) -> Self {
+        Self {
+            active: Mutex::new(Vec::new()),
+            total,
+            per_adapter,
+        }
+    }
+
     fn acquire(&self, luid: (i32, u32)) -> Option<GpuSlot<'_>> {
-        let mut active = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if active.len() >= 2 || active.contains(&luid) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.len() >= self.total
+            || active.iter().filter(|&&device| device == luid).count() >= self.per_adapter
+        {
             return None;
         }
         active.push(luid);
@@ -81,13 +102,15 @@ pub(crate) struct GpuSlot<'a> {
 
 #[cfg(feature = "native-vpl")]
 pub(crate) fn acquire_image_slot(adapter: GpuAdapter) -> Option<GpuSlot<'static>> {
-    GPU_SLOTS.acquire((adapter.luid_high, adapter.luid_low))
+    image_slots().acquire((adapter.luid_high, adapter.luid_low))
 }
 
 impl Drop for GpuSlot<'_> {
     fn drop(&mut self) {
-        let mut active = self.slots.0.lock().unwrap_or_else(|e| e.into_inner());
-        active.retain(|luid| *luid != self.luid);
+        let mut active = self.slots.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = active.iter().position(|luid| *luid == self.luid) {
+            active.swap_remove(index);
+        }
     }
 }
 
@@ -294,7 +317,7 @@ fn unpremultiply_bgra(pixels: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::unpremultiply_bgra;
+    use super::{unpremultiply_bgra, GpuSlots};
 
     #[test]
     #[ignore = "requires a real Windows GPU for transparent PNG resize/readback"]
@@ -346,9 +369,22 @@ mod tests {
 
     #[test]
     fn gpu_readback_restores_rgba_and_transparent_alpha() {
+        let slots = GpuSlots::new(4, 3);
+        let first = slots.acquire((0, 1)).unwrap();
+        let second = slots.acquire((0, 1)).unwrap();
+        let third = slots.acquire((0, 1)).unwrap();
+        assert!(slots.acquire((0, 1)).is_none());
+        let other = slots.acquire((0, 2)).unwrap();
+        assert!(slots.acquire((0, 3)).is_none());
         let mut pixels = [0, 0, 128, 128, 30, 20, 10, 255, 90, 70, 50, 0];
         unpremultiply_bgra(&mut pixels);
         assert_eq!(pixels, [255, 0, 0, 128, 10, 20, 30, 255, 0, 0, 0, 0]);
+        drop(first);
+        assert_eq!(slots.active.lock().unwrap().len(), 3, "只释放本图的槽位");
+        let next = slots.acquire((0, 1)).unwrap();
+        assert!(slots.acquire((0, 1)).is_none());
+        drop((second, third, other, next));
+        assert!(slots.active.lock().unwrap().is_empty());
     }
 }
 
@@ -454,7 +490,7 @@ pub fn decode_open_file(
                 let Ok(mut session) = shared.try_lock() else { continue; };
                 if !session.healthy { continue; }
                 let luid = (session.desc.AdapterLuid.HighPart, session.desc.AdapterLuid.LowPart);
-                let Some(_slot) = GPU_SLOTS.acquire(luid) else { continue; };
+                let Some(_slot) = image_slots().acquire(luid) else { continue; };
                 match session.resize(&source, target_width, target_height) {
                     Ok(pixels) => {
                         return Ok(Some((pixels, GpuAdapter {
