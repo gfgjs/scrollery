@@ -463,12 +463,13 @@ impl ThumbnailTaskKind {
     }
 }
 
-/// 任务队列阶段；与媒体格式的解码后端选择正交。
+/// 任务队列阶段；ImageRs是实际路由发现后的软件解码尾批。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThumbnailLane {
     Fast,
     Heavy,
     Exception,
+    ImageRs,
     ViewportFast,
     ViewportHeavy,
 }
@@ -479,6 +480,7 @@ impl ThumbnailLane {
             Self::Fast => "fast",
             Self::Heavy => "heavy",
             Self::Exception => "exception",
+            Self::ImageRs => "image_rs",
             Self::ViewportFast => "viewport_fast",
             Self::ViewportHeavy => "viewport_heavy",
         }
@@ -522,10 +524,10 @@ pub fn promote_thumbnail_task(
     Ok(changed == 1)
 }
 
-/// 已领取任务的实际阶段；视口在后台首次失败后加入时须延续 Q3，不能当成 Q1 重试。
+/// 已领取任务是否处于最终尝试阶段；异常/软件尾批不能再回到已结束的阶段。
 pub fn is_thumbnail_exception(conn: &Connection, key: &ThumbnailTaskKey) -> Result<bool> {
     conn.query_row(
-        "SELECT lane='exception' FROM media_derivations
+        "SELECT lane IN ('exception','image_rs') FROM media_derivations
          WHERE item_id=?1 AND kind=?2 AND output_fingerprint=?3
            AND source_revision=?4",
         params![
@@ -569,17 +571,43 @@ pub fn defer_thumbnail_failure(
     Ok(changed == 1)
 }
 
+/// 软件回退在解码前延期至最后阶段；仅当前源版本的有效lease可移动成员。
+pub fn defer_thumbnail_image_rs(
+    conn: &Connection,
+    key: &ThumbnailTaskKey,
+    lease_id: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE media_derivations
+         SET status=0, lane='image_rs', lease_id=NULL, lease_until=NULL,
+             failure_reason=NULL, updated_at=strftime('%s','now')
+         WHERE item_id=?1 AND kind='image_thumb' AND kind=?2 AND output_fingerprint=?3
+           AND source_revision=?4 AND status=1 AND lease_id=?5
+           AND lane IN ('fast','heavy','exception','viewport_fast','viewport_heavy')
+           AND EXISTS (SELECT 1 FROM media_items m WHERE m.id=?1
+                       AND m.source_revision=?4 AND m.is_deleted=0)",
+        params![
+            key.item_id,
+            key.kind.as_str(),
+            key.output_fingerprint,
+            key.source_revision,
+            lease_id
+        ],
+    )?;
+    Ok(changed == 1)
+}
+
 /// 本轮仍可运行的任务数；源已换代和已删除的成员不阻塞阶段转换。
-pub fn image_thumbnail_run_open_counts(conn: &Connection, run_id: &str) -> Result<[u64; 3]> {
+pub fn image_thumbnail_run_open_counts(conn: &Connection, run_id: &str) -> Result<[u64; 4]> {
     thumbnail_run_open_counts(conn, run_id, "image_thumb")
 }
 
 /// 本轮原生视频封面的阶段未完成数。
-pub fn native_video_cover_run_open_counts(conn: &Connection, run_id: &str) -> Result<[u64; 3]> {
+pub fn native_video_cover_run_open_counts(conn: &Connection, run_id: &str) -> Result<[u64; 4]> {
     thumbnail_run_open_counts(conn, run_id, "video_cover")
 }
 
-fn thumbnail_run_open_counts(conn: &Connection, run_id: &str, kind: &str) -> Result<[u64; 3]> {
+fn thumbnail_run_open_counts(conn: &Connection, run_id: &str, kind: &str) -> Result<[u64; 4]> {
     let sql = format!(
         "SELECT t.lane, COUNT(*) FROM media_derivations t
          JOIN media_items m ON m.id=t.item_id AND m.source_revision=t.source_revision
@@ -592,13 +620,14 @@ fn thumbnail_run_open_counts(conn: &Connection, run_id: &str, kind: &str) -> Res
     let rows = stmt.query_map(params![run_id, kind], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
     })?;
-    let mut counts = [0; 3];
+    let mut counts = [0; 4];
     for row in rows {
         let (lane, count) = row?;
         match lane.as_str() {
             "fast" | "viewport_fast" | "unclassified" => counts[0] += count,
             "heavy" | "viewport_heavy" => counts[1] += count,
             "exception" => counts[2] += count,
+            "image_rs" => counts[3] += count,
             _ => {}
         }
     }
@@ -987,7 +1016,7 @@ mod tests {
         let failed_result = ThumbResult {
             thumb_status: 2,
             thumb_path: None,
-            ..first_result
+            ..first_result.clone()
         };
         let tx = conn.unchecked_transaction().unwrap();
         let finished = finish_thumbnail_task_in_transaction(
@@ -1004,6 +1033,98 @@ mod tests {
             "已有成功缩略图不被失败覆盖或计作新发布"
         );
         tx.commit().unwrap();
+
+        // 资源准入失败只结束该成员，不能清掉已有展示产物或被同轮再次领取。
+        let unavailable = key("memory-limit");
+        enqueue_thumbnail_task(
+            &conn,
+            &unavailable,
+            ThumbnailLane::Fast,
+            "fast",
+            "memory-run",
+        )
+        .unwrap();
+        assert!(claim_thumbnail_task(&conn, &unavailable, "memory", 30, 40).unwrap());
+        assert_eq!(
+            image_thumbnail_run_open_counts(&conn, "memory-run").unwrap(),
+            [1, 0, 0, 0]
+        );
+        assert!(
+            !finish_thumbnail_unavailable(&conn, &unavailable, "stale", "worker_memory_limit")
+                .unwrap()
+        );
+        assert!(
+            finish_thumbnail_unavailable(&conn, &unavailable, "memory", "worker_memory_limit")
+                .unwrap()
+        );
+        assert!(!claim_thumbnail_task(&conn, &unavailable, "same-run", 40, 50).unwrap());
+        assert_eq!(
+            image_thumbnail_run_open_counts(&conn, "memory-run").unwrap(),
+            [0, 0, 0, 0]
+        );
+        let path: String = conn
+            .query_row("SELECT thumb_path FROM media_items WHERE id=7", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(path, "256/batch/91.webp");
+        enqueue_thumbnail_task(&conn, &unavailable, ThumbnailLane::Fast, "fast", "next-run")
+            .unwrap();
+        assert!(claim_thumbnail_task(&conn, &unavailable, "retry", 50, 60).unwrap());
+
+        let software = key("software-tail");
+        enqueue_thumbnail_task(
+            &conn,
+            &software,
+            ThumbnailLane::Fast,
+            "fast",
+            "software-run",
+        )
+        .unwrap();
+        assert!(claim_thumbnail_task(&conn, &software, "discover", 60, 70).unwrap());
+        assert!(!defer_thumbnail_image_rs(&conn, &software, "stale").unwrap());
+        assert!(defer_thumbnail_image_rs(&conn, &software, "discover").unwrap());
+        assert_eq!(
+            image_thumbnail_run_open_counts(&conn, "software-run").unwrap(),
+            [0, 0, 0, 1]
+        );
+        assert!(
+            image_thumbnail_lane_page(&conn, "software-run", ThumbnailLane::Fast, 0, 10, 70)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            image_thumbnail_lane_page(&conn, "software-run", ThumbnailLane::ImageRs, 0, 10, 70)
+                .unwrap()
+                .len(),
+            1
+        );
+        let unchanged: String = conn
+            .query_row("SELECT thumb_path FROM media_items WHERE id=7", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(unchanged, "256/batch/91.webp");
+        assert!(claim_thumbnail_task(&conn, &software, "tail", 70, 80).unwrap());
+        assert!(
+            !defer_thumbnail_image_rs(&conn, &software, "tail").unwrap(),
+            "尾批不能再次延期"
+        );
+        assert!(
+            is_thumbnail_exception(&conn, &software).unwrap(),
+            "失败不能返回已结束的异常批"
+        );
+        let tx = conn.unchecked_transaction().unwrap();
+        assert!(
+            finish_thumbnail_task_in_transaction(&tx, &software, "tail", &first_result, true)
+                .unwrap()
+                .display_updated
+        );
+        tx.commit().unwrap();
+        assert_eq!(
+            image_thumbnail_run_open_counts(&conn, "software-run").unwrap(),
+            [0; 4]
+        );
     }
 
     #[test]

@@ -96,10 +96,28 @@ impl ImageRsEngine {
 
     /// 在解码像素前检查调用方提供的字节上限；保留 image crate 的内部解码限制。
     pub fn decode_open_file_bounded(
+        file: File,
+        format: &str,
+        resize: Option<ResizeHint>,
+        max_decoded_bytes: u64,
+    ) -> Result<DecodedImage, AppError> {
+        Self::decode_open_file_bounded_with_source_done(
+            file,
+            format,
+            resize,
+            max_decoded_bytes,
+            || {},
+        )
+    }
+
+    /// 从受控句柄有界解码；源解码器释放后、缩放前通知调用方归还源盘许可。
+    /// 解码失败时不调用回调，由调用方的失败出口归还资源。
+    pub fn decode_open_file_bounded_with_source_done(
         mut file: File,
         format: &str,
         resize: Option<ResizeHint>,
         max_decoded_bytes: u64,
+        on_source_done: impl FnOnce(),
     ) -> Result<DecodedImage, AppError> {
         let orientation =
             if format.eq_ignore_ascii_case("jpg") || format.eq_ignore_ascii_case("jpeg") {
@@ -126,6 +144,8 @@ impl ImageRsEngine {
             .ok()
             .flatten();
         let img = image::DynamicImage::from_decoder(decoder).map_err(AppError::Engine)?;
+        // 解码器已消耗并关闭源句柄；内存中的缩放和转向不应继续串行化同盘读取。
+        on_source_done();
 
         // 如果有缩放请求则进行缩放
         let img = if let Some(hint) = resize {
@@ -175,9 +195,7 @@ impl ImageRsEngine {
             .and_then(|pixels| pixels.checked_mul(4))
             .unwrap_or(u64::MAX);
         if rgba_bytes > max_decoded_bytes {
-            return Err(AppError::Internal(
-                "decoded RGBA exceeds pixel limit".into(),
-            ));
+            return Err(AppError::ThumbnailUnavailable("pixel_limit"));
         }
         // 长/短边目标不依赖方向；先缩小再转正，避免为旋转大图再分配一份全尺寸像素。
         let img = apply_exif_orientation(img, orientation);
@@ -249,5 +267,53 @@ pub(crate) fn apply_exif_orientation(
         7 => img.rotate270().fliph(),
         8 => img.rotate270(),
         _ => img,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_done_releases_file_without_changing_pixels_or_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.png");
+        image::RgbImage::from_pixel(640, 480, image::Rgb([40, 120, 200]))
+            .save(&path)
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let hint = || Some(ResizeHint::LongEdge(32));
+        assert!(ImageRsEngine::decode_open_file_bounded_with_source_done(
+            File::open(&path).unwrap(),
+            "png",
+            hint(),
+            1,
+            || calls.set(calls.get() + 1),
+        )
+        .is_err());
+        assert_eq!(calls.get(), 0, "超额失败不能报告读取完成");
+        let expected = ImageRsEngine::decode_open_file_bounded(
+            File::open(&path).unwrap(),
+            "png",
+            hint(),
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        let actual = ImageRsEngine::decode_open_file_bounded_with_source_done(
+            File::open(&path).unwrap(),
+            "png",
+            hint(),
+            4 * 1024 * 1024,
+            || {
+                calls.set(calls.get() + 1);
+                // 回调之后只消费内存像素；清空源文件不影响后续缩放。
+                File::create(&path).unwrap();
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!((actual.width, actual.height), (32, 24));
+        assert_eq!(actual.pixels, expected.pixels);
+        assert_eq!(actual.icc, expected.icc);
     }
 }

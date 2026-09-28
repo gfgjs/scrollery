@@ -64,7 +64,21 @@ pub(crate) fn processing_budgets() -> (usize, usize) {
     let logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    processing_budgets_for(logical)
+    let budget = processing_budgets_for(logical);
+    #[cfg(windows)]
+    {
+        let limits = super::limits::get();
+        let total = limits.fast_threads_for(budget.0) + limits.tail_threads;
+        (total, total)
+    }
+    #[cfg(not(windows))]
+    budget
+}
+
+/// 原生 fast 计算线程上限；同一 CPU 预算为 tail 留一席，低核另受 Job 硬限约束。
+#[cfg(windows)]
+pub fn native_fast_parallelism() -> usize {
+    super::limits::get().fast_threads_for(processing_budgets().0)
 }
 
 /// 缩略图 worker 的前后台状态(由 Tauri 窗口 `Focused` 事件经 [`set_app_foreground`] 更新)。

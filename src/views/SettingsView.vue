@@ -517,7 +517,7 @@ import { ArrowLeft, AlertTriangle, Search, Info, Trash2, X, GraduationCap } from
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { useRoute, useRouter } from 'vue-router'
 import { IPC } from '../constants/ipc'
-import { isMobilePlatform } from '../utils/platform'
+import { isMobilePlatform, isWindows } from '../utils/platform'
 import { getSettingSpec, sectionSettingKeys, type SettingKey } from '../constants/settingsMap'
 import { SETTINGS_SECTIONS, SETTINGS_GROUPS, type SettingsNavId } from '../constants/settingsLayout'
 import { useSettingsCards } from '../composables/useSettingsCards'
@@ -582,7 +582,7 @@ const defaultSection: SettingsNavId = 'appearance'
 const cards = useSettingsCards()
 
 function groupsFor(section: SettingsNavId) {
-  return SETTINGS_GROUPS.filter(group => group.section === section && group.keys.length && (!group.desktopOnly || !isMobilePlatform))
+  return SETTINGS_GROUPS.filter(group => group.section === section && group.keys.length && (!group.desktopOnly || !isMobilePlatform) && (!group.windowsOnly || isWindows))
 }
 const thumbnailGroups = groupsFor('media').filter(group => group.id !== 'video')
 const timelineSummary = computed(() => t('settings.timelineSummary', {
@@ -590,7 +590,7 @@ const timelineSummary = computed(() => t('settings.timelineSummary', {
 }))
 
 const searchCatalog = computed<SettingsSearchResult[]>(() => SETTINGS_GROUPS
-  .filter(group => !group.desktopOnly || !isMobilePlatform)
+  .filter(group => (!group.desktopOnly || !isMobilePlatform) && (!group.windowsOnly || isWindows))
   .flatMap(group => {
     const sectionLabelKey = settingsSections.find(section => section.id === group.section)?.labelKey ?? ''
     const groupLabel = group.id === 'backup' ? bt(group.titleKey) : t(group.titleKey)

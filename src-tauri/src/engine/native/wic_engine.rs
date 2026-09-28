@@ -355,7 +355,7 @@ fn rgba_layout(width: u32, height: u32, limit: u64) -> Result<(u32, usize), AppE
         (Some(stride), Some(bytes)) if bytes > 0 && u64::from(bytes) <= limit => {
             Ok((stride, bytes as usize))
         }
-        _ => Err(AppError::Internal("WIC pixel output exceeds budget".into())),
+        _ => Err(AppError::ThumbnailUnavailable("pixel_limit")),
     }
 }
 

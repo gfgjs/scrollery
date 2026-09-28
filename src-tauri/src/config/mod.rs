@@ -622,8 +622,72 @@ mod tests {
     #[test]
     fn reset_all_touches_only_settings_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let (manager, _) = ConfigManager::load_or_init(dir.path().join("config.toml")).unwrap();
+        let path = dir.path().join("config.toml");
+        let (manager, _) = ConfigManager::load_or_init(path.clone()).unwrap();
+        let patch = BTreeMap::from([
+            ("thumb_fast_threads".into(), "6".into()),
+            ("thumb_tail_threads".into(), "2".into()),
+            ("thumb_gpu_inflight".into(), "4".into()),
+            ("thumb_gpu_per_adapter".into(), "3".into()),
+            ("thumb_process_memory_mb".into(), "1024".into()),
+            ("thumb_total_memory_mb".into(), "1536".into()),
+            ("thumb_workset_mb".into(), "1024".into()),
+        ]);
+        let patch = super::settings::canonicalize_patch(&patch).unwrap();
+        let committed = manager.commit_batch(&patch, 0).unwrap();
+        assert_eq!(
+            committed.restart_required.len(),
+            patch
+                .iter()
+                .filter(|(key, value)| crate::config::schema::SettingDef::find(key)
+                    .unwrap()
+                    .default
+                    != value.as_str())
+                .count()
+        );
+        let (reloaded, _) = ConfigManager::load_or_init(path).unwrap();
+        let limits =
+            crate::thumbnail::limits::ThumbnailLimits::from_reader(|key| reloaded.get(key));
+        assert_eq!(limits.fast_threads_for(10), 6);
+        assert_eq!(
+            (
+                limits.tail_threads,
+                limits.gpu_inflight,
+                limits.gpu_per_adapter
+            ),
+            (2, 4, 3)
+        );
+        assert_eq!(limits.process_memory_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(limits.total_memory_bytes(), 1536 * 1024 * 1024);
+        assert_eq!(limits.workset_bytes(), 1024 * 1024 * 1024);
+        let wire = serde_json::to_string(&limits).unwrap();
+        let worker_limits: crate::thumbnail::limits::ThumbnailLimits =
+            serde_json::from_str(&wire).unwrap();
+        assert_eq!(worker_limits.gpu_per_adapter, 3);
+        assert!(super::settings::canonicalize_patch(&BTreeMap::from([(
+            "thumb_fast_threads".into(),
+            "65".into()
+        )]))
+        .is_err());
+        assert!(super::settings::canonicalize_patch(&BTreeMap::from([(
+            "thumb_workset_mb".into(),
+            "0".into()
+        )]))
+        .is_err());
         let outcome = manager.reset_all().unwrap();
+        let defaults =
+            crate::thumbnail::limits::ThumbnailLimits::from_reader(|key| manager.get(key));
+        assert_eq!(defaults.fast_threads_for(10), 8);
+        assert_eq!(
+            (
+                defaults.tail_threads,
+                defaults.gpu_inflight,
+                defaults.gpu_per_adapter
+            ),
+            (2, 2, 1)
+        );
+        assert_eq!(defaults.process_memory_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(defaults.total_memory_bytes(), 2048 * 1024 * 1024);
         for key in outcome.keys {
             assert!(
                 SettingDef::find(&key).is_some(),

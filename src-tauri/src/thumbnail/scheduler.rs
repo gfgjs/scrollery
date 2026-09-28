@@ -84,7 +84,7 @@ impl OutputFingerprint {
 }
 
 /// 分级策略版本写入轮次日志，阈值尚未据真机样本调优。
-pub const COST_POLICY_VERSION: u32 = 1;
+pub const COST_POLICY_VERSION: u32 = 2;
 
 /// 全库轮次阶段。阶段只前进；视口任务在每一阶段都可独立提升优先级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,8 @@ pub enum ThumbnailRunPhase {
     Fast,
     Heavy,
     Exception,
+    ImageRs,
+    Video,
     Complete,
 }
 
@@ -99,14 +101,15 @@ pub enum ThumbnailRunPhase {
 pub fn advance_run_phase(
     current: ThumbnailRunPhase,
     discovery_complete: bool,
-    open_counts: [u64; 3],
+    open_counts: [u64; 4],
 ) -> ThumbnailRunPhase {
     match current {
         ThumbnailRunPhase::Fast if discovery_complete && open_counts[0] == 0 => {
             ThumbnailRunPhase::Heavy
         }
         ThumbnailRunPhase::Heavy if open_counts[1] == 0 => ThumbnailRunPhase::Exception,
-        ThumbnailRunPhase::Exception if open_counts[2] == 0 => ThumbnailRunPhase::Complete,
+        ThumbnailRunPhase::Exception if open_counts[2] == 0 => ThumbnailRunPhase::ImageRs,
+        ThumbnailRunPhase::ImageRs if open_counts[3] == 0 => ThumbnailRunPhase::Video,
         _ => current,
     }
 }

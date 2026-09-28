@@ -140,6 +140,8 @@ impl ThumbPerfMetrics {
             0 => ThumbnailRunPhase::Fast,
             1 => ThumbnailRunPhase::Heavy,
             2 => ThumbnailRunPhase::Exception,
+            3 => ThumbnailRunPhase::ImageRs,
+            4 => ThumbnailRunPhase::Video,
             _ => ThumbnailRunPhase::Complete,
         };
         progress(
@@ -271,8 +273,8 @@ fn log_thumb_window(
         host_qos_platform_supported = cfg!(any(windows, target_vendor = "apple")),
         qos_confirmation = "system request accepted; not CPU placement or frequency",
         qos_scope = "coordinator processing and native request threads; codec-internal threads unavailable",
-        stage_timing_scope = "app lifetime; decode+transform and hash+encode combined",
-        unavailable_stage_timings = "per-item read/upload/GPU-wait/GPU-timestamp/readback/resize/color/hash",
+        stage_timing_scope = "app lifetime; decode+transform and hash+encode combined; native encoding breakdown in thumbnail encode summary",
+        unavailable_stage_timings = "per-item read/upload/GPU-wait/GPU-timestamp/readback; embedded JPEG and host fallback encode substages",
         gpu_utilization = "unavailable",
         app_native_worker_processes = native.worker_processes,
         app_native_worker_memory_samples = native.worker_memory_samples,
@@ -299,6 +301,24 @@ fn log_thumb_window(
         app_host_db_transaction_p95_ms_upper = host_stage.db_transaction_wall.p95_ms_upper,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "thumbnail run summary"
+    );
+    // 编码分项单独成组，避免总览事件继续扩张触及 tracing 宏递归上限。
+    info!(
+        target: "scrollery::thumb_perf",
+        run_id,
+        origin,
+        event,
+        phase,
+        app_native_encode_hash_count = native.encode_hash.count,
+        app_native_encode_hash_us_sum = native.encode_hash.sum_us,
+        app_native_ai_cache = ?native.encode_stages[0],
+        app_native_thumb_resize = ?native.encode_stages[1],
+        app_native_thumb_color = ?native.encode_stages[2],
+        app_native_thumb_hash = ?native.encode_stages[3],
+        app_native_thumb_encode = ?native.encode_stages[4],
+        stage_timing_scope = "app lifetime; successful native replies; substages included in encode_hash, not additive to it; parallel sums are not wall time",
+        encode_substage_scope = "AI cache check+optional generation; thumbnail resize/color/hash/encode incl fallback; zero for skipped work; embedded JPEG remains combined",
+        "thumbnail encode summary"
     );
 }
 
@@ -630,7 +650,9 @@ async fn run_thumbnail_generation(
                 ThumbnailRunPhase::Fast => 0,
                 ThumbnailRunPhase::Heavy => 1,
                 ThumbnailRunPhase::Exception => 2,
-                ThumbnailRunPhase::Complete => 3,
+                ThumbnailRunPhase::ImageRs => 3,
+                ThumbnailRunPhase::Video => 4,
+                ThumbnailRunPhase::Complete => 5,
             };
             let prior = metrics.phase.swap(phase_code, Ordering::Relaxed);
             if prior != phase_code {
@@ -656,7 +678,9 @@ async fn run_thumbnail_generation(
                     let phase = match metrics.phase.load(Ordering::Relaxed) {
                         0 => ThumbnailRunPhase::Fast,
                         1 => ThumbnailRunPhase::Heavy,
-                        _ => ThumbnailRunPhase::Exception,
+                        2 => ThumbnailRunPhase::Exception,
+                        3 => ThumbnailRunPhase::ImageRs,
+                        _ => ThumbnailRunPhase::Video,
                     };
                     report(phase);
                 }
@@ -736,6 +760,8 @@ fn progress(
                 ThumbnailRunPhase::Fast => "fast",
                 ThumbnailRunPhase::Heavy => "heavy",
                 ThumbnailRunPhase::Exception => "exception",
+                ThumbnailRunPhase::ImageRs => "image_rs",
+                ThumbnailRunPhase::Video => "video",
                 ThumbnailRunPhase::Complete => "complete",
             }
             .to_owned()
@@ -838,84 +864,44 @@ where
     )?;
 
     let mut phase = ThumbnailRunPhase::Fast;
-    for (lane, index) in [
-        (ThumbnailLane::Fast, 0),
-        (ThumbnailLane::Heavy, 1),
-        (ThumbnailLane::Exception, 2),
+    for lane in [
+        ThumbnailLane::Fast,
+        ThumbnailLane::Heavy,
+        ThumbnailLane::Exception,
+        ThumbnailLane::ImageRs,
     ] {
         if cancel.is_cancelled() || !state.is_database_epoch_current(epoch) {
             break;
         }
         report(phase);
-        // 图片与视频使用同一 Coordinator 的额度；两个生产者并行避免慢视频挡住同阶段图片。
-        let counts = run_parallel_phases(
-            || run_background_image_phase(state, epoch, run_id, config, lane, cancel, on_result),
-            video_config
-                .filter(|_| lane != ThumbnailLane::Fast)
-                .map(|video_config| {
-                    || {
-                        state.thumb_coordinator.run_background_video_cover_phase(
-                            state,
-                            epoch,
-                            video_config,
-                            VideoCoverPhase {
-                                run_id,
-                                lane,
-                                index,
-                            },
-                            cancel,
-                            on_result,
-                        )
-                    }
-                }),
-            cancel,
-        )?;
+        let counts =
+            run_background_image_phase(state, epoch, run_id, config, lane, cancel, on_result)?;
         phase = advance_run_phase(phase, true, counts);
+    }
+    // 软件图片完成后才派发视频，两类媒体不再抢占同阶段额度。
+    if let Some(video_config) = video_config {
+        for (lane, index) in [(ThumbnailLane::Heavy, 1), (ThumbnailLane::Exception, 2)] {
+            if cancel.is_cancelled() || !state.is_database_epoch_current(epoch) {
+                break;
+            }
+            report(ThumbnailRunPhase::Video);
+            state.thumb_coordinator.run_background_video_cover_phase(
+                state,
+                epoch,
+                video_config,
+                VideoCoverPhase {
+                    run_id,
+                    lane,
+                    index,
+                },
+                cancel,
+                on_result,
+            )?;
+        }
     }
     Ok(())
 }
-
-fn run_parallel_phases<I, V>(
-    images: I,
-    video: Option<V>,
-    cancel: &CancellationToken,
-) -> Result<[u64; 3]>
-where
-    I: FnOnce() -> Result<[u64; 3]> + Send,
-    V: FnOnce() -> Result<()> + Send,
-{
-    std::thread::scope(|scope| {
-        let video = video.map(|video| {
-            scope.spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(video))
-                    .unwrap_or_else(|_| {
-                        Err(AppError::Internal("video cover phase panicked".into()))
-                    });
-                if result.is_err() {
-                    cancel.cancel();
-                }
-                result
-            })
-        });
-        let images = std::panic::catch_unwind(std::panic::AssertUnwindSafe(images))
-            .unwrap_or_else(|_| Err(AppError::Internal("image thumbnail phase panicked".into())));
-        if images.is_err() {
-            cancel.cancel();
-        }
-        let videos = video.map(|handle| {
-            handle
-                .join()
-                .map_err(|_| AppError::Internal("video cover phase panicked".into()))?
-        });
-        let counts = images?;
-        if let Some(result) = videos {
-            result?;
-        }
-        Ok(counts)
-    })
-}
-
-/// 一段图片阶段与同阶段原生视频并行派发，结束后再推进整轮阶段。
+/// 完成本段图片任务（包括在途提交）后才推进阶段。
 fn run_background_image_phase<F>(
     state: &Arc<AppState>,
     epoch: u64,
@@ -924,7 +910,7 @@ fn run_background_image_phase<F>(
     lane: ThumbnailLane,
     cancel: &CancellationToken,
     on_result: &F,
-) -> Result<[u64; 3]>
+) -> Result<[u64; 4]>
 where
     F: Fn(ImageExecution) + Sync,
 {
@@ -932,11 +918,12 @@ where
         ThumbnailLane::Fast => 0,
         ThumbnailLane::Heavy => 1,
         ThumbnailLane::Exception => 2,
+        ThumbnailLane::ImageRs => 3,
         _ => unreachable!("background image phase uses only run lanes"),
     };
     loop {
         if cancel.is_cancelled() || !state.is_database_epoch_current(epoch) {
-            return Ok([0; 3]);
+            return Ok([0; 4]);
         }
         let counts = {
             let conn = state.db_read_pool.get().map_err(AppError::from)?;

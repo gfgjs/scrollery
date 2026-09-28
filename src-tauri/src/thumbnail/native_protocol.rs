@@ -4,11 +4,23 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use super::generator::{EncodedThumbPayload, MAX_ENCODED_ARTIFACT_BYTES};
+use super::generator::{EncodedThumbPayload, ENCODE_STAGE_COUNT, MAX_ENCODED_ARTIFACT_BYTES};
 
-pub const WORKER_HELLO: [u8; 4] = *b"NTHE";
+pub const WORKER_HELLO: [u8; 4] = *b"NTHH";
+/// 后台发现软件回退时先转入尾批；视口沿用自动路由。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeImageRoute {
+    Automatic,
+    DeferImageRs,
+    ImageRsOnly,
+}
+
+/// 仅表示调度延期，不计为解码失败。
+pub const IMAGE_RS_DEFERRED: u8 = 7;
 /// 两份最终产物及小型任务数据的预留；剩余工作集供解码/变换的同时存活缓冲共享。
 pub const RESULT_RESERVATION_BYTES: u64 = 36 * 1024 * 1024;
+/// 小图编码工作集；与普通图片的最低预留共用，允许和一项 432 MiB 解码并存。
+pub const ENCODING_RESERVATION_BYTES: u64 = 80 * 1024 * 1024;
 
 /// 从宿主已持有的工作集折算单像素缓冲上限，留出四份同时存活的缓冲空间。
 pub fn pixel_limit_for_reservation(bytes: u64) -> u64 {
@@ -30,6 +42,7 @@ pub struct NativeRequest {
     /// `DuplicateHandle` 复制到子进程后的句柄值，子进程独占并关闭。
     pub file_handle: u64,
     pub kind: NativeKind,
+    pub image_route: NativeImageRoute,
     pub format: String,
     pub codec_hint: Option<String>,
     /// 图片允许 GPU 变换；视频允许硬件会话。false 时视频不枚举或绑定 D3D 设备。
@@ -131,6 +144,8 @@ pub struct NativeTimings {
     pub decode_transform_us: u64,
     pub encode_hash_us: u64,
     pub embedded_jpeg_combined_us: u64,
+    /// encode_hash_us 的互斥子阶段，顺序见 ENCODE_STAGE_COUNT；嵌入 JPEG 路径均为零。
+    pub encode_stages_us: [u64; ENCODE_STAGE_COUNT],
 }
 
 /// 原生处理线程对本次 QoS revision 的应答；仅 attempted 表示本次实际调用了系统接口。
@@ -143,11 +158,13 @@ pub struct NativeQosAck {
     pub attempted: bool,
 }
 
-/// 只报告已经结束的资源阶段；顺序为 GPU、源读取，随后才编码回包。
+/// 顺序为 GPU、源读取；小图可在变换结束后追加编码就绪，再发送最终回包。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeStage {
     GpuDone = 1,
     SourceDone = 2,
+    /// 已释放解码/变换大缓冲，剩余编码工作集不超过 ENCODING_RESERVATION_BYTES。
+    EncodingReady = 3,
 }
 
 pub enum NativeResponse {
@@ -237,6 +254,9 @@ pub fn write_response(mut writer: impl Write, response: &NativeResponse) -> io::
             writer.write_all(&timings.decode_transform_us.to_le_bytes())?;
             writer.write_all(&timings.encode_hash_us.to_le_bytes())?;
             writer.write_all(&timings.embedded_jpeg_combined_us.to_le_bytes())?;
+            for elapsed in timings.encode_stages_us {
+                writer.write_all(&elapsed.to_le_bytes())?;
+            }
             writer.write_all(&(payload.webp.len() as u32).to_le_bytes())?;
             writer.write_all(&(hash.len() as u16).to_le_bytes())?;
             writer.write_all(&(ai.len() as u32).to_le_bytes())?;
@@ -268,13 +288,15 @@ pub fn read_response(mut reader: impl Read) -> io::Result<NativeResponse> {
         let stage = match stage[0] {
             1 => NativeStage::GpuDone,
             2 => NativeStage::SourceDone,
+            3 => NativeStage::EncodingReady,
             _ => return Err(invalid_data("invalid native stage")),
         };
         return Ok(NativeResponse::Stage { id, stage });
     }
     let mut qos_bytes = [0u8; 18];
     reader.read_exact(&mut qos_bytes)?;
-    if qos_bytes[8] > 3 || !(1..=4).contains(&qos_bytes[9]) {
+    // 线协议只要求非零槽号；实际进程容量由宿主 record_qos_receipt 校验，不能固化旧线程上限。
+    if qos_bytes[8] > 3 || qos_bytes[9] == 0 {
         return Err(invalid_data("invalid native thumbnail QoS acknowledgement"));
     }
     let qos = NativeQosAck {
@@ -309,16 +331,25 @@ pub fn read_response(mut reader: impl Read) -> io::Result<NativeResponse> {
             _ => return Err(invalid_data("invalid native thumbnail adapter kind")),
         },
     };
-    let mut timing_bytes = [0u8; 24];
+    let mut timing_bytes = [0u8; 24 + 8 * ENCODE_STAGE_COUNT];
     reader.read_exact(&mut timing_bytes)?;
     let timings = NativeTimings {
         decode_transform_us: u64::from_le_bytes(timing_bytes[0..8].try_into().unwrap()),
         encode_hash_us: u64::from_le_bytes(timing_bytes[8..16].try_into().unwrap()),
         embedded_jpeg_combined_us: u64::from_le_bytes(timing_bytes[16..24].try_into().unwrap()),
+        encode_stages_us: std::array::from_fn(|index| {
+            let offset = 24 + index * 8;
+            u64::from_le_bytes(timing_bytes[offset..offset + 8].try_into().unwrap())
+        }),
     };
     if timings.decode_transform_us > MAX_STAGE_US
         || timings.encode_hash_us > MAX_STAGE_US
         || timings.embedded_jpeg_combined_us > MAX_STAGE_US
+        || timings
+            .encode_stages_us
+            .iter()
+            .fold(0u64, |sum, elapsed| sum.saturating_add(*elapsed))
+            > timings.encode_hash_us
         || (timings.embedded_jpeg_combined_us > 0
             && (timings.decode_transform_us > 0 || timings.encode_hash_us > 0))
     {

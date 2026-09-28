@@ -1,4 +1,4 @@
-// 已授权的维护者入口：只编译本项目薄桥，复用显式准备的官方 dispatcher。
+// 编译本项目薄桥；开发入口允许按需准备锁定的官方 dispatcher。
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -21,6 +21,12 @@ function run(command, args, capture = false) {
 }
 if (process.platform !== 'win32' || process.arch !== 'x64') {
   throw new Error('VPL bridge currently targets Windows x64');
+}
+// target 可被清理，开发启动时补齐源码或静态库，已有依赖直接复用。
+if (process.argv.includes('--dev') &&
+    (!existsSync(source) || !existsSync(path.join(install, 'lib/vpl.lib')))) {
+  console.log('[VPL] 开发依赖缺失，正在准备锁定的 dispatcher（首次需要下载并编译）…');
+  run(process.execPath, [path.join(root, 'scripts/build-vpl-dispatcher.mjs')]);
 }
 if (!existsSync(source)) {
   throw new Error('VPL dispatcher source is missing. Run node scripts/build-vpl-dispatcher.mjs from the repository root, then retry.');

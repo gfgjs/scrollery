@@ -97,6 +97,11 @@ pub fn init(app_data_dir: &Path) -> ConfigBoot {
     // 注:thumb_use_pipeline 配置键已退役(2026-07-10 A/B 裁决删方案一,流水线成唯一
     // 实现,7.3s vs 16-20s);旧库残留的该键无读者,无害。
 
+    crate::thumbnail::limits::install(crate::thumbnail::limits::ThumbnailLimits::from_reader(
+        |key| config_manager.get(key),
+    ))
+    .expect("thumbnail limits must be installed before workers start");
+
     ConfigBoot {
         path: config_path,
         manager: config_manager,

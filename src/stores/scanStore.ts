@@ -602,6 +602,10 @@ export const useScanStore = defineStore('scan', () => {
         return i18n.global.t('settings.thumbPhaseHeavy')
       case 'exception':
         return i18n.global.t('settings.thumbPhaseException')
+      case 'image_rs':
+        return i18n.global.t('settings.thumbPhaseImageRs')
+      case 'video':
+        return i18n.global.t('settings.thumbPhaseVideo')
       default:
         return ''
     }
