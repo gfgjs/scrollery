@@ -1,5 +1,5 @@
 // src/composables/useExoticStore.ts
-// 插件商店数据层（Part5 T11，消费 Part6 registry/install/processing 命令）。
+// 插件商店数据层：消费 registry/install/processing 命令。
 //
 // 前后端职责：本 composable 只做「取列表 / 触发安装生命周期 / 读进度」的薄封装；
 //    验签 / 防回滚 / 安装完整性校验全在后端（命令只接受已校验 pluginId，绝不接受 URL/路径/hash）。
@@ -100,20 +100,32 @@ export function useExoticStore() {
   const status = ref<ExoticProcessingStatus | null>(null)
   const loading = ref(false)
   const error = ref<IpcError | null>(null)
+  let statusRequest = 0
+  let installedRequest = 0
+  let registryRequest = 0
 
   /** 从本地缓存列出可安装条目（无缓存→空）。 */
   async function loadRegistry(): Promise<void> {
-    registry.value = await invokeIpc<ExoticRegistryEntry[]>(IPC.LIST_EXOTIC_REGISTRY)
+    const request = ++registryRequest
+    const snapshot = await invokeIpc<ExoticRegistryEntry[]>(IPC.LIST_EXOTIC_REGISTRY)
+    // 初次读取可能晚于用户的远程刷新返回，不能恢复旧版本或过期状态。
+    if (request === registryRequest) registry.value = snapshot
   }
 
   /** 列已安装插件。 */
   async function loadInstalled(): Promise<void> {
-    installed.value = await invokeIpc<InstalledExoticPlugin[]>(IPC.LIST_INSTALLED_EXOTIC_PLUGINS)
+    const request = ++installedRequest
+    const snapshot = await invokeIpc<InstalledExoticPlugin[]>(IPC.LIST_INSTALLED_EXOTIC_PLUGINS)
+    // 首次加载和安装生命周期的刷新会重叠，旧快照不能恢复已经失效的卡片操作状态。
+    if (request === installedRequest) installed.value = snapshot
   }
 
   /** 读处理进度摘要。 */
   async function loadStatus(): Promise<void> {
-    status.value = await invokeIpc<ExoticProcessingStatus>(IPC.GET_EXOTIC_PROCESSING_STATUS)
+    const request = ++statusRequest
+    const snapshot = await invokeIpc<ExoticProcessingStatus>(IPC.GET_EXOTIC_PROCESSING_STATUS)
+    // 后台刷新与用户启停后的刷新会重叠，迟到旧快照不能倒退当前处理状态。
+    if (request === statusRequest) status.value = snapshot
   }
 
   /** 一次性刷新商店三态（列表 + 已装 + 进度）。失败置 `error` 不抛（列表视图容错）。 */
@@ -150,7 +162,13 @@ export function useExoticStore() {
   }
 
   async function repair(pluginId: string): Promise<void> {
-    await invokeIpc(IPC.REPAIR_EXOTIC_PLUGIN, { pluginId })
+    try {
+      await invokeIpc(IPC.REPAIR_EXOTIC_PLUGIN, { pluginId })
+    } catch (error) {
+      if ((error as IpcError)?.code !== 'repair_corrupt') throw error
+      // 完整性复核不能补回损坏文件，转入现有验签安装链重装，避免“修复”反复停在同一错误。
+      return install(pluginId)
+    }
     await loadInstalled()
   }
 

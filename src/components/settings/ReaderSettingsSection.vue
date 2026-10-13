@@ -1,7 +1,7 @@
 <template>
-  <!-- 设置页「阅读」节(阅读器方案 R3):阅读主题日/夜配对的全局家。
+  <!-- 设置页同时配置日/夜阅读主题。
        与阅读器内设置面板的分工:字号/排版等「边读边调」项留在书内面板(见 ReaderSettingsPanel);
-       此处只放**开书前就想定**的默认阅读主题,且是唯一能同时配日/夜两槽的地方
+       此处配置默认阅读主题，且能同时调整日/夜两槽
        (书内面板据当前 app 明暗只改一槽)。二者写同一组 app_config 键(doc_reader_theme_*),非双源。 -->
   <CollapsibleCard id="reading" :title="$t('settings.reading')">
     <!-- 提示与分组行各自补横向 var(--spacing-lg)/纵向 var(--spacing-md) 内边距，

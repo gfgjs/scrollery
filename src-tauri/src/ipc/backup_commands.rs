@@ -1,8 +1,8 @@
-//! 数据备份 IPC 命令(方案 B §5/§8 app 接线,阶段 2b)。
+//! 数据备份 IPC 命令。
 //!
-//! 纯备份引擎在 `crate::backup::core`;本模块负责:文件任务门闩获取、文档一致性 write guard、
+//! 备份引擎在 `crate::backup::core`;本模块负责:文件任务门闩获取、文档一致性 write guard、
 //! backup_id / 时间戳注入、**分离任务**执行(webview 关闭也跑到底、gate 必释放)、进度事件 +
-//! 快照 + `backup_status` 查询(Channel 随 webview 死,故用 app 级事件 + AppState 快照,方案 §5.1)。
+//! 快照 + `backup_status` 查询。Channel 随 webview 关闭，状态由 app 级事件和 AppState 快照承载。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -491,12 +491,29 @@ pub async fn list_backups(
                 out.push(e);
             }
         }
-        // 按 created_at_utc 降序(RFC3339 字典序 == 时间序);缺失回退文件名。
-        out.sort_by(|a, b| b.created_at_utc.cmp(&a.created_at_utc));
+        sort_backup_entries(&mut out);
         Ok(out)
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+}
+
+fn sort_backup_entries(entries: &mut [BackupListEntry]) {
+    entries.sort_by(|a, b| {
+        b.created_at_utc.cmp(&a.created_at_utc).then_with(|| {
+            // 同秒包按发布序号倒排；去掉扩展名，首包才能排在带后缀的新包之后。
+            crate::utils::natural_sort::natural_cmp(
+                &Path::new(&b.file_name)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                &Path::new(&a.file_name)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+            )
+        })
+    });
 }
 
 /// 读一个备份包的 manifest → 列表条目。任何失败(非法 zip / 无 manifest)返回 None(跳过)。
@@ -561,6 +578,28 @@ pub async fn restore_stage(
     result.map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
+/// 取消一轮预检，仅释放该轮仍拥有且尚未确认恢复的暂存。
+#[tauri::command]
+pub async fn restore_discard(
+    backup_id: String,
+    staging_token: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<()> {
+    if !state.try_acquire_file_job(FILE_JOB_RESTORE) {
+        return Err(AppError::Backup {
+            code: CODE_JOB_BUSY,
+            message: "已有文件任务在运行 | file job busy".into(),
+        });
+    }
+    let state_arc = Arc::clone(&*state);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::backup::restore_discard(&state_arc.app_data_dir, &backup_id, &staging_token)
+    })
+    .await;
+    state.release_file_job(FILE_JOB_RESTORE);
+    result.map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+}
+
 /// 恢复第二步(用户双确认后):arm。获取 FILE_JOB_RESTORE 门闩 + 持文档一致性 write guard →
 /// 生成 pre-restore 回滚包(成功前绝不 arm)+ 写 pending-restore 标记(§6.2.1-2)。成功后前端调
 /// `relaunch_app` 触发重启,启动期 `perform_swap_at_boot` 完成交换。`backup_id`/`staging_dir` 取自
@@ -569,35 +608,12 @@ pub async fn restore_stage(
 pub async fn restore_arm(
     backup_id: String,
     staging_dir: String,
+    staging_token: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
     // span 埋点(W1,D-312 info 档:回滚包生成+文档一致性 write guard,真实重负载 IO)。
     let _span = crate::logging::SpanTimer::info("ipc:restore_arm");
-    // backup_id 来自 IPC(webview 可被绕过),当不可信输入校验:拒穿越/绝对/盘符/多段。staging 目录
-    // 一律由本机 app_data + 校验后的 backup_id **服务端派生**,不信前端传来的 staging_dir——否则开机
-    // 交换会据裸路径把活库移出 appdata / 装入任意 DB(违反「canonicalize + bounds-check user paths」硬约束)。
-    if !crate::backup::is_safe_backup_id(&backup_id) {
-        return Err(AppError::Restore {
-            code: crate::backup::restore::CODE_PATH_INVALID,
-            message: "非法 backupId | invalid backup id".into(),
-        });
-    }
     let app_data = state.app_data_dir.clone();
-    let staging = app_data.join("restore-staging").join(&backup_id);
-    // 前端传来的 staging_dir 仅作一致性核对(非空且不匹配即拒);真实路径以派生为准。
-    if !staging_dir.trim().is_empty() && Path::new(&staging_dir) != staging.as_path() {
-        return Err(AppError::Restore {
-            code: crate::backup::restore::CODE_PATH_INVALID,
-            message: "staging 路径与 backupId 不符 | staging path mismatch".into(),
-        });
-    }
-    // 暂存库须已存在(restore_stage 已成功暂存),否则无可 arm。
-    if !staging.join("db").join("scrollery.db").exists() {
-        return Err(AppError::Restore {
-            code: crate::backup::restore::CODE_IO,
-            message: "暂存库缺失,请先暂存 | staging db missing".into(),
-        });
-    }
     if !state.try_acquire_file_job(FILE_JOB_RESTORE) {
         return Err(AppError::Backup {
             code: CODE_JOB_BUSY,
@@ -620,7 +636,8 @@ pub async fn restore_arm(
         crate::backup::arm_restore(
             &app_data,
             &backup_id,
-            &staging, // 服务端派生的安全路径(非前端裸串)
+            Path::new(&staging_dir), // 仅供一致性核对；core 在跨进程锁内派生真实目录。
+            &staging_token,
             &rollback_backup_id,
             &created_at_utc,
             &timestamp_label,

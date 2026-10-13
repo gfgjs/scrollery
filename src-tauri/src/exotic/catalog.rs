@@ -1,13 +1,13 @@
 // src-tauri/src/exotic/catalog.rs
-//! 冷门格式插件 · 能力目录（v3 §5.1「能力真相」/ Part1 §1.2-1.4）。
+//! 冷门格式插件的能力目录。
 //!
 //! Catalog 回答：某扩展名**是否有产品**、属哪类媒体、提供哪些能力、哪些平台可用。
-//! 它**不**回答「是否已安装」「是否已授权」——那是另外两份真相（v3 §5.1）。
+//! 它**不**回答「是否已安装」「是否已激活」——那是另外两份真相（v3 §5.1）。
 //!
 //! 设计要点：
-//!   - 内置 Catalog 用 `include_str!` 编入二进制（= 随应用签名发布，首次离线也可识别可购买格式）。
+//!   - 内置 Catalog 用 `include_str!` 编入二进制（= 随应用签名发布，首次离线也可识别可安装格式）。
 //!   - 运行时只读快照 `RwLock<Arc<CatalogSnapshot>>`：热路径一次读锁 + Arc clone，不查 DB；
-//!     刷新时先**完整**解析新快照、校验通过后整体替换，禁止半更新（Part1 §1.4）。
+//!     刷新时先完整解析并校验新快照，再整体替换，避免半更新。
 //!   - `by_format` 以**规范化小写扩展名**为键（R13：分类只依赖扩展名，扫描事务内即可判定）。
 
 use std::collections::HashMap;
@@ -44,21 +44,21 @@ impl From<MediaKind> for MediaType {
     }
 }
 
-/// 能力类型。首发只交付 `thumbnail`（v3 §3.2）；metadata/text 为后续扩展预留。
+/// Catalog 中声明的能力类型。`metadata` 与 `text` 尚无任务派发实现。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Capability {
     Thumbnail,
     Metadata,
     Text,
-    /// CLIP 批量嵌入(Part4 T10/G5,协议 v2)。
+    /// CLIP 批量嵌入。
     Embedding,
-    /// 人脸检测+嵌入(Part4 T10/G5,协议 v2)。rename 保 snake_case 全名——
+    /// 人脸检测与嵌入。rename 保 snake_case 全名——
     /// 本枚举的 rename_all="lowercase" 会把驼峰挤成 "facedetectembed",
     /// 与协议侧 capability::FACE_DETECT_EMBED 不一致。
     #[serde(rename = "face_detect_embed")]
     FaceDetectEmbed,
-    /// 影像增强(降噪/超分子系统 design.md §C):同 OCR 的 D-OCR-7 豁免——enhance **不**进
+    /// 影像增强：与 OCR 一样，enhance 不进入
     /// exotic 任务化调度(host 侧 EnhanceService 直持 supervisor+worker client),本变体
     /// 仅作 catalog 展示/授权面存在,不接 coordinator 任务队列。serde 小写序列化为 "enhance"。
     Enhance,
@@ -78,7 +78,7 @@ impl Capability {
     }
 }
 
-/// Catalog 解析/校验错误。整个 Catalog 校验失败时拒绝**全部**，不做部分接受（Part1 §1.2）。
+/// Catalog 解析/校验错误；整表校验失败时拒绝全部，不做部分接受。
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("catalog JSON 解析失败：{0}")]
@@ -129,19 +129,18 @@ struct RawOffering {
     license_tier: String,
     platforms: Vec<String>,
     min_host_version: String,
-    /// 授权 SKU（License token 验签的 expected_sku 来源，§5.2）。paid offering 应声明；
-    /// free/无 SKU 时为 None（无法验签 → 已装也只能 InstalledUnlicensed）。
+    /// schema 1 发行元数据，保留旧目录的解析兼容，不参与功能激活。
     #[serde(default)]
     sku: Option<String>,
     #[serde(default)]
     override_common: bool,
     #[serde(default)]
     store_url: Option<String>,
-    /// 分发形态(D-OCR-5):`"builtin"` = 无安装包,`availability_of` 跳过安装态门直接验 license;
+    /// 分发形态：`"builtin"` = 无安装包，`availability_of` 跳过安装态门读取本地激活记录；
     /// 缺省/其它值按常规 package 处理。
     #[serde(default)]
     distribution: Option<String>,
-    /// 运行期调度信息(Part8 前由发布侧显式声明):worker 握手期望的 worker_id。
+    /// 运行期调度信息：worker 握手期望的 worker_id。
     /// 缺省/None 表示该 offering 不进入 exotic Coordinator 调度(如 OCR/Enhance 独立服务)。
     #[serde(default)]
     worker_id: Option<String>,
@@ -162,10 +161,10 @@ pub struct CatalogOffering {
     pub license_tier: String,
     pub platforms: Vec<String>,
     pub min_host_version: String,
-    /// 授权 SKU（§5.2）；None=无 SKU（不可验签）。
+    /// schema 1 发行元数据，不参与功能激活。
     pub sku: Option<String>,
     pub store_url: Option<String>,
-    /// builtin offering(D-OCR-5):无安装包,`availability_of` 跳过安装态门直接验 license。
+    /// builtin offering 无安装包；`availability_of` 跳过安装态门读取本地激活记录。
     pub builtin: bool,
     /// 运行期调度信息:worker 握手期望的 worker_id。None 表示不进入 exotic 调度。
     pub worker_id: Option<String>,
@@ -201,7 +200,7 @@ impl CatalogSnapshot {
 
     /// 解析 + 严格校验 JSON → 快照。任一项不合规即整体拒绝。
     ///
-    /// 撞常见格式（`classify_media_type` 已认领，如 jpg/mp4）→ 拒绝**整个** Catalog（Part1 §1.2）。
+    /// 撞常见格式（`classify_media_type` 已认领，如 jpg/mp4）时拒绝整个 Catalog。
     /// 这是纵深防御：扫描 common-first 只挡解码劫持，挡不住缩略图 router（直接 key 于
     /// `resolve_format`）把误登记的常见格式 gate 出主 generator，也挡不住错误产品暴露到市场。
     pub fn parse(json: &str) -> Result<Self, CatalogError> {
@@ -314,7 +313,7 @@ impl CatalogSnapshot {
     }
 
     /// 查某格式的媒体大类——`classify_scanned_file` 的 catalog 回退用。
-    /// builtin offering(D-OCR-5)恒返回 None:它是能力插件而非文件格式,扩展名分类面
+    /// builtin offering 恒返回 None：它是能力插件而非文件格式，扩展名分类面
     /// 一律不可见——磁盘上真出现同名扩展杂散文件(如 `.ocr`)不得被判为媒体、进库。
     /// `resolve_format` 是独立方法,不受此过滤影响(availability 通路仍可查到 builtin offering)。
     pub fn media_kind(&self, format: &str) -> Option<MediaKind> {

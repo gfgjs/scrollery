@@ -1,5 +1,5 @@
 <template>
-  <!-- 网络存储（需求8 8B, §3.8）：管理 WebDAV / 远程存储后端。 -->
+  <!-- 管理 WebDAV 等远程存储后端。 -->
   <CollapsibleCard id="networkStorage" :title="$t('settings.nsTitle')">
     <div class="ns-intro" v-html="$t('settings.nsIntro')"></div>
 
@@ -90,7 +90,7 @@
 </template>
 
 <script setup lang="ts">
-// 网络存储后端管理（需求8 8B, §3.8）：列出 / 测试 / 添加 / 移除 WebDAV（及 SMB/本地）后端。
+// 网络存储后端管理：列出、测试、添加和移除 WebDAV、SMB 等后端。
 // 密码经后端存入系统 keyring，不落库（前端永不回显密码）。
 import { ref, reactive, computed, onMounted } from 'vue'
 import { invokeIpc } from '../../utils/ipc'
@@ -208,12 +208,6 @@ onMounted(loadBackends)
 </script>
 
 <style scoped>
-/* 注:此处曾有一份自绘 `.settings-card` / `.settings-card__header`(CollapsibleCard 迁移前的遗留)。
-   本节根节点已是 <CollapsibleCard>,卡片外观归全局 .settings-card(index.css)统一,故两块删除。
-   删因不是「重复」而是**它盖掉了全局卡**:scoped CSS 的 data-v 会打在子组件根节点上,那条
-   `.settings-card` 因而命中 CollapsibleCard 的根 div,让本卡在六套主题下都取 bg-surface 而非
-   --card-bg(=bg-elevated)、圆角 md 而非 lg、外加 16px 下边距 —— 全设置页 9 张卡里唯独这张不同。
-   (`.settings-card__header` 则相反:CollapsibleCard 内部 DOM 拿不到本组件 data-v,是死代码。) */
 .ns-intro {
   padding: 12px 16px;
   font-size: var(--font-size-xs);
@@ -286,9 +280,7 @@ onMounted(loadBackends)
   display: flex;
   gap: 10px;
 }
-/* 字段 label 关联/朝向/caption 由 UiField 原语提供（原 .ns-field 基座 + > span 已删）；行内布局用的
-   --grow/--kind 修饰类经 class passthrough 落到 UiField 根（仍命中：子根带父 data-v）。输入框视觉从
-   `.ns-field 后代`重锚到不变的 `.ns-form 后代`（迁移后 .ns-field 类消失，原选择器会失配）。 */
+/* UiField 提供字段 label 与 caption；修饰类透传到根，输入框样式以稳定的 .ns-form 锚定。 */
 .ns-field--grow {
   flex: 1;
 }

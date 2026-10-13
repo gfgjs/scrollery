@@ -1,13 +1,12 @@
 // src-tauri/src/exotic/limiter.rs
-//! 后台重活公平并发池（v3.1 勘误 R4）。
-//! 另含 GPU 推理令牌 [`GpuToken`](Part4 D2/T11)——复用同一公平队列骨架的独立类型,额度恒 1。
+//! 后台重活公平并发池，以及独立的单额度 GPU 推理令牌 [`GpuToken`]。
 //!
-//! **缩略图重型项、derivation 与 exotic Worker 请求共享同一个全局 permit 预算**。
-//! 若各开各的 semaphore，大视频库持续派生会饿死 exotic（PSD 永不出图）。
+//! **derivation 重型任务与 exotic Worker 请求共享同一个全局 permit 预算**——二者同级（总纲优先级阶梯），
+//! 谁也不硬让步谁。若各开各的 semaphore，大视频库持续派生会饿死 exotic（PSD 永不出图）。
 //!
 //! 关键性质：
-//!   - **FIFO 公平**：重活共享份额按票号服务；快速缩略图另保留一个名额，
-//!     仅在没有重活等待者时借用共享份额，避免尾批占满快速入口。
+//!   - **FIFO 公平**：按到达顺序授予 permit（票号 + 队首服务），exotic 票一旦入队，下一个释放的
+//!     permit 必落到它头上、不被后到的 derivation 票插队 → 最大排队等待有上界（R4 公平验收）。
 //!   - **取消感知**：`acquire` 周期性醒来检查 `CancellationToken`；取消即退队返回 None，不泄漏票。
 //!   - **即时释放**：`HeavyPermit` Drop 归还 permit 并唤醒队首（故障测试查无泄漏）。
 //!
@@ -26,8 +25,6 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 struct LimiterState {
     /// 当前可用 permit 数。
     available: usize,
-    fast_in_use: usize,
-    peak: usize,
     /// 下一张票号（单调递增）。
     next_ticket: u64,
     /// 等待队列（票号 FIFO）。队首才有资格在 available>0 时取走 permit。
@@ -39,95 +36,39 @@ pub struct BackgroundHeavyLimiter {
     state: Mutex<LimiterState>,
     cv: Condvar,
     total: usize,
-    fast_reserved: usize,
 }
 
 impl BackgroundHeavyLimiter {
     /// 以 `permits` 个并发额度创建（建议 = 后台重活目标并发，如 `available_parallelism()`）。
     pub fn new(permits: usize) -> Arc<Self> {
-        Self::create(permits.max(1), 0)
-    }
-
-    /// CPU 准入总额中保留一个快速名额；低核至少允许快速与重活各一项。
-    pub(crate) fn with_fast_reservation(permits: usize) -> Arc<Self> {
-        Self::create(permits.max(2), 1)
-    }
-
-    fn create(permits: usize, fast_reserved: usize) -> Arc<Self> {
+        let permits = permits.max(1);
         Arc::new(BackgroundHeavyLimiter {
             state: Mutex::new(LimiterState {
                 available: permits,
-                fast_in_use: 0,
-                peak: 0,
                 next_ticket: 0,
                 queue: VecDeque::new(),
             }),
             cv: Condvar::new(),
             total: permits,
-            fast_reserved,
         })
     }
 
-    /// 重活可用的总额度，供现有后台池配置并发数。
+    /// 总额度。
     pub fn total(&self) -> usize {
-        self.total - self.fast_reserved
+        self.total
     }
 
     /// 当前可用额度（瞬时快照；仅供观测/测试）。
     pub fn available(&self) -> usize {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        self.heavy_available(&state)
-    }
-
-    fn heavy_available(&self, state: &LimiterState) -> usize {
-        let heavy_in_use = self.total - state.available - state.fast_in_use;
-        state.available.min(self.total() - heavy_in_use)
-    }
-
-    /// 返回共享准入的总额、在途数、快速在途数和峰值；不代表实际 CPU 利用率。
-    pub(crate) fn snapshot(&self) -> (usize, usize, usize, usize) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            self.total,
-            self.total - state.available,
-            state.fast_in_use,
-            state.peak,
-        )
-    }
-
-    fn grant(self: &Arc<Self>, state: &mut LimiterState, fast: bool) -> HeavyPermit {
-        state.available -= 1;
-        state.fast_in_use += usize::from(fast);
-        state.peak = state.peak.max(self.total - state.available);
-        HeavyPermit {
-            limiter: Arc::clone(self),
-            fast,
-        }
-    }
-
-    /// 快速项不阻塞；保留名额可直接取得，借共享名额时不越过重活等待者。
-    pub(crate) fn try_acquire_fast(self: &Arc<Self>) -> Option<HeavyPermit> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.available == 0
-            || (!state.queue.is_empty() && state.fast_in_use >= self.fast_reserved)
-        {
-            return None;
-        }
-        Some(self.grant(&mut state, true))
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .available
     }
 
     /// 公平取一个 permit；阻塞直到拿到或 `token` 取消。取消返回 `None`（已退队，不泄漏）。
     pub fn acquire(self: &Arc<Self>, token: &CancellationToken) -> Option<HeavyPermit> {
         self.acquire_cancellable(&|| token.is_cancelled())
-    }
-
-    /// 不等待地领取空闲额度；已有 FIFO 等待者时让其先行。
-    pub fn try_acquire(self: &Arc<Self>) -> Option<HeavyPermit> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if self.heavy_available(&state) == 0 || !state.queue.is_empty() {
-            return None;
-        }
-        Some(self.grant(&mut state, false))
     }
 
     /// 公平取额度，等待期间允许调用方按取消、熔断或授权状态退队。
@@ -154,9 +95,12 @@ impl BackgroundHeavyLimiter {
                 return None;
             }
             // 仅队首在有额度时取走（FIFO，杜绝插队 → 等待上界）。
-            if self.heavy_available(&state) > 0 && state.queue.front() == Some(&ticket) {
+            if state.available > 0 && state.queue.front() == Some(&ticket) {
+                state.available -= 1;
                 state.queue.pop_front();
-                return Some(self.grant(&mut state, false));
+                return Some(HeavyPermit {
+                    limiter: Arc::clone(self),
+                });
             }
             let (state, _timeout) = self
                 .cv
@@ -167,10 +111,9 @@ impl BackgroundHeavyLimiter {
     }
 
     /// 释放一个 permit（仅由 [`HeavyPermit::drop`] 调用）。
-    fn release(&self, fast: bool) {
+    fn release(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.available += 1;
-        state.fast_in_use -= usize::from(fast);
         // 唤醒全部等待者：只有当前队首会真正取走，其余继续等（Condvar 无法精确点名队首）。
         drop(state);
         self.cv.notify_all();
@@ -189,32 +132,27 @@ fn remove_ticket(queue: &mut VecDeque<u64>, ticket: u64) {
 #[must_use]
 pub struct HeavyPermit {
     limiter: Arc<BackgroundHeavyLimiter>,
-    fast: bool,
 }
 
 impl Drop for HeavyPermit {
     fn drop(&mut self) {
-        self.limiter.release(self.fast);
+        self.limiter.release();
     }
 }
 
-/// GPU 推理令牌:全局额度**恒 1**(集显/单 GPU 语义,Part4 D2 §3.1;多 permit 放行留
-/// T22 按 VRAM 档位实测)。薄封装复用 [`BackgroundHeavyLimiter`] 的 FIFO 公平队列 +
+/// GPU 推理令牌：全局额度恒为 1。薄封装复用 [`BackgroundHeavyLimiter`] 的 FIFO 公平队列 +
 /// 取消感知 + RAII 释放,但作为**独立类型**存在——防 CPU permit 池与 GPU 令牌在调用点
 /// 混用,也让获取顺序纪律有类型可依。
 ///
-/// 分层(D2 §3.2,勿合并):`AppState::gpu_analysis_owner` 管**会话语义**(哪条流水线在
+/// `AppState::gpu_analysis_owner` 管**会话语义**（哪条流水线在
 /// 分析,分钟级,用户可见的 start/pause);本令牌管**物理并发**(哪个 worker 此刻真的在
 /// 打 GPU,批粒度,秒级)。合并会让「暂停人脸让 CLIP 跑」这类语义纠缠进批调度。
 ///
-/// 🔴 获取顺序天条(D2 §3.1/§4,防死锁):同时需要 CPU permit 与 GPU 令牌的路径,必须
+/// 防死锁获取顺序：同时需要 CPU permit 与 GPU 令牌的路径，必须
 /// **先 `BackgroundHeavyLimiter::acquire` 再 `GpuToken::acquire`**;释放顺序不限(RAII
 /// Drop)。全局唯一获取顺序 → 等待图无环 → 无死锁。
 ///
-/// 形态不变性(D2 §3.3):合并单 ai-worker(池宽 1)下令牌几乎恒空闲即得,退化为保险丝
-/// (防未来第二 GPU 消费者);分离双 worker 下真跨池仲裁。两形态代码路径一致,T9.5/T20
-/// 拍板不影响本模块。acquire 点接线随 T13/T15 批派发落地(发 EmbedBatch/FaceDetectEmbed
-/// 前;文本塔恒 CPU 不占令牌,D2 §5)。
+/// AI 与增强请求共用令牌，避免不同 worker 同时占用 GPU；文本塔恒为 CPU，不占令牌。
 pub struct GpuToken {
     inner: Arc<BackgroundHeavyLimiter>,
 }
@@ -244,4 +182,31 @@ impl GpuToken {
 #[must_use]
 pub struct GpuPermit {
     _permit: HeavyPermit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn cancel_unblocks_waiter_without_leak() {
+        let lim = BackgroundHeavyLimiter::new(1);
+        let token = CancellationToken::new();
+        // 主线程占满唯一 permit。
+        let held = lim.acquire(&token).unwrap();
+
+        let lim2 = Arc::clone(&lim);
+        let token2 = token.clone();
+        let waiter = thread::spawn(move || lim2.acquire(&token2).is_none());
+
+        // 给 waiter 时间进入等待，然后取消。
+        thread::sleep(Duration::from_millis(50));
+        token.cancel();
+        assert!(waiter.join().unwrap(), "取消应使等待者返回 None");
+
+        // 持有者释放后额度回到 1，无票泄漏（队列已清）。
+        drop(held);
+        assert_eq!(lim.available(), 1);
+    }
 }

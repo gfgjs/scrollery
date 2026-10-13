@@ -1,14 +1,13 @@
-// src/composables/useHoverPreview.ts
-// 视频 / 动态照片格子的悬停自动播放预览（需求1, §3.1）。
+// 视频与动态照片格子的悬停预览。
 //
-// 设计要点（§3.1）：
+// 运行约束：
 //  - **共享池（容量 1）**：模块级 `activeId` 保证同一时刻最多一个格子在预览，移到新格子时
 //    旧格子立即卸载 —— 严禁每格一个 video（百万级库内存/解码爆炸）。
-//  - **悬停防抖 200ms**：快速划过不触发解码。
+//  - **悬停延迟**：快速划过不触发解码，时长取自设置。
 //  - **compact / 选择模式 / 设置关闭** 下禁用。
 //  - 源解析：普通视频 → 原文件；Apple Live / Google Motion Photo → get_companion_video_url
 //    （后端按 companion MOV 或内嵌 MP4 偏移自动抽出，前端无需区分）。
-//  - **超大视频降级（§3.3）**：判「重」（分辨率超 4K / 体积超 10GB，见 HEAVY_VIDEO_*）的视频
+//  - **超大视频降级**：判「重」（阈值见 uiStore 设置）的视频
 //    不解码播放，改用预生成的关键帧 sprite 做悬停 scrub（鼠标横向位置 → background-position
 //    切帧）；无 sprite 时回退为直接播放。DB 尺寸不可信（enrich 前占位）由 onPreviewMeta 的
 //    真实 metadata 运行时补判兜底。
@@ -34,7 +33,7 @@ const spriteMissAt = new Map<number, number>()
 // 播放起步的 loadedmetadata 会带回真实分辨率；超 4K 者记入此集，当场降级并在后续 hover 直接走
 // scrub-only。会话级缓存，无需失效（分辨率是文件固有属性）。
 const runtimeHeavy = new Set<number>()
-// 当前活动实例的清理入口（随 activeId 同步指向持有者的 onLeave）。窗口失焦/页签隐藏时鼠标事件
+// 当前悬停实例的清理入口（含延迟起播和源解析阶段）。窗口失焦/页签隐藏时鼠标事件
 // 不会到来，若不主动收尾，后台会一直白解码视频；模块级注册一次（应用单例生命周期，无需反注册）。
 let activeLeave: (() => void) | null = null
 // document 一并判存在:node 测试环境只桩 window 时本模块仍可安全载入。
@@ -55,15 +54,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 //  ② fileSize > 10GB：仅作病态大文件兜底。**播放是渐进流式**（起播只读头 + 首个 GOP，不读整
 //     文件），故文件大小与起播延迟几乎无关（实测 SSD 上数十 GB 仍秒开）——size 基本是红鲱鱼，
 //     阈值故意抬到 10GB，只挡真正异常的巨型文件（如高码率无损）。
-// TODO(phase-2)：接 video_meta.video_codec（HEVC/AV1 long-GOP 才是 seek/软解真凶）需给
-//   LayoutRowItem 加行列或懒取 IPC，届时把 codec 并入本判据。
 // sprite 负结果（无 sprite）重试间隔：TTL 内不重复 IPC，过期后重查——覆盖「悬停过→用户手动
 // 触发关键帧提取→sprite 迟到」的场景，scrub 能力在一个 TTL 内恢复而非瘫到重启。
 const SPRITE_MISS_TTL_MS = 30_000
 // 关键帧 sprite 的帧数兜底默认值（与后端 derive/video.rs::KEYFRAME_COUNT / schema.rs
-// video_keyframe_count 键缺省值一致）。小批 C2（2026-07-22）起改由 ui.videoKeyframeCount
-// 响应式下发（经 get_startup_config），此常量仅在取不到该值时兜底——不再是恒定生效值，
-// 之前用户改 video_keyframe_count 后新雪碧图会被本处硬编码 10 错切，本批修复该缺口。
+// video_keyframe_count 键缺省值一致）。正常情况下帧数由 ui.videoKeyframeCount 响应式提供，
+// 此常量仅在取不到设置值时兜底。
 const KEYFRAME_COUNT_FALLBACK = 10
 // 横移死区（px）：悬停播放态下，光标相对进入点的水平位移累计超过此值，才认作「想逐帧看」的
 // scrub 意图并切入 scrub。小于此值的微抖不触发——否则光标停在格上的轻微抖动会反复打断正在播放
@@ -164,6 +160,9 @@ export function useHoverPreview(opts: HoverPreviewOptions) {
 
   function onEnter() {
     if (!eligible()) return
+    // 等待起播时也必须可退出，否则失焦后迟到的计时或 IPC 仍会在后台启动预览。
+    if (activeLeave !== onLeave) activeLeave?.()
+    activeLeave = onLeave
     if (timer) clearTimeout(timer)
     playEntryX = null
     const myToken = ++resolveToken
@@ -187,7 +186,6 @@ export function useHoverPreview(opts: HoverPreviewOptions) {
             previewSrc.value = ''
             mode.value = 'scrub'
             activeId.value = opts.id()
-            activeLeave = onLeave
             return
           }
           // 无 sprite → 落到下方直接播放
@@ -199,7 +197,6 @@ export function useHoverPreview(opts: HoverPreviewOptions) {
         scrubFrame.value = 0
         mode.value = 'play'
         activeId.value = opts.id()
-        activeLeave = onLeave
       } catch {
         // 无 companion / 解析失败 → 不预览
       }

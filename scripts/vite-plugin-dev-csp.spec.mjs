@@ -1,6 +1,4 @@
-// F14:dev 态 CSP 的 WebSocket 来源必须收敛到开发服务器实际地址,不再放行裸 ws:。
-//
-// 先红后绿:旧实现对 connect-src 追加裸 `ws:`,以下两例会失败(红)。
+// dev 态 CSP 的 WebSocket 来源必须收敛到开发服务器实际地址。
 // 只覆盖 vite.config.ts 的两种**实际**配置——默认 127.0.0.1:1420、显式 TAURI_DEV_HOST 时
 // HMR host:1421——来源取自真实 resolved Vite config,不另维护一份地址,也不构造通用配置矩阵。
 import { describe, it, expect, afterEach } from 'vitest'

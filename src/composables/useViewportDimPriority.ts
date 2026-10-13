@@ -1,5 +1,5 @@
 // src/composables/useViewportDimPriority.ts
-// 可视窗口优先取尺寸（从 MediaGrid 抽出的自包含关注点，T18 轨道 B）。
+// 可视窗口优先取尺寸。
 //
 // 拖动跳转时用户可能落在尚未补全真实尺寸的项上（按占位比例渲染）。本 composable 在滚动停稳后
 // 即时测量可视区的占位项（originalWidth/Height ≤ 0），调用后端 PRIORITIZE_DIMENSIONS 抢在自上

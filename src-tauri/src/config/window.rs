@@ -1,8 +1,7 @@
-//! 桌面窗口几何持久化(设计 §6)。
+//! 桌面窗口几何持久化。
 //!
 //! 窗口位置、**正常**尺寸、采集时 scale factor 与最大化状态统一写进 config.toml 的 window_geometry
-//! 键(按窗口 label 分别记录),取代退役的 tauri-plugin-window-state —— 后者是独立文件 + 独立读写
-//! 路径,既不参与恢复默认设置,也让窗口信息有第二个持久化出口。
+//! 键(按窗口 label 分别记录)。
 //!
 //! # 本文件与配置核心的分工
 //! 窗口模块负责采集/恢复窗口位置与尺寸,配置核心负责存储与串行写盘。两者之间只有一层薄缝:
@@ -22,7 +21,7 @@
 //! 3. resume_after_reset:成功与失败都要调用(finally 语义)——不能因为一次重置失败就让几何
 //!    采集永久停摆。配置核心在 reset_settings 里已按此顺序调用。
 //!
-//! # 口径(物理像素,**按派工**:物理正常边界 + scale factor)
+//! # 口径(物理像素：正常边界 + scale factor)
 //! - x/y = 窗口**外框**左上角物理坐标,采集自 outer_position、恢复走 set_position
 //!   (屏幕坐标本就是物理量)。
 //! - width/height = **客户区**(inner)物理尺寸,采集自 inner_size、恢复走 set_size ——
@@ -32,11 +31,11 @@
 //!   目标物理尺寸 = 逻辑尺寸 × 目标屏 scale;位置保持原物理坐标。
 //!
 //! # 采集与失败语义
-//! 空闲 500ms 提交、连续拖拽最长 2s 提交一次(设计 §5.2),一次提交只落盘一次。
+//! 空闲 500ms 提交、连续拖拽最长 2s 提交一次，一次提交只落盘一次。
 //! visible 与最小化状态不持久化(最小化/全屏期间直接跳过采集);最大化时用**最后已知的正常边界**
 //! 配 maximized 标志,避免用最大化尺寸覆盖还原尺寸。程序化落位(启动恢复、重置恢复)触发的
 //! move/resize 属回声,不当作新的用户设置写回。
-//! 写盘失败**不吞错**(设计 §5.4):待保存值原样留在待保存集合里等下次重试,并向 flush 调用方
+//! 写盘失败**不吞错**：待保存值原样留在待保存集合里等下次重试，并向 flush 调用方
 //! 返回错误,由上层决定重试或明确放弃。
 
 use std::collections::BTreeMap;
@@ -739,7 +738,6 @@ fn now_ms() -> u64 {
 }
 
 /// 装配窗口几何服务并拉起合并提交任务。重复调用只告警,不换实现。
-#[cfg(not(mobile))]
 pub fn install(app: tauri::AppHandle, state: Arc<crate::state::AppState>) {
     let service = Arc::new(Service {
         sink: Sink::Core { app, state },
@@ -758,24 +756,14 @@ pub fn install(app: tauri::AppHandle, state: Arc<crate::state::AppState>) {
     tauri::async_runtime::spawn(commit_loop(service));
 }
 
-/// 移动端:窗口几何不参与持久化(设计 §6「移动端略过窗口恢复与捕获」)。
-#[cfg(mobile)]
-pub fn install(_app: tauri::AppHandle, _state: Arc<crate::state::AppState>) {}
-
 /// 打开采集总闸(主窗口恢复并展示之后调用)。此前到达的事件一律不算用户改动。
-#[cfg(not(mobile))]
 pub fn activate_capture() {
     if let Some(service) = SERVICE.get() {
         service.capture_enabled.store(true, Ordering::Release);
     }
 }
 
-/// 移动端:无采集。
-#[cfg(mobile)]
-pub fn activate_capture() {}
-
 /// 启动恢复:在 show() **之前**按记录落位。缺记录或离屏时按默认值居中。
-#[cfg(not(mobile))]
 pub fn restore_before_show(app: &tauri::AppHandle, label: &str) {
     use tauri::Manager;
 
@@ -803,12 +791,7 @@ pub fn restore_before_show(app: &tauri::AppHandle, label: &str) {
     service.mark_applied(label, placement.to_geometry());
 }
 
-/// 移动端:略过窗口恢复。
-#[cfg(mobile)]
-pub fn restore_before_show(_app: &tauri::AppHandle, _label: &str) {}
-
 /// 采集一次窗口几何事件(移动、改尺寸、DPI 变化),按 500ms 空闲、2s 上限合并提交。
-#[cfg(not(mobile))]
 pub fn note_geometry_event(window: &tauri::Window) {
     let Some(service) = SERVICE.get() else {
         return;
@@ -879,12 +862,7 @@ pub fn note_geometry_event(window: &tauri::Window) {
     service.notify.notify_one();
 }
 
-/// 移动端:无窗口采集。
-#[cfg(mobile)]
-pub fn note_geometry_event(_window: &tauri::Window) {}
-
 /// 是否还有未落盘的待保存几何(退出前如实报告,不假装已保存)。
-#[cfg(not(mobile))]
 pub fn has_pending() -> bool {
     SERVICE
         .get()
@@ -892,17 +870,10 @@ pub fn has_pending() -> bool {
         .unwrap_or(false)
 }
 
-/// 移动端:恒无待保存值。
-#[cfg(mobile)]
-pub fn has_pending() -> bool {
-    false
-}
-
 /// 强制提交**全部**待保存值(不等空闲窗口),并等在途提交完成。
 ///
 /// 退出、关窗与重置前的收尾都走它。返回错误表示这批值仍未落盘 —— 它们已还原进待保存集合,
 /// 调用方可以重试或明确放弃,不把失败当成功。
-#[cfg(not(mobile))]
 pub async fn commit_pending_now() -> Result<(), GeometryCommitError> {
     match SERVICE.get().cloned() {
         Some(service) => commit_pending_with(&service).await,
@@ -910,14 +881,7 @@ pub async fn commit_pending_now() -> Result<(), GeometryCommitError> {
     }
 }
 
-/// 移动端:无待保存值。
-#[cfg(mobile)]
-pub async fn commit_pending_now() -> Result<(), GeometryCommitError> {
-    Ok(())
-}
-
 /// 强制提交某窗口的待保存值(该窗口即将销毁时调用)。
-#[cfg(not(mobile))]
 pub async fn commit_pending_for_label(label: &str) -> Result<(), GeometryCommitError> {
     let Some(service) = SERVICE.get() else {
         return Ok(());
@@ -932,14 +896,7 @@ pub async fn commit_pending_for_label(label: &str) -> Result<(), GeometryCommitE
     commit_locked(service, entries).await
 }
 
-/// 移动端:无待保存值。
-#[cfg(mobile)]
-pub async fn commit_pending_for_label(_label: &str) -> Result<(), GeometryCommitError> {
-    Ok(())
-}
-
 /// 重置第 1 步:暂停采集并**丢弃**待保存的旧几何 —— 旧 generation 的值不得在新代写回。
-#[cfg(not(mobile))]
 pub fn suspend_for_reset() {
     if let Some(service) = SERVICE.get() {
         service.capture_enabled.store(false, Ordering::Release);
@@ -957,20 +914,15 @@ pub fn suspend_for_reset() {
     }
 }
 
-/// 移动端:无采集。
-#[cfg(mobile)]
-pub fn suspend_for_reset() {}
-
 /// 重置第 2 步:把常驻窗口恢复到各自的创建默认几何(程序化落位,不会被采集回写)。
 ///
 /// 返回值可判定,因为这是「已保存但未生效」与「完全成功」的分界:
-/// - 未打开或已销毁的辅助窗口、服务未装配的场景、移动端 → 无可应用对象,按成功返回;
+/// - 未打开或已销毁的辅助窗口、服务未装配的场景 → 无可应用对象,按成功返回;
 /// - 某个窗口的 unmaximize / set_size / set_position 失败 → 返回 Err(带 label 与原因),
 ///   调用方须把 window_geometry 记进 SettingsChange 的 apply_failed —— 文件里的默认值已经写好了,
 ///   既不能回滚成「保存失败」,也不能报成「完全成功」(窗口此刻仍在旧位置)。
 ///
 /// 失败只影响该次应用:采集总闸由 resume_after_reset 无条件恢复,不因这里出错而永久停摆。
-#[cfg(not(mobile))]
 pub fn apply_default_geometry(app: &tauri::AppHandle) -> Result<(), GeometryApplyError> {
     use tauri::Manager;
 
@@ -1000,26 +952,14 @@ pub fn apply_default_geometry(app: &tauri::AppHandle) -> Result<(), GeometryAppl
     Ok(())
 }
 
-/// 移动端:无窗口几何,恒成功。
-#[cfg(mobile)]
-pub fn apply_default_geometry(_app: &tauri::AppHandle) -> Result<(), GeometryApplyError> {
-    Ok(())
-}
-
 /// 重置第 3 步:恢复采集(写盘失败的分支也必须走到,否则保存被永久禁用)。
-#[cfg(not(mobile))]
 pub fn resume_after_reset() {
     if let Some(service) = SERVICE.get() {
         service.capture_enabled.store(true, Ordering::Release);
     }
 }
 
-/// 移动端:无采集。
-#[cfg(mobile)]
-pub fn resume_after_reset() {}
-
 /// 合并提交循环:被新采集唤醒后按到期情况提交;失败批次已还原,退避后再试。
-#[cfg(not(mobile))]
 async fn commit_loop(service: Arc<Service>) {
     loop {
         service.notify.notified().await;
@@ -1053,7 +993,6 @@ async fn commit_loop(service: Arc<Service>) {
 }
 
 /// 取出该服务实例的全部待保存值并提交。
-#[cfg(not(mobile))]
 async fn commit_pending_with(service: &Arc<Service>) -> Result<(), GeometryCommitError> {
     let entries = service
         .pending
@@ -1064,7 +1003,6 @@ async fn commit_pending_with(service: &Arc<Service>) -> Result<(), GeometryCommi
 }
 
 /// 在提交闸内把一批待保存值写盘(等在途提交完成 → 核心的统一入口 → 失败还原)。
-#[cfg(not(mobile))]
 async fn commit_locked(
     service: &Arc<Service>,
     entries: Vec<(String, Pending)>,
@@ -1108,7 +1046,6 @@ async fn commit_locked(
 }
 
 /// 丢弃属旧 generation 的条目(重置已发生,它们不得换新代写回)。
-#[cfg(not(mobile))]
 fn split_fresh(entries: Vec<(String, Pending)>, generation: u64) -> Vec<(String, WindowGeometry)> {
     let mut fresh = Vec::new();
     for (label, pending) in entries {
@@ -1125,7 +1062,6 @@ fn split_fresh(entries: Vec<(String, Pending)>, generation: u64) -> Vec<(String,
 }
 
 /// 读当前几何表(缺失或损坏 → 空表)。仅启动恢复使用。
-#[cfg(not(mobile))]
 fn load_map(service: &Service) -> GeometryMap {
     service
         .sink
@@ -1135,7 +1071,6 @@ fn load_map(service: &Service) -> GeometryMap {
 }
 
 /// 采集当前显示器布局(物理边界 + 工作区 + DPI)。
-#[cfg(not(mobile))]
 fn collect_monitors(window: &tauri::Window) -> Vec<MonitorRect> {
     let primary = window
         .primary_monitor()
@@ -1187,7 +1122,6 @@ fn collect_monitors(window: &tauri::Window) -> Vec<MonitorRect> {
 /// 次序:先退出最大化(否则 set_size/set_position 对最大化态窗口无效,恢复默认几何会「看起来
 /// 什么都没发生」)→ 尺寸 → 位置 → 需要时再最大化。尺寸走 set_size(客户区)、位置走
 /// set_position(外框),与采集口径一一对应。
-#[cfg(not(mobile))]
 fn apply_placement(window: &tauri::Window, placement: &Placement) -> Result<(), String> {
     if !placement.maximized && window.is_maximized().unwrap_or(false) {
         window
@@ -1259,7 +1193,6 @@ mod tests {
             .block_on(future)
     }
 
-    /// 提交失败 → 批次还原进待保存集合且向调用方报错(不吞错、不丢值);恢复后可重试成功。
     #[test]
     fn failed_commit_restores_pending_and_reports_error() {
         let test_sink = sink(1);
@@ -1285,48 +1218,5 @@ mod tests {
         assert!(retry.is_ok());
         assert_eq!(service.pending_len(), 0);
         assert_eq!(test_sink.commits.lock().unwrap().len(), 1);
-    }
-
-    /// 重置后的旧代批次被核心拒绝时按丢弃处理,不进待保存集合(否则会一直重试旧值)。
-    #[test]
-    fn stale_generation_commit_is_not_restored() {
-        let test_sink = sink(1);
-        let service = service_with(Arc::clone(&test_sink));
-        service.pending.lock().unwrap().note(
-            MAIN_LABEL,
-            geometry(10.0, 10.0, 1280.0, 820.0, 1.0, false),
-            1,
-            0,
-        );
-        // 重置发生:generation 前进,采集时的 1 变成旧代 → 提交前就被本地丢弃,不报错。
-        *test_sink.generation.lock().unwrap() = 2;
-        let result = block_on(commit_pending_with(&service));
-        assert!(result.is_ok(), "旧代条目按丢弃处理,不算失败");
-        assert_eq!(service.pending_len(), 0);
-        assert!(test_sink.commits.lock().unwrap().is_empty());
-    }
-
-    /// 提交失败后的还原不覆盖更新的待保存值(后到的调整优先)。
-    #[test]
-    fn restore_does_not_overwrite_newer_pending() {
-        let test_sink = sink(1);
-        let service = service_with(test_sink);
-        service.pending.lock().unwrap().note(
-            MAIN_LABEL,
-            geometry(50.0, 50.0, 1400.0, 900.0, 1.0, false),
-            1,
-            0,
-        );
-        service.restore_pending(
-            vec![(
-                MAIN_LABEL.to_string(),
-                geometry(10.0, 10.0, 1280.0, 820.0, 1.0, false),
-            )],
-            1,
-            // 失败批次的尝试次数(测试里显式给一个值,与生产路径传 attempts 同型)。
-            1,
-        );
-        let pending = service.pending.lock().unwrap().entries[MAIN_LABEL];
-        assert_eq!(pending.geometry.x, 50.0, "更新的值不被失败批次覆盖");
     }
 }

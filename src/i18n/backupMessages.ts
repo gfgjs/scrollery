@@ -67,6 +67,7 @@ export const backupMessages = {
       packageFilter: 'Scrollery 备份',
       restoreTitle: '恢复数据',
       restoreValidating: '正在校验并暂存备份包…',
+      restoreDiscarding: '正在清理恢复暂存数据…',
       restorePrivacyWarning:
         '校验已通过。请核对摘要；继续后仍会再次确认，当前资料库在重启前不会被替换。',
       restoreExternalWarning:
@@ -91,11 +92,14 @@ export const backupMessages = {
       restoreErrorFormat: '此备份包格式不受当前版本支持。',
       restoreErrorSchema: '此备份的数据库格式与当前版本不一致，请用当前版本重新导出备份，或重置数据库。',
       restoreErrorCorrupt: '备份包损坏或完整性校验失败，请改选另一份备份。',
-      restoreErrorPath: '备份包含不安全或冲突的路径，已拒绝解压。',
+      restoreErrorPath: '备份或暂存目录的路径不安全或存在冲突，已停止操作。',
+      restoreErrorMarker: '恢复状态记录无法读取或已损坏，暂存数据已保留。',
       restoreErrorSpace: '可用空间不足，无法安全暂存此备份。',
       restoreErrorDocument: '备份中的应用内文档版本缺失，无法恢复为完整资料库。',
       restoreErrorRollback: '无法生成恢复前回滚包；当前资料库未被替换。',
-      restoreErrorIo: '读取或暂存备份失败，请检查磁盘和文件权限。',
+      restoreErrorIo: '读取或处理恢复暂存数据失败，请检查磁盘和文件权限。',
+      restoreErrorPending: '已有备份安排在下次启动时恢复，暂存数据必须保留。',
+      restoreErrorStageStale: '此预检已失效，请重新校验备份并核对摘要。',
       restoreErrorBusy: '另一个导出、备份或恢复任务正在运行，请稍后重试。',
       restoreErrorUnknown: '恢复失败；当前资料库未被替换，请稍后重试。',
     },
@@ -168,6 +172,7 @@ export const backupMessages = {
       packageFilter: 'Scrollery Backup',
       restoreTitle: 'Restore Data',
       restoreValidating: 'Validating and staging the backup package…',
+      restoreDiscarding: 'Cleaning up staged restore data…',
       restorePrivacyWarning:
         'Validation passed. Review the summary below; there is another confirmation before the live catalog is replaced on restart.',
       restoreExternalWarning:
@@ -197,15 +202,18 @@ export const backupMessages = {
         'The backup database format does not match this version. Export a fresh backup with the current version, or reset the database.',
       restoreErrorCorrupt:
         'The backup is damaged or failed integrity checks. Choose another backup.',
-      restoreErrorPath: 'The package contains unsafe or conflicting paths and was not extracted.',
+      restoreErrorPath: 'The backup or staging directory has an unsafe or conflicting path. The operation was stopped.',
+      restoreErrorMarker: 'The restore state record could not be read or is damaged. Staged data has been kept.',
       restoreErrorSpace: 'There is not enough free space to stage this backup safely.',
       restoreErrorDocument:
         'An in-app document version is missing from the package, so a complete restore is impossible.',
       restoreErrorRollback:
         'The pre-restore rollback package could not be created. The current catalog was not replaced.',
       restoreErrorIo:
-        'The backup could not be read or staged. Check the disk and file permissions.',
+        'The restore staging data could not be read or processed. Check the disk and file permissions.',
       restoreErrorBusy: 'Another export, backup, or restore task is running. Try again later.',
+      restoreErrorPending: 'A backup is scheduled for restore at the next launch. Its staged data must be kept.',
+      restoreErrorStageStale: 'This preflight is no longer current. Validate the backup again and review its summary.',
       restoreErrorUnknown:
         'Restore failed. The current catalog was not replaced; please try again.',
     },

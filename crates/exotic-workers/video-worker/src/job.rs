@@ -6,8 +6,7 @@
 //! supervisor kill 时,OS 关闭其所有句柄触发 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
 //! 自动收割所有在途 ffmpeg,杜绝孤儿继续烧 CPU 写文件。
 //!
-//! 非 Windows(macOS/iOS/Android 前瞻,§7)cfg 门控为空实现:进程组/spawn 细节各平台
-//! 后续独立适配,协议与本 crate 的 op 逻辑不变。
+//! 非 Windows 平台的 cfg 门控为空实现。
 //!
 //! **已裁决接受的残留窗**:`ffrun.rs::spawn()` 先 `Command::spawn()` 起子进程、再调用
 //! [`assign_current_job`] 纳管,两步之间存在毫秒级窗口——若 worker 恰在此窗口内被杀,

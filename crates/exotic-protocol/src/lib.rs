@@ -1,5 +1,5 @@
 // crates/exotic-protocol/src/lib.rs
-//! 冷门格式插件 · Host↔Worker IPC 协议（v3 Part2 §3.1-3.3）。
+//! Host↔Worker IPC 协议。
 //!
 //! 设计天条：
 //!   - **唯一帧格式**（[`frame`]）：magic + 版本 + 类型 + request_id + json_len + blob_len + json + blob。

@@ -1,5 +1,4 @@
-// src/stores/toastStore.ts
-// Toast 通知队列 —— 从 uiStore 上帝 store 拆出的独立域(P1-21 渐进拆分第一刀)。
+// Toast 通知队列。
 // 全应用唯一的瞬时提示来源:任意异步操作的成功/失败反馈经 addToast 入队,ToastContainer 渲染,
 // 到期(duration + 300ms 退场动画余量)自动 removeToast 出队。状态零耦合其他 UI 域,故独立成 store。
 

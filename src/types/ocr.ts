@@ -1,11 +1,10 @@
-// src/types/ocr.ts
-// OCR 文字提取类型定义（B′ 路线，2026-07-23，T7）
+// OCR 文字提取类型。
 
 import type { Availability } from './exotic'
 
 /**
  * 单行 OCR 结果（后端 `OcrLineDto`，来自 `ocr_extract_image`/`ocr_extract_frame`）。
- * `quad` 为四角坐标（原图坐标系，阅读序：左上/右上/右下/左下），二期用于高亮，一期未渲染。
+ * `quad` 为四角坐标（原图坐标系，阅读序：左上/右上/右下/左下）。
  */
 export interface OcrLine {
   text: string
@@ -42,7 +41,6 @@ export interface OcrTier {
  */
 export interface OcrStatus {
   availability: Availability
-  storeUrl: string | null
   activeTier: string
   tiers: OcrTier[]
 }

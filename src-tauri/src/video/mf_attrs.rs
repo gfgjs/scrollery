@@ -1,9 +1,4 @@
-// src-tauri/src/video/mf_attrs.rs
-//! Media Foundation 属性/编解码器辅助函数（尾段抽出，纯 GUID/PROPVARIANT 解析，与
-//! `Session`/`ReaderCallback` 等异步回调核心无引用关系）。
-//!
-//! Attribute/codec helper functions extracted from `media_foundation.rs` — pure GUID/PROPVARIANT
-//! parsing with no reference into the `Session` async-callback core.
+//! Media Foundation 属性与编解码器辅助函数，解析 GUID/PROPVARIANT。
 
 use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::*;
@@ -39,7 +34,7 @@ pub(super) unsafe fn read_duration_ms(reader: &IMFSourceReader) -> u64 {
 
 /// 尽力将视频子类型 GUID 映射为简短编解码标签。
 pub(super) fn codec_label(subtype: GUID) -> Option<String> {
-    let name = if subtype == MFVideoFormat_H264 || subtype == MFVideoFormat_H264_ES {
+    let name = if subtype == MFVideoFormat_H264 {
         "H264"
     } else if subtype == MFVideoFormat_HEVC || subtype == MFVideoFormat_HEVC_ES {
         "HEVC"
@@ -51,10 +46,6 @@ pub(super) fn codec_label(subtype: GUID) -> Option<String> {
         "WMV3"
     } else if subtype == MFVideoFormat_WVC1 {
         "VC1"
-    } else if subtype == MFVideoFormat_VP90 {
-        "VP9"
-    } else if subtype == MFVideoFormat_AV1 {
-        "AV1"
     } else {
         return None;
     };

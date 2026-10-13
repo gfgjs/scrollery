@@ -1,16 +1,11 @@
 <script setup lang="ts">
-// VideoPlayer — 视频播放器编排层。持有 <video crossorigin="anonymous">,装配控制条/进度条/诊断,
-// 接线全部 composables(useVideoPlayback 状态、usePlayerPrefs 偏好持久化、useVideoFullscreen 全屏对),
-// 并 expose PlayerApi 供 ContentViewer 的 viewerApi 透传给命令层(GD 批)。
-//
-// 交互契约(计划 §裁决):
+// 视频播放器编排层：装配播放、偏好、字幕、续播、截帧和预览，并向 ContentViewer 暴露 PlayerApi。
+// 交互约束：
 //  · crossorigin 随 :src 一同渲染(截帧 taint 前提,不可事后追加)。
 //  · 根上点击 = 播放/暂停,带 4px 拖拽守卫;mousedown **不** stopPropagation——保 ContentViewer
 //    的 .detail-viewer startDrag 平移链(缩放后可拖视频)。控制层区 @mousedown.stop/@click.stop,
 //    避免操作控件时误触平移/播放切换。
 //  · transform 施加在内部 <video>(缩放/平移/旋转),控制条不随缩放旋转(独立浮层)。
-//  · 字幕/截帧/进度记忆/seekbar sprite 预览为 GE 批接线(useVideoResume/useVideoSubtitles/
-//    useVideoFrameCapture/useSeekbarPreview)。
 import { ref, computed, watch, onBeforeUnmount } from 'vue'
 import { Play } from '@lucide/vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
@@ -36,13 +31,13 @@ const props = defineProps<{
   transform: string
   /** 平移拖拽中(禁 transform 过渡,与图像一致)。 */
   dragging: boolean
-  /** 库内资产 id(进度续播 / 截帧命名用,GE 批消费)。 */
+  /** 库内资产 id，供续播和字幕关联使用。 */
   itemId: number | null
   /** 文件扩展名(诊断用)。 */
   fileFormat: string
-  /** 原始文件名(截帧默认命名取 basename 用,GE 批消费)。 */
+  /** 原始文件名，供截帧生成默认文件名。 */
   fileName: string
-  /** 该条目上次退出时的播放位置记忆(ms;GE①消费)。 */
+  /** 该条目上次退出时的播放位置，单位毫秒。 */
   playbackPositionMs: number
   /** 视频元数据(hasAudio / codec);null=非视频或未探测。 */
   videoMeta: VideoMeta | null
@@ -55,14 +50,14 @@ const props = defineProps<{
    */
   intrinsicWidth: number
   intrinsicHeight: number
-  /** 视频格式扩展子系统(design.md §5.3,V7 项2,additive 可选):resolve_video_playback 原始判定
+  /** resolve_video_playback 原始判定
    * 分支(如 needs_hevc_ext)。仅透传给 VideoDiagnostics 作诊断输入,本体播放逻辑不消费。 */
   resolveVerdict?: string | null
 }>()
 
 const emit = defineEmits<{
-  /** 元数据就绪(视频宽高可读)→ ContentViewer 驱动 updateZoomRatio。 */
-  (e: 'loadedmetadata'): void
+  /** 元数据就绪，携带源归属供查看器校正尺寸及文件信息。 */
+  (e: 'loadedmetadata', metadata: { itemId: number | null; src: string; width: number; height: number }): void
   /** 控制条内「底部操作栏显隐」切换钮 → ContentViewer toggleControls(状态不下沉)。 */
   (e: 'toggle-toolbar'): void
 }>()
@@ -98,7 +93,7 @@ const {
 const { prefs, setPrefs } = usePlayerPrefs()
 const fullscreen = useVideoFullscreen()
 
-// ── GE 批接线:进度记忆 / 字幕 / 截帧 / seekbar sprite 预览 ───────────────────
+// 续播、字幕、截帧和进度条帧预览共用当前视频元素与条目。
 const itemIdRef = computed(() => props.itemId)
 const playbackPositionMsRef = computed(() => props.playbackPositionMs)
 const fileNameRef = computed(() => props.fileName)
@@ -106,12 +101,12 @@ useVideoResume(videoEl, itemIdRef, playbackPositionMsRef)
 const subtitles = useVideoSubtitles(videoEl, itemIdRef)
 const frameCapture = useVideoFrameCapture(videoEl, fileNameRef)
 const seekPreview = useSeekbarPreview(itemIdRef)
-// OCR 文字提取(T9):模块级单例,与 ContentViewer 内的 useOcr() 调用共享同一份 busy/panelOpen/result。
+// OCR 模块级状态与 ContentViewer 共享，避免两个入口出现不同的忙态和结果。
 const ocr = useOcr()
 
 // ── 偏好施加 / 回写 ─────────────────────────────────────────────────────────
 // 元素挂载即把持久化偏好施加到 <video>(loop 无 media 事件,经 setLoop 同步镜像)。
-// 时序门控(采纳 opus 深审):useVideoPlayback 的 attach() 在同一 videoEl watch 批次里先跑,
+// 时序门控：useVideoPlayback 的 attach() 在同一 videoEl watch 批次里先跑，
 // 会把镜像 ref(volume/muted/rate)同步成元素的**默认值**(1/false/1)。若下面的回写 watch
 // 无门控,这个默认值会在 applyPrefs() 真正施加已存偏好之前抢先写回 prefs.value,
 // 用默认值错写覆盖已存偏好。门控:首次 applyPrefs() 完成前,回写 watch 一律早退。
@@ -121,7 +116,7 @@ function applyPrefs(): void {
   if (!el) return
   el.volume = prefs.value.volume
   el.muted = prefs.value.muted
-  el.playbackRate = prefs.value.rate
+  setRate(prefs.value.rate)
   el.loop = prefs.value.loop
   setLoop(prefs.value.loop)
   prefsApplied = true
@@ -190,10 +185,13 @@ const sizeStyle = computed(() => {
 
 function onLoadedMeta(): void {
   const el = videoEl.value
-  if (el && el.videoWidth > 0 && el.videoHeight > 0) {
+  if (!el || el.currentSrc !== el.src) return
+  if (el.videoWidth > 0 && el.videoHeight > 0) {
     displayDims.value = { w: el.videoWidth, h: el.videoHeight }
   }
-  emit('loadedmetadata')
+  emit('loadedmetadata', {
+    itemId: props.itemId, src: props.src, width: el.videoWidth, height: el.videoHeight,
+  })
   // 视频元素+条目均已就绪的自然汇合点(首次挂载与每次切条目都会触发一次):字幕自动探测
   // 挂 <track> 需要真实 DOM 元素,故不在更早的 itemId/src watch 里做(那时 videoEl 可能未就绪)。
   void subtitles.autoDetectForItem()
@@ -279,7 +277,7 @@ function onRootClick(e: MouseEvent): void {
   playPause()
 }
 
-// ── 全屏对 / GE 批存根 ───────────────────────────────────────────────────────
+// 全屏、截帧与 OCR 操作由各自的 composable 执行。
 function toggleFullscreenPair(): void {
   void fullscreen.togglePair()
 }
@@ -290,7 +288,7 @@ function isFullscreenPair(): boolean {
 function captureFrame(): void {
   void frameCapture.captureFrame()
 }
-/** 当前帧 OCR 提取(T9);videoEl 空守卫(未挂载/已卸载态点击无效)。 */
+/** 当前帧 OCR 提取；视频元素未挂载时不执行。 */
 function ocrFrame(): void {
   if (!videoEl.value) return
   void ocr.extractFromVideoFrame(videoEl.value, fileNameRef.value)
@@ -317,7 +315,7 @@ onBeforeUnmount(() => {
   void exitPipIfActive()
 })
 
-// ── PlayerApi:供 ContentViewer viewerApi 透传给命令层(GD 批)────────────────
+// ContentViewer 通过 viewerApi 将播放器操作提供给命令层。
 defineExpose({
   /** 原生 <video> 元素(ContentViewer getMediaDimensions 用)。 */
   videoEl,
@@ -337,7 +335,7 @@ defineExpose({
 
 <template>
   <div class="video-player" @mousedown="onRootMouseDown" @click="onRootClick" @pointermove="onRootPointerMove">
-    <!-- crossorigin 随 :src 一同渲染(截帧 taint 前提,计划 §裁决 0.3)。 -->
+    <!-- crossorigin 随 :src 一同渲染，确保截帧时画布可读取。 -->
     <video
       ref="videoEl"
       class="video-player__video"

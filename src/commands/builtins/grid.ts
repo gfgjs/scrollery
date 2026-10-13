@@ -1,8 +1,4 @@
-// 网格视图导航命令(顶栏重构 P3):撤销/重做/全屏从 AppToolbar 迁入标题栏 ContextualToolbar
-// (navigation 组=主图标按钮)。数据类命令直接 useXxxStore()(store 不入 context,见 types.ts)。
-//
-// 密集控件(面包屑/筛选/搜索/分组·排序/行高)留 AppToolbar(Phase G 已随之并入标题栏单行),
-// 不入注册表(是值选择器/复合控件,非单动作命令)。
+// 网格导航命令显示在标题栏；值选择器等复合控件由 AppToolbar 承载。
 
 import { markRaw } from 'vue'
 import { Undo2, Redo2, Maximize2 } from '@lucide/vue'
@@ -40,8 +36,7 @@ export const gridCommands: Command[] = [
   },
   {
     id: 'grid.toggleFullscreen',
-    // 标题随态切换(进入/退出);图标暂静态 Maximize2 + isActive 高亮(动态图标待 P5 播放/暂停一并做)。
-    // 全屏态来自 useWindowMode(窗口三态唯一所有者),不再经 uiStore(2026-07-16 迁出,见其 Fullscreen 段注)。
+    // 标题与高亮随全屏态切换；全屏态由 useWindowMode 提供。
     title: () => (isFullscreen.value ? t('toolbar.exitFullscreen') : t('toolbar.fullscreen')),
     icon: markRaw(Maximize2),
     group: 'navigation',

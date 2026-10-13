@@ -1,12 +1,10 @@
 // src-tauri/src/ai/remote_registry.rs
 //! 动态发现自托管仓库 `gficcg/clip_cn_vit-onnx` 中可下载的 ONNX，按「架构文件夹 → batch 变体」分类。
-//! Dynamically discover downloadable ONNX in the self-hosted `gficcg/clip_cn_vit-onnx` repo,
-//! classified by "architecture folder → batch variant".
 //!
 //! # 为什么动态发现
 //! 仓库按架构分文件夹（clip_cn_vit-b-16 / -h-14 / -l-14-336 / -l-14），每个文件夹下提供图像塔的
-//! 多个固定 batch 导出（bN）+ 一个动态 batch（dyn）+ 一个文本塔，且未来还会增删。把这些写死在
-//! profile.rs 既冗长又易过期 —— 改为运行时拉 HF tree API 列文件，按命名约定归类。
+//! 多个固定 batch 导出（bN）+ 一个动态 batch（dyn）+ 一个文本塔。
+//! 运行时读取 HF tree API，并按命名约定归类，避免固定清单过期。
 //!
 //! # 关键点
 //! - 所有 onnx 都是 LFS 文件，tree API 的 `lfs.oid` **即文件 sha256**、`lfs.size` 即真实大小，
@@ -217,6 +215,13 @@ fn store_disk_cache(path: &Path, archs: &[DiscoveredArch], now_unix: u64) {
             return;
         }
     };
+    // 首次浏览模型列表时还没有下载模型，models 目录可能尚未创建。
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!("动态发现缓存目录创建失败 | registry cache directory failed: {e}");
+            return;
+        }
+    }
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path)) {
         tracing::warn!("动态发现缓存写盘失败 | registry cache persist failed: {e}");

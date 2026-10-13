@@ -22,11 +22,11 @@ export const IPC = {
   // ── 布局 ────────────────────────────────────────────────────────────
   COMPUTE_LAYOUT: 'compute_layout',
   GET_LAYOUT_ROWS_BY_Y: 'get_layout_rows_by_y',
-  // T16 方案B:按段取行(半开区间 [startY,endY) 精确归属,区别于 by_y 的视口相交语义)
+  // 按段取行：半开区间 [startY,endY) 精确归属，区别于 by_y 的视口相交语义。
   GET_BUCKET_ROWS: 'get_bucket_rows',
   GET_ITEM_Y_BY_ID: 'get_item_y_by_id',
   GET_SUBTREE_SCROLL_TARGET: 'get_subtree_scroll_target',
-  // 按布局序的视图全集 id（Part5 T4 选区脱离 DOM 的顺序来源；后端 layout_commands.rs:128 已注册）
+  // 按布局序的视图全集 id，供选区脱离 DOM 获取顺序。
   GET_VIEW_IDS: 'get_view_ids',
 
   // ── H-Lab 横向画廊实验(docs/designs/2026-07-02-horizontal-gallery-lab.md)────────
@@ -49,7 +49,7 @@ export const IPC = {
   SET_RATING: 'set_rating',
   // 批量评分（0-5,选区键盘 1-5 快捷评分用,单条 UPDATE+IN,避免逐项 N 次 IPC）。
   BATCH_SET_RATING: 'batch_set_rating',
-  // 颜色标签（0=无 / 1-7 色档,T16）。set 单项,batch 选区批量(单条 UPDATE+IN)。
+  // 颜色标签（0=无 / 1-7 色档）。set 单项，batch 选区批量（单条 UPDATE+IN）。
   SET_COLOR_LABEL: 'set_color_label',
   BATCH_SET_COLOR_LABEL: 'batch_set_color_label',
   // 看图台展示旋转持久化（归一化 0/90/180/270,V20;仅大图查看用,不进网格）。
@@ -61,7 +61,7 @@ export const IPC = {
   // 播放器截帧保存为 PNG。
   SAVE_FRAME_PNG: 'save_frame_png',
   // ── 查看器渲染色域(自定义 ICC 与色域切换,方案 B §0①)──────────────────────
-  // 查看器大图换源色域:None=直显原图(target=srgb/移动端/非派生适用),Some=派生文件绝对路径。
+  // 查看器大图换源色域:None=直显原图(target=srgb/非派生适用),Some=派生文件绝对路径。
   // target 不由前端传参,后端从 ConfigManager 单源读取(防前后端口径分叉)。
   GET_VIEWER_COLOR_URL: 'get_viewer_color_url',
   // 自定义 ICC 导入/枚举/删除(设置页 ICC 管理列表用)。
@@ -91,6 +91,7 @@ export const IPC = {
 
   // ── 缩略图 ─────────────────────────────────────────────────────────
   BATCH_REQUEST_THUMBNAILS: 'batch_request_thumbnails',
+  /** 按 requestId 退订离屏项，保留同图的其它消费者。 */
   CANCEL_VIEWPORT_THUMBNAIL_REQUEST: 'cancel_viewport_thumbnail_request',
   START_FULL_THUMBNAIL_GENERATION: 'start_full_thumbnail_generation',
   // 增量生成:只补 thumb_status=0(缺失/被复位)的项,不做全表重置;与全量共用停止命令与进度通道。
@@ -98,7 +99,6 @@ export const IPC = {
   STOP_FULL_THUMBNAIL_GENERATION: 'stop_full_thumbnail_generation',
   /** 缩略图生成状态快照(webview 刷新后恢复进度用;进度流走 EVENTS.THUMB_GEN_PROGRESS)。 */
   FULL_THUMB_GEN_STATUS: 'full_thumb_gen_status',
-  // 「在途项保留后端单飞——同项大概率重回视口」的设计(useRequestQueue.cancel)不调用它。
   // 优先测量给定项的真实尺寸（滚动到锚点前抢先算其 y，避免跳动）。
   PRIORITIZE_DIMENSIONS: 'prioritize_dimensions',
   // 清空全部缩略图缓存。
@@ -106,7 +106,7 @@ export const IPC = {
   // 懒自愈：某项 thumb_status=1 但封面文件已被 LRU 驱逐（404）→ 复位待重生成。
   REGENERATE_MISSING_THUMB: 'regenerate_missing_thumb',
 
-  // ── 派生流水线（P2/P3/P4，§3.2/§3.3/§3.6：视频封面/关键帧、音频封面、epub 封面） ────
+  // ── 派生流水线：视频封面/关键帧、音频封面、epub 封面 ────
   START_DERIVATION: 'start_derivation',
   STOP_DERIVATION: 'stop_derivation',
   DERIVATION_STATUS: 'derivation_status',
@@ -137,21 +137,21 @@ export const IPC = {
   ADD_TO_COLLECTION: 'add_to_collection',
   REMOVE_FROM_COLLECTION: 'remove_from_collection',
 
-  // ── 文档（P4, §3.4/§3.5） ─────────────────────────────────────────────
+  // ── 文档 ─────────────────────────────────────────────
   ENSURE_DOC_THUMB_QUEUE: 'ensure_doc_thumb_queue',
   LIST_PENDING_DOC_THUMBS: 'list_pending_doc_thumbs',
   STORE_DOC_THUMBNAIL: 'store_doc_thumbnail',
   GET_READING_PROGRESS: 'get_reading_progress',
   SET_READING_PROGRESS: 'set_reading_progress',
-  // 阅读器 R1(§6.3):txt 编码检测 + 分章(索引)/ 分段(单章内容)。字节偏移不出 Rust。
+  // 阅读器：txt 编码检测、分章索引和单章分段；字节偏移不出 Rust。
   GET_TEXT_BOOK_INDEX: 'get_text_book_index',
   GET_TEXT_CHAPTER: 'get_text_chapter',
-  // 阅读器(§5.10):简繁转换(ferrous-opencc)。前端在替换规则之后按章批量调用。
+  // 阅读器简繁转换（ferrous-opencc）；前端在替换规则之后按章批量调用。
   CONVERT_CHINESE: 'convert_chinese',
-  // 阅读器(§6.1):每书阅读偏好(R1 承载手动编码覆盖 prefs.encoding,R3 扩充竖排/主题/字号)。
+  // 每书阅读偏好：手动编码、竖排、主题和字号。
   GET_READER_BOOK_PREFS: 'get_reader_book_prefs',
   SET_READER_BOOK_PREFS: 'set_reader_book_prefs',
-  // 阅读器 R4(§6.2):书签 CRUD。locator 现用 foliate CFI（cfi:...），与阅读进度同源。
+  // 阅读器书签 CRUD；locator 使用 foliate CFI（cfi:...），与阅读进度同源。
   LIST_READER_BOOKMARKS: 'list_reader_bookmarks',
   ADD_READER_BOOKMARK: 'add_reader_bookmark',
   DELETE_READER_BOOKMARK: 'delete_reader_bookmark',
@@ -162,6 +162,7 @@ export const IPC = {
   LIST_VERSIONS: 'list_versions',
   GET_CURRENT_VERSION: 'get_current_version',
   GET_DOCUMENT_TEXT: 'get_document_text',
+  RESOLVE_DOCUMENT_LINK: 'resolve_document_link',
   SAVE_VERSION: 'save_version',
   SET_CURRENT_VERSION: 'set_current_version',
   DELETE_VERSION: 'delete_version',
@@ -196,13 +197,12 @@ export const IPC = {
   GET_STARTUP_CONFIG: 'get_startup_config',
   // 应用日志目录路径（设置页"打开日志目录"用）。
   GET_LOG_DIR: 'get_log_dir',
-  // ── 外置配置文件（config.toml，批次B）───────────────────────────────
+  // ── 外置配置文件（config.toml）───────────────────────────────
   // 用系统默认编辑器打开外置配置文件；保存后由后端热应用并广播 CONFIG_FILE_CHANGED。
   OPEN_CONFIG_FILE: 'open_config_file',
   // 查询外置配置文件路径 / 是否存在 / 最近一次解析错误。
   GET_CONFIG_STATUS: 'get_config_status',
 
-  // ── Logs window（日志能力重构 S4，方案 §5/§9.4 S4）───────────────────────
   // ── 独立日志窗口 ─────────────────────────────────────────────────────
   // 打开（或聚焦既有）独立日志窗口；建窗即在后端翻转环形缓冲订阅标志。
   OPEN_LOG_WINDOW: 'open_log_window',
@@ -211,7 +211,6 @@ export const IPC = {
   // 读取单个日志文件的一页（从文件末尾按 offsetFromEnd/limit 切片）。
   READ_LOG_FILE_PAGE: 'read_log_file_page',
 
-  // ── Logs analysis（日志能力重构 S5 P1/P2，方案 §5/§9.4 S5）───────────────
   // ── 日志分析 ──────────────────────────────────────────────────────────
   // 日志系统自身可观测性快照：non_blocking 丢弃行数 + 当前正在压缩中的错误签名列表。
   GET_LOG_DIAGNOSTICS: 'get_log_diagnostics',
@@ -226,6 +225,7 @@ export const IPC = {
   REMOVE_MEDIA_ITEMS_HARD: 'remove_media_items_hard',
   MOVE_DIRECTORY: 'move_directory',
   COPY_DIRECTORY: 'copy_directory',
+  CANCEL_DIRECTORY_COPY: 'cancel_directory_copy',
   DELETE_DIRECTORY_TO_TRASH: 'delete_directory_to_trash',
   // 目录移动的半完成收尾（P0-1）：只读列出未完成项（读清单本身不触发任何物理动作）。
   LIST_PENDING_DIRECTORY_MOVES: 'list_pending_directory_moves',
@@ -281,14 +281,14 @@ export const IPC = {
   // 下载 OCR 档位模型（mobile/server 二选）。
   DOWNLOAD_OCR_MODELS: 'download_ocr_models',
 
-  // ── 影像增强（降噪/超分子系统，2026-07-24，P0 批 5）────────────────────────
+  // ── 影像增强 ─────────────────────────────────────────────────────────
   // 门控 + 模型态查询（设置页「影像增强」分节 / EnhanceDialog 判门共用）。
   ENHANCE_STATUS: 'enhance_status',
   // 下载某增强模型档位（复用 download_assets 进度事件；下载免费，不过授权门）。
   DOWNLOAD_ENHANCE_MODEL: 'download_enhance_model',
   // 删除某增强模型档位的两文件（fp32 + fp16）。
   DELETE_ENHANCE_MODEL: 'delete_enhance_model',
-  // 前后对比预览（P0 后端返 enhance_not_implemented 占位，实现归 4.5 批）。
+  // 前后对比预览：后端对单个 tile 执行增强并返回 before/after 路径。
   ENHANCE_PREVIEW: 'enhance_preview',
   // 发起增强（多选入队，顺序执行），返回 job_id。
   ENHANCE_START: 'enhance_start',
@@ -324,12 +324,11 @@ export const IPC = {
   CREATE_PERSON: 'create_person',
 
   // ── Exotic 插件平台（Part5 T11/T12，消费 Part6）────────────────────────
-  // 某插件的授权判定（gate / 购买引导用）；判定全在后端 EntitlementProvider，前端不持验签逻辑。
-  GET_OFFICIAL_ENTITLEMENT: 'get_official_entitlement',
+  // 某插件的激活与资源可用状态。
+  GET_FEATURE_ACTIVATION: 'get_feature_activation',
+  ACTIVATE_FEATURE: 'activate_feature',
   LIST_FEATURE_OFFERINGS: 'list_feature_offerings',
-  ACTIVATE_OFFICIAL_LICENSE: 'activate_official_license',
-  DEACTIVATE_OFFICIAL_LICENSE: 'deactivate_official_license',
-  GET_PLUGIN_ENTITLEMENT: 'get_plugin_entitlement',
+  GET_PLUGIN_AVAILABILITY: 'get_plugin_availability',
   // 单个媒体项的 exotic 状态（可用态 + 任务态）；resolution=null 即普通格式，触点据此决定是否 gate。
   GET_EXOTIC_ITEM_STATE: 'get_exotic_item_state',
   // Catalog 全部格式解析（前端据此缓存"哪些格式属 exotic"，避免为普通格式空跑 item-state IPC）。
@@ -362,13 +361,11 @@ export const IPC = {
   FORGET_VOLUME: 'forget_volume',
 
   // ── Thumbnail cache（缩略图缓存目录）────────────────
-  // 注:SET_WINDOW_THEME 已随自绘标题栏(顶栏重构 L1)废弃——Windows DWM 染色链移除,
-  // 窗口明暗同步改前端 getCurrentWindow().setTheme()(uiStore.applyAppearance)。
   GET_THUMB_CACHE_DIR: 'get_thumb_cache_dir',
   /** 缓存占用统计(分类目字节+文件数;设置页缩略图卡统计行,点击刷新)。 */
   GET_CACHE_STATS: 'get_cache_stats',
 
-  // ── Export（导出整理成果，方案 A §3/§4）────────────────────────────────
+  // ── 导出 ─────────────────────────────────────────────────────────────
   /** 预检:选区规模/估算体积/离线缺失数/非零旋转数/目的地可写性/是否命中库内。 */
   PREFLIGHT_EXPORT: 'preflight_export',
   /** 启动导出,立即返回 jobId;前端订阅 EVENTS.EXPORT_PROGRESS + 轮询/恢复用 EXPORT_STATUS。 */
@@ -378,7 +375,7 @@ export const IPC = {
   /** 取消导出;jobId 须匹配当前运行任务,不匹配静默忽略(过期引用保护)。 */
   STOP_EXPORT: 'stop_export',
 
-  // ── Backup / Restore（数据备份与恢复，方案 B §5/§8）────────────────────
+  // ── 备份与恢复 ───────────────────────────────────────────────────────
   /** 备份预检:目的地可写性、同卷警告、文档一致性与估算体积。 */
   PREFLIGHT_BACKUP: 'preflight_backup',
   /** 启动一次手动完整备份；实际任务与当前 webview 生命周期分离。 */
@@ -391,12 +388,13 @@ export const IPC = {
   STOP_BACKUP: 'stop_backup',
   /** 校验并暂存恢复包，不改动活库。 */
   RESTORE_STAGE: 'restore_stage',
+  RESTORE_DISCARD: 'restore_discard',
   /** 生成恢复前回滚包并写入重启交换 marker。 */
   RESTORE_ARM: 'restore_arm',
   /** 恢复 arm 成功后重启应用，由启动期状态机完成交换。 */
   RELAUNCH_APP: 'relaunch_app',
 
-  // ── 图片简单编辑（方案 C §6/§7）────────────────────────────────
+  // ── 图片简单编辑 ─────────────────────────────────────────────────────
   /** 获取 orientation 烤入、sRGB、长边受限的 raw 编辑预览 packet。 */
   GET_EDIT_PREVIEW: 'get_edit_preview',
   /** 保存编辑副本:旋转/翻转/裁剪 + 编码落盘 + 单文件入库,直接返回终态(非 job/事件模型)。 */
@@ -410,13 +408,17 @@ export const IPC = {
 
 // ── Tauri 事件 ──────────────────────────────────────────────────────────
 export const EVENTS = {
-  OFFICIAL_LICENSE_CHANGED: 'official-license-changed',
+  FEATURE_ACTIVATION_CHANGED: 'feature-activation-changed',
   // 退出前 flush 请求，载荷 { requestId }；前端落盘后经 IPC.SETTINGS_FLUSH_DONE 回执。
   SETTINGS_FLUSH_REQUESTED: 'settings-flush-requested',
   MEDIA_ENRICHED: 'db:media_enriched',
   ENRICHMENT_COMPLETED: 'enrichment:completed',
   /** 卷插拔监听（Part2 T2）：卷在线态变化 → 画廊刷新离线徽标显隐。 */
   VOLUMES_CHANGED: 'volumes:changed',
+  /** 文件系统监听（scanner/fs_watch）对账完成：某扫描根有目录内容变化，
+      载荷 { rootId: number, directories: string[] }（directories 为根相对**父**目录路径，"" 表示根自身）。
+      画廊据此刷新统计并重算当前视图；文件树据此原位刷新这些已加载父目录的子项与文件范围。 */
+  FILES_CHANGED: 'files:changed',
   /** exotic 处理进度/状态变化（后端 Pipeline 每批进度 + 租约清扫时发）→ 商店进度区实时刷新。 */
   EXOTIC_STATUS_CHANGED: 'exotic:status-changed',
   /** 缩略图全量/增量生成进度(app 级广播,替代 Channel——Channel 随发起它的 webview 一起死,

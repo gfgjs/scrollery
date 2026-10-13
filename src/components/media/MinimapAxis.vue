@@ -198,7 +198,7 @@ function startThumbLoad(item: LayoutRowItem, sig: string, drawW: number, drawH: 
   }
   const url = buildThumbUrl(item.thumbStatus, item.thumbPath, props.cacheDir)
   if (!url) return // status 0/2:留色块,生成推进由主画廊负责
-  thumbState.markLoading(item.id)
+  thumbState.markLoading(item.id, sig)
   const loadToken = Symbol(`minimap-thumb-${item.id}`)
   thumbLoadTokens.set(item.id, loadToken)
   const controller = thumbAbortController
@@ -225,7 +225,6 @@ function startThumbLoad(item: LayoutRowItem, sig: string, drawW: number, drawH: 
       thumbLoadTokens.delete(item.id)
       // 模式/目录切换路径已整体 clear；旧 abort 不得误清新代次 loading。
       if (controller.signal.aborted) return
-      thumbState.cancelLoad(item.id)
       const failureCount = (thumbRetries.get(item.id)?.failureCount ?? 0) + 1
       const delay = minimapThumbRetryDelay(failureCount)
       if (delay === null) {
@@ -233,6 +232,8 @@ function startThumbLoad(item: LayoutRowItem, sig: string, drawW: number, drawH: 
         thumbState.failLoad(item.id, 0, sig)
         return
       }
+      // 最后一次失败交 failLoad 保留失败签名；只有仍需退避重试时才取消并释放空闲签名。
+      thumbState.cancelLoad(item.id)
       const retryAt = Date.now() + delay
       thumbRetries.set(item.id, { sig, failureCount, retryAt })
       // 快速滚过大量坏图时限制退避账本；被驱逐项未来重新进入视窗才会重新尝试。

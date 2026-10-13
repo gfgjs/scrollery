@@ -1,5 +1,4 @@
-// src/utils/duplicateLensQuery.ts
-// 重复镜头（2026-09-02 方案 §4.4）的 URL query 编解码。纯函数,无 Vue/store 依赖,便于单测。
+// 重复镜头的 URL query 编解码，无 Vue/store 依赖。
 //
 // 与 galleryQuery.ts 同一防御式姿态:URL 是外部输入（可手改/深链）,枚举一律白名单、开关只认
 // 字面 '1',任何垃圾值回落「镜头关闭」而非直灌类型化字段。镜头是临时状态:关闭时 URL 必须干净
@@ -8,7 +7,7 @@
 import type { LocationQuery } from 'vue-router'
 import type { DuplicateLensModeDto } from '../types/view'
 
-/** 本模块管理的 query 键（§4.4）。已并入 useGalleryQuerySync 的 MANAGED 集（store→URL 投影）。 */
+/** 本模块管理的 query 键，已并入 useGalleryQuerySync 的 MANAGED 集。 */
 export const DUPLICATE_LENS_QUERY_KEYS = ['duplicates', 'duplicateUnique'] as const
 
 /** 重复镜头的 URL 状态（mode=null = 镜头关闭,即普通画廊）。 */

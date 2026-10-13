@@ -1,7 +1,4 @@
-/* src/assets/styles/animations.css */
-/* Micro-animations as specified in §14.1
-   NOTE: We do NOT add transitions to * (avoids 150k thumbnail repaints).
-   Only layout skeleton elements get theme transitions. */
+/* 只给布局骨架添加主题过渡；全局过渡会造成大量缩略图重绘。 */
 
 /* ── Layout skeleton theme transitions ─────────────────────────────────── */
 .app-shell,

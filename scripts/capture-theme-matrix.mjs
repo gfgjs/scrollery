@@ -1,15 +1,9 @@
 // 主题视觉矩阵截图捕获器 —— 配色档 × 绘制路径 出图,供人眼过一遍。
 //
-// 为什么是**捕获器而不是视觉回归门**(有意的取舍):
-//   截图基线门(pixel diff)在本仓是幽灵门禁反模式——字体栅格/抗锯齿/Chrome 版本任一变动即红,
-//   而红了唯一可能的响应是「重新生成基线」。设阈值前先问「红了我能做什么」,若答案只有「改基线」
-//   就别设(判据见 docs/experience.md)。故本脚本只做**捕获**这件苦力,判定留给人眼:
-//   token 契约与对比度各有真门把守(npm test 里的生成契约、npm run check:contrast),
-//   人眼要抓的是它们**证明不了**的东西——取值合法但视觉失调、自定义配色下观感断层、
-//   DOM 与 Canvas 两条绘制路径的差异。
+// 截图供人工检查视觉失调、自定义配色断层，以及 DOM 与 Canvas 绘制差异。
+// 像素差受字体栅格、抗锯齿和 Chrome 版本影响，不作为门禁。
 //
-// 为什么无 Playwright:本仓已有先例(headless Chrome + `?ui-harness=` 做 DOM 断言)。
-//   加 Playwright 要为一次性视觉核对背上浏览器下载与新 devDependency,不值。
+// 使用现有 headless Chrome 和 `?ui-harness=` 驱动截图。
 //
 // 边界(**这不是真机**):headless Chrome 与 Tauri WebView2 同为 Chromium,故 CSS 变量解析/布局
 //   /配色可信;但**原生窗口边框、WebView2 特有行为、原生玻璃(DWM 背板)、GPU canvas 路径不在
@@ -48,7 +42,7 @@ const PALETTES = {
 /** 绘制路径:画廊两条实现不同,色板同源不代表绘制结果同源,故两路都出图。 */
 const RENDER_MODES = ['dom', 'canvas']
 
-/** 默认矩阵 = 三档配色 × 两条绘制路径 = 6 张(方案 §9 的关键画廊矩阵预算)。 */
+/** 默认矩阵 = 三档配色 × 两条绘制路径 = 6 张。 */
 const DEFAULT_PALETTES = ['light', 'dark', 'custom']
 
 const DEV_ORIGIN = 'http://127.0.0.1:1420'
@@ -138,7 +132,7 @@ async function main() {
   if (unknown) {
     throw new Error(`未知配色档 --palette=${unknown}(可选:${Object.keys(PALETTES).join(' / ')})`)
   }
-  // 默认只拍画廊(方案 §9 的关键矩阵预算);settings/viewer 要显式 --scene= 才纳入。
+  // 默认只拍画廊；settings/viewer 要显式 --scene= 才纳入。
   const scenes = onlyScene === null ? ['gallery'] : SCENES.filter((s) => s === onlyScene)
   const renders = RENDER_MODES.filter((r) => !onlyRender || r === onlyRender)
   if (scenes.length === 0) throw new Error(`没有匹配的场景(--scene=${onlyScene})`)

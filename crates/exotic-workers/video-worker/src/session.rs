@@ -189,19 +189,20 @@ mod tests {
     }
 
     #[test]
-    fn output_whitelist_dotdot_traversal_rejected() {
-        let work = temp_dir("dd");
-        let outside = work
+    fn output_whitelist_inside_ok_outside_rejected() {
+        let work = temp_dir("wl");
+        let inside = work.join("job.mp4.tmp");
+        let r = resolve_output_path(inside.to_str().unwrap(), &work).unwrap();
+        assert!(r.starts_with(&work));
+
+        let sibling = work
             .parent()
             .unwrap()
-            .join(format!("video-worker-sess-{}-out", std::process::id()));
-        let _ = std::fs::remove_dir_all(&outside);
-        std::fs::create_dir_all(&outside).unwrap();
-        let traversal = work
-            .join("..")
-            .join(outside.file_name().unwrap())
-            .join("x.tmp");
-        assert!(resolve_output_path(traversal.to_str().unwrap(), &work).is_err());
+            .join(format!("video-worker-sess-{}-evil", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sibling);
+        std::fs::create_dir_all(&sibling).unwrap();
+        let out = sibling.join("x.tmp");
+        assert!(resolve_output_path(out.to_str().unwrap(), &work).is_err());
     }
 
     #[test]

@@ -1,5 +1,4 @@
-// src/stores/directoryMoveRecoveryStore.ts
-// 目录移动的半完成恢复清单（P0-1）。
+// 目录移动的半完成恢复清单。
 //
 // 后端把「物理已落盘、索引或源目录清理未完成」的移动留成阶段日志，并暴露只读清单
 // （list_pending_directory_moves）与按日志 id 的重试（retry_directory_move）。本 store 是这两条
@@ -30,6 +29,7 @@ const RECOVERY_DETAILS = [
   'target_unverified',
   'target_conflict',
   'target_unresolved',
+  'source_cleanup_required',
   'source_leftover',
   'source_changed',
   'staging_busy',
@@ -117,18 +117,24 @@ export const useDirectoryMoveRecoveryStore = defineStore('directoryMoveRecovery'
       try {
         do {
           reloadQueued = false
-          const revision = listRevision
-          const list = await invokeIpc<DirectoryMoveRecovery[]>(IPC.LIST_PENDING_DIRECTORY_MOVES)
-          if (revision !== listRevision) {
-            // 读取期间清单被就地改动（重试已收尾/退回一条）：这份快照已过期，丢掉重读。
-            reloadQueued = true
-            continue
+          try {
+            const revision = listRevision
+            const list = await invokeIpc<DirectoryMoveRecovery[]>(IPC.LIST_PENDING_DIRECTORY_MOVES)
+            if (revision !== listRevision) {
+              // 读取期间清单被就地改动（重试已收尾/退回一条）：这份快照已过期，丢掉重读。
+              reloadQueued = true
+              continue
+            }
+            // 契约外响应不能当成空清单，否则会清掉仍需收尾的恢复入口。
+            if (!Array.isArray(list)) {
+              throw new Error(`list_pending_directory_moves 返回契约外响应: ${typeof list}`)
+            }
+            items.value = list
+          } catch (e) {
+            // 失败仅结束当前读取；期间登记触发的补读仍须完成，避免遗漏新条目。
+            logger.error('directory move: 读取未完成清单失败', { error: e })
           }
-          // 非数组响应（如 UI harness 未覆盖该命令时的兜底 null）按空清单处理，别让契约外数据抛崩整块 UI。
-          items.value = Array.isArray(list) ? list : []
         } while (reloadQueued)
-      } catch (e) {
-        logger.error('directory move: 读取未完成清单失败', { error: e })
       } finally {
         loading.value = false
         inFlight = null
@@ -179,6 +185,14 @@ export const useDirectoryMoveRecoveryStore = defineStore('directoryMoveRecovery'
       if (report.needsRetry) {
         // 目标离线 / 目标冲突 / 源残留仍在：条目与原因都得留下，不能报「已收尾」。
         upsert(report)
+        // 这几种结果都在索引重写成功后返回，源目录需要用户处理；目录树与图库须读取新的资产位置。
+        if (
+          report.detail === 'source_leftover' ||
+          report.detail === 'source_changed' ||
+          report.detail === 'source_cleanup_required'
+        ) {
+          refreshLibrary()
+        }
         toast.addToast(
           'warning',
           i18n.global.t('sidebar.dirRecovery.stillPending', {

@@ -1,20 +1,17 @@
 // crates/scrollery-ai-core/src/ocr_profile.rs
 //! OCR 模型契约（`OcrProfile`）+ 内置注册表（纯数据，零 ort）。
 //!
-//! 仿 [`crate::face_profile`] 之法：把「换 OCR 模型档位」变成 DATA 而非 CODE——
-//! 文件名、几何、阈值、通道序、字典全部来自 profile。
+//! 文件名、几何、阈值、通道序与字典均由 profile 定义。
 //!
-//! # 单源约定
-//! **最终文件名以 `docs/planning/2026-07-23-OCR文字提取/model-assets.md` 为单源**：
-//! host 描述符、worker 校验、下载清单全部从这里取名，改名只动本文件单点。
+//! host 描述符、worker 校验与下载清单共用本注册表的文件名。
 //!
 //! # 档位（PP-OCRv5）
 //! - `pp-ocrv5-mobile`：轻量，det/cls/rec 合计约 30MB，交互默认。
 //! - `pp-ocrv5-server`：高精度，约 190MB。
 //!
-//! # cls 不共用（主线复核修正）
+//! # cls 文件
 //! PP-OCRv5 两档各带**专属** textline 方向分类模型（PP-LCNet_x0_25 / x1_0），
-//! 已非旧版 `ch_ppocr_mobile_v2.0_cls`；`cls_file` 两档互异，仅 `dict_file` 共用。
+//! `cls_file` 两档互异，仅 `dict_file` 共用。
 
 use serde::{Deserialize, Serialize};
 

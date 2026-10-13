@@ -27,9 +27,10 @@ const props = defineProps<{
 
 const emit = defineEmits<{ change: [rect: CropRectNorm] }>()
 
+// 键盘微调统一由查看器按原图像素处理；库的全局键盘监听会抢走比例下拉框按键。
 const TEMPLATE =
   '<cropper-canvas>' +
-  '<cropper-selection movable resizable keyboard outlined precise>' +
+  '<cropper-selection movable resizable outlined precise>' +
   '<cropper-grid bordered covered></cropper-grid>' +
   '<cropper-crosshair centered></cropper-crosshair>' +
   '<cropper-handle action="move" theme-color="rgba(255,255,255,.28)"></cropper-handle>' +
@@ -70,6 +71,15 @@ function onSelectionChange(event: Event): void {
   if (syncingFromProps || !props.box.width || !props.box.height) return
   const detail = (event as CustomEvent<{ x: number; y: number; width: number; height: number }>)
     .detail
+  // Cropper 在更新自身坐标前发出可取消事件；拒绝越界以保留上一次合法框，避免负坐标进入保存。
+  if (
+    detail.x < 0 || detail.y < 0 ||
+    detail.x + detail.width > props.box.width ||
+    detail.y + detail.height > props.box.height
+  ) {
+    event.preventDefault()
+    return
+  }
   emit('change', selectionToNormalized(detail, props.box.width, props.box.height))
 }
 

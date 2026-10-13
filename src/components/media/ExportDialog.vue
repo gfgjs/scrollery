@@ -75,17 +75,27 @@ function buildRequest(): ExportRequest | null {
 // 并发守卫(审查 P2):打开对话框即发 preflight#1(大 selectAll 下 resolve+meta 查询可达秒级),
 // 用户随即选目录触发 preflight#2 ——只接受最新一次请求的结果,防旧请求晚到覆盖新结果。
 let preflightSeq = 0
-async function runPreflight() {
+async function runPreflight(message = '', rebuildOnStale = true): Promise<void> {
   const req = buildRequest()
   if (!req) return
   const seq = ++preflightSeq
-  errorMessage.value = ''
+  // 目录或选集已变时，旧计数/可写性/库内确认不能授权新请求；预检失败也须保持不可开始。
+  preflight.value = null
+  // 视图重建后需保留重新确认提示；预检失败时仍由下方错误覆盖。
+  errorMessage.value = message
   try {
     const result = await store.preflightExport(req)
     if (seq !== preflightSeq) return
     preflight.value = result
   } catch (e) {
     if (seq !== preflightSeq) return
+    // 预检失败时开始按钮不可用，须在这里重建原入口集合；持续变化时只重试一次。
+    const fresh = rebuildOnStale && isViewStale(e) ? store.resolveViewStaleRetry() : null
+    if (fresh) {
+      store.dialogSelection = fresh
+      await runPreflight(t('export.viewStaleRetry'), false)
+      return
+    }
     errorMessage.value = ipcErrorMessage(e)
   }
 }
@@ -154,8 +164,7 @@ async function start() {
     const fresh = isViewStale(e) ? store.resolveViewStaleRetry() : null
     if (fresh) {
       store.dialogSelection = fresh
-      errorMessage.value = t('export.viewStaleRetry')
-      await runPreflight()
+      await runPreflight(t('export.viewStaleRetry'))
     } else {
       errorMessage.value = ipcErrorMessage(e)
     }

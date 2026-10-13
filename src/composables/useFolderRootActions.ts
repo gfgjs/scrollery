@@ -1,6 +1,5 @@
 // src/composables/useFolderRootActions.ts
-// 根目录管理:导入/迁移/新建子文件夹 + 右键菜单构建——从 FoldersSection.vue 域 19、20、21、22
-// 迁出(见 docs/planning/2026-07-25-超长文件拆分方案/analysis/FoldersSection-vue.md §2.1)。
+// 根目录管理:导入/迁移/新建子文件夹 + 右键菜单构建。
 // 依赖 useFolderTreeSync 暴露的 reloadTreePreserveExpansion(迁移/新建后都要重载保留展开态)与
 // setPendingSelectRootId(新增根后要选中新根节点);方向单向,Sync 不反向依赖本 composable。
 import { ref, markRaw, onMounted, onBeforeUnmount } from 'vue'
@@ -62,7 +61,7 @@ export function useFolderRootActions(deps: FolderRootActionsDeps) {
     contextMenu.value.visible = true
   }
 
-  // ── #7 方案A：文件夹迁移后重链接根路径 ──────────────────────────────────────────
+  // ── 文件夹迁移后重链接根路径 ──────────────────────────────────────────
   interface RelinkResult {
     root: { id: number; path: string }
     sampled: number
@@ -200,22 +199,21 @@ export function useFolderRootActions(deps: FolderRootActionsDeps) {
       const overlap = await invokeIpc<FolderOverlapResult>(IPC.CHECK_FOLDER_OVERLAP, {
         newPath: path,
       })
+      let mergeChildren = false
       if (overlap.children.length > 0) {
         const childNames = overlap.children.map((c) => c.alias || c.path).join(', ')
-        const { confirmed: merge } = await confirm({
+        const { confirmed, checkboxValue } = await confirm({
           title: t('sidebar.overlapDetected'),
           message: t('sidebar.overlapParentMsg', { path, children: childNames }),
-          confirmText: t('sidebar.mergeAndReplace'),
-          cancelText: t('sidebar.addAnyway'),
+          confirmText: t('sidebar.addFolder'),
+          cancelText: t('common.cancel'),
+          showCheckbox: true,
+          checkboxLabel: t('sidebar.mergeAndReplace'),
+          checkboxValue: true,
         })
-        if (merge) {
-          for (const child of overlap.children) {
-            await invokeIpc(IPC.REMOVE_SCAN_ROOT_WITH_OPTIONS, {
-              id: child.id,
-              clearThumbnails: false,
-            })
-          }
-        }
+        if (!confirmed) return
+        // 后端在同一事务中迁移归属，保留资产 ID 及收藏、版本等关联。
+        mergeChildren = checkboxValue
       } else if (overlap.parents.length > 0) {
         const parentNames = overlap.parents.map((p) => p.alias || p.path).join(', ')
         const { confirmed: proceed } = await confirm({
@@ -230,7 +228,7 @@ export function useFolderRootActions(deps: FolderRootActionsDeps) {
       // 第二步：添加根目录，随后由 scanRoots 的
       // watch 加载树，并在加载完成后选中新根节点。
       try {
-        const root = await scan.addScanRoot(path)
+        const root = await scan.addScanRoot(path, undefined, mergeChildren)
         setPendingSelectRootId(root.id)
         await scan.loadScanRoots() // 重建 scanRoots → 触发上方 watch
         await scan.startScan(root.id, () => {
@@ -238,10 +236,16 @@ export function useFolderRootActions(deps: FolderRootActionsDeps) {
           window.dispatchEvent(new CustomEvent('folder-stats-changed'))
         })
       } catch (e) {
-        toast.addToast('error', t('sidebar.addFolderFailed') + ' ' + e)
+        const code = parseAppError(e).code
+        const message = code === 'scan_merge_conflict' ? t('sidebar.mergeConflict')
+          : code === 'scan_merge_visibility_conflict' ? t('sidebar.mergeVisibilityConflict')
+          : code === 'scan_merge_pending_move' ? t('sidebar.mergePendingMove')
+          : code === 'scan_merge_invalid_path' ? t('sidebar.mergeInvalidPath')
+          : t('sidebar.addFolderFailed', { error: ipcErrorMessage(e) })
+        toast.addToast('error', message)
       }
     } catch (e) {
-      toast.addToast('error', t('sidebar.chooseDirFailed') + ' ' + e)
+      toast.addToast('error', t('sidebar.chooseDirFailed', { error: ipcErrorMessage(e) }))
     }
   }
 

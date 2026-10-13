@@ -1,12 +1,12 @@
 // src/composables/useContentViewerRouteNav.ts
-// 从 ContentViewer.vue 下沉(超长文件拆分方案 2.1):路由驱动翻页。不含 close/closeViewer——
+// 查看器路由驱动翻页。不含 close/closeViewer——
 // 那两个跨多个功能域被引用,留在编排层(ContentViewer.vue)。
 // 缓存与实时翻页经 mediaStore 的同一上下文守卫提交,随后同步当前路由。
 
 import { computed, onScopeDispose } from 'vue'
 import type { RouteLocationNormalizedLoaded, Router } from 'vue-router'
 import type { AdjacentDetail, useMediaStore } from '../stores/mediaStore'
-import type { useImageEditor } from './useImageEditor'
+import { requestDiscardEdits, type useImageEditor } from './useImageEditor'
 
 export function useContentViewerRouteNav(options: {
   media: ReturnType<typeof useMediaStore>
@@ -25,7 +25,23 @@ export function useContentViewerRouteNav(options: {
   const routeId = computed(() => Number(route.params.id))
   let navigationEpoch = 0
   let disposed = false
-  onScopeDispose(() => { disposed = true; navigationEpoch++ })
+  let pendingDiscard: Promise<boolean> | null = null
+  // 查看器位于 RouterView 外，侧栏、历史记录和换图都需在路由提交前保护当前草稿。
+  const removeRouteGuard = router.beforeEach(async (to, from) => {
+    if (to.path === from.path || editor.status.value === 'idle') return true
+    if (editor.status.value === 'saving') return false
+    // 连续导航共用一次确认，避免后一次请求替换全局对话框的回调。
+    pendingDiscard ??= requestDiscardEdits(editor).finally(() => { pendingDiscard = null })
+    const confirmed = await pendingDiscard
+    if (disposed || !confirmed) return false
+    editor.close()
+    return true
+  })
+  onScopeDispose(() => {
+    disposed = true
+    navigationEpoch++
+    removeRouteGuard()
+  })
 
   function ensureLensContext() {
     if (!isLensActive?.() || media.navContext?.type === 'lens') return
@@ -47,7 +63,7 @@ export function useContentViewerRouteNav(options: {
   // 统一翻页:镜头上下文经带 layoutVersion 的镜头 IPC；普通上下文保持缓存/普通邻接路径。
   // replace 同步 URL(loadFromRoute 守卫跳过重载)。onKeydown/onWheel/移动后跳转共用。
   async function navigate(offset: number) {
-    if (disposed || editor.status.value !== 'idle') return // 编辑中禁翻页(方案 §7);顶栏工具栏按钮同经此函数
+    if (disposed || editor.status.value !== 'idle') return // 编辑中禁翻页；顶栏工具栏按钮同经此函数
     const epoch = ++navigationEpoch
     onNavigate?.(offset)
     const curId = media.detailItem?.id

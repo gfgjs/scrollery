@@ -1,6 +1,6 @@
-// Canvas 网格算术命中(点击/右键/拖拽手柄),从 MediaGridCanvas.vue 下沉(方案 2.2 ⑥)。
+// Canvas 网格的点击、右键和拖拽手柄算术命中。
 // 工厂在宿主 <script setup> 顶层只调用一次。HANDLE_INSET/HANDLE_SIZE 从
-// mediaGridCanvas.painters.ts 单一来源导入(§3.3:防绘制/命中两处几何漂移)。
+// mediaGridCanvas.painters.ts 单一来源导入，防止绘制与命中几何漂移。
 import type { Ref } from 'vue'
 import { hitTestCell, hitTestCellWithRow } from '../components/media/mediaGridCanvas.helpers'
 import { HANDLE_INSET, HANDLE_SIZE } from '../components/media/mediaGridCanvas.painters'

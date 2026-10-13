@@ -1,9 +1,5 @@
-<!-- 影像增强队列进度面板（降噪/超分子系统 P0 批 5.5，复核缺口收口）：队列态此前无消费方——
-     `enhanceStore` 已有 subscribeQueue/fetchQueue/queue，但无任何组件挂载订阅、无 UI 展示。
-     本组件展示队列内各 job：状态标签 + 进度条(tilesDone/tilesTotal，估算总数为 0 时退化为
-     不定长态) + 失败行文案(enhanceErrorMessageKey 稳定码 → i18n) + 取消按钮(排队/处理中态)。
-     生命周期内 subscribeQueue/unsubscribeQueue（计数守卫，见 store 注释）；两处挂载
-     （设置分节顶部 + 对话框内）互不干扰监听。 -->
+<!-- 展示增强队列各任务的状态、进度、错误和取消入口；总数未知时使用不定长进度。
+     生命周期内订阅和取消订阅队列；设置页与对话框可同时挂载。 -->
 <template>
   <div v-if="enhance.queue.length" class="enh-queue">
     <h3 class="enh-queue__title">{{ $t('enhance.queueTitle') }}</h3>

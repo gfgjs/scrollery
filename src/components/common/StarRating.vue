@@ -12,7 +12,9 @@
       class="star-rating__star"
       :class="{ filled: n <= displayValue }"
       :disabled="readonly"
-
+      :aria-label="$t('detail.starCount', { count: n })"
+      :aria-pressed="n === modelValue"
+      :title="$t('detail.starCount', { count: n })"
       @mouseenter="onHover(n)"
       @click="onClick(n)"
     >

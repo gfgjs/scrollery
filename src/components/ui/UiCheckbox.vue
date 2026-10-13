@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// UiCheckbox — 表单复选框原语（S1 UI primitive）。
+// 表单复选框原语。
 // 蒸馏 ConfirmDialog/CloseConfirmDialog 两处重复定义的 `.remember-checkbox` 视觉
 // (native input 16×16 + `accent-color:var(--color-accent)` + flex 行 + gap 8px),零自绘 SVG,
 // 选中/焦点态全由原生 checkbox + accent-color 驱动,无 JS 态。
@@ -33,7 +33,6 @@ function onChange(e: Event) {
 </template>
 
 <style scoped>
-/* 蒸馏自 ConfirmDialog/CloseConfirmDialog 的 `.remember-checkbox`——字节复刻使二者迁移同构。 */
 .checkbox-field {
   display: flex;
   align-items: center;

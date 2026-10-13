@@ -32,6 +32,7 @@ const licenseSourcesPath = path.join(repo, 'third-party', 'license-sources.json'
 
 const SHIP_RUST_ROOTS = [
   { manifest: 'Cargo.toml', package: 'scrollery', target: 'x86_64-pc-windows-msvc' },
+  { manifest: 'Cargo.toml', package: 'native-thumbnail-worker', target: 'x86_64-pc-windows-msvc' },
   { manifest: 'Cargo.toml', package: 'ai-worker', target: 'x86_64-pc-windows-msvc' },
   { manifest: 'Cargo.toml', package: 'psd-worker', target: 'x86_64-pc-windows-msvc' },
   { manifest: 'crates/exotic-workers/raw-worker/Cargo.toml', package: null, target: 'x86_64-pc-windows-gnu' },
@@ -271,7 +272,7 @@ async function main() {
         // 已固定正文按 kind 分组收录:onnxruntime/ffmpeg 属运行时侧,graphviz/lute 属前端
         // vendored 编译件(graphviz 含 Graphviz 2.40.1 与 Viz.js 2.1.2 两份正文)。
         ...Object.fromEntries(
-          ['onnxruntime', 'ffmpeg', 'graphviz', 'lute', 'libvpl'].map((kind) => [
+          ['onnxruntime', 'ffmpeg', 'graphviz', 'lute'].map((kind) => [
             kind,
             pinnedTexts(sourceManifest, kind),
           ]),

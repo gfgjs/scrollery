@@ -1,11 +1,6 @@
 // src/composables/selection/classicMode.ts
-// Part5 T4a · classic 选择模式 —— 桌面照片管理器语义（单击替换 / Ctrl 翻转 / Shift 区间 / Ctrl+A 全选 / 反选）。
-//
-// 🔴 这是**当前默认起步模式**,非定死（no-contract-freeze-during-dev）。现阶段只实现这一个 + 搭好
-//   SelectionMode seam；需要实测比较时再增候选模式（rubber-band / lasso / semantic-select），
-//   届时新增一个实现 + 注册即可,协议层与消费方零改动（KISS：不预造未验证的模式）。
-//
-// 全部为纯函数：旧态 + 意图 + 上下文 → 新态,不改入参、不触外部状态。
+// 经典选区模式：单击替换、Ctrl 翻转、Shift 区间、Ctrl+A 全选及反选。
+// apply 只依据旧态、意图与上下文返回新态，不修改输入。
 
 import type { SelectionMode, SelectionState } from './types'
 

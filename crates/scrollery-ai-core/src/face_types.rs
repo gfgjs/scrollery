@@ -1,9 +1,5 @@
 // crates/scrollery-ai-core/src/face_types.rs
-//! 人脸检测的纯几何类型(T16 准备:自 face.rs 外移)。
-//!
-//! 本模块**永远可用**(不在 `inference` feature 门内):host 在 T16 删 ort 后,
-//! worker 派发路径仍需 `DetectedFace`(协议 FaceDet 搬运回本类型走共用落库映射
-//! `faces_to_records`,quality 派生同源)。路径兼容:face.rs 以 `pub use` 原位再导出。
+//! 人脸检测的几何类型；host 可在未启用 `inference` feature 时处理 worker 结果。
 
 /// 一张检测到的人脸，坐标均在**输入 `DecodedImage` 的像素坐标系**。
 #[derive(Clone, Debug)]

@@ -51,15 +51,14 @@ export function useFolderTree(
   const nodes = shallowRef<DirNode[]>([])
   const loading = ref(false)
   let loadingId = 0 // 防止并发 loadRoots 调用的守卫
-  // 同一父目录子节点加载的「在途去重表」:并发的 loadChildren(sameParent) 复用同一在途 Promise,
+  // 同一父节点的「在途去重表」:并发的 loadChildren(sameParent) 复用同一在途 Promise,
   // 避免两次 splice 注入同一批子节点造成重复目录行——即 Vue "Duplicate keys found during update"
   // 刷屏的根因(两个 watch:activeDirectoryId / scrolledDirectoryId 在 groupBy=folder 滚动时对同一
   // 未展开祖先并发 expandToNode → loadChildren,均在 await 完成前读到 !expanded 故各插一次)。
   //
-  // 键是**路径身份**(nodeKey)而非 DB id(D-013):去重的对象是「树上的同一个节点」,而树的结构轴
-  // 是路径。FS-only 目录的 id 全是 null,按 id 建表会让它们**全部撞成同一个键** —— 两个毫不相干的
-  // 目录并发展开时互相顶掉,后到的那个直接拿前一个的 Promise 当自己的结果,子节点永远不出现。
-  const childLoadInflight = new Map<string, Promise<void>>()
+  // 按节点对象区分请求归属：祖先折叠重开后，同路径已是新节点，不能复用旧节点的请求。
+  // FS-only 节点也各有独立对象，不会因 DB id 同为 null 而互相合并。
+  const childLoadInflight = new Map<DirNode, Promise<void>>()
   // 文件页的独立代际号。分类切换只重置文件分页，不换目录树；旧 IPC 返回时必须不能把
   // 上一组分类的 rows 写回当前节点。
   let fileLoadGeneration = 0
@@ -201,42 +200,41 @@ export function useFolderTree(
     // 死代码删除;549861c 引入模式 watch 整树重载后恰恰重新制造了它要挡的场景(F-023:删死
     // 守卫前先问引入它的竞态会不会被本批变更复活)。
     const myLoadId = loadingId
+    const generation = fileLoadGeneration
+    const wasExpanded = parent.expanded
     try {
       // 并发去重:同一节点的加载若已在途,复用其 Promise 并「等待」(而非早退)——保证 resolve
       // 后子节点确已注入,这样 expandToNode 顺序展开祖先链时,读到的每一层都已就绪(否则可能
       // 在子节点尚未 splice 时就去找更深祖先而漏展开)。
-      const inflight = childLoadInflight.get(parent.nodeKey)
+      const inflight = childLoadInflight.get(parent)
       if (inflight) {
         await inflight
         return
       }
       const task = (async () => {
         const children = await fetchChildDirs(parent)
-        if (myLoadId !== loadingId) return // 整树已换代(切模式/换根)——丢弃,不动新树
+        if (myLoadId !== loadingId || generation !== fileLoadGeneration ||
+          (wasExpanded && !parent.expanded)) return
+        // 同路径的新节点不继承旧请求；祖先折叠移除本对象后，迟到结果直接作废。
+        const idx = nodes.value.indexOf(parent)
+        if (idx < 0) return
         attachAbsPath(children)
         // 在其父节点之后注入子节点
-        const idx = nodes.value.findIndex((n) => n.nodeKey === parent.nodeKey)
-        if (idx >= 0) {
-          // 第二道防线(防御式):滤掉已在树中的节点再 splice。判重用 **nodeKey(路径身份)** 而非
-          // id——「一个节点在拍平树中至多一行」这条硬不变量的正确表述是按树的结构轴,而结构轴是
-          // 路径(D-013);FS-only 目录根本没有 id,用 id 判重会让它们全部塌成同一条(null === null)。
-          const existing = new Set(nodes.value.map((n) => n.nodeKey))
-          const fresh = children.filter((c) => !existing.has(c.nodeKey))
-          if (fresh.length) nodes.value.splice(idx + 1, 0, ...fresh)
-        }
+        // 判重仍用路径身份：FS-only 目录没有 DB id，同一路径在树中只能出现一次。
+        const existing = new Set(nodes.value.map((n) => n.nodeKey))
+        const fresh = children.filter((c) => !existing.has(c.nodeKey))
+        if (fresh.length) nodes.value.splice(idx + 1, 0, ...fresh)
         // 标记父节点为展开状态
-        const inTree = nodes.value.find((n) => n.nodeKey === parent.nodeKey)
-        if (inTree) inTree.expanded = true
+        parent.expanded = true
         triggerRef(nodes) // splice + expanded 均原地 mutate,shallowRef 需显式触发
       })()
-      childLoadInflight.set(parent.nodeKey, task)
+      childLoadInflight.set(parent, task)
       try {
         await task
       } finally {
-        // 只删**自己**注册的那条:loadRoots 换代时会 clear 本表,新一代可能已对同键注册了
-        // 新任务——旧任务的 finally 无条件 delete 会把新任务的在途去重顶掉。
-        if (childLoadInflight.get(parent.nodeKey) === task) {
-          childLoadInflight.delete(parent.nodeKey)
+        // 原位刷新会清表并复用节点；旧任务收尾时不能删除同一对象后来注册的新请求。
+        if (childLoadInflight.get(parent) === task) {
+          childLoadInflight.delete(parent)
         }
       }
     } finally {
@@ -334,6 +332,142 @@ export function useFolderTree(
     }
   }
 
+  type RefilledFiles = { files: DirFile[]; filesHasMore: boolean; filesCursor?: number }
+
+  async function refillLoadedFiles(parent: DirNode, requested: number): Promise<RefilledFiles> {
+    if (getMode() === 'registeredOnly') {
+      if (parent.id === null) return { files: [], filesHasMore: false }
+      const rows = await invokeIpc<DirFile[]>(IPC.LIST_DIRECTORY_FILES, {
+        directoryId: parent.id,
+        limit: requested + 1,
+        offset: 0,
+        ...categoryArgs(),
+      })
+      return { files: rows.slice(0, requested), filesHasMore: rows.length > requested }
+    }
+    const files: DirFile[] = []
+    let cursor: number | undefined = 0
+    while (cursor !== undefined && files.length < requested) {
+      const page = await fetchTreePage(parent, 'files', cursor)
+      files.push(...adaptTreeEntries(page.entries, parent.depth + 1).files)
+      const next: number | undefined = page.nextCursor
+      if (next !== undefined && next <= cursor) throw new Error('目录分页游标未前进')
+      cursor = next
+    }
+    // 末页必须整页保留，否则游标已前进而被截掉的文件会永久漏显。
+    return { files, filesHasMore: cursor !== undefined, filesCursor: cursor }
+  }
+
+  /** 按根相对目录刷新已加载内容；所有路径身份均取自后端，失败时保留原树。 */
+  async function refreshDirectories(rootId: number, paths: readonly string[]) {
+    if (!paths.length || !roots.value.some((root) => root.id === rootId)) return
+    const myLoadId = loadingId
+    const generation = ++fileLoadGeneration
+    const mode = getMode()
+    const categories = categoryArgs().categories.join(',')
+    const stale = () =>
+      myLoadId !== loadingId || generation !== fileLoadGeneration || mode !== getMode() ||
+      categories !== categoryArgs().categories.join(',')
+    childLoadInflight.clear()
+
+    const before = [...nodes.value]
+    const expandedBefore = before.map((node) => node.expanded)
+    const byKey = new Map(before.map((node) => [node.nodeKey, node]))
+    const byId = new Map(before.filter((node) => node.rootId === rootId && node.id !== null)
+      .map((node) => [node.id, node]))
+    const oldChildren = new Map<string, DirNode[]>()
+    for (const node of before) {
+      if (node.parentKey === null) continue
+      const siblings = oldChildren.get(node.parentKey) ?? []
+      siblings.push(node)
+      oldChildren.set(node.parentKey, siblings)
+    }
+    const affected = new Set(paths)
+    for (const rel of paths) {
+      let parent = rel
+      while (parent) {
+        const split = parent.lastIndexOf('/')
+        parent = split < 0 ? '' : parent.slice(0, split)
+        affected.add(parent)
+      }
+    }
+
+    type PreparedNode = { node: DirNode; fields: DirNode; files?: RefilledFiles }
+    const prepared: PreparedNode[] = []
+    const reused = new Set<DirNode>()
+    // 只准备副本，任何后续读取失败都不能先删分支或改掉旧节点的路径。
+    async function prepare(fresh: DirNode, force: boolean) {
+      if (stale()) return
+      let old = byKey.get(fresh.nodeKey) ?? (fresh.id === null ? undefined : byId.get(fresh.id))
+      if (old && reused.has(old)) old = undefined
+      if (old) reused.add(old)
+      const moved = !!old && old.relPath !== fresh.relPath
+      const current: DirNode = { ...old, ...fresh, expanded: old?.expanded }
+      const needsRead = force || moved || affected.has(fresh.relPath)
+      const entry: PreparedNode = { node: old ?? current, fields: current }
+      if (old?.filesLoaded && needsRead) {
+        entry.files = await refillLoadedFiles(current, old.files?.length || FILE_PAGE)
+        if (stale()) return
+      }
+      prepared.push(entry)
+      if (!old?.expanded) return
+      const children = needsRead ? await fetchChildDirs(current) : oldChildren.get(old.nodeKey) ?? []
+      if (stale()) return
+      // 未刷新分支沿用原对象；新取回的字段只在副本中补绝对路径。
+      const freshChildren = children.map((child) => ({ ...child }))
+      attachAbsPath(freshChildren)
+      for (const child of freshChildren) await prepare(child, force || moved)
+    }
+
+    const rootRows = await invokeIpc<DirNode[]>(IPC.GET_DIRECTORY_TREE, {
+      rootId,
+      ...(mode === 'registeredOnly' ? categoryArgs() : {}),
+    })
+    if (stale()) return
+    const freshRoots = rootRows.map((root) => ({ ...root }))
+    if (mode !== 'registeredOnly') {
+      for (const root of freshRoots) { root.mediaCount = null; root.hasChildren = null }
+    }
+    attachAbsPath(freshRoots)
+    for (const root of roots.value) {
+      if (root.id === rootId) {
+        for (const fresh of freshRoots) await prepare(fresh, false)
+      } else {
+        for (const node of before) {
+          if (node.rootId === root.id) prepared.push({ node, fields: node })
+        }
+      }
+    }
+    if (stale()) return
+    // 用户在准备期间折叠/展开时按最新结构重取，不让旧响应重新打开已折叠分支。
+    if (before.length !== nodes.value.length || before.some((node, index) =>
+      nodes.value[index] !== node || node.expanded !== expandedBefore[index])) {
+      await refreshDirectories(rootId, paths)
+      return
+    }
+    for (const { node, fields, files } of prepared) {
+      node.nodeKey = fields.nodeKey
+      node.parentKey = fields.parentKey
+      node.id = fields.id
+      node.rootId = fields.rootId
+      node.parentId = fields.parentId
+      node.name = fields.name
+      node.relPath = fields.relPath
+      node.depth = fields.depth
+      node.mediaCount = fields.mediaCount
+      node.hasChildren = fields.hasChildren
+      node.hidden = fields.hidden
+      node.absPath = fields.absPath
+      if (files) {
+        node.files = files.files
+        node.filesCursor = files.filesCursor
+        node.filesHasMore = files.filesHasMore
+        node.filesLoaded = true
+      }
+    }
+    nodes.value = prepared.map(({ node }) => node)
+  }
+
   async function toggleNode(node: DirNode) {
     if (node.expanded) {
       // 折叠：删除后代「目录」行。缓存的 `files` 仍留在节点上，但模板在折叠时隐藏它们，
@@ -358,6 +492,8 @@ export function useFolderTree(
       try {
         await Promise.all(tasks)
       } catch (err) {
+        // 旧节点的失败也无权按同路径折叠新分支或弹出过时错误。
+        if (!nodes.value.includes(node)) return
         // R-10:展开取数失败(含卷不可用)不能停在「expanded=true + 空树」——那与「确实为空」
         // 不可分。回退折叠(collapseNode 顺带移除可能已注入的部分子行)+ 上报,用户重试有路径。
         collapseNode(node)
@@ -463,6 +599,7 @@ export function useFolderTree(
     toggleNode,
     loadMoreFiles,
     reloadFilesForFilter,
+    refreshDirectories,
     expandToNode,
     expandAll,
     collapseAll,

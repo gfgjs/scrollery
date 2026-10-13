@@ -1,5 +1,5 @@
 <template>
-  <div class="rs-panel">
+  <div class="rs-panel" :class="{ 'rs-panel--editor': editorMode }">
     <div class="rs-panel__head">
       <span class="rs-panel__title">{{ t('doc.readerSettings') }}</span>
       <button
@@ -13,7 +13,7 @@
     </div>
 
     <div class="rs-panel__body">
-      <ReaderSettingsGroup id="theme" :title="t('doc.readerGroupTheme')">
+      <ReaderSettingsGroup v-if="!editorMode" id="theme" :title="t('doc.readerGroupTheme')">
         <div class="rs-group-rows">
           <!-- 阅读主题（R3）：跟随应用 + 当前明暗槽可选的阅读专属调色板。编辑的是当前 app 明暗对应的那一槽
            （日/夜两槽的完整配置在设置页「阅读」节）。 -->
@@ -33,7 +33,7 @@
         </div>
       </ReaderSettingsGroup>
 
-      <ReaderSettingsGroup id="typography" :title="t('doc.readerGroupTypography')">
+      <ReaderSettingsGroup id="typography" :default-open="editorMode" :title="t('doc.readerGroupTypography')">
         <div class="rs-group-rows">
           <!-- 字号：−/+ 步进 1px，钳制 [FONT_MIN, FONT_MAX]。 -->
           <div class="rs-row">
@@ -41,6 +41,7 @@
             <div class="rs-stepper">
               <button
                 @click="setFontSize(fontSizePx - 1)"
+                :aria-label="`${t('doc.decrease')} ${t('doc.fontSize')}`"
                 :disabled="fontSizePx <= FONT_MIN"
 
               >
@@ -49,6 +50,7 @@
               <span class="rs-stepper__val">{{ fontSizePx }}px</span>
               <button
                 @click="setFontSize(fontSizePx + 1)"
+                :aria-label="`${t('doc.increase')} ${t('doc.fontSize')}`"
                 :disabled="fontSizePx >= FONT_MAX"
 
               >
@@ -63,6 +65,7 @@
             <div class="rs-stepper">
               <button
                 @click="setLineHeight(lineHeight - LH_STEP)"
+                :aria-label="`${t('doc.decrease')} ${t('doc.lineHeight')}`"
                 :disabled="lineHeight <= LH_MIN + 1e-9"
 
               >
@@ -71,6 +74,7 @@
               <span class="rs-stepper__val">{{ lineHeight.toFixed(2) }}</span>
               <button
                 @click="setLineHeight(lineHeight + LH_STEP)"
+                :aria-label="`${t('doc.increase')} ${t('doc.lineHeight')}`"
                 :disabled="lineHeight >= LH_MAX - 1e-9"
 
               >
@@ -80,7 +84,7 @@
           </div>
 
           <!-- 段距（R5-c）：−/+ 步进 0.1em，钳制 [PS_MIN, PS_MAX]，控制段落之间的间隔。 -->
-          <div class="rs-row">
+          <div v-if="!editorMode" class="rs-row">
             <span class="rs-row__label">{{ t('doc.paragraphSpacing') }}</span>
             <div class="rs-stepper">
               <button
@@ -107,6 +111,7 @@
             <div class="rs-stepper">
               <button
                 @click="setWidth(maxInlineSizePx - W_STEP)"
+                :aria-label="`${t('doc.decrease')} ${t('doc.pageWidth')}`"
                 :disabled="maxInlineSizePx <= W_MIN"
 
               >
@@ -115,6 +120,7 @@
               <span class="rs-stepper__val">{{ maxInlineSizePx }}px</span>
               <button
                 @click="setWidth(maxInlineSizePx + W_STEP)"
+                :aria-label="`${t('doc.increase')} ${t('doc.pageWidth')}`"
                 :disabled="maxInlineSizePx >= W_MAX"
 
               >
@@ -124,7 +130,7 @@
           </div>
 
           <!-- 字体族：衬线 / 无衬线。 -->
-          <div class="rs-row">
+          <div v-if="!fixedFontFamily" class="rs-row">
             <span class="rs-row__label">{{ t('doc.fontFamily') }}</span>
             <div class="rs-seg">
               <button :class="{ active: fontFamily === 'serif' }" @click="setFontFamily('serif')">
@@ -137,7 +143,7 @@
           </div>
 
           <!-- 字重（R3）：常规 / 中 / 粗。 -->
-          <div class="rs-row">
+          <div v-if="!editorMode" class="rs-row">
             <span class="rs-row__label">{{ t('doc.fontWeight') }}</span>
             <div class="rs-seg">
               <button
@@ -152,7 +158,7 @@
           </div>
 
           <!-- 字距（R3）：−/+ 步进 0.01em，钳制 [LS_MIN, LS_MAX]。 -->
-          <div class="rs-row">
+          <div v-if="!editorMode" class="rs-row">
             <span class="rs-row__label">{{ t('doc.letterSpacing') }}</span>
             <div class="rs-stepper">
               <button
@@ -174,7 +180,7 @@
           </div>
 
           <!-- 对齐（R3）：两端 / 左。 -->
-          <div class="rs-row">
+          <div v-if="!editorMode" class="rs-row">
             <span class="rs-row__label">{{ t('doc.textAlign') }}</span>
             <div class="rs-seg">
               <button :class="{ active: textAlign === 'justify' }" @click="setTextAlign('justify')">
@@ -187,7 +193,7 @@
           </div>
 
           <!-- 章题缩放（R3「章题独立」）：−/+ 步进 0.1×，钳制 [TS_MIN, TS_MAX]。 -->
-          <div class="rs-row">
+          <div v-if="!editorMode" class="rs-row">
             <span class="rs-row__label">{{ t('doc.titleScale') }}</span>
             <div class="rs-stepper">
               <button
@@ -209,7 +215,7 @@
           </div>
 
           <!-- 版式（R5 竖排竹简）：横排 / 竖排右起 / 竖排左起。切换重挂载渲染器(渲染器 getDirection 仅在 load 探测)。 -->
-          <div class="rs-row">
+          <div v-if="!editorMode" class="rs-row">
             <span class="rs-row__label">{{ t('doc.layoutMode') }}</span>
             <select
               class="rs-select"
@@ -224,7 +230,7 @@
         </div>
       </ReaderSettingsGroup>
 
-      <ReaderSettingsGroup id="paging" :default-open="false" :title="t('doc.readerGroupPaging')">
+      <ReaderSettingsGroup v-if="!editorMode" id="paging" :default-open="false" :title="t('doc.readerGroupPaging')">
         <div class="rs-group-rows">
           <!-- 翻页动画：关 / 滑动 / 仿真翻页。 -->
           <div class="rs-row">
@@ -267,7 +273,7 @@
       </ReaderSettingsGroup>
 
       <!-- 每书设置：简繁（三格式通用）+ 编码/重排（仅 txt）。改动经 set_reader_book_prefs 持久化并重挂载渲染器。 -->
-      <template v-if="book">
+      <template v-if="book && !editorMode">
         <ReaderSettingsGroup id="book" :default-open="false" :title="t('doc.readerGroupBook')">
           <div class="rs-group-rows">
             <!-- 简繁转换（R4）：纯显示层，txt/md/epub 通用。 -->
@@ -333,7 +339,7 @@
 </template>
 
 <script setup lang="ts">
-// 阅读器设置面板（阅读器方案 R2-6a/b）。字号 / 行距 / 栏宽 / 字体族（全局阅读偏好）。变更即 emit 'change'，
+// 阅读器设置面板管理字号、行距、栏宽和字体族等全局偏好。变更即 emit 'change'，
 // 由 DocumentViewer 持久化并透传给 BookReader（watch 后经 setStyles / setAttribute 实时重排，无需 remount）。
 // 每书区（R2-6c / R4）：简繁（zhConvert，三格式通用）/ 编码 / 重排（后二者仅 txt，由 isTxt 门控）。
 import { computed } from 'vue'
@@ -378,6 +384,10 @@ export interface BookPrefsState {
 
 const props = defineProps<
   ReaderPrefs & {
+    /** 即时编辑器只提供已接通的字号、行距、字体族和正文宽度。 */
+    editorMode?: boolean
+    /** 源码编辑使用固定等宽字体时隐藏不生效的字体族切换。 */
+    fixedFontFamily?: boolean
     /** 每书设置状态；foliate 全格式传入（承载简繁），非 foliate 为 null。 */
     book?: BookPrefsState | null
     /** 是否 txt：仅 txt 显示编码/重排（简繁对全格式显示）。 */
@@ -550,6 +560,11 @@ function setTitleScale(s: number) {
   emitChange({ titleScale: clamp(Number(snapped.toFixed(1)), TS_MIN, TS_MAX) })
 }
 function resetDefaults() {
+  if (props.editorMode) {
+    // 仅恢复当前面板的四项，不改隐藏的阅读主题、版式与每书偏好。
+    emitChange({ fontSizePx: DEFAULT_FONT, lineHeight: DEFAULT_LH, fontFamily: 'serif', maxInlineSizePx: DEFAULT_W })
+    return
+  }
   emit('change', {
     fontSizePx: DEFAULT_FONT,
     lineHeight: DEFAULT_LH,
@@ -578,6 +593,18 @@ function resetDefaults() {
   height: 100%;
   background: var(--color-bg-surface);
   border-left: 1px solid var(--color-divider);
+}
+.rs-panel--editor {
+  flex-shrink: 0;
+}
+@media (max-width: 680px) {
+  .rs-panel--editor {
+    position: absolute;
+    inset: 0 0 0 auto;
+    z-index: 10;
+    max-width: 100%;
+    box-shadow: -4px 0 16px rgb(0 0 0 / 12%);
+  }
 }
 .rs-panel__head {
   display: flex;

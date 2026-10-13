@@ -1,5 +1,5 @@
 // src-tauri/src/ai/mod.rs
-//! AI 推理模块 — CLIP 语义搜索 + （第 4B 阶段）人脸识别。
+//! AI 功能的 host 侧入口：CLIP 语义搜索、人脸识别与 OCR。
 
 pub mod clip;
 pub mod engine_boot;
@@ -9,6 +9,7 @@ pub mod face_pipeline;
 pub mod face_profile;
 pub mod ocr_registry;
 pub mod pipeline;
+mod prepared;
 pub mod profile;
 pub mod provider;
 pub mod remote_registry;

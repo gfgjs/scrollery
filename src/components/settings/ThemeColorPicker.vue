@@ -70,7 +70,7 @@
 </template>
 
 <script setup lang="ts">
-// 选色器(方案 §2):二维饱和度/明度面板 + 色相条 + HEX 输入 + 常用色。
+// 选色器包含饱和度/明度面板、色相条、HEX 输入与常用色。
 // 拖动即时上抛预览;HEX 未完成不发布,失焦恢复最后有效值。弹层收起只收起控件,主题草稿不受影响。
 import { ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'

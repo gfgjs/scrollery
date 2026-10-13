@@ -13,7 +13,7 @@ use exotic_protocol::RequestBody;
 use super::outcome::{RawOutcome, TaskOutcome};
 use super::worker::{WorkerConfig, WorkerLimits, WorkerSpec};
 
-/// Worker 生命周期公共面(T15 拆分,Part6 §3.4.2 C5):thumbnail 与 embed 两类 worker
+/// Worker 生命周期公共面：thumbnail 与 embed 两类 worker
 /// 共享的簿记能力;各自的任务方法在子 trait。
 pub trait WorkerTask: Send {
     fn worker_version(&self) -> String;
@@ -32,7 +32,7 @@ pub trait ThumbnailWorker: WorkerTask {
     ) -> TaskOutcome;
 }
 
-/// 嵌入/人脸 Worker 行为(C5;会话生命周期 + 批量 op)。消费方 = T17 的
+/// 嵌入/人脸 Worker 行为：会话生命周期与批量 op。消费方是
 /// [`crate::ai::worker_client::AiWorkerClient`];批结果校验用 [`super::validate`] 的 validate_*。
 pub trait EmbedWorker: WorkerTask {
     /// 当前已加载会话的快照;None = 未加载。派批前 host 据此比对目标模型,
@@ -126,7 +126,7 @@ impl WorkerFactory for SupervisorFactory {
     }
 }
 
-/// 视频缩略图 Worker 包装(rmvb/vob 收编,D-444③):video-worker 是 Service 型进程——
+/// 视频缩略图 Worker 包装：video-worker 是 Service 型进程，
 /// 任务化 Thumbnail 请求本身不携带 ffmpeg 路径(协议 `Thumbnail` 无此字段,亦无 session_id)。
 /// 故本包装在首个 thumbnail 派发前,先经既有公共面 [`WorkerSupervisor::run_request`] 发一次
 /// `VideoSessionInit`(ffmpeg 路径 + sha256 防换包 + work_dir 白名单,与 Service 门同样式),
@@ -179,6 +179,7 @@ impl ThumbnailWorker for VideoThumbnailWorker {
                 }
                 RawOutcome::Failure(fb) => return TaskOutcome::Failure(fb),
                 RawOutcome::TimedOut => return TaskOutcome::TimedOut,
+                RawOutcome::Cancelled => return TaskOutcome::Cancelled,
                 RawOutcome::Disconnected => return TaskOutcome::Disconnected,
                 RawOutcome::Protocol(r) => return TaskOutcome::Protocol(r),
             }

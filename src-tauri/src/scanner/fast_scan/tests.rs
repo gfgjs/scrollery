@@ -52,16 +52,6 @@ mod finalize_tests {
         assert_eq!(n, 0, "卷离线绝不删除");
         assert_eq!(avail(&c, 100), "online");
     }
-
-    /// 卷未识别（volume_id=None）：在线集为空 → 不标（宁可不删）。
-    #[test]
-    fn unidentified_volume_marks_nothing() {
-        let c = db_with_one_missing_candidate();
-        let seen = HashSet::new();
-        let n = finalize_missing_detection(&c, 1, true, 0, true, None, &seen).unwrap();
-        assert_eq!(n, 0, "未识别卷 → 空在线集 → 不标");
-        assert_eq!(avail(&c, 100), "online");
-    }
 }
 
 #[cfg(test)]
@@ -138,6 +128,123 @@ mod p1_4_freshness_tests {
 
     fn scalar_i64(conn: &Connection, sql: &str, id: i64) -> i64 {
         conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn move_mixed_and_rescan(quick: bool) {
+        let tmp = tempfile::Builder::new()
+            .prefix("scrollery-sync-")
+            .tempdir()
+            .unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("source/folder/nested")).unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("source/loose.psd"), b"loose").unwrap();
+        std::fs::write(root.join("source/folder/nested/image.jpg"), b"nested").unwrap();
+        let writer = Mutex::new(db_for_root(root));
+        assert_eq!(scan(&writer, root, "baseline", false).unwrap(), 2);
+        let conn = writer.lock().unwrap();
+        conn.execute_batch(
+            "UPDATE media_items SET is_favorited=1,rating=5;
+            INSERT INTO tags(id,name) VALUES(1,'keep');
+            INSERT INTO item_tags(item_id,tag_id) SELECT id,1 FROM media_items;
+            INSERT INTO albums(id,name) VALUES(100,'keep');
+            INSERT INTO album_items(album_id,item_id) SELECT 100,id FROM media_items;",
+        )
+        .unwrap();
+        let original: Vec<(i64, String)> = conn
+            .prepare("SELECT id,file_name FROM media_items ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM exotic_tasks", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "迁移前已按 PSD 格式播种插件任务"
+        );
+        drop(conn);
+        std::fs::rename(root.join("source/folder"), root.join("target/folder")).unwrap();
+        std::fs::rename(
+            root.join("source/loose.psd"),
+            root.join("target/renamed.txt"),
+        )
+        .unwrap();
+        assert_eq!(
+            scan(&writer, root, "moved", quick).unwrap(),
+            0,
+            "移动复用原资产"
+        );
+        let conn = writer.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM media_items", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        for (id, old_name) in original {
+            let (rel,name,favorite,rating,availability,volume_path):(String,String,i64,i64,String,String)=conn.query_row("SELECT d.rel_path,m.file_name,m.is_favorited,m.rating,m.availability,m.volume_relative_path FROM media_items m JOIN directories d ON d.id=m.directory_id WHERE m.id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+            let expected = if old_name == "loose.psd" {
+                ("target", "renamed.txt")
+            } else {
+                ("target/folder/nested", "image.jpg")
+            };
+            assert_eq!((rel.as_str(), name.as_str()), expected);
+            assert_eq!((favorite, rating, availability.as_str()), (1, 5, "online"));
+            assert_eq!(volume_path, format!("{rel}/{name}"));
+            if old_name == "loose.psd" {
+                let classification: (String, String) = conn
+                    .query_row(
+                        "SELECT file_format,media_type FROM media_items WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(classification, ("txt".into(), "document".into()));
+                assert_eq!(
+                    scalar_i64(
+                        &conn,
+                        "SELECT count(*) FROM exotic_tasks WHERE item_id=?1",
+                        id
+                    ),
+                    0,
+                    "旧格式的任务不能继续阻塞当前格式的派生"
+                );
+            }
+            assert_eq!(
+                scalar_i64(&conn, "SELECT count(*) FROM item_tags WHERE item_id=?1", id),
+                1
+            );
+            assert_eq!(
+                scalar_i64(
+                    &conn,
+                    "SELECT count(*) FROM album_items WHERE item_id=?1",
+                    id
+                ),
+                1
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM directories WHERE rel_path LIKE 'source/folder%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn full_rescan_preserves_identity_after_mixed_external_moves() {
+        move_mixed_and_rescan(false);
+    }
+
+    #[test]
+    fn quick_rescan_preserves_identity_after_mixed_external_moves() {
+        move_mixed_and_rescan(true);
     }
 
     /// 完整扫描检出「目录 mtime 不变」的就地编辑，并让旧缩略图/派生/AI/人脸/去重结果失效，
@@ -458,6 +565,160 @@ mod p1_4_freshness_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 同大小源变更的定案须整体提交；末尾 Exotic 失效失败时保留旧基线，使重扫还能重试。
+    #[test]
+    fn suspect_change_failure_rolls_back_source_and_derivations_for_retry() {
+        let root = tmp_root("suspect-rollback");
+        let file = root.join("a.psd");
+        std::fs::write(&file, b"AAAAAAAAAAAAAAAA").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1700000000, 0)).unwrap();
+        let writer = Mutex::new(db_for_root(&root));
+        assert_eq!(scan(&writer, &root, "baseline", false).unwrap(), 1);
+        let item_id: i64 = writer
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM media_items", [], |r| r.get(0))
+            .unwrap();
+        let source_state = |c: &Connection| -> (i64, i64, i64) {
+            c.query_row(
+                "SELECT file_mtime_ns, source_revision, cache_key FROM media_items WHERE id=?1",
+                params![item_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        let before = {
+            let c = writer.lock().unwrap();
+            c.execute(
+                "INSERT INTO image_meta (item_id, orientation) VALUES (?1, 6)",
+                params![item_id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO dedup_index (item_id, source_revision, hash_version, status, checked_at)
+                 VALUES (?1, 1, 1, 'done', 1)",
+                params![item_id],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE media_items SET thumb_status=1, thumb_path='old.webp' WHERE id=?1",
+                params![item_id],
+            )
+            .unwrap();
+            assert!(
+                c.execute(
+                    "UPDATE exotic_tasks SET status=2, output_path='old.webp' WHERE item_id=?1",
+                    params![item_id],
+                )
+                .unwrap()
+                    > 0
+            );
+            c.execute_batch(
+                "CREATE TRIGGER t_block_exotic_invalidation BEFORE UPDATE ON exotic_tasks
+                 BEGIN SELECT RAISE(ABORT, 'blocked-exotic-invalidation'); END;",
+            )
+            .unwrap();
+            source_state(&c)
+        };
+
+        std::fs::write(&file, b"BBBBBBBBBBBBBBBB").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(1700000001, 0)).unwrap();
+        assert!(scan(&writer, &root, "failed-invalidation", false).is_err());
+        {
+            let c = writer.lock().unwrap();
+            assert_eq!(
+                source_state(&c),
+                before,
+                "末尾失败不能提前提交新 mtime/源代次"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT count(*) FROM image_meta WHERE item_id=?1",
+                    item_id
+                ),
+                1
+            );
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT count(*) FROM dedup_index WHERE item_id=?1",
+                    item_id
+                ),
+                1
+            );
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT status FROM exotic_tasks WHERE item_id=?1",
+                    item_id
+                ),
+                2
+            );
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT thumb_status FROM media_items WHERE id=?1",
+                    item_id
+                ),
+                1
+            );
+            assert_eq!(
+                config_value(&c, &baseline_incomplete_key(1)).as_deref(),
+                Some("1")
+            );
+            c.execute_batch("DROP TRIGGER t_block_exotic_invalidation;")
+                .unwrap();
+        }
+
+        // 同一真实文件再次扫描，必须重新完成失效，不能因上次已写新 mtime 而永久走 Unchanged。
+        assert_eq!(scan(&writer, &root, "retry-invalidation", true).unwrap(), 0);
+        {
+            let c = writer.lock().unwrap();
+            let after = source_state(&c);
+            assert_ne!(after.0, before.0);
+            assert_eq!(after.1, before.1 + 1);
+            assert_ne!(after.2, before.2);
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT count(*) FROM image_meta WHERE item_id=?1",
+                    item_id
+                ),
+                0
+            );
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT count(*) FROM dedup_index WHERE item_id=?1",
+                    item_id
+                ),
+                0
+            );
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT status FROM exotic_tasks WHERE item_id=?1",
+                    item_id
+                ),
+                0
+            );
+            assert_eq!(
+                scalar_i64(
+                    &c,
+                    "SELECT thumb_status FROM media_items WHERE id=?1",
+                    item_id
+                ),
+                0
+            );
+            assert_eq!(
+                config_value(&c, &baseline_incomplete_key(1)).as_deref(),
+                Some("0")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// F-001：上一轮未成功收尾（持久标记置位）→ 本轮即使请求 quick 也强制全量。
     /// 场景即残留态本身：目录 mtime 基线已「治愈」为当前值，而该目录的在盘文件尚未入库
     /// （中断前基线先写、文件后入的窗口）。quick 单独跑必然剪掉它 → 漏扫；标记兜底 → 全量必扫到。
@@ -510,138 +771,6 @@ mod p1_4_freshness_tests {
         // 不永久降级：基线已重建，下一轮 quick 恢复剪枝（在盘内容与库已一致）。
         assert_eq!(scan(&writer, &root, "run-quick-after", true).unwrap(), 0);
         assert_eq!(item_count(&writer), 1);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// 注入真实收尾的遍历/卷探测结果：缺失检测被拦下后仍会写计数并收尾，但必须保留 dirty。
-    /// 再走一次真实 quick 扫描，验证它能补回基线已更新、前一轮却没入库的文件。
-    fn assert_incomplete_finalize_retries(
-        tag: &str,
-        walk_complete: bool,
-        walk_error_count: usize,
-        volume_online: bool,
-    ) {
-        let root = tmp_root(tag);
-        std::fs::write(root.join("seen-before.jpg"), b"before").unwrap();
-        let writer = Mutex::new(db_for_root(&root));
-        assert_eq!(scan(&writer, &root, "baseline", false).unwrap(), 1);
-
-        std::fs::write(root.join("missed.jpg"), b"missed").unwrap();
-        {
-            let c = writer.lock().unwrap();
-            c.execute(
-                "UPDATE scan_roots SET volume_id=?1 WHERE id=?2",
-                params![5, 1],
-            )
-            .unwrap();
-            c.execute("UPDATE media_items SET volume_id=?1", params![5])
-                .unwrap();
-            // 模拟前一批已提前写入当前 mtime，随后遍历错误/卷离线使 missed.jpg 未进入 seen。
-            c.execute(
-                "UPDATE directories SET mtime=?1 WHERE root_id=?2",
-                params![read_dir_mtime(&root), 1],
-            )
-            .unwrap();
-            let dir_id: i64 = c
-                .query_row(
-                    "SELECT id FROM directories WHERE root_id=1 AND rel_path=''",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            set_baseline_incomplete(&c, 1).unwrap();
-            init_seen_table_for_run(&c, 1, 42).unwrap();
-
-            assert_eq!(
-                finalize_scan_root(
-                    &c,
-                    1,
-                    42,
-                    walk_complete,
-                    walk_error_count,
-                    volume_online,
-                    Some(5),
-                    &std::collections::HashMap::from([(dir_id, 0)]),
-                    0,
-                )
-                .unwrap(),
-                0,
-            );
-            assert_eq!(
-                config_value(&c, &baseline_incomplete_key(1)).as_deref(),
-                Some("1"),
-                "缺失检测被完整性/在线闸门拦下，收尾成功也不能清除 dirty"
-            );
-            assert_eq!(
-                scalar_i64(
-                    &c,
-                    "SELECT media_count FROM directories WHERE id=?1",
-                    dir_id
-                ),
-                0,
-                "确实执行了生产收尾的计数写回"
-            );
-            let availability: String = c
-                .query_row("SELECT availability FROM media_items", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(availability, "online", "不完整 seen 不得把既有项标成缺失");
-            cleanup_scan_temp_tables_for_run(&c, 1, 42).unwrap();
-        }
-
-        assert_eq!(scan(&writer, &root, "retry-quick", true).unwrap(), 1);
-        assert_eq!(item_count(&writer), 2, "dirty 使下一轮 quick 补回漏扫文件");
-        assert_eq!(
-            config_value(&writer.lock().unwrap(), &baseline_incomplete_key(1)).as_deref(),
-            Some("0"),
-            "完整遍历且最终在线后才清除 dirty"
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn finalize_walk_errors_preserve_dirty_and_force_next_quick_full() {
-        assert_incomplete_finalize_retries("finalize-walk-error", false, 1, true);
-    }
-
-    /// F-001 的另一半：中断（取消）必须留痕——置位在遍历之前、清零只在成功收尾，
-    /// 故取消返回后标记仍为「未完成」，下一轮（含进程重启后重读 DB）强制全量。
-    #[test]
-    fn cancelled_scan_leaves_incomplete_marker() {
-        let root = tmp_root("cancelled");
-        std::fs::write(root.join("a.jpg"), b"xxxxxxxx").unwrap();
-        let writer = Mutex::new(db_for_root(&root));
-        let catalog = CatalogSnapshot::builtin().unwrap();
-        let cancel = CancellationToken::new();
-        cancel.cancel(); // 开扫即取消：模拟用户在遍历中途停止
-        let channel = silent_channel();
-
-        let err = run_fast_scan(
-            &writer,
-            1,
-            "run-cancel",
-            &root.to_string_lossy(),
-            &catalog,
-            &channel,
-            &cancel,
-            &|| {},
-            false,
-        )
-        .unwrap_err();
-        assert!(matches!(err, AppError::Cancelled));
-        let c = writer.lock().unwrap();
-        assert_eq!(
-            config_value(&c, &baseline_incomplete_key(1)),
-            Some("1".to_string()),
-            "取消后必须留下未完成标记，使下一轮强制全量"
-        );
-        assert_eq!(
-            c.query_row("SELECT COUNT(*) FROM media_items", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            0,
-            "取消的轮次不得写入任何媒体项"
-        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

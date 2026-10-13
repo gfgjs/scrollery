@@ -8,7 +8,7 @@
     >
       <Settings :size="18" />
     </UiIconButton>
-    <!-- 三态循环 亮→暗→跟随系统(P2 修复:原二态循环使 system 从此处不可达)。
+    <!-- 三态循环：亮→暗→跟随系统。
          图标显示当前模式本身(Sun=亮/Moon=暗/Monitor=跟随系统),而非"将切换到"的目标。 -->
     <UiIconButton :label="$t('sidebar.toggleTheme')" @click="theme.cycleAppearance()">
       <Sun v-if="theme.appearance === 'light'" :size="18" />

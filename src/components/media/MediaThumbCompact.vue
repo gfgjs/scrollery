@@ -1,8 +1,6 @@
 <template>
-  <!-- 极密网格专用轻量卡片(T1 §6):w/h<100px 时替代 MediaThumb。只渲染 60px 尺度下真正可见的东西——
-       占位 + <img> + 颜色色条 + 可用态角标 + 选中态(纯 class)。刻意不含:useHoverPreview / 徽章 /
-       评分 / 收藏 / info-overlay / thumbInfoLines(7 依赖) —— 这些在 60px 下看不清/点不动,却 ×数千格
-       构成快滚 churn 与常驻内存主源(维度 B)。加载逻辑复用 useThumbLoader 单源,与 MediaThumb 零漂移。 -->
+  <!-- 极密网格的轻量卡片只绘制小尺寸下可辨认的内容，省去数千格的悬停与操作层开销。
+       图片加载与 MediaThumb 共用 useThumbLoader。 -->
   <div
     class="media-thumb media-thumb--compact"
     :style="thumbStyle"
@@ -14,7 +12,7 @@
       'media-thumb--offline': availability === 'offline',
     }"
   >
-    <!-- 可用态角标(缺失检测 Part2 §3.2):missing/offline 始终可见,一眼可辨。 -->
+    <!-- missing/offline 角标始终可见。 -->
     <div
       v-if="availability !== 'online'"
       class="media-thumb__avail"

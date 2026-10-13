@@ -1,17 +1,16 @@
 // src/stores/duplicateLensStore.ts
-// 主画廊重复镜头状态（docs/designs/2026-09-02-主画廊重复项浏览方案.md §10.1）。pinia id 'duplicate-lens'。
+// 主画廊重复镜头状态；URL 是镜头模式的事实源。
 //
-// 红线（方案原文，勿凭直觉放松）：
+// 状态约束：
 // - **URL 是镜头模式的事实源**：本 store 的 mode/showUniqueItems 只是路由 query 的镜像。一切变更
 //   必须经本文件的动作落到 URL（enterLens/exitLens 用 push 制造历史节点，setMode/setShowUniqueItems
-//   用 replace 不制造节点，§4.2/§4.3），再由 useGalleryQuerySync 的 URL→store 同步收敛；浏览器返回、
+//   用 replace 不制造节点），再由 useGalleryQuerySync 的 URL→store 同步收敛；浏览器返回、
 //   深链等外部导航改 URL 时同样由该同步回写本 store。禁止绕过 URL 直接改 mode。
 // - **return snapshot 只属当前会话**：returnFullPath 不入 URL、不持久化，退出镜头
-//   即清空；深链直开镜头（无快照）时退出回普通「/」（§4.3）。滚动位的恢复不走快照：退出后普通
+//   即清空；深链直开镜头（无快照）时退出回普通「/」。滚动位的恢复不走快照：退出后普通
 //   画廊的重算链（layoutVersion watcher）自己从 scrollCache 普通键读回进入前的滚动位（缓存是
-//   模块级 Map,镜头会话不触碰普通键）,快照无需另存滚动/视图键,故不设 §10.1 草案里的
-//   returnAnchorItemId/returnViewKey 字段（P2 收口裁定,见 docs/designs/2026-09-02-主画廊重复项浏览方案.md）。
-// - **大数组/成员列表绝不进本 store**（§10.1）——成员/文件夹图留在后端布局缓存与 mediaStore/layout。
+//   模块级 Map,镜头会话不触碰普通键）。
+// - **大数组/成员列表不进本 store**——成员/文件夹图留在后端布局缓存与 mediaStore/layout。
 
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'

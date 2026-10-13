@@ -1,7 +1,6 @@
 <template>
   <div class="settings-view">
-    <!-- 外置配置文件解析错误横幅(批次B):config-file-error 有值时显示,变更成功事件到达后清除
-         (useConfigFile 内的 config-file-changed 处理器会清空 lastError)。置顶,不受滚动/搜索影响。 -->
+    <!-- 配置解析错误置顶显示；成功变更事件由 useConfigFile 清空错误。 -->
     <div v-if="configFile.lastError.value" class="settings-config-banner">
       <AlertTriangle :size="16" />
       <span>
@@ -12,8 +11,7 @@
       </span>
     </div>
 
-    <!-- 外置配置文件「需重启生效」提示条(批次B深审 #7):外部编辑触及了 restart_required 键
-         时展示,信息级(非 alert)、可关闭——与上方错误横幅同结构，颜色改走 --color-info。 -->
+    <!-- 外部编辑触及需重启的设置键时，展示可关闭的信息提示。 -->
     <div
       v-if="configFile.restartRequiredKeys.value.length"
       class="settings-config-banner settings-config-banner--info"
@@ -86,6 +84,14 @@
         </div>
       </div>
       <div class="settings-header__actions">
+        <UiButton
+          class="btn-sm settings-pin-all"
+          :aria-pressed="allSettingsPinned"
+          @click="toggleAllPinned"
+        >
+          <component :is="allSettingsPinned ? PinOff : Pin" :size="15" aria-hidden="true" />
+          {{ $t(allSettingsPinned ? 'settings.unpinAllSettings' : 'settings.pinAllSettings') }}
+        </UiButton>
         <!-- 详细首次使用引导手册入口:与首启向导独立,随时可重开(强开,不受 guideSeen 影响)。 -->
         <button class="btn-guide" :title="$t('settings.userGuide')" @click="ui.openUserGuide()">
           <GraduationCap :size="15" />
@@ -110,8 +116,8 @@
         </button>
       </nav>
 
-      <main id="settings-main" class="settings-content">
-        <section v-for="section in generalSections" :key="section.id"
+      <main id="settings-main" ref="settingsContent" class="settings-content">
+        <section v-for="section in mountedGeneralSections" :key="section.id"
           v-show="currentSection === section.id" :id="`settings-${section.id}`" class="settings-section">
           <div class="settings-section__heading"><h2>{{ $t(section.labelKey) }}</h2></div>
           <CollapsibleCard v-for="group in groupsFor(section.id)" :id="group.id" :key="group.id"
@@ -166,7 +172,7 @@
           <ReaderSettingsSection v-if="section.id === 'gallery'" />
         </section>
 
-        <section v-show="currentSection === 'media'" id="settings-media" class="settings-section">
+        <section v-if="visitedSections.includes('media')" v-show="currentSection === 'media'" id="settings-media" class="settings-section">
           <div class="settings-section__heading">
             <div>
               <h2>{{ $t('settings.sectionMedia') }}</h2>
@@ -276,9 +282,9 @@
                       <span v-else-if="scan.thumbGenProgress.status === 'error'">{{
                         $t('settings.genStatusError')
                       }}</span>
-                      <span v-if="scan.thumbGenResultsLabel">{{ scan.thumbGenResultsLabel }}</span>
-                      <ThumbExecutionSummary />
                     </div>
+                    <span v-if="scan.thumbGenResultsLabel">{{ scan.thumbGenResultsLabel }}</span>
+                    <ThumbExecutionSummary />
                   </div>
                 </template>
                 <div class="setting-actions">
@@ -368,7 +374,7 @@
           </CollapsibleCard>
         </section>
 
-        <section v-show="currentSection === 'ai'" id="settings-ai" class="settings-section">
+        <section v-if="visitedSections.includes('ai')" v-show="currentSection === 'ai'" id="settings-ai" class="settings-section">
           <div class="settings-section__heading">
             <div>
               <h2>{{ $t('settings.sectionAi') }}</h2>
@@ -414,6 +420,7 @@
         </section>
 
         <section
+          v-if="visitedSections.includes('storage')"
           v-show="currentSection === 'storage'"
           id="settings-storage"
           class="settings-section"
@@ -423,7 +430,7 @@
               <h2>{{ $t('settings.sectionStorage') }}</h2>
             </div>
           </div>
-          <!-- ── 数据备份与恢复（方案 B §8）───────────────────── -->
+          <!-- 数据备份与恢复。 -->
           <BackupSection @toggle="onBackupCardToggle" />
 
           <!-- ── 根文件夹显隐（V21，库级排除）───────────────────── -->
@@ -437,6 +444,7 @@
         </section>
 
         <section
+          v-if="visitedSections.includes('advanced')"
           v-show="currentSection === 'advanced'"
           id="settings-advanced"
           class="settings-section settings-section--advanced"
@@ -446,9 +454,17 @@
               <h2>{{ $t('settings.sectionAdvanced') }}</h2>
             </div>
           </div>
-          <!-- ── 开发者工具 ─────────────────────────────────── -->
-          <CollapsibleCard id="debug" :title="$t('sidebar.debugSettings')">
-            <template v-for="key in sectionSettingKeys('debug')" :key="key">
+          <!-- 高级页也从分组表渲染，避免新设置只进入搜索与固定清单却没有页面入口。 -->
+          <CollapsibleCard
+            v-for="group in groupsFor('advanced')"
+            :id="group.id"
+            :key="group.id"
+            :title="$t(group.titleKey)"
+            :default-open="group.defaultOpen"
+            :class="{ 'settings-card--danger': group.id === 'danger' }"
+          >
+            <p v-if="group.id === 'danger'" class="danger-zone__hint">{{ $t('settings.dangerZoneHint') }}</p>
+            <template v-for="key in group.keys" :key="key">
               <!-- 特例:日志目录(可点路径描述 + 换目录按钮) -->
               <SettingRow v-if="key === 'logDir'" setting-key="logDir">
                 <template #desc>
@@ -464,7 +480,7 @@
                   {{ $t('settings.changeDir') }}
                 </UiButton>
               </SettingRow>
-              <!-- 特例:外置配置文件(config.toml,批次B) —— 说明文案 + 当前路径 + 用外部编辑器打开按钮。 -->
+              <!-- 配置文件展示路径，并提供外部编辑器入口。 -->
               <SettingRow v-else-if="key === 'configFile'" setting-key="configFile">
                 <template #desc>
                   <div class="settings-card__desc">{{ $t('settings.configFileDesc') }}</div>
@@ -480,16 +496,6 @@
             </template>
           </CollapsibleCard>
 
-          <!-- ── 危险操作(设计 §7.2:破坏性项独立分区,不与普通设置混排;默认折叠=渐进披露)── -->
-          <CollapsibleCard
-            id="danger"
-            :title="$t('settings.dangerZone')"
-            :default-open="false"
-            class="settings-card--danger"
-          >
-            <p class="danger-zone__hint">{{ $t('settings.dangerZoneHint') }}</p>
-            <SettingRow v-for="key in sectionSettingKeys('danger')" :key="key" :setting-key="key" />
-          </CollapsibleCard>
         </section>
       </main>
     </div>
@@ -508,19 +514,20 @@ import { useMediaStore } from '../stores/mediaStore'
 import { useConfirm } from '../composables/useConfirm'
 import { useAiStore } from '../stores/aiStore'
 import { useConfigStore } from '../stores/configStore'
+import { SettingsNotSavedError } from '../stores/settingsPersistence'
 import { useThemeStore } from '../stores/themeStore'
 import { useDerivationStore } from '../stores/derivationStore'
 import { useConfigFile } from '../composables/useConfigFile'
 import { useI18n } from 'vue-i18n'
 import { useBackupI18n } from '../i18n/backupMessages'
-import { ArrowLeft, AlertTriangle, Search, Info, Trash2, X, GraduationCap } from '@lucide/vue'
+import { ArrowLeft, AlertTriangle, Search, Info, Trash2, X, GraduationCap, Pin, PinOff } from '@lucide/vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { useRoute, useRouter } from 'vue-router'
 import { IPC } from '../constants/ipc'
-import { isMobilePlatform, isWindows } from '../utils/platform'
 import { getSettingSpec, sectionSettingKeys, type SettingKey } from '../constants/settingsMap'
 import { SETTINGS_SECTIONS, SETTINGS_GROUPS, type SettingsNavId } from '../constants/settingsLayout'
 import { useSettingsCards } from '../composables/useSettingsCards'
+import { useSettingsNavigation } from '../composables/useSettingsNavigation'
 import { formatFileSize } from '../utils/format'
 import { setThumbCacheDir } from '../utils/thumbCacheDir'
 import SettingRow from '../components/settings/SettingRow.vue'
@@ -548,16 +555,15 @@ const media = useMediaStore()
 const { confirm } = useConfirm()
 const ai = useAiStore()
 const config = useConfigStore()
-// 主题草稿随设置页退出丢弃:取消／Esc／退出设置都丢弃草稿,无需额外确认(方案 §2)。
+// 取消、Esc 或退出设置均丢弃未提交的主题草稿。
 const theme = useThemeStore()
 const derive = useDerivationStore()
-// 外置配置文件(config.toml,批次B):App.vue 已挂过一次全局监听,这里再次调用只是复用同一份
-// 共享状态(status/lastError 跨调用同源,见 useConfigFile.ts 头注),不会重复注册监听。
+// 复用 App.vue 注册的配置文件监听与共享状态，不重复注册监听器。
 const configFile = useConfigFile()
 const { t } = useI18n()
 const { t: bt } = useBackupI18n()
-const route = useRoute()
 const router = useRouter()
+const route = useRoute()
 
 // 视频派生进度(特例行):完成数/总数,分母含四态(pending/processing/done/error)。
 const videoDerivePercent = computed(
@@ -578,11 +584,21 @@ interface SettingsSearchResult {
 const settingsSections = SETTINGS_SECTIONS
 const generalSections = settingsSections.filter(({ id }) => ['common', 'appearance', 'gallery'].includes(id))
 const settingsQuery = ref('')
-const defaultSection: SettingsNavId = 'appearance'
 const cards = useSettingsCards()
+const { currentSection, visitedSections, settingsContent, selectSection: navigateToSection } = useSettingsNavigation()
+const mountedGeneralSections = computed(() => generalSections.filter(section => visitedSections.value.includes(section.id)))
+
+// 与页面可用设置共用分组表；保留用户既有顺序，批量取消只移除这些设置项。
+const pinnableSettingKeys = [...new Set(SETTINGS_GROUPS
+  .flatMap(group => group.keys))]
+const allSettingsPinned = computed(() => pinnableSettingKeys.every(key => ui.pinnedSettings.includes(key)))
+function toggleAllPinned() {
+  // 设置服务统一回滚并提示写入失败。
+  void ui.setPinnedSettings(pinnableSettingKeys, !allSettingsPinned.value).catch(() => {})
+}
 
 function groupsFor(section: SettingsNavId) {
-  return SETTINGS_GROUPS.filter(group => group.section === section && group.keys.length && (!group.desktopOnly || !isMobilePlatform) && (!group.windowsOnly || isWindows))
+  return SETTINGS_GROUPS.filter(group => group.section === section && group.keys.length)
 }
 const thumbnailGroups = groupsFor('media').filter(group => group.id !== 'video')
 const timelineSummary = computed(() => t('settings.timelineSummary', {
@@ -590,7 +606,6 @@ const timelineSummary = computed(() => t('settings.timelineSummary', {
 }))
 
 const searchCatalog = computed<SettingsSearchResult[]>(() => SETTINGS_GROUPS
-  .filter(group => (!group.desktopOnly || !isMobilePlatform) && (!group.windowsOnly || isWindows))
   .flatMap(group => {
     const sectionLabelKey = settingsSections.find(section => section.id === group.section)?.labelKey ?? ''
     const groupLabel = group.id === 'backup' ? bt(group.titleKey) : t(group.titleKey)
@@ -612,29 +627,32 @@ const searchResults = computed(() => {
   ).slice(0, 10)
 })
 
-function normalizeSection(value: unknown): SettingsNavId {
-  if (value === 'general') return 'appearance'
-  return settingsSections.some(section => section.id === value) ? value as SettingsNavId : defaultSection
-}
-const currentSection = ref<SettingsNavId>(normalizeSection(route.params.section))
-function sectionPath(section: SettingsNavId): string {
-  return section === defaultSection ? '/settings' : `/settings/${section}`
-}
 function selectSection(section: SettingsNavId) {
   settingsQuery.value = ''
-  currentSection.value = section
-  void router.replace(sectionPath(section))
+  navigateToSection(section)
 }
-watch(() => route.params.section, section => { currentSection.value = normalizeSection(section) })
-watch(currentSection, async () => {
-  await nextTick()
-  // 窄屏分类横向滚动；搜索跨分类后仍需露出当前分类。
-  document.querySelector<HTMLElement>('.settings-nav__item.active')
-    ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
-})
 
 async function selectSearchResult(result: SettingsSearchResult) {
   selectSection(result.section)
+  await revealSettingsResult(result)
+}
+
+// 下载引导与设置搜索共用展开、滚动和聚焦，深链进入时也能露出原本折叠的卡片。
+watch(
+  () => route.fullPath,
+  () => {
+    const result = searchCatalog.value.find(
+      (item) => item.groupId === route.hash.slice(1)
+        && item.section === currentSection.value && !item.settingKey,
+    )
+    if (result) void revealSettingsResult(result)
+  },
+  { immediate: true, flush: 'post' },
+)
+
+async function revealSettingsResult(result: SettingsSearchResult) {
+  // 新分类须先登记卡片的默认折叠态，再展开命中的分组。
+  await nextTick()
   cards.expand(result.groupId)
   await nextTick()
   const group = document.querySelector<HTMLElement>(`[data-settings-card="${result.groupId}"]`)
@@ -677,9 +695,7 @@ const THUMB_INFO_ELEMENTS = [
   { value: 'params', labelKey: 'settings.thumbInfoParams' },
 ]
 
-// 缓存占用统计(缩略图/日志目录 + 缩略图缓存统计 + 视频可播产物独立池统计)下沉
-// useSettingsCacheStats;自定义 ICC 导入/枚举/删除下沉 useIccProfileManager
-// (超长文件拆分方案 tierB-2 §SettingsView.vue ②)。
+// 缓存统计与 ICC 管理分别由 useSettingsCacheStats、useIccProfileManager 负责。
 const {
   thumbCacheDir,
   logDir,
@@ -701,36 +717,46 @@ const thumbGenPercent = computed(() => {
   return Math.min(100, Math.round((generated / total) * 100))
 })
 
-onMounted(async () => {
-  // 视频派生计数:进设置页即取一次(fetch 内含「在跑则起表轮询」),特例行状态才不落后。
-  void derive.fetchVideoStatus()
-  await config.loadConfig()
-
+async function loadThumbnailSettings() {
   try {
     thumbCacheDir.value = await invokeIpc<string>(IPC.GET_THUMB_CACHE_DIR)
   } catch (e) {
     logger.warn('Failed to fetch resolved cache dir', { error: e })
   }
 
-  // 缓存占用统计:不 await(遍历大缓存秒级),结果就绪后行体自会响应式补上。
+  // 先取得目录，再查询其占用；不让未打开媒体分类的用户等待缓存遍历。
   void refreshCacheStats()
-  void refreshVideoCacheStats()
+}
 
-  // 自定义 ICC 列表(方案 B §0④):移动端行本就隐藏,不发起(D-414)。
-  if (!isMobilePlatform) void refreshIccProfiles()
-
+async function loadLogDirectory() {
   try {
     logDir.value = await invokeIpc<string>(IPC.GET_LOG_DIR)
   } catch (e) {
     logger.warn('Failed to fetch resolved log dir', { error: e })
   }
 
-  try {
-    await ai.fetchStatus()
-  } catch (e) {
-    logger.error('Failed to get ai status', { error: e })
-  }
+}
 
+// 只加载本次新访问的分类；已有组件和数据保留，切回来不重复初始化。
+watch(visitedSections, (sections, previous = []) => {
+  for (const section of sections.slice(previous.length)) {
+    if (section === 'media') {
+      void derive.fetchVideoStatus()
+      void loadThumbnailSettings()
+      void refreshVideoCacheStats()
+    } else if (section === 'gallery') {
+      void refreshIccProfiles()
+    } else if (section === 'advanced') {
+      void loadLogDirectory()
+    } else if (section === 'ai') {
+      void ai.fetchStatus().catch(error => logger.error('Failed to get ai status', { error }))
+    }
+  }
+}, { immediate: true })
+
+onMounted(() => {
+  void config.loadConfig()
+  // 绑定不等待异步请求，确保快速离开时卸载钩子能完整清理。
   document.addEventListener('keydown', onKeyDown)
 })
 
@@ -762,6 +788,7 @@ async function changeLogDir() {
       toast.addToast('success', t('settings.logDirChanged'))
     }
   } catch (e) {
+    if (e instanceof SettingsNotSavedError) return
     logger.error('Failed to select log directory', { error: e })
   }
 }
@@ -781,13 +808,12 @@ async function changeCacheDir() {
       toast.addToast('success', t('settings.cacheDirChanged'))
     }
   } catch (e) {
+    if (e instanceof SettingsNotSavedError) return
     logger.error('Failed to select directory', { error: e })
   }
 }
 
-// 外置配置文件(config.toml,批次B):打开系统默认编辑器。成功后无需本地状态变更——
-// 后端保存时广播 config-file-changed/config-file-error,useConfigFile 的全局监听器会更新
-// lastError 并刷新 config/ui store;这里只兜底展示「打开动作本身」失败(如无默认编辑器)。
+// 保存后的配置事件由全局监听器更新状态；此处仅展示打开编辑器失败。
 async function handleOpenConfigFile() {
   try {
     await configFile.openInEditor()
@@ -834,7 +860,7 @@ async function handleThumbInfoToggle(e: MouseEvent, val: string) {
 }
 
 function closeSettings() {
-  // 退出设置即丢弃主题草稿(取消／Esc／返回同语义,无需额外确认;方案 §2)。
+  // 退出设置即丢弃未提交的主题草稿。
   theme.cancelEdit()
   if (window.history.state?.back) router.back()
   else void router.replace('/')

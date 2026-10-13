@@ -1,12 +1,5 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# F8b 对拍基准：InsightFace SCRFD + ArcFace 参考实现，验证 Rust 的 detect_scrfd / ArcFace 路径。
-#
-# ⚠️ 为什么需要这个脚本（前车之鉴）
-#   F2 当初把 SFace 的预处理"推断"成了 BGR，端到端 cosine 才 0.2，直到 F8 用 OpenCV C++
-#   对拍才抓出真相（SFace 内部 swapRB=true，要喂 RGB）。SCRFD 轨的 detect_scrfd 现在处于
-#   **完全同样的状态**：输出顺序、预处理 (RGB/(x-127.5)/128/左上角 pad)、anchor 解码
-#   (num_anchors=2)、score 激活、distance2bbox —— 全是推断，从未对拍。落地前**必须**像 F8
-#   那样用一个独立的权威实现（InsightFace 官方包）对拍，cosine ≥ 0.99 方证 Rust 实现正确。
+# InsightFace SCRFD + ArcFace 参考实现，用于对拍 Rust 的检测与嵌入路径。
+# 对照输出顺序、预处理、anchor 解码和距离解码；同脸向量余弦阈值为 0.99。
 #
 # ⚠️ 许可（务必自行确认）
 #   SCRFD (scrfd_10g_bnkps.onnx) 与 ArcFace (w600k_r50.onnx) 均来自 InsightFace model-zoo，
@@ -22,7 +15,7 @@
 #      注意：InsightFace 的 buffalo_l 检测器文件名是 det_10g.onnx，与本项目约定的
 #      scrfd_10g_bnkps.onnx 是同一模型不同命名 —— 复制时重命名，或改 face_profile.rs 的 detect_file。
 #
-# ── 对拍流程（仿 F8）─────────────────────────────────────────────────────────────
+# ── 对拍流程 ──────────────────────────────────────────────────────────────
 #   A. 切 Rust 到 SCRFD 轨并 dump 向量（face_smoke 已支持 FACE_PROFILE 环境变量）：
 #        cd src-tauri
 #        FACE_PROFILE=scrfd-arcface-r50 cargo run --example face_smoke -- <图片> [models目录]

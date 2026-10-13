@@ -1,8 +1,8 @@
-// 画廊滚动闸门 + 程序化滚动守卫(自 MediaGrid.vue 结构拆分抽出,阈值与滞回逐字保留)。
+// 画廊滚动闸门 + 程序化滚动守卫。
 //
-// 拆分方案 §3.3 取「方案 A」:onGridScroll 主体仍留根组件(多域汇合点),此处只承载纯判定的
-// 状态机——速度采样/滞回、程序化落点豁免、滚动条拖拽链关闸、释放去抖。
-// 阈值常量(GATE_RELEASE_MS / INTERNAL_HOP_CHAIN_MS / SCROLLBAR_DRAG_CHAIN_MS)不得改动。
+// onGridScroll 主体仍留根组件(多域汇合点),此处只承载纯判定的状态机——
+// 速度采样/滞回、程序化落点豁免、滚动条拖拽链关闸、释放去抖。
+// 释放延迟与程序化滚动、滚动条拖拽的连锁窗口由下方常量统一控制。
 import {
   scrollVelocity,
   shouldDeferThumbLoad,
@@ -70,13 +70,15 @@ export function useGalleryScrollGate(deps: GalleryScrollGateDeps) {
 
   /**
    * 轴侧(自研滚动条 / minimap)跳转的拖拽链关闸链头。相邻 jump < SCROLLBAR_DRAG_CHAIN_MS
-   * 判为拖拽中 → 强制关闸;释放路径在 sampleScrollGate 的 scrollbarDragUntil 判定,与引擎无关。
+   * 判为拖拽中 → 强制关闸，并与滚动采样共用停稳释放计时器。
    */
   function noteAxisJump() {
     const now = performance.now()
     if (now - lastScrollbarJumpTs < SCROLLBAR_DRAG_CHAIN_MS) {
       scrollbarDragUntil = now + SCROLLBAR_DRAG_CHAIN_MS
       setDeferThumbLoad(true)
+      // 边界处重复跳转可能不产生 scroll 事件，关闸本身必须安排释放并延后旧排程。
+      scheduleGateRelease()
     }
     lastScrollbarJumpTs = now
   }
@@ -108,6 +110,10 @@ export function useGalleryScrollGate(deps: GalleryScrollGateDeps) {
     lastScrollSampleTs = now
     // B-甲:一旦滚动停顿即快速放行闸门(急停不必苦等 150ms settle 兜底)。慢滚时闸门本已
     // false,此路径为幂等 no-op;飞掠中每帧 clear+重排,只有真停顿(>64ms 无事件)才触发。
+    scheduleGateRelease()
+  }
+
+  function scheduleGateRelease() {
     if (gateReleaseTimer !== null) clearTimeout(gateReleaseTimer)
     gateReleaseTimer = setTimeout(() => {
       gateReleaseTimer = null

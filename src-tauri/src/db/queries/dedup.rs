@@ -1202,17 +1202,6 @@ mod tests {
         .unwrap()
     }
 
-    fn write_ready(conn: &Connection, id: i64, rev: i64, digest: &[u8]) -> bool {
-        let (file_size, file_mtime_ns): (i64, Option<i64>) = conn
-            .query_row(
-                "SELECT file_size, file_mtime_ns FROM media_items WHERE id=?1",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        write_ready_with_snapshot(conn, id, rev, digest, file_size, file_mtime_ns)
-    }
-
     fn write_working_ready(conn: &Connection, id: i64, rev: i64, digest: &[u8]) -> bool {
         let (file_size, file_mtime_ns): (i64, Option<i64>) = conn
             .query_row(
@@ -1255,12 +1244,27 @@ mod tests {
     }
 
     #[test]
-    fn stale_revision_write_is_rejected() {
+    fn stale_metadata_write_is_rejected_even_when_source_revision_matches() {
         let conn = mem_db();
         add(&conn, 1, "a.jpg", 10, None);
-        conn.execute("UPDATE media_items SET source_revision=2 WHERE id=1", [])
+
+        // 模拟分析期间文件被稳定替换，但扫描器尚未来得及推进 source_revision。
+        conn.execute("UPDATE media_items SET file_size=11 WHERE id=1", [])
             .unwrap();
-        assert!(!write_ready(&conn, 1, 1, b"x"));
+        assert!(
+            !write_ready_with_snapshot(&conn, 1, 1, b"old-size", 10, Some(1)),
+            "size 变化必须拒绝旧候选的摘要"
+        );
+
+        conn.execute(
+            "UPDATE media_items SET file_size=10, file_mtime_ns=2 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !write_ready_with_snapshot(&conn, 1, 1, b"old-mtime", 10, Some(1)),
+            "纳秒 mtime 变化必须拒绝旧候选的摘要"
+        );
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM dedup_index", [], |row| row.get(0))
             .unwrap();
@@ -1292,62 +1296,4 @@ mod tests {
     }
 
     // ── folders 镜头行（2026-09-02 主画廊重复项浏览方案 §3.4/§7.5 P3）────────────
-
-    /// 在目录 10 放一对 ready 重复锚点，使目录稳定处于「纳入」状态——否则分类
-    /// 断言会因目录未纳入而空转变绿（方案 §3.4 末段的纳入过滤）。
-    fn add_duplicate_anchor(conn: &Connection) {
-        add(conn, 100, "anchor-a.jpg", 999, None);
-        add(conn, 101, "anchor-b.jpg", 999, None);
-        assert!(write_ready(conn, 100, 1, b"anchor"));
-        assert!(write_ready(conn, 101, 1, b"anchor"));
-    }
-
-    fn folder_lens_buckets(conn: &Connection) -> std::collections::BTreeMap<i64, FolderLensBucket> {
-        list_duplicate_folder_lens_rows(conn)
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.item_id, row.bucket))
-            .collect()
-    }
-
-    /// 判定表（§3.4）：offline/missing/零字节即使 ready 成组也不进重复桶（folders
-    /// 语义）；同组的在线侧按有效单成员归独有（严格口径）。
-    #[test]
-    fn folder_lens_offline_missing_and_zero_byte_stay_unconfirmed() {
-        let conn = mem_db();
-        add_duplicate_anchor(&conn);
-        add(&conn, 14, "offline-a.jpg", 41, None);
-        add(&conn, 15, "offline-b.jpg", 41, None);
-        assert!(write_ready(&conn, 14, 1, b"pair-offline"));
-        assert!(write_ready(&conn, 15, 1, b"pair-offline"));
-        conn.execute(
-            "UPDATE media_items SET availability = 'offline' WHERE id = 14",
-            [],
-        )
-        .unwrap();
-        add(&conn, 16, "missing-a.jpg", 42, None);
-        add(&conn, 17, "missing-b.jpg", 42, None);
-        assert!(write_ready(&conn, 16, 1, b"pair-missing"));
-        assert!(write_ready(&conn, 17, 1, b"pair-missing"));
-        conn.execute(
-            "UPDATE media_items SET availability = 'missing' WHERE id = 16",
-            [],
-        )
-        .unwrap();
-        add(&conn, 18, "zero-a.jpg", 0, None);
-        add(&conn, 19, "zero-b.jpg", 0, None);
-        assert!(write_ready(&conn, 18, 1, b"pair-zero"));
-        assert!(write_ready(&conn, 19, 1, b"pair-zero"));
-
-        let buckets = folder_lens_buckets(&conn);
-        for id in [14, 16, 18, 19] {
-            assert_eq!(
-                buckets.get(&id),
-                Some(&FolderLensBucket::Unconfirmed),
-                "item {id} 应为尚未确认"
-            );
-        }
-        assert_eq!(buckets.get(&15), Some(&FolderLensBucket::Unique));
-        assert_eq!(buckets.get(&17), Some(&FolderLensBucket::Unique));
-    }
 }

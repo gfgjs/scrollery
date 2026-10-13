@@ -1,7 +1,7 @@
 # crates/exotic-workers/psd-probe/Cargo.toml
-# PSD 技术探针（Part1 P0）。实验 crate，现为 workspace member（§3.9.1，供测试可达）；
+# PSD 技术探针，作为 workspace member 供测试使用；
 # version=0.0.0、publish=false、非 app 二进制，不进发布 bundle。
-# 目的：在冻结 Catalog/manifest「支持范围」之前，用实测锁定 `psd` crate 的能力与畸形输入健壮性。
+# 通过实测确认 `psd` crate 的能力与畸形输入健壮性。
 # 锁定精确版本（`=0.3.5`），P0 结论只对该版本成立；升级须重跑探针（见报告）。
 
 [package]

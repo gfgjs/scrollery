@@ -1,7 +1,7 @@
 // 设置页缓存占用统计(缩略图/日志目录 + 缩略图缓存统计 + 视频可播产物独立池统计),从
 // SettingsView.vue 下沉(超长文件拆分方案 tierB-2 §SettingsView.vue ②)。返回值名与模板
 // 现有绑定逐一同名、ref/computed 本体不解包不改名(§③ 最大风险红线)。
-import { ref, computed } from 'vue'
+import { ref, computed, watch, onScopeDispose } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
@@ -35,6 +35,17 @@ export function useSettingsCacheStats() {
 
   const cacheStats = ref<CacheStatsPayload | null>(null)
   const cacheStatsLoading = ref(false)
+  let cacheDirectoryRevision = 0
+  let disposed = false
+  onScopeDispose(() => { disposed = true })
+
+  watch(thumbCacheDir, (_directory, previous) => {
+    // 首次路径水合后由设置页主动取数；热切换须立即撤销旧路径统计及在途回执。
+    if (!previous) return
+    cacheDirectoryRevision++
+    cacheStats.value = null
+    void refreshCacheStats()
+  }, { flush: 'sync' })
 
   // 视频可播产物独立池默认上限(镜像 `src-tauri/src/video/playable_cache.rs::DEFAULT_VIDEO_CACHE_MAX_MB`
   // = 20 * 1024 MB):仅作 videoCacheStats 取回前/失败时的降级静态展示兜底,不代表实时占用。
@@ -53,14 +64,20 @@ export function useSettingsCacheStats() {
 
   // 遍历缓存目录是秒级阻塞 IO(后端 spawn_blocking):进设置页拉一次 + 手动刷新,不轮询。
   async function refreshCacheStats() {
-    if (cacheStatsLoading.value) return
+    if (disposed || cacheStatsLoading.value) return
+    const revision = cacheDirectoryRevision
     cacheStatsLoading.value = true
     try {
-      cacheStats.value = await invokeIpc<CacheStatsPayload>(IPC.GET_CACHE_STATS)
+      const result = await invokeIpc<CacheStatsPayload>(IPC.GET_CACHE_STATS)
+      if (!disposed && revision === cacheDirectoryRevision) cacheStats.value = result
     } catch (e) {
-      logger.warn('Failed to fetch cache stats', { error: e })
+      if (!disposed && revision === cacheDirectoryRevision) {
+        logger.warn('Failed to fetch cache stats', { error: e })
+      }
     } finally {
       cacheStatsLoading.value = false
+      // 不并行遍历大缓存；换目录发生在旧遍历期间时，收尾后只补查最新路径。
+      if (!disposed && revision !== cacheDirectoryRevision) void refreshCacheStats()
     }
   }
 

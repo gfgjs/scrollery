@@ -1,9 +1,5 @@
-// 画廊空状态决策(自 MediaGrid.vue 结构拆分抽出,逻辑逐字保留)。
-//
-// 空状态决策:消息 + 下一步动作的**单一源**(resolveGalleryEmptyState 纯函数,穷举 spec 锁死)。
-// 收敛此前内联在 MediaGrid 的 emptyStateText / showEmptyAction 双 computed 里的 precedence,并修一个
-// 真实错 CTA——全局筛选态激活却零结果时,此前落「空库·添加文件夹」把用户引向加目录,而正确的
-// 下一步是**清除筛选**(precedence:search > filtered > directory > smartAlbum,详见 utils/resolveEmptyState)。
+// 空状态消息与下一步动作由 resolveGalleryEmptyState 决定。
+// 筛选后零结果引导清除筛选；优先级为 search > filtered > directory > smartAlbum。
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useUiStore } from '../stores/uiStore'

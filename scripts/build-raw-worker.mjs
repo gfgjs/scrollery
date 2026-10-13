@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 把 raw-worker(gnu-only sidecar)编译并暂存进 tauri externalBin 目录(H2b-prod)。
+// 将 raw-worker(gnu-only sidecar)编译并暂存进 Tauri externalBin 目录。
 //
 // 背景:raw-worker(crates/exotic-workers/raw-worker)依赖 rsraw,其 build.rs 在 MSVC 下硬 panic,
 // 故该 crate 脱离父 workspace(空 [workspace] 表),只能用 --target x86_64-pc-windows-gnu 编译。
@@ -21,7 +21,7 @@ const GNU_TARGET = 'x86_64-pc-windows-gnu';
 const workerCrate = path.join(repo, 'crates', 'exotic-workers', 'raw-worker');
 const binariesDir = path.join(repo, 'src-tauri', 'binaries');
 
-// 非 Windows:mac/Linux 的 sidecar 打包属剩余工作(#4),此处跳过(不阻断跨平台 dev/build)。
+// 非 Windows 平台跳过 sidecar 编译。
 if (process.platform !== 'win32') {
   console.log(
     `[build-raw-worker] 非 Windows(${process.platform})——跳过 raw-worker(gnu-only sidecar)编译;` +

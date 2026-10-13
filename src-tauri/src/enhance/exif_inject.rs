@@ -1,6 +1,5 @@
 // src-tauri/src/enhance/exif_inject.rs
-//! 容器级 EXIF 注入（不重编码，best-effort）。从 `service.rs` 拆出的纯字节操作单元
-//! （超长文件拆分方案 tierB-2:与 `EnhanceService` 状态零耦合,`finalize_output` 是唯一调用点）。
+//! 容器级 EXIF 注入（不重编码，best-effort）；由 `finalize_output` 调用。
 
 use std::path::Path;
 

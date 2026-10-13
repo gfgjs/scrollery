@@ -81,7 +81,7 @@ fn active_face_model_id(state: &AppState) -> String {
     active_face_model_id_with(&state.config)
 }
 
-/// A2 前称「连接已在手的变体」——已迁往 config.toml,改收 `&ConfigManager`。
+/// 从 `ConfigManager` 读取人脸模型设置。
 fn active_face_model_id_with(config: &crate::config::ConfigManager) -> String {
     config
         .get("face_model_active")
@@ -96,31 +96,17 @@ fn face_loaded(state: &AppState) -> bool {
     face_loaded_with(&state.config, state)
 }
 
-/// A2 前称「连接已在手的变体」——已迁往 config.toml,改收 `&ConfigManager`。
+/// 从 `ConfigManager` 读取人脸模型设置。
 fn face_loaded_with(config: &crate::config::ConfigManager, state: &AppState) -> bool {
     crate::ai::runtime_config::active_face_profile_with(config)
         .map(|p| face_variant_installed(&models_dir(state), &p))
         .unwrap_or(false)
 }
 
-/// 人脸分析的**完整**依赖预检(2026-07-11 加固批 A-4,会话解耦的便宜版):
-/// 合并单 worker 下 face SessionInit 强制携带 CLIP 成对模型(worker 侧角色完备性校验),
-/// CLIP 缺失时旧行为是流水线已启动、GPU 槽已占,才在 worker 侧以笼统错误失败。
-/// 此处把跨轨依赖前置为指名报错;真正的 face-only 会话解耦待实际场景需要再做(todo P 节 g)。
+/// 人脸分析仅依赖所选人脸模型，与 CLIP 的安装状态独立。
 fn face_dependencies_ready(state: &AppState) -> Result<()> {
     if !face_loaded(state) {
         return Err(AppError::AiModelNotLoaded("人脸模型未启用或未下载".into()));
-    }
-    let prof = crate::ai::runtime_config::active_profile(state);
-    if !crate::ai::runtime_config::variant_installed(
-        &models_dir(state),
-        &prof.image_file,
-        &prof.text_file,
-    ) {
-        return Err(AppError::AiModelNotLoaded(format!(
-            "人脸分析经合并推理会话运行,需 CLIP 模型就位:激活变体 {} 未安装或不完整,请先在模型库下载/修复",
-            prof.id
-        )));
     }
     Ok(())
 }
@@ -144,7 +130,7 @@ pub async fn get_face_status(state: State<'_, Arc<AppState>>) -> Result<FaceStat
             .unwrap_or_default();
 
         // B-1:全程只用头上这一个 conn(model_id/face_loaded 曾各自再取池)。
-        // A2:model_id 已迁往 config.toml,改传 `&state.config`。
+        // model_id 从 config.toml 的设置快照读取。
         let model_id = active_face_model_id_with(&state.config);
         let total_items = count_total_ai_items(&conn).unwrap_or(0);
         let processed_items = count_processed_face_items(&conn).unwrap_or(0);

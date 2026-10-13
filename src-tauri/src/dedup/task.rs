@@ -179,8 +179,7 @@ fn db_file_size(size: u64) -> i64 {
 
 /// 去重查询的最小适配面。
 ///
-/// 方法名与未来 `db::queries` 契约一一对应；真实适配器可以在方法内部取得
-/// `DbPool`/`DbWriter` 连接并调用查询函数。所有 hash 都在 `write_*` 之前完成，
+/// `AppStateDedupStore` 从 `DbPool`/`DbWriter` 取得连接并调用查询函数。所有 hash 都在 `write_*` 之前完成，
 /// 因而不会在 DB writer 锁内读文件。
 pub trait DedupStore: Send + Sync {
     fn list_dedup_scan_candidates(
@@ -740,14 +739,14 @@ struct ManagerInner {
 /// 精确去重分析管理器。
 ///
 /// `new/start/stop/status` 是稳定的生命周期 API。查询和事件接线通过
-/// `with_store`/`with_parts` 注入，便于在查询波次落地后不改任务状态机。
+/// `with_store`/`with_parts` 注入，任务状态机与存储实现解耦。
 #[derive(Clone)]
 pub struct DedupTaskManager {
     inner: Arc<ManagerInner>,
 }
 
 impl DedupTaskManager {
-    /// 创建可直接使用的 manager。空存储让尚未接入查询的构建仍可验证生命周期。
+    /// 创建使用空存储和无事件接收器的 manager。
     pub fn new() -> Self {
         Self::with_parts(
             Arc::new(EmptyDedupStore),
@@ -757,7 +756,7 @@ impl DedupTaskManager {
         )
     }
 
-    /// 使用未来查询波次提供的存储适配器。
+    /// 使用数据库查询的存储适配器。
     pub fn with_store(store: Arc<dyn DedupStore>) -> Self {
         Self::with_parts(
             store,
@@ -1805,5 +1804,160 @@ impl DedupTaskManager {
 impl Default for DedupTaskManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Condvar;
+
+    struct SlowEmptyStore {
+        first_list_started: AtomicBool,
+        list_calls: AtomicUsize,
+    }
+
+    impl SlowEmptyStore {
+        fn new() -> Self {
+            Self {
+                first_list_started: AtomicBool::new(false),
+                list_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DedupStore for SlowEmptyStore {
+        fn list_dedup_scan_candidates(
+            &self,
+            _cursor: Option<&DedupCandidateCursor>,
+            _limit: usize,
+        ) -> Result<Vec<DedupScanCandidate>, AppError> {
+            if self.list_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.first_list_started.store(true, Ordering::Release);
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(Vec::new())
+        }
+
+        fn count_dedup_scan_candidates(&self) -> Result<u64, AppError> {
+            Ok(0)
+        }
+
+        fn begin_run(&self, _generation: u64, _reset: bool) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        fn write_dedup_quick_for_generation(
+            &self,
+            _generation: u64,
+            _rows: &[DedupQuickRow],
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        fn list_dedup_quick_collisions(
+            &self,
+            _cursor: Option<&DedupCandidateCursor>,
+            _limit: usize,
+        ) -> Result<Vec<DedupScanCandidate>, AppError> {
+            Ok(Vec::new())
+        }
+
+        fn write_dedup_exact_for_generation(
+            &self,
+            _generation: u64,
+            _rows: &[DedupExactRow],
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        fn write_dedup_error_for_generation(
+            &self,
+            _generation: u64,
+            _item_id: i64,
+            _source_revision: i64,
+            _size: u64,
+            _file_mtime_ns: Option<i64>,
+            _code: &'static str,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingSink {
+        snapshots: Mutex<Vec<DedupProgress>>,
+        changed: Condvar,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                snapshots: Mutex::new(Vec::new()),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn all(&self) -> Vec<DedupProgress> {
+            self.snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl DedupEventSink for RecordingSink {
+        fn emit(&self, progress: &DedupProgress) {
+            self.snapshots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(progress.clone());
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_until<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..100 {
+            if predicate() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(predicate(), "timed out waiting for dedup worker");
+    }
+
+    #[test]
+    fn stop_then_restart_does_not_publish_old_terminal_state_or_clear_new_run() {
+        let store = Arc::new(SlowEmptyStore::new());
+        let sink = Arc::new(RecordingSink::new());
+        let manager = DedupTaskManager::with_parts(
+            store.clone(),
+            sink.clone(),
+            Arc::new(DedupPriorityGate::new()),
+            4,
+        );
+        let first = manager.start(false).expect("first run starts");
+        wait_until(|| store.first_list_started.load(Ordering::Acquire));
+        let stopped = manager.stop().expect("stop first run");
+        assert_eq!(stopped.run_id, first.run_id);
+        assert_eq!(stopped.status, DedupStatus::Stopped);
+
+        let second = manager.start(false).expect("restart starts");
+        assert!(second.run_id > first.run_id);
+        wait_until(|| manager.status().status == DedupStatus::Completed);
+        thread::sleep(Duration::from_millis(130));
+
+        let snapshots = sink.all();
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot.run_id == second.run_id && snapshot.status == DedupStatus::Completed
+        }));
+        assert!(!snapshots.iter().any(|snapshot| {
+            snapshot.run_id == first.run_id && snapshot.status == DedupStatus::Completed
+        }));
+        assert_eq!(manager.status().run_id, second.run_id);
+        assert_eq!(manager.status().status, DedupStatus::Completed);
     }
 }

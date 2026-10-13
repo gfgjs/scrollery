@@ -100,9 +100,8 @@
         <button
           type="button"
           class="person-card__primary"
-
+          :aria-label="t('persons.viewPhotos', { name: p.name || t('persons.unnamed') })"
           @click="onCardClick(p)"
-          @dblclick.stop="startEdit(p)"
         />
         <!-- 墙/隐藏模式:选择合并 + 隐藏/恢复 + 移入误检桶(误检桶管理模式下隐藏这三者) -->
         <!-- 选择复选框（hover 或已选时显示） -->
@@ -159,7 +158,7 @@
           <ScanFace v-if="!coverSrc(p)" :size="32" class="person-card__avatar-fallback" />
         </div>
 
-        <!-- 名字：双击编辑 -->
+        <!-- 命名与进入照片分开，避免双击的首个 click 已触发导航。 -->
         <div class="person-card__name">
           <input
             v-if="editingId === p.id"
@@ -167,16 +166,25 @@
             v-model="editName"
             :readonly="submitted"
             class="person-card__input"
+            :aria-label="t('persons.namePlaceholder')"
             :placeholder="t('persons.namePlaceholder')"
             maxlength="40"
-            @keydown.enter="submitEdit(p)"
-            @keydown.esc="cancelEdit"
+            @keydown.enter="submitEdit(p, $event)"
+            @keydown.esc="cancelEdit($event)"
             @blur="submitEdit(p)"
             @click.stop
           />
-          <span v-else :class="{ 'person-card__name--unnamed': !p.isNamed }">
+          <button
+            v-else
+            type="button"
+            class="person-card__rename"
+            :class="{ 'person-card__name--unnamed': !p.isNamed }"
+            :aria-label="t('persons.rename', { name: p.name || t('persons.unnamed') })"
+            :title="t('persons.rename', { name: p.name || t('persons.unnamed') })"
+            @click.stop="startEdit(p)"
+          >
             {{ p.name || t('persons.unnamed') }}
-          </span>
+          </button>
         </div>
         <div class="person-card__count">{{ t('persons.faceCount', { count: p.faceCount }) }}</div>
       </article>
@@ -478,7 +486,9 @@ function startEdit(p: PersonSummary) {
   })
 }
 
-async function submitEdit(p: PersonSummary) {
+async function submitEdit(p: PersonSummary, event?: KeyboardEvent) {
+  // Enter 在组合输入中用于确认候选，最终名字尚未同步，不能提前保存旧值。
+  if (event?.isComposing) return
   if (submitted.value || editingId.value !== p.id) return
   submitted.value = true
   const generation = editGeneration
@@ -494,7 +504,8 @@ async function submitEdit(p: PersonSummary) {
   }
 }
 
-function cancelEdit() {
+function cancelEdit(event?: KeyboardEvent) {
+  if (event?.isComposing) return
   editGeneration++
   submitted.value = false
   editingId.value = null
@@ -697,9 +708,27 @@ async function mergeSelected() {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.person-card__name--unnamed {
+.person-card__rename.person-card__name--unnamed {
   color: var(--color-text-tertiary);
   font-style: italic;
+}
+.person-card__rename {
+  display: block;
+  max-width: 100%;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: text;
+}
+.person-card__rename:focus-visible {
+  outline: none;
+  box-shadow: var(--control-focus-ring);
 }
 .person-card__count {
   font-size: var(--font-size-xs);
@@ -769,6 +798,7 @@ async function mergeSelected() {
 .person-card .person-card__hide,
 .person-card .person-card__ignore,
 .person-card .person-card__restore,
+.person-card .person-card__rename,
 .person-card .person-card__input {
   z-index: 2;
   pointer-events: auto;

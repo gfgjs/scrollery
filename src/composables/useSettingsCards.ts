@@ -5,9 +5,9 @@
 // ModelLibrary / NetworkStorageSection 等子组件内。单例无需层层 provide 即可让「一键
 // 全部折叠/展开」作用于所有当前已挂载的卡片。
 //
-// 存储（设置集中保存，批次B）：settings_cards_expanded 是「卡片 ID → 布尔」的内联表设置；
-// 各卡默认展开与否由后端 schema 固化，故前端不再按 defaultOpen 自动补种写入（那会与 schema
-// 默认值形成两份真源）。快照未到达前按调用方声明的 defaultOpen 呈现，不落盘。
+// settings_cards_expanded 是「卡片 ID → 布尔」的内联表设置；
+// 各卡默认展开状态由后端 schema 固化；前端不按 defaultOpen 补种写入，以免产生第二份默认值。
+// 快照未到达前按调用方声明的 defaultOpen 呈现，不落盘。
 
 import { computed, reactive } from 'vue'
 import { readSetting, settingsReady, writeSettings } from '../stores/settingsPersistence'

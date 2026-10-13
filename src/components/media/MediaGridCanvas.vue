@@ -1,15 +1,13 @@
 <template>
   <!-- Canvas 网格(§9 T4「转正 v2」:零逐格 DOM + 单元素算术命中)。结构(均在 .media-grid
-       滚动容器内):wrap(高占位=逻辑总高,撑原生滚动条) └─ canvas(sticky 满视口,唯一元素;
+       滚动容器内):wrap(物理占位由 bucket 封顶,撑原生滚动条) └─ canvas(sticky 满视口,唯一元素;
        滚动时按 currentY 重绘)。交互全在 canvas 一个元素:点击/右键/pointerdown → hitTestCell
        两级二分命中(O(log n));框选经注入 setPointerIdResolver 用同一算术命中,脱离逐格 DOM。
        ⚠️ v1 的「DOM 镜像层」已被推翻(每格一个 div 重新引入数千节点,真机实测更卡);
        逐格键盘焦点降级为 DOM 模式专属。 -->
   <div ref="wrapRef" class="mgc-wrap" :style="{ height: spacerHeight + 'px' }">
-    <!-- 悬停卡层(T12):与 canvas 同 sticky 钉视口、高 0 不占流,内部绝对定位与 canvas 绘制
-         共用同一视口坐标系。⚠️ 这是**单例** DOM(同一时刻至多一张卡),不是被推翻的 v1 逐格
-         镜像层——O(1) 节点不随库规模增长。复用 MediaThumb 整卡,收藏/星级/checkbox/悬停
-         预览/信息浮窗与 DOM 模式逐字节同源;极小格按放大镜放大到最小可用尺寸(用户裁决)。 -->
+    <!-- 悬停层与 Canvas 共用视口坐标，至多挂载一张 MediaThumb。
+         静态画面沿用 Canvas，DOM 保留卡片动作和动态预览。 -->
     <div ref="hoverLayerRef" class="mgc-hover-layer">
       <div
         v-if="hoverCard"
@@ -17,18 +15,23 @@
         class="mgc-hover-card"
         :class="{
           'mgc-hover-card--static': isSelectionMode,
-          'mgc-hover-card--bare': hoverCardBare,
+          'mgc-hover-card--ready': hoverCard.ready,
+          'mgc-hover-card--leaving': hoverCard.leaving,
           'mgc-hover-card--zoom': hoverCard.rect.scale0 !== 1,
-          'mgc-hover-card--mirror': hoverCardMirror,
         }"
         :style="{
-          left: hoverCard.rect.x + 'px',
-          top: hoverCard.rect.y + 'px',
-          width: hoverCard.rect.w + 'px',
-          height: hoverCard.rect.h + 'px',
-          '--mgc-scale0': hoverCard.rect.scale0,
-          '--mgc-origin-x': hoverCard.rect.originX + 'px',
-          '--mgc-origin-y': hoverCard.rect.originY + 'px',
+          left: hoverCard.base.x + 'px',
+          top: hoverCard.base.y + 'px',
+          width: hoverCard.base.w + 'px',
+          height: hoverCard.base.h + 'px',
+          // 半透明预览沿用原格底面，避免放大后透出相邻格内容。
+          backgroundColor:
+            hoverUsesSurface && !glassBackground ? themePalette.canvasGap : 'transparent',
+          transform: hoverCard.expanded
+            ? `translate(${hoverCard.rect.x - hoverCard.base.x}px, ${hoverCard.rect.y - hoverCard.base.y}px) scale(${1 / hoverCard.rect.scale0})`
+            : 'translate(0px, 0px) scale(1)',
+          '--mgc-enter-ms': HOVER_ENTER_MS + 'ms',
+          '--mgc-leave-ms': HOVER_LEAVE_MS + 'ms',
         }"
         @pointermove="onHoverCardPointerMove"
         @pointerleave="onHoverCardPointerLeave"
@@ -41,8 +44,8 @@
         <MediaThumb
           :id="hoverCard.item.id"
           :item="hoverCard.item"
-          :w="hoverCard.rect.w"
-          :h="hoverCard.rect.h"
+          :w="hoverCard.base.w"
+          :h="hoverCard.base.h"
           :media-type="hoverCard.item.mediaType"
           :is-live-photo="hoverCard.item.isLivePhoto"
           :duration-ms="hoverCard.item.durationMs"
@@ -58,23 +61,30 @@
           :is-selected="hoverSelected"
           :is-selection-mode="isSelectionMode"
           :browse-only="lensActive"
-          :force-full="!isSelectionMode"
+          :force-full="!isSelectionMode && hoverActionsFit"
           :cache-dir="cacheDir"
-          @request-thumb="scheduleDraw"
-          @regenerate-thumb="(id: number) => emit('regenerate-thumb', id)"
+          canvas-interactions
+          :interaction-active="!hoverCard.leaving"
+          @preview-state="onHoverPreviewState"
           @favorite="(id: number) => emit('cell-favorite', id)"
           @rate="(id: number, value: number) => emit('cell-rate', id, value)"
           @select="(id: number) => emit('cell-select', id)"
-        />
+        >
+          <template #canvas-surface>
+            <canvas
+              ref="hoverSurfaceRef"
+              class="mgc-hover-surface"
+              :style="{ visibility: hoverUsesSurface ? 'visible' : 'hidden' }"
+            />
+          </template>
+        </MediaThumb>
       </div>
     </div>
     <canvas
       :key="glassBackground ? 'glass' : 'opaque'"
       ref="canvasRef"
       class="mgc-canvas"
-
       tabindex="0"
-
       @click="onClick"
       @contextmenu.prevent="onContextMenu"
       @pointerdown="onPointerDown"
@@ -101,7 +111,11 @@ import { setPointerIdResolver } from '../../composables/useSelection'
 import { isThumbLoadDeferred, useThumbLoadGate } from '../../composables/useThumbLoadGate'
 import { useCanvasThumbPipeline } from '../../composables/useCanvasThumbPipeline'
 import { useCanvasHitTest } from '../../composables/useCanvasHitTest'
-import { useCanvasHoverCard } from '../../composables/useCanvasHoverCard'
+import {
+  useCanvasHoverCard,
+  HOVER_ENTER_MS,
+  HOVER_LEAVE_MS,
+} from '../../composables/useCanvasHoverCard'
 import {
   visibleRowRange,
   CanvasRenderLifecycle,
@@ -109,25 +123,30 @@ import {
   SelectionAnimTracker,
   SELECT_ANIM_MS,
 } from './mediaGridCanvas.helpers'
-import { PALETTE_METRICS_FALLBACK, projectPalette, readPaletteMetrics, type Palette } from './mediaGridCanvas.palette'
 import {
-  drawSeparator,
-  type LensFolderHeaderLines,
-} from './mediaGridCanvas.painters'
+  PALETTE_METRICS_FALLBACK,
+  projectPalette,
+  readPaletteMetrics,
+  type Palette,
+} from './mediaGridCanvas.palette'
+import { drawSeparator, type LensFolderHeaderLines } from './mediaGridCanvas.painters'
 import { createInfoOverlayCache } from './mediaGridCanvas.infoOverlay'
 import { createCellRenderer } from './mediaGridCanvas.cellRenderer'
+import { createGalleryBlendLayer } from './mediaGridCanvas.blend'
+import { thumbActionsFit } from './thumbBottomLayout'
 import type { LayoutRow, LayoutRowItem, LayoutRowSeparator, MediaMeta } from '../../types/layout'
+import type { GalleryBlendSettings } from '../../types/config'
 import type { ThemePalette } from '../../themes/types'
 import type { DemoInfoFormatter } from '../../utils/demoAlias'
 import { performanceRecorder } from '../../perf/performanceRecorder'
 import { createCanvasThumbCellMetrics } from '../../perf/canvasThumbCellMetrics'
 
 const props = defineProps<{
-  /** 当前挂载窗口的布局行(双引擎同源,由宿主 activeRows 提供)。 */
+  /** 宿主 activeRows 提供的布局行，DOM 与 Canvas 共用。 */
   rows: LayoutRow[]
   /** 逻辑滚动位(视口顶部对应的逻辑 y)。 */
   currentY: number
-  /** 逻辑总高(撑起 wrap 高度 → 原生滚动条)。 */
+  /** bucket 提供的物理占位高度(超大库封顶),只撑原生滚动条,不参与逻辑坐标计算。 */
   spacerHeight: number
   /** 缩略图缓存目录(已规整为正斜杠)。 */
   cacheDir: string
@@ -152,9 +171,11 @@ const props = defineProps<{
   scrolling: boolean
   /** 缩略图悬停放大开关(config.enableHoverScale):Canvas 不经过 DOM hover CSS,需显式下发。 */
   enableHoverScale: boolean
+  /** 实验性画廊融合：只改变 Canvas 图缘和缝隙，不影响布局几何。 */
+  galleryBlend: GalleryBlendSettings
   /** 信息浮窗开关(ui.showThumbInfo 经宿主注入,canvas 不进 store)。 */
   showThumbInfo: boolean
-  /** 演示打码开关(2026-09-16):开启时缩略图位图强模糊、信息浮窗换示例文案、悬停卡完全停用。 */
+  /** 演示打码开启时模糊位图、替换浮窗文案并禁用悬停卡。 */
   demoPrivacy: boolean
   /** 信息浮窗演示文案组装(宿主注入;关闭时为 null → 走真实文案)。 */
   demoInfoText?: DemoInfoFormatter | null
@@ -162,9 +183,7 @@ const props = defineProps<{
   demoSeparatorLabel?: (row: LayoutRowSeparator) => string | null
   /** 选择态拖拽手柄开关(#5,ui.showDragHandle 经宿主注入):关闭时不绘且不可命中。 */
   showDragHandle: boolean
-  /** 就地 patch 信号(#15):宿主乐观更新(收藏/评分/色标/缩略图回写)后递增。canvas 据此
-   *  重绘,替代原 rows 深 watch——深 watch 在 bucket 段边界帧对整个挂载窗口做依赖遍历+
-   *  响应式代理物化(密行高下数千 item),正是「按住方向键每隔一段距离卡一下」的主因。 */
+  /** 宿主就地更新后递增，替代整窗深 watch，避免段边界遍历大量响应式项。 */
   patchTick: number
   /** 信息浮窗勾选元素(ui.thumbInfoElements)。 */
   thumbInfoElements: readonly string[]
@@ -209,6 +228,8 @@ const emit = defineEmits<{
 
 const wrapRef = ref<HTMLElement | null>(null)
 const canvasRef = ref<HTMLCanvasElement | null>(null)
+const hoverSurfaceRef = ref<HTMLCanvasElement | null>(null)
+const hoverPreviewId = ref(-1)
 const renderLifecycle = new CanvasRenderLifecycle()
 const drawScheduler = new CanvasRafScheduler({
   snapshot: () => renderLifecycle.snapshot(),
@@ -329,6 +350,8 @@ const pipeline = useCanvasThumbPipeline({
   viewportW: () => viewW,
   viewportH: () => viewH,
 })
+const blendLayer = createGalleryBlendLayer()
+const blendEnabled = computed(() => props.galleryBlend.enabled && props.galleryBlend.strength > 0)
 
 // 有限录制期指标(§7.3):首次入屏命中/未命中与「入屏→首次绘出位图」代理时延。非录制态
 // beginFrame 返回 false、noteCell/endFrame 全 no-op,零维护成本与零分配。
@@ -349,11 +372,8 @@ const {
   hoverLayerRef,
   hoverCard,
   hoverSelected,
-  hoverCardBare,
-  hoverCardMirror,
-  mirrorCellId,
   clearHover,
-  cancelHoverPrep,
+  markHoverReady,
   onPointerMove,
   onHoverCardPointerMove,
   onCanvasPointerLeave,
@@ -369,7 +389,6 @@ const {
   isSelected: props.isSelected,
   enableHoverScale: () => props.enableHoverScale,
   demoPrivacy: () => props.demoPrivacy,
-  cacheDir: () => props.cacheDir,
   currentY: () => props.currentY,
   selectionVersion: () => props.selectionVersion,
   viewport: () => ({ w: viewW, h: viewH }),
@@ -377,6 +396,36 @@ const {
   requestRedraw: scheduleDraw,
   emit,
 })
+
+const hoverUsesSurface = computed(() => {
+  const card = hoverCard.value
+  return !!card && (card.rect.scale0 !== 1 || hoverPreviewId.value === card.item.id)
+})
+const hoverActionsFit = computed(() => {
+  const item = hoverCard.value?.item
+  if (!item) return false
+  const unavailable = item.availability === 'missing' || item.availability === 'offline'
+  return thumbActionsFit(
+    item.w,
+    item.h,
+    unavailable || !!item.durationMs,
+    item.w < 112 && unavailable && !!item.durationMs,
+  )
+})
+function onHoverPreviewState(id: number, active: boolean) {
+  if (id !== hoverCard.value?.item.id) return
+  hoverPreviewId.value = active ? id : -1
+  scheduleDraw()
+}
+watch(
+  () => hoverCard.value?.item.id,
+  () => {
+    hoverPreviewId.value = -1
+    scheduleDraw()
+  },
+  { flush: 'post' },
+)
+watch(hoverSurfaceRef, scheduleDraw, { flush: 'post' })
 
 // 信息浮窗组装 + 逐帧缓存(原逻辑域 G)。
 const infoOverlay = createInfoOverlayCache()
@@ -386,6 +435,16 @@ const drawCell = createCellRenderer({
   getPalette: paletteOf,
   selAnim,
   getImage: pipeline.getImage,
+  isBlendEnabled: () => blendEnabled.value,
+  drawBlendEdges: (ctx, item, y, hoverSurface) =>
+    blendLayer.drawEdges(
+      ctx,
+      item.x,
+      y,
+      item.w,
+      item.h,
+      hoverSurface ? (hoverCard.value?.base.y ?? y) : y,
+    ),
   isPendingDelete: props.isPendingDelete,
   isSelected: props.isSelected,
   compactCells: () => props.compactCells,
@@ -393,7 +452,7 @@ const drawCell = createCellRenderer({
   thumbInfoElements: () => props.thumbInfoElements,
   demoPrivacy: () => props.demoPrivacy,
   devicePixelRatio: () => canvasDpr,
-  demoInfo: () => (props.demoPrivacy ? props.demoInfoText ?? null : null),
+  demoInfo: () => (props.demoPrivacy ? (props.demoInfoText ?? null) : null),
   showDragHandle: () => props.showDragHandle,
   isSelectionMode: () => props.isSelectionMode,
   pendingDeleteLabel: () => props.pendingDeleteLabel,
@@ -402,9 +461,41 @@ const drawCell = createCellRenderer({
   lensActive: () => props.lensActive ?? false,
   lensCardBadgeText: (item) => props.lensCardBadgeText?.(item) ?? null,
   viewportMeta: () => props.viewportMeta,
-  mirrorCellId,
+  interactionCellId: () => (hoverCard.value?.ready ? hoverCard.value.item.id : -1),
+  previewCellId: () => hoverPreviewId.value,
   drawInfoOverlay: infoOverlay.drawInfoOverlay,
 })
+
+/** 原尺寸绘制同一管线图源，动画只交给合成器；返回值沿用冷格指标口径。 */
+function drawHoverSurface(now: number): boolean | null {
+  const card = hoverCard.value
+  const surface = hoverSurfaceRef.value
+  if (!card || !surface) return null
+  if (!hoverUsesSurface.value) {
+    markHoverReady()
+    return null
+  }
+  const ctx = surface.getContext('2d')
+  if (!ctx) return null
+  const width = Math.max(1, Math.round(card.base.w * canvasDpr))
+  const height = Math.max(1, Math.round(card.base.h * canvasDpr))
+  if (surface.width !== width) surface.width = width
+  if (surface.height !== height) surface.height = height
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  ctx.clearRect(0, 0, width, height)
+  if (!props.glassBackground && hoverPreviewId.value !== card.item.id) {
+    ctx.fillStyle = paletteOf().canvasGap
+    ctx.fillRect(0, 0, width, height)
+  }
+  ctx.setTransform(canvasDpr, 0, 0, canvasDpr, -card.item.x * canvasDpr, 0)
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  // getImage 仍以原格规格登记可见需求；单例不持有或关闭管线的位图。
+  const image = pipeline.getImage(card.item)
+  const loaded = drawCell(ctx, card.item, 0, now, image, true)
+  markHoverReady()
+  return loaded
+}
 
 // ── canvas 元素交互(点击/右键/pointerdown,原逻辑域 I 的入口函数)────────────────────
 function onClick(e: MouseEvent) {
@@ -439,8 +530,27 @@ function draw() {
   const rows = drawRows.value
   const range = visibleRowRange(rows, y0, y0 + viewH)
   pipeline.prioritizeVisibleThumbLoads(rows, range.start, range.end)
+  if (blendEnabled.value) {
+    blendLayer.draw(
+      ctx,
+      rows,
+      y0,
+      viewW,
+      viewH,
+      pipeline.getImage,
+      paletteOf().canvasPlaceholder,
+      props.isPendingDelete,
+      props.demoPrivacy,
+      props.galleryBlend,
+    )
+  }
   const metricsOn = cellMetrics.beginFrame(now)
   selAnim.sync(visibleItems(rows, range.start, range.end), props.isSelected, now)
+  const hoverLoaded = drawHoverSurface(now)
+  const surfaceOwner =
+    hoverUsesSurface.value && hoverCard.value?.ready && hoverLoaded !== null
+      ? hoverCard.value.item.id
+      : -1
   const firstVisible = range.start < range.end ? range.start : -1
   const lastVisible = range.start < range.end ? range.end - 1 : -1
   let visibleCells = 0
@@ -466,23 +576,30 @@ function draw() {
     }
     visibleCells += row.items.length
     for (const item of row.items) {
-      const drewImage = drawCell(ctx, item, sy, now)
+      const drewImage = item.id === surfaceOwner ? hoverLoaded! : drawCell(ctx, item, sy, now)
       // 冷格 = 本帧未画出任何位图(现行/stale 均算已出图)且未判失败的媒体格——即用户
       // 看到的「占位等待真图」;逐帧累计为 coldCellFrames(格·帧积分),量化换图波强度。
       if (monitored) {
         // DB已判失败的格保持固定占位,不属于等待出图;管线失败表只覆盖本次加载失败。
-        const failed = !drewImage && (item.thumbStatus === 2 || pipeline.thumbState.isFailed(item.id))
+        const failed =
+          !drewImage && (item.thumbStatus === 2 || pipeline.thumbState.isFailed(item.id))
         if (!drewImage && !failed) coldCells++
         if (metricsOn) cellMetrics.noteCell(item.id, drewImage, failed)
       }
     }
   }
   if (metricsOn) cellMetrics.endFrame()
-  // 视口外预取:开闸态全窗(前 1.25 屏+后 0.5 屏),关闸态收缩为仅前向(稍快速滚动
-  // 的换图波根治,2026-07-17 阶段 6)。计划登记后先跑 draw 尾同步小分片保底推进
-  // (idle 空隙真机不可靠),深填仍交 idle 分片;可见格已在上方绘制循环中先占加载槽。
+  // 开闸预取前向 1.25 屏与后向 0.5 屏，关闸仅保留前向。
+  // 可见格先占加载槽，draw 尾部小分片保证推进，其余填充交给 idle 分片。
   if (firstVisible !== -1) {
-    pipeline.ensurePrefetchPlan(rows, y0, firstVisible, lastVisible, visibleCells, isThumbLoadDeferred())
+    pipeline.ensurePrefetchPlan(
+      rows,
+      y0,
+      firstVisible,
+      lastVisible,
+      visibleCells,
+      isThumbLoadDeferred(),
+    )
     pipeline.runDrawPrefetchSlice()
   } else pipeline.cancelPrefetchPlan()
   if (selAnim.hasActive(now, SELECT_ANIM_MS)) scheduleDraw()
@@ -501,6 +618,7 @@ function draw() {
 // ── 生命周期 + 重绘触发源 ───────────────────────────────────────────────────
 let ro: ResizeObserver | null = null
 function scheduleResizeSettle() {
+  clearHover()
   resizeSettling = true
   drawScheduler.cancel()
   measure()
@@ -543,7 +661,6 @@ function stopCanvasWork(): void {
   performanceRecorder.setGauge('gallery.visibleColdCells', 0)
   performanceRecorder.setGauge('gallery.visibleCells', 0)
   cellMetrics.reset()
-  cancelHoverPrep()
   clearHover()
   setPointerIdResolver(null)
 }
@@ -568,6 +685,7 @@ onDeactivated(() => {
 })
 onBeforeUnmount(() => {
   stopCanvasWork()
+  blendLayer.dispose()
   pipeline.dispose() // 复刻原 cancelPrefetchPlan → cancelAbortableThumbLoads → thumbState.clear 顺序(§3.4)
 })
 
@@ -590,12 +708,40 @@ watch(
 watch(
   () => props.rows,
   () => {
+    const card = hoverCard.value
+    if (card) {
+      let current: LayoutRowItem | undefined
+      let currentRowY = 0
+      for (const row of props.rows) {
+        if (row.rowType !== 'normal') continue
+        current = row.items.find((item) => item.id === card.item.id)
+        if (current) {
+          currentRowY = row.y
+          break
+        }
+      }
+      if (
+        !current ||
+        current.x !== card.base.x ||
+        current.w !== card.base.w ||
+        current.h !== card.base.h ||
+        currentRowY - props.currentY !== card.base.y
+      )
+        clearHover()
+      else hoverCard.value = { ...card, item: current }
+    }
     pipeline.cancelPrefetchPlan()
     scheduleDraw()
   },
 )
 // 宿主乐观 patch(收藏/评分/色标/缩略图回写):几何不变,仅重绘、不作废预取计划。
-watch(() => props.patchTick, scheduleDraw)
+watch(
+  () => props.patchTick,
+  () => {
+    if (hoverCard.value && props.isPendingDelete(hoverCard.value.item.id)) clearHover()
+    scheduleDraw()
+  },
+)
 watch(() => props.selectionVersion, scheduleDraw)
 // 进出选择模式:重绘(checkbox 常显切换)并清悬停卡——卡的几何按旧模式算(放大↔原位),
 // 留着会以错误尺寸挡在格上,清掉等下一次 pointermove 按新模式重建。
@@ -608,6 +754,15 @@ watch(
 )
 // 悬停放大开关由设置页实时切换:清掉按旧倍率创建的单例悬停卡,避免旧卡继续覆盖画面。
 watch(() => props.enableHoverScale, clearHover)
+// 配置快照换代即重绘；关闭后释放融合缓冲，不承担额外绘制和模糊成本。
+watch(
+  () => props.galleryBlend,
+  () => {
+    if (!blendEnabled.value) blendLayer.dispose()
+    clearHover()
+    scheduleDraw()
+  },
+)
 // 信息浮窗数据/设置换代:缓存整体作废(gen 递增)并重绘——viewportMeta 每批到达换 Map 引用,
 // thumbInfoElements/showThumbInfo 由设置页改动。
 watch(
@@ -630,7 +785,7 @@ watch(() => props.groupBy, scheduleDraw)
 watch(() => props.lensActive, scheduleDraw)
 // 手柄开关(#5)由设置页改动:无缓存可作废,重绘即生效。
 watch(() => props.showDragHandle, scheduleDraw)
-// 演示打码开关(2026-09-16):翻转即整块作废信息浮窗文案缓存(防残留真实文件名/路径),并清掉
+// 演示打码切换时作废浮窗缓存，防止残留真实文件名与路径，并清掉
 // 悬停卡——卡内是真实缩略图与真实文案,打码期间必须立即消失;随后的重绘让位图模糊/还原同帧生效。
 watch(
   () => props.demoPrivacy,
@@ -667,7 +822,7 @@ watch(
   },
 )
 // 主题/配色换代(store 每帧最多发布一次新色板引用):重新投影调色板并重绘。只重绘——
-// 几何与预取计划不变,不触发缩略图重载(与旧 themeToken/tintToken/textToken 同一触发面)。
+// 调色板变化仅重绘，不改变几何或预取计划，不重载缩略图。
 watch(
   () => props.themePalette,
   () => {
@@ -675,8 +830,7 @@ watch(
     scheduleDraw()
   },
 )
-// B:加载闸门翻转 → 重绘。draw 会按新闸门态重建预取计划(开闸=全窗恢复被推迟的加载;
-// 关闸=收缩为仅前向 1 屏,不再整体停取——稍快速滚动也要持续出真图,阶段 6 裁决)。
+// 加载闸门变化后重绘并更新预取：开闸恢复全窗，关闸保留前向一屏。
 watch(useThumbLoadGate(), () => scheduleDraw())
 </script>
 

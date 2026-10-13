@@ -1,4 +1,4 @@
-// Canvas 网格调色板:把主题生成的色板投影成网格绘制所需的字段(方案 §6)。
+// Canvas 网格调色板:把主题生成的色板投影成网格绘制所需的字段。
 //
 // Canvas 需要具体色值(fillStyle 吃不下 var()/color-mix()),故颜色**只**来自 store 发布的
 // ThemePalette——DOM 与 Canvas 同一份生成结果,这里不保留第二套默认色、也不逐帧 getComputedStyle。

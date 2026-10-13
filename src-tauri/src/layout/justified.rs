@@ -1,7 +1,6 @@
 // src-tauri/src/layout/justified.rs
-//! 两端对齐布局算法（Rust 实现，§ 10.1）。
+//! 两端对齐布局算法。
 //!
-//! Input: flat list of `LayoutItem` sorted by `sort_datetime DESC`.
 //! 输入：按 `sort_datetime DESC` 排序的 `LayoutItem` 扁平列表。
 //! 输出：`Vec<LayoutRow>` — 每一行是普通图像行或日期分隔符。
 //!
@@ -11,8 +10,7 @@
 //!   - 当行宽达到 `container_width ± tolerance` 时，提交该行。
 //!   - 当 `sort_datetime` 跨越日期边界时，首先插入分隔符行。
 //!
-//! 共享骨架(输出类型/`LayoutParams`/并行组骨架/分组辅助/出口拼装/宽高比辅助)已迁至
-//! `layout::geometry`;`compute_grid_layout` 已迁至 `layout::grid_pack`(tierB-4 简案)。
+//! 公共布局类型与辅助函数在 `layout::geometry`；宫格布局在 `layout::grid_pack`。
 
 use std::borrow::Borrow;
 use std::collections::HashMap;

@@ -241,3 +241,118 @@ pub fn apply_face_clusters(
     tx.commit()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod f2_f3_cluster_concurrency_tests {
+    //! 2026-07-10 审查 F2/F3 回归钉(FK=ON,生产 pragma):
+    //! F2=增量聚类快照-写回与人工命令并发不得炸批/覆盖;F3=孤儿脸对账的判别边界。
+    use super::*;
+
+    fn bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn mem_fk_on() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        c.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
+             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, face_status) VALUES
+                 (100, 10, 'a.jpg', 1, 1, 'jpg', 'image', 10, 10, 100, 11, 2),
+                 (101, 10, 'b.jpg', 1, 1, 'jpg', 'image', 10, 10, 200, 12, 2),
+                 (102, 10, 'c.jpg', 1, 1, 'jpg', 'image', 10, 10, 300, 13, 2),
+                 (103, 10, 'd.jpg', 1, 1, 'jpg', 'image', 10, 10, 400, 14, 2),
+                 (104, 10, 'e.jpg', 1, 1, 'jpg', 'image', 10, 10, 500, 15, 2);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn add_face(
+        c: &Connection,
+        id: i64,
+        item_id: i64,
+        person_id: Option<i64>,
+        quality: f32,
+        unassigned: bool,
+    ) {
+        c.execute(
+            "INSERT INTO faces (id, item_id, person_id, model_name, bbox_x, bbox_y, bbox_w, bbox_h,
+                                landmarks, det_score, quality, embedding, is_confirmed, is_unassigned)
+             VALUES (?1, ?2, ?3, 'm', 0.1, 0.1, 0.2, 0.2, NULL, 0.9, ?4, ?5, 0, ?6)",
+            params![id, item_id, person_id, quality, bytes(&[1.0, 0.0]), unassigned as i64],
+        )
+        .unwrap();
+    }
+
+    fn add_person(c: &Connection, id: i64, count: i64) {
+        c.execute(
+            "INSERT INTO persons (id, model_name, centroid, face_count) VALUES (?1, 'm', ?2, ?3)",
+            params![id, bytes(&[1.0, 0.0]), count],
+        )
+        .unwrap();
+    }
+
+    fn face_person(c: &Connection, id: i64) -> Option<i64> {
+        c.query_row(
+            "SELECT person_id FROM faces WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn person_count_col(c: &Connection, id: i64) -> i64 {
+        c.query_row(
+            "SELECT face_count FROM persons WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// F2-②:快照后人物被人工命令精确重算(face_count 与快照推导值不符)。
+    /// 旧实现整行覆盖(lost update);现在放弃内存值、按库内真相重算。
+    #[test]
+    fn apply_recomputes_on_concurrent_modification() {
+        let c = mem_fk_on();
+        add_person(&c, 1, 5); // 库内已被人工命令改成 5(快照时是 1)
+        add_face(&c, 10, 100, Some(1), 0.8, false);
+        add_face(&c, 11, 101, None, 0.8, false);
+        let updates = vec![PersonClusterUpdate {
+            id: 1,
+            centroid: bytes(&[0.5, 0.5]),
+            face_count: 2, // 快照推导:旧 1 + 新 1
+            cover_face_id: 11,
+            face_ids: vec![11],
+        }];
+        apply_face_clusters(&c, "m", &updates).unwrap();
+        assert_eq!(face_person(&c, 11), Some(1), "脸仍归入目标人物");
+        assert_eq!(
+            person_count_col(&c, 1),
+            2,
+            "face_count 按实际成员数重算(非快照值 2 恰巧同值——成员=脸10+脸11)"
+        );
+    }
+
+    /// F3:孤儿发现的判别边界——只命中「未归属+非用户移出+质量达标+无负样本」。
+    #[test]
+    fn orphan_scan_respects_user_intent_boundaries() {
+        let c = mem_fk_on();
+        add_person(&c, 1, 1);
+        add_face(&c, 20, 100, None, 0.9, false); // 真孤儿 → 命中
+        add_face(&c, 21, 101, None, 0.9, true); // 用户移出 → 排除
+        add_face(&c, 22, 102, None, 0.1, false); // 低质量有意不聚 → 排除
+        add_face(&c, 23, 103, None, 0.9, false); // 有负样本 → 排除
+        c.execute(
+            "INSERT INTO face_rejections (face_id, person_id) VALUES (23, 1)",
+            [],
+        )
+        .unwrap();
+        add_face(&c, 24, 104, Some(1), 0.9, false); // 已归属 → 排除
+        let ids = get_orphan_cluster_item_ids(&c, "m", 0.5).unwrap();
+        assert_eq!(ids, vec![100], "仅真孤儿的宿主项命中");
+    }
+}

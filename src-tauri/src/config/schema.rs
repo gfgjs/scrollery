@@ -1,44 +1,5 @@
-//! 设置类键定义单源(A1)。新增/改名/调整任何用户可配置的设置项,只改本文件——
-//! `file.rs` 的校验/渲染都从 `SETTING_DEFS` 派生,不重复枚举键名。
-//!
-//! # 键全集的来源与口径(穷举方法论,供后续维护者复核)
-//! 本表是对代码实际读写路径穷举后的结果,并集自三处:
-//! 1. `db/schema.rs` 各版本 `INSERT OR IGNORE INTO app_config` 的种子键;
-//! 2. `ipc/config_commands.rs::set_app_config` 里带热应用副作用的 match 分支;
-//! 3. `ipc/config_commands.rs::get_startup_config` / `StartupConfig` 返回的键。
-//!
-//! 在此之上按代码实际 `get_config`/`set_config` 调用点(含前端 `saveConfig`/`fetchStr` 等
-//! 泛化 IPC 调用里的字面量键)做了两项修正,均在本文件对应条目的注释里可查:
-//! - **剔除死键**:`thumb_format`/`thumb_quality`/`ai_enabled`/`ai_auto_analyze`/
-//!   `clip_model`/`face_auto_analyze`/`exotic_max_workers`/`ai_backend` 仅在种子表出现,
-//!   全仓无任何 `get_config` 读取点消费——写进 schema 会让用户以为改了会生效,实际无效果,
-//!   比不收录更误导人,故不收录(`ai_backend` 现已惰性无读,不驱动任何行为,同归此类)。
-//! - **状态类键的补充排除**:任务给定的排除清单(schema_version 等 12 项)之外,又找到 6 个
-//!   同属"应用自己记账、非用户表单可编辑"的键,按同一判据补充排除,理由随每项列在下方
-//!   "排除清单"小节:`ai_provider`(worker 会话回声,写者与 `ai_gpu_name` 同一函数
-//!   `persist_provider_echo`)、`ai_analysis_active`/`face_analysis_active`/
-//!   `derivation_active`(启停时置位的"期望运行"标志,与已排除的 `exotic_paused` 同构)、
-//!   `backup_last_success_at`/`last_cover_stat_reconcile`(后台任务自记的时间戳,无表单)。
-//!
-//! # 排除清单(内部状态类,留 DB `app_config` 表,不进本 schema)
-//! 2026-09-16(设置集中保存实施)后只剩 12 个**应用自己记账**的内部键:`schema_version`
-//! `last_directory_id` `first_launch` `guide_seen` `ai_gpu_name` `ai_provider`
-//! `exotic_paused` `ai_analysis_active` `face_analysis_active` `derivation_active`
-//! `backup_last_success_at` `last_cover_stat_reconcile`。
-//! 原先存在 DB `app_config` 表或 localStorage 的用户偏好(`layout_mode`/`group_by`/
-//! `sort_within_group`/`last_sort_*` `sidebar_width` `pinned_settings` 与 17 项 `doc_*`
-//! 阅读器偏好)**改为归入本 schema**,唯一真源即 config.toml——判据是「全局范围决定应用外观/
-//! 交互方式或用户选项」,它们与设置页参数同类;**不读取也不转存旧存储里的值**,未在文件中出现
-//! 的键直接用 schema 默认值(2026-09-16 方案 §8)。而开机引导标记、任务启停标志、环境探测结果
-//! 与后台时间戳属应用状态,留 DB,重置设置不得清除(方案 §3.2)。
-//!
-//! # section 划分
-//! `ui`/`gallery`/`thumbnails`/`video`/`ai`/`face`/`exotic`/`logging`/`advanced` 九段来自
-//! 任务给定分类;另加 `backup`(备份目的地/自动策略)与 `proofread`(远程 AI 校对端点)——
-//! 这两组键在现有代码里自成一体、塞进 `advanced` 反而降低 config.toml 的可读性,故加两段
-//! 而非削足适履(与"每键必填/回执列出假设"的方针一致,已在批次回执里注明此判断)。
-//! 2026-07-23(B 线)再加 `viewer`(查看器渲染色域目标/自定义 ICC id)——同一判据:自成一体,
-//! 不与缩略图/视频等既有段混淆。
+//! `SETTING_DEFS` 是用户设置键、类型、默认值和分组的单一来源。
+//! `file.rs` 据此校验和渲染 config.toml；内部运行状态留在 DB `app_config`，不随设置重置。
 
 /// 结构体字段的取值类型(`Struct`/`StructMap`/`StructList` 内部使用)。
 ///
@@ -193,6 +154,11 @@ pub const STATE_KEYS: &[&str] = &[
     // 首次使用与引导完成标记:重置设置**不重放引导**,故留应用状态。
     "first_launch",
     "guide_seen",
+    // 免费激活是使用记录，重置用户设置时保留。
+    "feature_editing_activated",
+    "feature_ocr_activated",
+    "feature_enhance_activated",
+    "feature_psd_activated",
     // 运行环境探测结果(worker 会话回声)。
     "ai_gpu_name",
     "ai_provider",
@@ -439,6 +405,7 @@ pub const SETTINGS_CARD_IDS: &[&str] = &[
     "danger",
     "debug",
     "enhanceModels",
+    "experimental",
     "faceModels",
     "galleryBehavior",
     "galleryTimeline",
@@ -656,7 +623,7 @@ opacity(0–100 整数)。名称去首尾空白后不得为空且不得与已有
         comment_zh: "画廊网格目标行高(像素,justified 排版算法输入)。典型范围 64–1024。默认 200。",
         hot: true,
     },
-    // ── 以下为 2026-09-16 设置集中保存新纳入的界面偏好(此前散在 localStorage / DB)────
+    // ── 界面偏好 ────────────────────────────────────────────
     SettingDef {
         section: "ui",
         key: "titlebar_merged",
@@ -706,8 +673,40 @@ false=分离(工具栏独立成第二行)。",
         key: "gallery_render_mode",
         kind: SettingKind::Enum(&["dom", "canvas"]),
         default: "canvas",
-        comment_zh: "画廊渲染引擎。可选:dom(常规 DOM 渲染) / canvas(默认,实验性画布渲染,内存更省;\
-超大图库或 iOS 仍自动回退 DOM)。显式存 dom 即尊重用户选择。",
+        comment_zh: "画廊渲染引擎。可选:dom(常规 DOM 渲染) / canvas(默认,实验性画布渲染,按视口绘制)。\
+显式存 dom 即尊重用户选择。",
+        hot: true,
+    },
+    SettingDef {
+        section: "ui",
+        key: "gallery_blend_enabled",
+        kind: SettingKind::Bool,
+        default: "false",
+        comment_zh: "Canvas 画廊是否启用实验性图片融合。默认关闭。",
+        hot: true,
+    },
+    SettingDef {
+        section: "ui",
+        key: "gallery_blend_edge_width",
+        kind: SettingKind::Int { min: 0, max: 8 },
+        default: "2",
+        comment_zh: "Canvas 画廊图片融合的边缘宽度(像素)。范围 0–8 整数。默认 2。",
+        hot: true,
+    },
+    SettingDef {
+        section: "ui",
+        key: "gallery_blend_blur_radius",
+        kind: SettingKind::Int { min: 0, max: 24 },
+        default: "3",
+        comment_zh: "Canvas 画廊图片融合的模糊半径(像素)。范围 0–24 整数。默认 3。",
+        hot: true,
+    },
+    SettingDef {
+        section: "ui",
+        key: "gallery_blend_strength",
+        kind: SettingKind::Int { min: 0, max: 100 },
+        default: "100",
+        comment_zh: "Canvas 画廊图片融合的强度(百分比)。范围 0–100 整数。默认 100。",
         hot: true,
     },
     SettingDef {
@@ -787,7 +786,7 @@ library / tools / folders / management。默认全部展开。",
             ids: SETTINGS_CARD_IDS,
         },
         default: "{\"aiModels\":true,\"backup\":true,\"common\":true,\"danger\":false,\
-\"debug\":true,\"enhanceModels\":true,\"faceModels\":true,\"galleryBehavior\":true,\
+\"debug\":true,\"enhanceModels\":true,\"experimental\":true,\"faceModels\":true,\"galleryBehavior\":true,\
 \"galleryTimeline\":false,\"general\":true,\"knownVolumes\":true,\"layout\":true,\
 \"modelLibrary\":true,\"networkStorage\":true,\"ocrModels\":true,\"reading\":true,\
 \"rootVisibility\":true,\"thumbnailCache\":true,\"thumbnailDisplay\":true,\"thumbnails\":true,\
@@ -944,8 +943,16 @@ similarity(按相似度,语义搜索场景)。",
         key: "thumb_strategy",
         kind: SettingKind::Enum(&["cpu", "gpu", "direct"]),
         default: "gpu",
-        comment_zh: "缩略图解码策略。可选:cpu(CPU 软解) / gpu(GPU 加速,首选) / direct(直接\
-显示原图,不生成缩略图)。默认 gpu。",
+        comment_zh: "缩略图解码策略。gpu=自动(Windows 系统原生优先),cpu=兼容(通用解码优先),\
+direct=直接显示原图；其它平台使用可用解码器。默认 gpu。",
+        hot: true,
+    },
+    SettingDef {
+        section: "thumbnails",
+        key: "gpu_engine",
+        kind: SettingKind::Enum(&["wic"]),
+        default: "wic",
+        comment_zh: "兼容既有配置的原生解码器标识。当前仅 wic(Windows Imaging Component)，普通静态图片使用 CPU 解码。",
         hot: true,
     },
     SettingDef {
@@ -980,62 +987,6 @@ similarity(按相似度,语义搜索场景)。",
         comment_zh: "缩略图缓存 LRU 预算(MB)。默认 10240(10GB)。⚠当前实现仅在应用启动时读取\
 一次用于后台清理任务,运行期修改本项需重启应用才会影响实际清理上限(设置页展示的当前上限\
 数值会实时刷新,但清理动作按启动时读到的值执行——发现的既有限制,非本次改动引入)。",
-        hot: false,
-    },
-    SettingDef {
-        section: "thumbnails",
-        key: "thumb_fast_threads",
-        kind: SettingKind::Int { min: 0, max: 64 },
-        default: "0",
-        comment_zh: "快速图片线程数。0 按 CPU 自动分配；1–64 手动指定。修改后重启应用生效。",
-        hot: false,
-    },
-    SettingDef {
-        section: "thumbnails",
-        key: "thumb_tail_threads",
-        kind: SettingKind::Int { min: 1, max: 16 },
-        default: "2",
-        comment_zh: "重型图片与补救线程数。大图、视频封面和失败补救共用，仍受像素工作集限制。修改后重启应用生效。",
-        hot: false,
-    },
-    SettingDef {
-        section: "thumbnails",
-        key: "thumb_gpu_inflight",
-        kind: SettingKind::Int { min: 1, max: 64 },
-        default: "2",
-        comment_zh: "GPU 总并发。宿主允许同时进入 GPU 路径的请求数。修改后重启应用生效。",
-        hot: false,
-    },
-    SettingDef {
-        section: "thumbnails",
-        key: "thumb_gpu_per_adapter",
-        kind: SettingKind::Int { min: 1, max: 64 },
-        default: "1",
-        comment_zh: "单显卡 JPEG 硬解并发。VPL 每张显卡的并发上限，同时受 GPU 总并发限制；D2D 共享上下文仍串行。修改后重启生效。",
-        hot: false,
-    },
-    SettingDef {
-        section: "thumbnails",
-        key: "thumb_process_memory_mb",
-        kind: SettingKind::Int { min: 128, max: 16384 },
-        default: "1024",
-        comment_zh: "缩略图单进程内存上限。每个缩略图处理进程的内存上限，包含解码、编码和驱动开销。修改后重启生效。",
-        hot: false,
-    },
-    SettingDef {
-        section: "thumbnails",
-        key: "thumb_total_memory_mb",
-        kind: SettingKind::Int { min: 128, max: 32768 },
-        default: "2048",
-        comment_zh: "缩略图进程总内存上限。快速与重型进程合计上限；实际值至少等于单进程上限。修改后重启生效。",
-        hot: false,
-    },
-    SettingDef {
-        section: "thumbnails",
-        key: "thumb_workset_mb",
-        kind: SettingKind::Int { min: 512, max: 16384 },
-        default: "1024",
-        comment_zh: "缩略图像素工作集额度。限制同时解码的像素内存预留。提高线程数时也需检查此额度和进程内存上限。修改后重启生效。",
         hot: false,
     },
     // ── viewer ──────────────────────────────────────────────────────────────
@@ -1602,7 +1553,7 @@ MAX_LOG_DIR_BYTES(config.toml 缺省时的回退值)。默认 512(512MB)。",
         comment_zh: "桌面窗口的几何记忆(TOML 内联表:窗口 label = 几何结构)。每个窗口的字段:\
 x / y(正常物理位置,副屏可为负)、width / height(正常物理尺寸,像素)、scaleFactor(保存时的\
 屏幕缩放)、maximized(是否最大化)。删除某个 label 即让该窗口下次启动回到默认位置与尺寸;\
-整表清空(或恢复默认设置)会恢复主窗口 1280×820 居中。移动端忽略本项。",
+整表清空(或恢复默认设置)会恢复主窗口 1280×820 居中。",
         // hot=true 的理由:本键的值由窗口模块自行按需读取并即时落位,不经过「启动期一次性读入」
         // 那条路径;而用户每拖动一次窗口都会提交本键,若标 false 就会在每次提交的
         // config-file-changed 载荷里塞进「需重启」,前端照着弹重启提示——那是假提示(窗口此刻

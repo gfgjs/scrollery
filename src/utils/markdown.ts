@@ -1,21 +1,7 @@
-// src/utils/markdown.ts
-// 轻量 Markdown → HTML 渲染（§5.1）。零依赖，覆盖常见语法即可（标题/粗斜体/行内码/代码块/
-// 列表/引用/链接/分割线/段落）。先做 HTML 转义再套用变换，避免 XSS。
-// Lightweight Markdown → HTML (§5.1). Dependency-free; covers common syntax. HTML is escaped
-// first, then markdown transforms applied, so raw input can't inject markup.
-
-/**
- * HTML 转义。**必须含引号** —— 本模块的产物里有两处**属性**上下文（代码块的 class="language-…"
- * 与链接的 href="…"），只转义 `& < >` 挡不住「用引号提前闭合属性、再补一个事件处理器」。
- *
- * 2026-07-16 安全审查实证（此前只转 & < >）：
- *   输入围栏 ```a"onmouseover="alert(1)
- *   产出     <pre><code class="language-a"onmouseover="alert(1)">…
- * 即一个 .md 文件即可把事件属性注入到渲染它的 iframe 里。链接那处同理，且**协议白名单挡不住**
- * ——注入发生在合法协议之后（[x](https://a"onmouseover="…)）。
- * 文本上下文里多转引号无害：`&quot;` / `&#39;` 在文本节点里照常渲染为 " 与 '。
- * 用 &#39; 而非 &apos;：后者不在 HTML4 命名实体表内，老解析器不认。
- */
+import { Lexer, type MarkedToken, type Token, type Tokens } from 'marked'
+import { decodeHTMLStrict } from 'entities/decode'
+import { getDocumentResourceBaseUrl } from './documentResourceUrl'
+import { parseMarkdownTable } from './markdownTable'
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -32,182 +18,176 @@ function codeBlockHtml(lang: string, code: string): string {
   return `<pre><code${cls}>${escapeHtml(code)}</code></pre>`
 }
 
-// 行内：代码 `x` > 粗 **x** > 斜 *x* > 链接 [t](u)。先处理行内码占位，避免其内部再被转义破坏。
-function renderInline(text: string): string {
-  let out = escapeHtml(text)
-  // 行内代码（先于其它，内部不再解析）
-  out = out.replace(/`([^`]+)`/g, (_m, c) => `<code>${c}</code>`)
-  // 粗体
-  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-  // 斜体（避开已消费的 **）
-  out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
-  // 链接 [text](url) —— 仅允许 http(s)/相对，禁止 javascript: 等协议
-  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_m, t, u) => {
-    const safe = /^(https?:\/\/|\/|#)/i.test(u) ? u : '#'
-    return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${t}</a>`
-  })
-  return out
+function safeResourceUrl(destination: string): boolean {
+  if (!destination.trim()) return false
+  try {
+    return ['http:', 'https:', 'asset:'].includes(new URL(destination, 'https://scrollery.invalid/').protocol)
+  } catch { return false }
 }
 
-/**
- * 单 `<p>` 断长跑双上限(2026-07-17 内存爆炸修复)。
- * 无空行的日志型文本会把上万行聚进一个 `<p>`(`<br>` join)——单块在 foliate paginated 的
- * CSS multicol 下横跨数百列,是「整文档 rect 查询 × fragmentainer 数」乘积放大的最坏形态
- * (实证:6.6MB log.md 单 `<p>` 9k+ 行,renderer 7.9GB + 主线程阻塞分钟级,见
- * docs/worklogs/2026-07-17-md阅读器巨型文档内存爆炸修复/findings.md 测量阶梯)。
- * 行数与字符**双上限**:只按行数切,长行日志(240 字符/行 × 200 行 ≈ 50K)仍会产出远超
- * section 预算(syntheticBook MD_SECTION_BUDGET_CHARS=24K)的单块,被迫独占超限片;
- * 6K 源字符 ≈ 数块拼一片,与预算对齐。对正常 markdown 段落双双无感。
- */
+function renderInlineTokens(tokens: Token[], resourceBase?: string, breakLines = false): string {
+  return tokens.map(rawToken => {
+    // 仅使用内建 Lexer，未注册自定义 token；未知块仍按字面文本显示。
+    const token = rawToken as MarkedToken
+    switch (token.type) {
+      case 'strong': case 'em': case 'del':
+        return `<${token.type}>${renderInlineTokens(token.tokens, resourceBase, breakLines)}</${token.type}>`
+      case 'codespan': return `<code>${escapeHtml(token.text)}</code>`
+      case 'br': return '<br>'
+      case 'link': {
+        const label = renderInlineTokens(token.tokens, resourceBase, breakLines)
+        const href = token.href.trim()
+        if (!href.trim() || (/^[a-z][a-z\d+.-]*:/i.test(href) && !/^https?:\/\//i.test(href)) || /^[\/\\?]/.test(href)) {
+          return `<a aria-disabled="true">${label}</a>`
+        }
+        // 相对文档链接保留原始引用，由宿主授权解析到库内身份，不能当合成书章节号。
+        if (!href.startsWith('#') && !/^https?:\/\//i.test(href)) {
+          return `<a href="${escapeHtml(href)}" data-document-link="">${label}</a>`
+        }
+        return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`
+      }
+      case 'image': {
+        // Vditor 粘贴位图使用内嵌 data URL；只允许位图 base64，链接和其他 data 内容仍不开放。
+        const embeddedBitmap = /^data:image\/(?:png|jpeg|gif|webp|bmp|avif);base64,[a-z0-9+/]+={0,2}$/i.test(token.href)
+        if (!embeddedBitmap && !safeResourceUrl(token.href)) return escapeHtml(token.text)
+        const src = resourceBase ? new URL(token.href, resourceBase).href : token.href
+        const title = token.title ? ` title="${escapeHtml(token.title)}"` : ''
+        return `<img src="${escapeHtml(src)}" alt="${escapeHtml(token.text)}"${title}>`
+      }
+      case 'text': case 'escape': {
+        // 普通 Markdown 正文的分号实体只解码一次，再统一转义；代码和反斜线转义仍按字面显示。
+        const text = escapeHtml(token.type === 'text' ? decodeHTMLStrict(token.text) : token.text)
+        return breakLines ? text.replace(/\n/g, '<br>') : text
+      }
+      default: return escapeHtml(token.raw)
+    }
+  }).join('')
+}
+
 const MAX_PARA_LINES = 200
-const MAX_PARA_CHARS = 6_000
+const MAX_PARA_CHARS = 6000
 
 /**
- * 渲染为**块级 HTML 数组**(一项 = 一个自包含块:`<p>`/`<pre>`/`<ul>`/`<h1>`…)。
- * 供 SyntheticBook 按块边界分片成多 section(阅读器 section 大小是硬约束,单 section 过大
- * 会触发 multicol 布局灾难);`renderMarkdown` = join,两者产物字节一致。
+ * Markdown 先整体块词法分析，令引用定义、容器和围栏共享同一文档上下文。
+ * HTML 仅由白名单生成；段落在行边界按 200 行/6K 源字符切块，供既有 24K section 分组。
+ * 单行和不可拆容器仍整体输出，超大 section 沿用阅读器的 256K 强制滚动护栏。
  */
-export function renderMarkdownBlocks(src: string): string[] {
-  const lines = src.replace(/\r\n?/g, '\n').split('\n')
-  const html: string[] = []
-  let inCode = false
-  let codeLang = ''
-  let codeBuf: string[] = []
-  let listType: 'ul' | 'ol' | null = null
-  let listBuf: string[] = []
-  let paraBuf: string[] = []
-
-  const flushPara = () => {
-    if (paraBuf.length) {
-      // 断长跑:行数/字符双上限切 `<p>`,防单块无界(见常量注释)。字符按源行长累计
-      // (HTML 转义放大同量级,近似足够;单行超限自成一块,交 section 层护栏兜底)。
-      let chunk: string[] = []
-      let chars = 0
-      const flushChunk = () => {
-        if (chunk.length) {
-          html.push(`<p>${chunk.map(renderInline).join('<br>')}</p>`)
-          chunk = []
-          chars = 0
+export function renderMarkdownBlocks(src: string, options?: {
+  documentUrl?: string
+  /** 可选输出：各 HTML 块在 LF 规范化源码中的 UTF-16 起点，与返回块数组一一对应。 */
+  sourceOffsets?: number[]
+}): string[] {
+  const source = src.replace(/\r\n?/g, '\n')
+  const sourceOffsets = options?.sourceOffsets
+  if (sourceOffsets) sourceOffsets.length = 0
+  const tokenOffsets = new Map<Token, number>()
+  let recordedTokens = 0, pendingOffset = 0
+  const recordTokens = () => {
+    for (; recordedTokens < lexer.tokens.length; recordedTokens++) {
+      tokenOffsets.set(lexer.tokens[recordedTokens], pendingOffset)
+    }
+  }
+  const lexer = new Lexer({
+    gfm: true,
+    ...(sourceOffsets ? { extensions: { renderers: {}, childTokens: {}, block: [(remaining, currentTokens) => {
+      if (currentTokens === lexer.tokens) {
+        // 上轮 token 已产出；无 token 的重复定义也会消耗原文，不能只累计 token.raw。
+        recordTokens()
+        pendingOffset = source.length - remaining.length
+      }
+      return undefined
+    }] } } : {}),
+  })
+  const tokens = lexer.blockTokens(source, lexer.tokens)
+  if (sourceOffsets) recordTokens()
+  // 避免先对巨段整段分析行内语法，再在安全分块后重复解析；定义表已由块词法器收齐。
+  lexer.inlineQueue = []
+  const base = options?.documentUrl ? getDocumentResourceBaseUrl(options.documentUrl) : undefined
+  const inline = (text: string, breakLines = false) => renderInlineTokens(lexer.inlineTokens(text), base, breakLines)
+  const paragraph = (token: Tokens.Paragraph | Tokens.Text, wrap = true, prefix = '', breakLines = true, sourceStart?: number): string[] => {
+    const lines = token.text.split('\n')
+    if (lines.length <= MAX_PARA_LINES && token.text.length <= MAX_PARA_CHARS) {
+      const content = prefix + renderInlineTokens(token.tokens?.length ? token.tokens : lexer.inlineTokens(token.text), base, breakLines)
+      if (sourceStart !== undefined) sourceOffsets?.push(sourceStart)
+      return [wrap ? `<p>${content}</p>` : content]
+    }
+    const chunks: string[] = []
+    let buf: string[] = [], chars = 0, firstLine = 0
+    const rawLineOffsets = [0]
+    if (sourceStart !== undefined) {
+      for (let i = 0; i < token.raw.length; i++) if (token.raw[i] === '\n') rawLineOffsets.push(i + 1)
+    }
+    const flush = () => {
+      if (!buf.length) return
+      const content = prefix + inline(buf.join('\n'), breakLines)
+      prefix = ''
+      chunks.push(wrap ? `<p>${content}</p>` : content)
+      // 行内语法和缩进可能改变显示长度；分块起点只沿 token 原始行界推进。
+      if (sourceStart !== undefined) sourceOffsets?.push(sourceStart + rawLineOffsets[firstLine])
+      buf = []; chars = 0
+    }
+    for (const [lineIndex, line] of lines.entries()) {
+      if (buf.length && (buf.length >= MAX_PARA_LINES || chars + line.length > MAX_PARA_CHARS)) flush()
+      if (!buf.length) firstLine = lineIndex
+      buf.push(line); chars += line.length
+    }
+    flush()
+    return chunks
+  }
+  const renderList = (list: Tokens.List): string => {
+    const tag = list.ordered ? 'ol' : 'ul'
+    return `<${tag}${list.ordered && list.start !== 1 ? ` start="${list.start}"` : ''}>` + list.items.map(item => {
+      let prefix = item.task ? `<input type="checkbox" disabled${item.checked ? ' checked' : ''}> ` : ''
+      const content = item.tokens.flatMap(raw => {
+        const token = raw as MarkedToken
+        if (token.type === 'checkbox' || token.type === 'space') return []
+        if (token.type === 'text' || token.type === 'paragraph') {
+          const chunks = paragraph(token, list.loose || token.type === 'paragraph', prefix, false)
+          prefix = ''
+          return chunks
         }
+        const html = prefix + block(token).join('\n')
+        prefix = ''
+        return [html]
+      }).join('')
+      return `<li${item.task ? ' class="sate-md-task-item"' : ''}>${content}${prefix}</li>`
+    }).join('') + `</${tag}>`
+  }
+  const block = (token: MarkedToken): string[] => {
+    switch (token.type) {
+      case 'space': case 'def': return []
+      case 'heading': return [`<h${token.depth}>${renderInlineTokens(lexer.inlineTokens(token.text), base)}</h${token.depth}>`]
+      case 'paragraph': case 'text': return paragraph(token)
+      case 'hr': return ['<hr>']
+      case 'code': return [codeBlockHtml((token.lang ?? '').split(/\s+/)[0], token.text)]
+      case 'blockquote': return [`<blockquote>${token.tokens.flatMap(child => block(child as MarkedToken)).join('\n')}</blockquote>`]
+      case 'list': return [renderList(token)]
+      case 'table': {
+        // 已识别表格仍保留代码内容中的竖线；直接消费 GFM cells 会把未转义的代码竖线拆列。
+        const result = parseMarkdownTable(token.raw.split('\n'), 0, inline)
+        return result ? [result.html] : [`<p>${escapeHtml(token.raw).replace(/\n/g, '<br>')}</p>`]
       }
-      for (const line of paraBuf) {
-        if (chunk.length && (chunk.length >= MAX_PARA_LINES || chars + line.length > MAX_PARA_CHARS)) {
-          flushChunk()
-        }
-        chunk.push(line)
-        chars += line.length
-      }
-      flushChunk()
-      paraBuf = []
+      default: return [`<p>${escapeHtml(token.raw).replace(/\n/g, '<br>')}</p>`]
     }
   }
-  // 列表整体收成**一个**块(项间 \n 连接,与旧「逐项 push 后统一 join」字节一致),
-  // 使块数组的每一项都自包含 —— 分片时不会把 <ul> 与 </ul> 切进不同 section。
-  const closeList = () => {
-    if (listType) {
-      html.push([`<${listType}>`, ...listBuf, `</${listType}>`].join('\n'))
-      listBuf = []
-      listType = null
+  return tokens.flatMap(rawToken => {
+    const token = rawToken as MarkedToken
+    const offset = tokenOffsets.get(token)
+    if (sourceOffsets && (token.type === 'paragraph' || token.type === 'text')) {
+      return paragraph(token, true, '', true, offset)
     }
-  }
-
-  for (const raw of lines) {
-    // 代码块围栏 ```（可带语言：```js / ```python）
-    if (/^```/.test(raw.trim())) {
-      if (inCode) {
-        html.push(codeBlockHtml(codeLang, codeBuf.join('\n')))
-        codeBuf = []
-        inCode = false
-        codeLang = ''
-      } else {
-        flushPara()
-        closeList()
-        inCode = true
-        // 围栏后首个 token 为语言标识（语法高亮插件位，R4）；无则留空不高亮。
-        codeLang = raw.trim().slice(3).trim().split(/\s+/)[0] ?? ''
-      }
-      continue
-    }
-    if (inCode) {
-      codeBuf.push(raw)
-      continue
-    }
-
-    const line = raw.trimEnd()
-
-    // 空行：段落/列表分隔
-    if (!line.trim()) {
-      flushPara()
-      closeList()
-      continue
-    }
-
-    // 标题 # … ######
-    const h = /^(#{1,6})\s+(.*)$/.exec(line)
-    if (h) {
-      flushPara()
-      closeList()
-      const level = h[1].length
-      html.push(`<h${level}>${renderInline(h[2])}</h${level}>`)
-      continue
-    }
-
-    // 分割线
-    if (/^(\*\*\*|---|___)\s*$/.test(line)) {
-      flushPara()
-      closeList()
-      html.push('<hr>')
-      continue
-    }
-
-    // 引用 >
-    if (/^>\s?/.test(line)) {
-      flushPara()
-      closeList()
-      html.push(`<blockquote>${renderInline(line.replace(/^>\s?/, ''))}</blockquote>`)
-      continue
-    }
-
-    // 无序列表 - * +
-    const ul = /^[-*+]\s+(.*)$/.exec(line)
-    if (ul) {
-      flushPara()
-      if (listType !== 'ul') {
-        closeList()
-        listType = 'ul'
-      }
-      listBuf.push(`<li>${renderInline(ul[1])}</li>`)
-      continue
-    }
-
-    // 有序列表 1. 2. …
-    const ol = /^\d+\.\s+(.*)$/.exec(line)
-    if (ol) {
-      flushPara()
-      if (listType !== 'ol') {
-        closeList()
-        listType = 'ol'
-      }
-      listBuf.push(`<li>${renderInline(ol[1])}</li>`)
-      continue
-    }
-
-    // 普通段落行
-    closeList()
-    paraBuf.push(line)
-  }
-
-  if (inCode) html.push(codeBlockHtml(codeLang, codeBuf.join('\n')))
-  flushPara()
-  closeList()
-  return html
+    const rendered = block(token)
+    if (sourceOffsets) for (const _html of rendered) sourceOffsets.push(offset ?? -1)
+    return rendered
+  })
 }
 
+/** 渲染安全 Markdown HTML；按块分片的阅读器使用 renderMarkdownBlocks。 */
 export function renderMarkdown(src: string): string {
   return renderMarkdownBlocks(src).join('\n')
 }
 
-/// 纯文本 → 安全的预格式化 HTML（保留空白）。
+/** 纯文本保留空白，并转义所有 HTML 和属性特殊字符。 */
 export function renderPlainText(src: string): string {
   return `<pre class="doc-plain">${escapeHtml(src.replace(/\r\n?/g, '\n'))}</pre>`
 }

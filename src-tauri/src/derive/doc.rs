@@ -42,10 +42,10 @@ pub fn run_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
 
     // 2) 解码为 RGBA → 复用缩略图编码器（缩放 → WebP → 写入缓存 by cache_key → thumbhash），
     //    与视频封面（derive/video.rs::run_cover）完全同构，使 MediaThumb 零改动显示。
-    let dynimg =
-        crate::engine::image_rs::decode_image_bytes_bounded(&img_bytes, ctx.max_pixel_bytes)?;
-    let rgba = dynimg.into_rgba8();
-    drop(img_bytes);
+    let dynimg = image::load_from_memory(&img_bytes).map_err(|e| {
+        AppError::Internal(format!("epub cover decode failed | epub 封面解码失败: {e}"))
+    })?;
+    let rgba = dynimg.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
     let decoded = crate::engine::traits::DecodedImage {
         pixels: rgba.into_raw(),
@@ -59,10 +59,10 @@ pub fn run_thumb(ctx: &DerivationContext) -> Result<DerivationOutput> {
         size: snap_to_tier(ctx.thumb_size),
         skip_max_bytes: 0,
         strategy: String::new(),
+        gpu_engine: String::new(),
         ai_hq_cache: false, // 文档封面非 CLIP 分析对象，不产 AI 缓存
         webp_quality: ctx.webp_quality,
         ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
-        output_fingerprint: None,
     };
     let res = encode_media_step_with_snapshot(
         ctx.item_id,

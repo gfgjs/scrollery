@@ -1,391 +1,319 @@
-//! 原生缩略图子进程的有界 stdio 协议；请求不携带可自行选取的输出路径。
-
-use std::io::{self, Read, Write};
+//! 图片隔离域协议：仅授权句柄进入，编码字节返回；帧和产物长度均有上限。
 
 use serde::{Deserialize, Serialize};
+use std::io::{self, Read, Write};
 
-use super::generator::{EncodedThumbPayload, ENCODE_STAGE_COUNT, MAX_ENCODED_ARTIFACT_BYTES};
+pub(crate) const HELLO: [u8; 8] = *b"SCIM0004";
+pub(crate) const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 4096;
 
-pub const WORKER_HELLO: [u8; 4] = *b"NTHH";
-/// 后台发现软件回退时先转入尾批；视口沿用自动路由。
+/// 旧配置值保留；协议明确表达解码器顺序，避免 worker 忽略用户策略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NativeImageRoute {
-    Automatic,
-    DeferImageRs,
-    ImageRsOnly,
+pub(crate) enum NativeDecodePolicy {
+    NativeFirst,
+    ImageRsFirst,
 }
 
-/// 仅表示调度延期，不计为解码失败。
-pub const IMAGE_RS_DEFERRED: u8 = 7;
-/// 两份最终产物及小型任务数据的预留；剩余工作集供解码/变换的同时存活缓冲共享。
-pub const RESULT_RESERVATION_BYTES: u64 = 36 * 1024 * 1024;
-/// 小图编码工作集；与普通图片的最低预留共用，允许和一项 432 MiB 解码并存。
-pub const ENCODING_RESERVATION_BYTES: u64 = 80 * 1024 * 1024;
-
-/// 从宿主已持有的工作集折算单像素缓冲上限，留出四份同时存活的缓冲空间。
-pub fn pixel_limit_for_reservation(bytes: u64) -> u64 {
-    (bytes.saturating_sub(RESULT_RESERVATION_BYTES) / 4).min(128 * 1024 * 1024)
-}
-const MAX_REQUEST_BYTES: usize = 4096;
-const MAX_HASH_BYTES: usize = 1024;
-const MAX_STAGE_US: u64 = 60_000_000;
-
-#[derive(Serialize, Deserialize)]
-pub enum NativeKind {
-    Image,
-    VideoCover,
+impl NativeDecodePolicy {
+    pub(crate) fn from_strategy(strategy: &str) -> Self {
+        if strategy == "cpu" {
+            Self::ImageRsFirst
+        } else {
+            Self::NativeFirst
+        }
+    }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct NativeRequest {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct NativeRequest {
     pub id: u64,
-    /// `DuplicateHandle` 复制到子进程后的句柄值，子进程独占并关闭。
     pub file_handle: u64,
-    pub kind: NativeKind,
-    pub image_route: NativeImageRoute,
     pub format: String,
-    pub codec_hint: Option<String>,
-    /// 图片允许 GPU 变换；视频允许硬件会话。false 时视频不枚举或绑定 D3D 设备。
-    pub prefer_gpu: bool,
-    /// 原始 GPU 策略，仅控制会话保留；准入失败不改变快捷路径与 CPU 后端。
-    pub gpu_policy: bool,
-    pub decode_long_edge: u32,
-    /// 宿主根据已取得的共享工作集发放；worker 按真实尺寸检查，不信任数据库尺寸。
-    pub max_pixel_bytes: u64,
+    pub decode_policy: NativeDecodePolicy,
     pub output_size: u32,
+    pub decode_long_edge: u32,
     pub webp_quality: u8,
     pub ai_cache_short_edge: u32,
-    pub emit_ai_cache: bool,
-    pub qos_foreground: bool,
-    pub qos_revision: u64,
+    pub emit_ai: bool,
+    pub emit_display: bool,
+    /// 调用方按本次产物尺寸估算的编码载荷上界；宿主读取载荷前核验。
+    pub max_encoded_bytes: u64,
+    pub max_pixel_bytes: u64,
+    pub foreground: bool,
 }
 
-/// 子进程确认的实际处理后端；VideoMfHardwareMft 表示确认硬件 MFT，VideoMf 的加速程度未知。
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[repr(u8)]
-pub enum NativeBackend {
-    EmbeddedJpeg = 1,
-    ImageD2d = 2,
-    ImageWic = 3,
-    ImageRs = 4,
-    VideoMf = 5,
-    VideoMfHardwareMft = 6,
-    /// VPL 的 JPEG decode 与同设备 VPP 全部无警告成功。
-    ImageVpl = 7,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NativeFailure {
+    Content,
+    Unsupported,
+    Resource,
+    Unavailable,
+    Cancelled,
 }
 
-impl NativeBackend {
-    fn from_byte(value: u8) -> io::Result<Self> {
-        match value {
-            1 => Ok(Self::EmbeddedJpeg),
-            2 => Ok(Self::ImageD2d),
-            3 => Ok(Self::ImageWic),
-            4 => Ok(Self::ImageRs),
-            5 => Ok(Self::VideoMf),
-            6 => Ok(Self::VideoMfHardwareMft),
-            7 => Ok(Self::ImageVpl),
-            _ => Err(invalid_data("invalid native thumbnail backend")),
-        }
-    }
-}
-
-/// 随有界结果回传的设备标识；D2D 是实际变换设备，MF 是候选设备，后端枚举区分确认程度。
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeExecution {
-    pub backend: NativeBackend,
-    pub vendor_id: u32,
-    pub device_id: u32,
-    pub luid_high: i32,
-    pub luid_low: u32,
-    pub adapter_kind: NativeAdapterKind,
-}
-
-/// 操作系统报告的实际图像设备类型；查询不可用或仅有候选设备时保持未知。
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[repr(u8)]
-pub enum NativeAdapterKind {
-    #[default]
-    Unknown = 0,
-    Integrated = 1,
-    Discrete = 2,
-}
-
-impl NativeExecution {
-    /// 构造没有已确认图像 GPU 变换的处理结果。
-    pub fn cpu(backend: NativeBackend) -> Self {
-        Self {
-            backend,
-            vendor_id: 0,
-            device_id: 0,
-            luid_high: 0,
-            luid_low: 0,
-            adapter_kind: NativeAdapterKind::Unknown,
-        }
-    }
-
-    /// 在隔离 worker 内补全实际图像设备类型；MF 候选不提升为已确认设备。
-    #[cfg(windows)]
-    pub fn resolve_adapter_kind(&mut self) {
-        if matches!(
-            self.backend,
-            NativeBackend::ImageD2d | NativeBackend::ImageVpl
-        ) {
-            self.adapter_kind = super::native_adapter::classify(self.luid_high, self.luid_low);
-        }
-    }
-}
-
-/// 子进程内阶段耗时（微秒）。0 表示该阶段不适用；解码接口内部不可拆分时合并计时。
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NativeTimings {
-    pub decode_transform_us: u64,
-    pub encode_hash_us: u64,
-    pub embedded_jpeg_combined_us: u64,
-    /// encode_hash_us 的互斥子阶段，顺序见 ENCODE_STAGE_COUNT；嵌入 JPEG 路径均为零。
-    pub encode_stages_us: [u64; ENCODE_STAGE_COUNT],
-}
-
-/// 原生处理线程对本次 QoS revision 的应答；仅 attempted 表示本次实际调用了系统接口。
-#[derive(Clone, Copy, Debug)]
-pub struct NativeQosAck {
-    pub worker_slot: u8,
-    pub sequence: u64,
-    pub revision: u64,
-    pub applied: bool,
-    pub attempted: bool,
-}
-
-/// 顺序为 GPU、源读取；小图可在变换结束后追加编码就绪，再发送最终回包。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeStage {
-    GpuDone = 1,
-    SourceDone = 2,
-    /// 已释放解码/变换大缓冲，剩余编码工作集不超过 ENCODING_RESERVATION_BYTES。
-    EncodingReady = 3,
-}
-
-pub enum NativeResponse {
-    Stage {
+// 完成事件沿现有队列按值移交，避免每张图片因可选度量再增加一次堆分配。
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) enum NativeEvent {
+    /// CopyPixels/软件解码完成，worker 已关闭源句柄并移交小图。
+    Decoded { id: u64 },
+    Finished {
         id: u64,
-        stage: NativeStage,
-    },
-    Ok {
-        id: u64,
-        payload: EncodedThumbPayload,
-        execution: NativeExecution,
-        timings: NativeTimings,
-        qos: NativeQosAck,
-    },
-    Failed {
-        id: u64,
-        code: u8,
-        qos: NativeQosAck,
+        failure: Option<NativeFailure>,
+        backend: String,
+        decode_us: u64,
+        encode_us: u64,
+        display_len: usize,
+        ai_len: usize,
+        thumbhash: Option<Vec<u8>>,
+        #[serde(default)]
+        stats: NativeStats,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpu: Option<NativeGpuMetrics>,
     },
 }
 
-fn invalid_data(message: &'static str) -> io::Error {
+/// GPU 实验的解码子阶段及一次性设备初始化；硬件时间戳缺失时保留 None。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct NativeGpuMetrics {
+    pub cpu_planar_us: u64,
+    pub queue_us: u64,
+    pub upload_us: u64,
+    pub gpu_us: Option<u64>,
+    pub readback_us: u64,
+    pub completion_wait_us: u64,
+    pub init_us: u64,
+    pub adapter: Option<String>,
+    pub fallback: Option<String>,
+    pub reserved_peak_bytes: u64,
+    pub usage_peak_bytes: u64,
+    pub budget_bytes: u64,
+}
+
+/// 当前执行域的累计峰值；宿主跨域取最大值，不能对不同阶段峰值求和冒充同时占用。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct NativeStats {
+    pub decode_active_peak: u64,
+    pub encode_active_peak: u64,
+    pub decoded_queue_peak: u64,
+    pub working_bytes_peak: u64,
+    pub encoded_bytes_peak: u64,
+}
+
+impl NativeStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.decode_active_peak = self.decode_active_peak.max(other.decode_active_peak);
+        self.encode_active_peak = self.encode_active_peak.max(other.encode_active_peak);
+        self.decoded_queue_peak = self.decoded_queue_peak.max(other.decoded_queue_peak);
+        self.working_bytes_peak = self.working_bytes_peak.max(other.working_bytes_peak);
+        self.encoded_bytes_peak = self.encoded_bytes_peak.max(other.encoded_bytes_peak);
+    }
+}
+
+pub(crate) struct NativeReply {
+    pub event: NativeEvent,
+    pub display: Vec<u8>,
+    pub ai: Vec<u8>,
+}
+
+pub(crate) fn write_request(out: &mut impl Write, request: &NativeRequest) -> io::Result<()> {
+    write_header(out, request)
+}
+
+pub(crate) fn read_request(input: &mut impl Read) -> io::Result<NativeRequest> {
+    let request: NativeRequest = read_header(input)?;
+    if request.file_handle == 0
+        || request.format.len() > 32
+        || request.output_size == 0
+        || request.output_size > 1024
+        || request.decode_long_edge < request.output_size
+        || request.ai_cache_short_edge == 0
+        || !(1..=100).contains(&request.webp_quality)
+        || request.max_pixel_bytes == 0
+        || request.max_encoded_bytes > MAX_ARTIFACT_BYTES as u64
+        || ((request.emit_display || request.emit_ai) && request.max_encoded_bytes == 0)
+    {
+        return Err(invalid("invalid image request"));
+    }
+    Ok(request)
+}
+
+pub(crate) fn write_reply(out: &mut impl Write, reply: &NativeReply) -> io::Result<()> {
+    validate(&reply.event, reply.display.len(), reply.ai.len())?;
+    write_header(out, &reply.event)?;
+    out.write_all(&reply.display)?;
+    out.write_all(&reply.ai)?;
+    out.flush()
+}
+
+#[cfg(test)]
+pub(crate) fn read_reply(input: &mut impl Read) -> io::Result<NativeReply> {
+    read_reply_with_limit(input, |_| Ok(MAX_ARTIFACT_BYTES))
+}
+
+/// 先解析有界小头，再按可信 pending 解析本请求上界；禁止先分配载荷再查额度。
+pub(crate) fn read_reply_with_limit(
+    input: &mut impl Read,
+    mut resolve_limit: impl FnMut(&NativeEvent) -> io::Result<usize>,
+) -> io::Result<NativeReply> {
+    let event: NativeEvent = read_header(input)?;
+    let (display_len, ai_len) = match &event {
+        NativeEvent::Decoded { .. } => (0, 0),
+        NativeEvent::Finished {
+            display_len,
+            ai_len,
+            ..
+        } => (*display_len, *ai_len),
+    };
+    validate(&event, display_len, ai_len)?;
+    let limit = resolve_limit(&event)?;
+    if display_len.saturating_add(ai_len) > limit {
+        return Err(invalid("image result exceeds request byte limit"));
+    }
+    let mut display = vec![0; display_len];
+    let mut ai = vec![0; ai_len];
+    input.read_exact(&mut display)?;
+    input.read_exact(&mut ai)?;
+    Ok(NativeReply { event, display, ai })
+}
+
+fn validate(event: &NativeEvent, display_len: usize, ai_len: usize) -> io::Result<()> {
+    if display_len.saturating_add(ai_len) > MAX_ARTIFACT_BYTES {
+        return Err(invalid("image result exceeds byte limit"));
+    }
+    match event {
+        NativeEvent::Decoded { .. } if display_len != 0 || ai_len != 0 => {
+            Err(invalid("invalid stage payload"))
+        }
+        NativeEvent::Finished {
+            display_len: expected_display,
+            ai_len: expected_ai,
+            thumbhash,
+            failure,
+            ..
+        } if *expected_display != display_len
+            || *expected_ai != ai_len
+            || thumbhash.as_ref().is_some_and(|hash| hash.len() > 128)
+            || (failure.is_some() && (display_len != 0 || ai_len != 0)) =>
+        {
+            Err(invalid("invalid image result"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn write_header(out: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if bytes.is_empty() || bytes.len() > MAX_HEADER_BYTES {
+        return Err(invalid("image header too large"));
+    }
+    out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    out.write_all(&bytes)?;
+    out.flush()
+}
+
+fn read_header<T: serde::de::DeserializeOwned>(input: &mut impl Read) -> io::Result<T> {
+    let mut length = [0; 4];
+    input.read_exact(&mut length)?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length == 0 || length > MAX_HEADER_BYTES {
+        return Err(invalid("invalid image header length"));
+    }
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-pub fn write_request(mut writer: impl Write, request: &NativeRequest) -> io::Result<()> {
-    let json = serde_json::to_vec(request).map_err(io::Error::other)?;
-    if json.len() > MAX_REQUEST_BYTES {
-        return Err(invalid_data("native thumbnail request exceeds limit"));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn untrusted_lengths_are_rejected_before_pixel_allocation() {
+        assert!(read_reply(&mut u32::MAX.to_le_bytes().as_slice()).is_err());
+        let mut wire = Vec::new();
+        write_header(
+            &mut wire,
+            &NativeEvent::Finished {
+                id: 1,
+                failure: None,
+                backend: "wic".into(),
+                decode_us: 0,
+                encode_us: 0,
+                display_len: MAX_ARTIFACT_BYTES + 1,
+                ai_len: 0,
+                thumbhash: None,
+                stats: Default::default(),
+                gpu: None,
+            },
+        )
+        .unwrap();
+        assert!(read_reply(&mut wire.as_slice()).is_err());
     }
-    writer.write_all(&(json.len() as u32).to_le_bytes())?;
-    writer.write_all(&json)?;
-    writer.flush()
-}
-
-pub fn read_request(mut reader: impl Read) -> io::Result<Option<NativeRequest>> {
-    let mut length = [0u8; 4];
-    if reader.read(&mut length[..1])? == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut length[1..])?;
-    let length = u32::from_le_bytes(length) as usize;
-    if length == 0 || length > MAX_REQUEST_BYTES {
-        return Err(invalid_data("invalid native thumbnail request length"));
-    }
-    let mut json = vec![0; length];
-    reader.read_exact(&mut json)?;
-    serde_json::from_slice(&json)
-        .map(Some)
-        .map_err(|_| invalid_data("invalid native thumbnail request"))
-}
-
-pub fn write_response(mut writer: impl Write, response: &NativeResponse) -> io::Result<()> {
-    match response {
-        NativeResponse::Stage { id, stage } => {
-            writer.write_all(&[250])?;
-            writer.write_all(&id.to_le_bytes())?;
-            writer.write_all(&[*stage as u8])?;
-        }
-        NativeResponse::Ok {
-            id,
-            payload,
-            execution,
-            timings,
-            qos,
-        } => {
-            let hash = payload.thumbhash.as_deref().unwrap_or_default();
-            let ai = payload.ai_cache.as_deref().unwrap_or_default();
-            if payload.webp.len() > MAX_ENCODED_ARTIFACT_BYTES
-                || ai.len() > MAX_ENCODED_ARTIFACT_BYTES
-                || hash.len() > MAX_HASH_BYTES
-            {
-                return Err(invalid_data("native thumbnail response exceeds limit"));
-            }
-            writer.write_all(&[0])?;
-            writer.write_all(&id.to_le_bytes())?;
-            writer.write_all(&qos.revision.to_le_bytes())?;
-            writer.write_all(&[u8::from(qos.applied) | (u8::from(qos.attempted) << 1)])?;
-            writer.write_all(&[qos.worker_slot])?;
-            writer.write_all(&qos.sequence.to_le_bytes())?;
-            writer.write_all(&[execution.backend as u8])?;
-            writer.write_all(&execution.vendor_id.to_le_bytes())?;
-            writer.write_all(&execution.device_id.to_le_bytes())?;
-            writer.write_all(&execution.luid_high.to_le_bytes())?;
-            writer.write_all(&execution.luid_low.to_le_bytes())?;
-            writer.write_all(&[execution.adapter_kind as u8])?;
-            writer.write_all(&timings.decode_transform_us.to_le_bytes())?;
-            writer.write_all(&timings.encode_hash_us.to_le_bytes())?;
-            writer.write_all(&timings.embedded_jpeg_combined_us.to_le_bytes())?;
-            for elapsed in timings.encode_stages_us {
-                writer.write_all(&elapsed.to_le_bytes())?;
-            }
-            writer.write_all(&(payload.webp.len() as u32).to_le_bytes())?;
-            writer.write_all(&(hash.len() as u16).to_le_bytes())?;
-            writer.write_all(&(ai.len() as u32).to_le_bytes())?;
-            writer.write_all(&payload.webp)?;
-            writer.write_all(hash)?;
-            writer.write_all(ai)?;
-        }
-        NativeResponse::Failed { id, code, qos } => {
-            writer.write_all(&[*code])?;
-            writer.write_all(&id.to_le_bytes())?;
-            writer.write_all(&qos.revision.to_le_bytes())?;
-            writer.write_all(&[u8::from(qos.applied) | (u8::from(qos.attempted) << 1)])?;
-            writer.write_all(&[qos.worker_slot])?;
-            writer.write_all(&qos.sequence.to_le_bytes())?;
-        }
-    }
-    writer.flush()
-}
-
-pub fn read_response(mut reader: impl Read) -> io::Result<NativeResponse> {
-    let mut status = [0u8; 1];
-    reader.read_exact(&mut status)?;
-    let mut id = [0u8; 8];
-    reader.read_exact(&mut id)?;
-    let id = u64::from_le_bytes(id);
-    if status[0] == 250 {
-        let mut stage = [0u8; 1];
-        reader.read_exact(&mut stage)?;
-        let stage = match stage[0] {
-            1 => NativeStage::GpuDone,
-            2 => NativeStage::SourceDone,
-            3 => NativeStage::EncodingReady,
-            _ => return Err(invalid_data("invalid native stage")),
-        };
-        return Ok(NativeResponse::Stage { id, stage });
-    }
-    let mut qos_bytes = [0u8; 18];
-    reader.read_exact(&mut qos_bytes)?;
-    // 线协议只要求非零槽号；实际进程容量由宿主 record_qos_receipt 校验，不能固化旧线程上限。
-    if qos_bytes[8] > 3 || qos_bytes[9] == 0 {
-        return Err(invalid_data("invalid native thumbnail QoS acknowledgement"));
-    }
-    let qos = NativeQosAck {
-        worker_slot: qos_bytes[9],
-        sequence: u64::from_le_bytes(qos_bytes[10..18].try_into().unwrap()),
-        revision: u64::from_le_bytes(qos_bytes[0..8].try_into().unwrap()),
-        applied: qos_bytes[8] & 1 != 0,
-        attempted: qos_bytes[8] & 2 != 0,
-    };
-    if qos.sequence == 0 {
-        return Err(invalid_data("invalid native thumbnail QoS sequence"));
-    }
-    if status[0] != 0 {
-        return Ok(NativeResponse::Failed {
-            id,
-            code: status[0],
-            qos,
+    #[test]
+    fn trusted_request_limit_and_unknown_id_reject_before_reading_payload() {
+        let mut wire = Vec::new();
+        write_reply(
+            &mut wire,
+            &NativeReply {
+                event: NativeEvent::Finished {
+                    id: 7,
+                    failure: None,
+                    backend: "wic".into(),
+                    decode_us: 0,
+                    encode_us: 0,
+                    display_len: 3,
+                    ai_len: 2,
+                    thumbhash: None,
+                    stats: Default::default(),
+                    gpu: Some(NativeGpuMetrics {
+                        cpu_planar_us: 3,
+                        gpu_us: Some(5),
+                        adapter: Some("adapter".into()),
+                        ..Default::default()
+                    }),
+                },
+                display: vec![1, 2, 3],
+                ai: vec![4, 5],
+            },
+        )
+        .unwrap();
+        let header_end = 4 + u32::from_le_bytes(wire[..4].try_into().unwrap()) as u64;
+        let mut input = std::io::Cursor::new(&wire);
+        let result = read_reply_with_limit(&mut input, |event| {
+            assert!(matches!(event, NativeEvent::Finished { id: 7, .. }));
+            Ok(4)
         });
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(input.position(), header_end);
+        input.set_position(0);
+        assert!(read_reply_with_limit(&mut input, |_| Err(invalid("unknown request"))).is_err());
+        assert_eq!(input.position(), header_end);
+        input.set_position(0);
+        let reply = read_reply_with_limit(&mut input, |_| Ok(5)).unwrap();
+        assert_eq!(reply.display, [1, 2, 3]);
+        assert_eq!(reply.ai, [4, 5]);
+        match reply.event {
+            NativeEvent::Finished { gpu: Some(gpu), .. } => {
+                assert_eq!(gpu.cpu_planar_us, 3);
+                assert_eq!(gpu.gpu_us, Some(5));
+                assert_eq!(gpu.adapter.as_deref(), Some("adapter"));
+                assert_eq!(gpu.completion_wait_us, 0);
+            }
+            _ => panic!("GPU metrics missing from finished reply"),
+        }
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&wire[4..header_end as usize]).unwrap();
+        legacy["Finished"].as_object_mut().unwrap().remove("gpu");
+        let mut legacy_wire = Vec::new();
+        write_header(&mut legacy_wire, &legacy).unwrap();
+        legacy_wire.extend_from_slice(&[1, 2, 3, 4, 5]);
+        assert!(matches!(
+            read_reply(&mut legacy_wire.as_slice()).unwrap().event,
+            NativeEvent::Finished { gpu: None, .. }
+        ));
     }
-    let mut execution_bytes = [0u8; 18];
-    reader.read_exact(&mut execution_bytes)?;
-    let execution = NativeExecution {
-        backend: NativeBackend::from_byte(execution_bytes[0])?,
-        vendor_id: u32::from_le_bytes(execution_bytes[1..5].try_into().unwrap()),
-        device_id: u32::from_le_bytes(execution_bytes[5..9].try_into().unwrap()),
-        luid_high: i32::from_le_bytes(execution_bytes[9..13].try_into().unwrap()),
-        luid_low: u32::from_le_bytes(execution_bytes[13..17].try_into().unwrap()),
-        adapter_kind: match execution_bytes[17] {
-            0 => NativeAdapterKind::Unknown,
-            1 => NativeAdapterKind::Integrated,
-            2 => NativeAdapterKind::Discrete,
-            _ => return Err(invalid_data("invalid native thumbnail adapter kind")),
-        },
-    };
-    let mut timing_bytes = [0u8; 24 + 8 * ENCODE_STAGE_COUNT];
-    reader.read_exact(&mut timing_bytes)?;
-    let timings = NativeTimings {
-        decode_transform_us: u64::from_le_bytes(timing_bytes[0..8].try_into().unwrap()),
-        encode_hash_us: u64::from_le_bytes(timing_bytes[8..16].try_into().unwrap()),
-        embedded_jpeg_combined_us: u64::from_le_bytes(timing_bytes[16..24].try_into().unwrap()),
-        encode_stages_us: std::array::from_fn(|index| {
-            let offset = 24 + index * 8;
-            u64::from_le_bytes(timing_bytes[offset..offset + 8].try_into().unwrap())
-        }),
-    };
-    if timings.decode_transform_us > MAX_STAGE_US
-        || timings.encode_hash_us > MAX_STAGE_US
-        || timings.embedded_jpeg_combined_us > MAX_STAGE_US
-        || timings
-            .encode_stages_us
-            .iter()
-            .fold(0u64, |sum, elapsed| sum.saturating_add(*elapsed))
-            > timings.encode_hash_us
-        || (timings.embedded_jpeg_combined_us > 0
-            && (timings.decode_transform_us > 0 || timings.encode_hash_us > 0))
-    {
-        return Err(invalid_data("invalid native thumbnail stage timing"));
-    }
-    let mut webp_len = [0u8; 4];
-    let mut hash_len = [0u8; 2];
-    let mut ai_len = [0u8; 4];
-    reader.read_exact(&mut webp_len)?;
-    reader.read_exact(&mut hash_len)?;
-    reader.read_exact(&mut ai_len)?;
-    let webp_len = u32::from_le_bytes(webp_len) as usize;
-    let hash_len = u16::from_le_bytes(hash_len) as usize;
-    let ai_len = u32::from_le_bytes(ai_len) as usize;
-    if webp_len == 0
-        || webp_len > MAX_ENCODED_ARTIFACT_BYTES
-        || hash_len > MAX_HASH_BYTES
-        || ai_len > MAX_ENCODED_ARTIFACT_BYTES
-    {
-        return Err(invalid_data("invalid native thumbnail response length"));
-    }
-    let mut webp = vec![0; webp_len];
-    let mut hash = vec![0; hash_len];
-    let mut ai = vec![0; ai_len];
-    reader.read_exact(&mut webp)?;
-    reader.read_exact(&mut hash)?;
-    reader.read_exact(&mut ai)?;
-    Ok(NativeResponse::Ok {
-        id,
-        execution,
-        timings,
-        qos,
-        payload: EncodedThumbPayload {
-            webp,
-            thumbhash: (hash_len > 0).then_some(hash),
-            ai_cache: (ai_len > 0).then_some(ai),
-        },
-    })
 }

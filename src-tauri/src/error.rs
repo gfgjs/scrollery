@@ -53,17 +53,15 @@ pub enum AppError {
     #[error("View stale — layout changed since selection; recompute and retry")]
     ViewStale,
 
-    /// 重复镜头描述符未通过 MVP 校验（2026-09-02 主画廊重复项浏览方案 §10.2）。
+    /// 重复镜头描述符未通过校验。
     /// message 由 [`crate::db::models::DuplicateLensDescriptor::validate`] 按违规规则
     /// 给出固定文案（中文|英文），前端按稳定 code `DuplicateLensInvalid` 统一分流
     /// （提示重建描述符，而非匹配文案）。
     #[error("Duplicate lens descriptor invalid: {0}")]
     DuplicateLensInvalid(String),
 
-    /// 重复镜头 **folders 模式**的 SQL lowering 尚未实现（方案 §13：groups 模式已在 P2
-    /// 落地，folders 排列属 P3）：`view_to_sql` 收到 `mode=folders` 的镜头描述符时显式
-    /// 拒绝，绝不静默按 groups 降维执行。稳定 code `DuplicateLensUnsupported`，
-    /// P3 落地后此变体的发射点应随之消失。
+    /// `view_to_sql` 尚不支持重复镜头的 folders 模式，收到该描述符时显式拒绝，
+    /// 避免静默按 groups 模式执行。稳定 code 为 `DuplicateLensUnsupported`。
     #[error("重复镜头 folders 模式解析尚未支持（P3） | Duplicate lens folders mode lowering not supported yet")]
     DuplicateLensUnsupported,
 
@@ -87,10 +85,6 @@ pub enum AppError {
         "图片读取超时，后台读取仍未结束 | Image read timed out; background read is still active"
     )]
     ImageReadTimeout,
-
-    /// 原生缩略图执行环境暂不可用；原因仅由内部固定码构造，不携带底层错误文本。
-    #[error("thumbnail temporarily unavailable: {0}")]
-    ThumbnailUnavailable(&'static str),
 
     #[error("AI inference error: {0}")]
     Ai(String),
@@ -122,21 +116,19 @@ pub enum AppError {
     Exotic { code: &'static str, message: String },
 
     /// reveal（在文件管理器中显示）失败。与 [`AppError::Exotic`] 同姿态：`code` 是稳定分流标识
-    /// （`unsupported_platform` = 移动端永不支持，前端据此**永久隐藏**动作而非提示重试；
-    /// `reveal_failed` = 通用失败，提示即可），原样透到 IPC `code` 字段。此前稳定子码寄生在
-    /// `PathResolution` 的 message 里、序列化 code 恒为 "PathResolution"——前端要分流就只能匹配
-    /// 文案，改文案即失效（S 线审查 R-08）。
+    /// （`unsupported_platform` = 系统打开器不支持此操作；`reveal_failed` = 通用失败），
+    /// 原样透到 IPC `code` 字段，供前端显示对应提示。
     #[error("reveal error [{code}]: {message}")]
     Reveal { code: &'static str, message: String },
 
-    /// 树内文本预览(path-based 只读打开,问题②方案 B v1)失败。与 [`AppError::Reveal`]
+    /// 树内文本预览(path-based 只读打开)失败。与 [`AppError::Reveal`]
     /// 同姿态:`code` 是稳定分流标识(`preview_unsupported_type` = 扩展名不在白名单,前端
     /// 不该发起、收到即为兜底;`preview_failed` = 读取失败,提示即可),原样透到 IPC `code`
     /// 字段。message **不携带绝对路径**(泄漏面)。
     #[error("preview error [{code}]: {message}")]
     Preview { code: &'static str, message: String },
 
-    /// 重链接扫描根(#7 方案A:文件夹整体迁移后改根路径、免重扫免重生成)失败。与
+    /// 重链接扫描根失败。与
     /// [`AppError::Preview`] 同姿态:`code` 是稳定分流标识,原样透到 IPC `code` 字段——
     /// `relink_not_a_dir`(新路径不存在或不是目录)/ `relink_path_taken`(该路径已被别的
     /// 扫描根占用,`scan_roots.path` 有 UNIQUE)/ `relink_mismatch`(抽样校验不过,目标
@@ -146,33 +138,33 @@ pub enum AppError {
     #[error("relink error [{code}]: {message}")]
     Relink { code: &'static str, message: String },
 
-    /// 数据备份(方案 B §9)失败。与 [`AppError::Relink`] 同姿态:`code` 是稳定小写分流标识,
+    /// 数据备份失败。与 [`AppError::Relink`] 同姿态:`code` 是稳定小写分流标识,
     /// 原样透到 IPC `code` 字段。稳定码集:`backup_dir_unset`(未设目的地)/ `backup_dir_not_writable`
     /// (目的地不可写)/ `backup_document_inconsistent`(文档行↔文件不一致,拒产假完整包)/
     /// `backup_cancelled`(用户取消)/ `backup_io`(读写失败)/ `file_job_busy`(A/B 文件任务占用)。
-    /// message **不携带绝对路径 / SQL / 内部错误串**(泄漏面,方案 §9)。
+    /// message **不携带绝对路径 / SQL / 内部错误串**。
     #[error("backup error [{code}]: {message}")]
     Backup { code: &'static str, message: String },
 
-    /// 数据恢复(方案 B §6/§9)失败。与 [`AppError::Backup`] 同姿态:`code` 是稳定小写分流标识,
+    /// 数据恢复失败。与 [`AppError::Backup`] 同姿态:`code` 是稳定小写分流标识,
     /// 原样透到 IPC `code` 字段。稳定码集:`restore_format_unsupported`(包格式版本过新)/
     /// `restore_schema_incompatible`(备份库结构非当前格式,过旧与过新一律不接受)/ `restore_corrupt`(quick_check/sha256 不符/
     /// 损坏)/ `restore_path_invalid`(zip-slip/盘符/符号链接逃逸)/ `restore_size_limit`(条目数/
     /// 解压尺寸超限,zip bomb)/ `restore_document_missing`(rebase 后版本文件缺失)/
     /// `restore_rollback_failed`(预恢复回滚包失败)/ `restore_io`。message **不携带绝对路径 / SQL /
-    /// 内部错误串**(泄漏面,方案 §9)。
+    /// 内部错误串**。
     #[error("restore error [{code}]: {message}")]
     Restore { code: &'static str, message: String },
 
-    /// 导出整理成果(方案 A)失败。与 [`AppError::Backup`] 同姿态:`code` 是稳定小写分流标识,
+    /// 导出整理成果失败。与 [`AppError::Backup`] 同姿态:`code` 是稳定小写分流标识,
     /// 原样透到 IPC `code` 字段。稳定码集:`export_target_invalid`(目的父目录不存在/不是目录)/
     /// `export_target_not_writable`(不可写)/ `export_target_inside_library`(命中扫描根内部,
-    /// 未带 `allow_inside_library` 确认)/ `export_cancelled`(用户取消)/ `export_io`(读写失败)/
+    /// 未带 `allow_inside_library` 确认)/ `export_cancelled`(用户取消且暂存已清理)/ `export_io`(读写失败)/
+    /// `export_cleanup_failed`(暂存清理失败，保留残余供手动清理，终态为 failed)/
     /// `file_job_busy`(A/B 文件任务占用,与 backup/restore 复用同一域共享码,前端不分
     /// backup/export 统一分流「有文件任务在跑」)。SelectAll 所据布局过期复用全局
-    /// [`AppError::ViewStale`](稳定码 `"ViewStale"`),不落本变体的私有码集(2026-07-19 复审 P3:
-    /// 此前误记 `export_view_stale`,全仓从无该发射点)。message **不携带绝对路径 / SQL / 内部
-    /// 错误串**(泄漏面,方案 §3.3)。
+    /// [`AppError::ViewStale`](稳定码 `"ViewStale"`),不落本变体的私有码集。
+    /// message **不携带绝对路径 / SQL / 内部错误串**。
     #[error("export error [{code}]: {message}")]
     Export { code: &'static str, message: String },
 
@@ -215,8 +207,8 @@ pub enum AppError {
     Color { code: &'static str, message: String },
 
     /// OCR 文字提取(B′路线,2026-07-23)失败。与 [`AppError::Player`] 同姿态:`code` 是稳定
-    /// 小写分流标识,原样透到 IPC `code` 字段。稳定码集:`ocr_unlicensed`(插件未激活)/
-    /// `ocr_license_expired`(授权过期)/ `ocr_unavailable`(平台/版本/安装态不满足)/
+    /// 小写分流标识,原样透到 IPC `code` 字段。稳定码集:`ocr_inactive`(插件未激活)/
+    /// `ocr_unavailable`(平台/版本/安装态不满足)/
     /// `ocr_model_missing`(档位模型未下载/未就位)/ `ocr_manifest_unready`(下载清单 URL
     /// 未钉定)/ `ocr_invalid_input`(base64/档位参数非法)/ `ocr_decode_failed`(图像读取
     /// /解码失败)/ `ocr_engine_failed`(推理资源超限/内部错误)/ `ocr_worker_failed`
@@ -226,7 +218,7 @@ pub enum AppError {
     Ocr { code: &'static str, message: String },
 
     /// 影像增强(降噪/超分子系统,2026-07-24)失败。与 [`AppError::Ocr`] 同姿态:`code` 是稳定
-    /// 小写分流标识,原样透到 IPC `code` 字段。稳定码集:`enhance_unlicensed`(插件未激活)/
+    /// 小写分流标识,原样透到 IPC `code` 字段。稳定码集:`enhance_inactive`(插件未激活)/
     /// `enhance_input_too_large`(输入/输出像素超准入门,J-6 草案)/ `enhance_input_unsupported`
     /// (RAW/不可解码格式)/ `enhance_model_missing`(模型未下载/未就位)/
     /// `enhance_manifest_unready`(下载清单尚未钉定)/ `enhance_busy`(队列/worker 忙)/
@@ -304,9 +296,8 @@ impl From<crate::dedup::HashError> for AppError {
     }
 }
 
-/// AI 推理核错误收敛(Part4-T15/T16):scrollery-ai-core 自持 AiError,此处映射回既有
-/// 变体,调用点 `?` 传播与前端 IPC code(Ai/AiTokenizer/Internal)完全不变。T16 收口后
-/// host 关闭 ai-core 的 `inference` feature(ort 直依赖已拆),AiError 为 non_exhaustive:
+/// AI 推理核错误映射到 IPC 变体 Ai/AiTokenizer/Internal。
+/// host 关闭 ai-core 的 `inference` feature；AiError 为 non_exhaustive:
 /// 通配臂携带字符串进 Ai 变体——workspace feature 并集把 Ort 臂带回来时同样落此臂。
 impl From<scrollery_ai_core::AiError> for AppError {
     fn from(e: scrollery_ai_core::AiError) -> Self {
@@ -319,7 +310,7 @@ impl From<scrollery_ai_core::AiError> for AppError {
     }
 }
 
-/// A2:config.toml 读写失败(`ConfigManager::set_and_persist`/`reset_key`)统一映射为
+/// config.toml 读写失败(`ConfigManager::set_and_persist`/`reset_key`)统一映射为
 /// `AppError::Config { code: "config_write_failed" }`——`ConfigFileError::to_status_message`
 /// 已按硬约束脱敏(`Io` 变体不透传原始路径),此处直接复用其输出作为 message。
 impl From<crate::config::ConfigFileError> for AppError {
@@ -343,7 +334,7 @@ struct ErrorDedupEntry {
 }
 
 /// signature = (调用点 target, AppError 稳定 code)。target 恒为本调用点的 `module_path!()`,
-/// 随参数传入而非硬编码,为未来若有第二个调用点复用此辅助函数留出余地(方案 §3.2 定型理由)。
+/// 由调用方传入 target，去重表按 target 和 code 区分签名。
 static ERROR_LOG_DEDUP: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(&'static str, &'static str), ErrorDedupEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -494,10 +485,6 @@ impl Serialize for AppError {
             AppError::System(m) => ("System", m.as_str()),
             AppError::Os(m) => ("Os", m.as_str()),
             AppError::AiTokenizer(m) => ("AiTokenizer", m.as_str()),
-            AppError::ThumbnailUnavailable(_) => (
-                "ThumbnailUnavailable",
-                "缩略图暂不可用，可稍后重试 | Thumbnail temporarily unavailable; retry later",
-            ),
             AppError::Internal(m) => ("Internal", m.as_str()),
             // 透出底层稳定 code（而非笼统 "Internal"）：前端按 code 分流 exotic 失败。
             AppError::Exotic { code, message } => (*code, message.as_str()),
@@ -521,9 +508,9 @@ impl Serialize for AppError {
             AppError::Player { code, message } => (*code, message.as_str()),
             // 同上：查看器色域的稳定码（icc_parse_failed / viewer_render_too_large / ...）供前端分流。
             AppError::Color { code, message } => (*code, message.as_str()),
-            // 同上：OCR 的稳定码（ocr_unlicensed / ocr_model_missing / ocr_engine_failed / ...）供前端分流。
+            // 同上：OCR 的稳定码（ocr_inactive / ocr_model_missing / ocr_engine_failed / ...）供前端分流。
             AppError::Ocr { code, message } => (*code, message.as_str()),
-            // 同上：影像增强的稳定码（enhance_unlicensed / enhance_input_too_large / enhance_model_missing / ...）供前端分流。
+            // 同上：影像增强的稳定码（enhance_inactive / enhance_input_too_large / enhance_model_missing / ...）供前端分流。
             AppError::Enhance { code, message } => (*code, message.as_str()),
             AppError::Dedup { code, message } => (*code, message.as_str()),
             AppError::Scan { code, message } => (*code, message.as_str()),

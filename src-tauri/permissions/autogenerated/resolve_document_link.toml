@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-document-link"
+description = "Enables the resolve_document_link command without any pre-configured scope."
+commands.allow = ["resolve_document_link"]
+
+[[permission]]
+identifier = "deny-resolve-document-link"
+description = "Denies the resolve_document_link command without any pre-configured scope."
+commands.deny = ["resolve_document_link"]

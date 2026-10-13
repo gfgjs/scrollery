@@ -1,10 +1,10 @@
 // src/composables/useFolderTreeKeyboardNav.ts
-// 文件树键盘导航的副作用层——从 FoldersSection.vue 域 5 迁出(见
-// docs/planning/2026-07-25-超长文件拆分方案/analysis/FoldersSection-vue.md §2.1)。
+// 文件树键盘导航的副作用层。
 // 决策在 treeKeyTarget 纯函数(已单测);此处只做副作用:移 active 行(即时滚入视口,虚拟化
 // 窗口随之渲染该行)、toggle 展开、按行类分发激活。
 import { ref, watch, type ComputedRef, type Ref, type ShallowRef } from 'vue'
 import {
+  sameEntityId,
   treeScrollTopForIndex,
   treeKeyTarget,
 } from '../components/sidebar/sections/folderTree.helpers'
@@ -47,10 +47,35 @@ export function useFolderTreeKeyboardNav(deps: FolderTreeKeyboardNavDeps) {
   } = deps
 
   const activeIndex = ref(-1)
-  // 行集变化(折叠/重载)后钳位,防 active 行下标越界指向不存在的行。
-  watch(displayRows, (rows) => {
-    if (activeIndex.value >= rows.length) activeIndex.value = rows.length - 1
-  })
+  // 重载时按身份保留活动行；实体 id 可跨改名，FS-only 只认现有路径。
+  watch(
+    displayRows,
+    (rows, oldRows) => {
+      const activeRow = oldRows[activeIndex.value]
+      if (activeRow) {
+        const index = rows.findIndex((row) => {
+          if (activeRow.kind === 'dir' && row.kind === 'dir') {
+            return activeRow.node.id !== null
+              ? sameEntityId(activeRow.node.id, row.node.id)
+              : activeRow.node.nodeKey === row.node.nodeKey
+          }
+          if (activeRow.kind === 'file' && row.kind === 'file') {
+            return activeRow.file.id !== null
+              ? sameEntityId(activeRow.file.id, row.file.id)
+              : activeRow.file.nodeKey === row.file.nodeKey
+          }
+          return activeRow.kind === 'more' && row.kind === 'more' && activeRow.dirKey === row.dirKey
+        })
+        if (index >= 0) {
+          activeIndex.value = index
+          return
+        }
+      }
+      if (activeIndex.value >= rows.length) activeIndex.value = rows.length - 1
+    },
+    // 行集与索引同步更新，避免连续刷新或鼠标改选后用新索引读取旧行集。
+    { flush: 'sync' },
+  )
   function setActiveIndex(i: number) {
     activeIndex.value = i
     scrollRowIntoView(i)

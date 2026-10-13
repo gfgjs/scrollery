@@ -15,9 +15,8 @@ use crate::error::{AppError, Result};
 pub type DbPool = Pool<SqliteConnectionManager>;
 pub type DbWriter = Mutex<Connection>;
 
-/// 适用于每个连接（写入 + 每个读池连接）的 PRAGMA 语句。
-/// journal_size_limit：checkpoint 后把 WAL 文件截回 64MiB 上限,防其高水位长期驻留(通用卫生封顶;
-/// 注:「WAL 膨胀致热启动慢」假设已被启动探针数据证伪〔全日开机 WAL≤10.4MB〕,故此为卫生改而非该问题修复)。
+/// 写连接和读池连接共用的 PRAGMA。
+/// journal_size_limit 在 checkpoint 后将 WAL 截回 64 MiB 上限，防止高水位长期驻留。
 const PRAGMAS: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA journal_size_limit = 67108864;
@@ -114,8 +113,8 @@ impl r2d2::CustomizeConnection<Connection, rusqlite::Error> for ReadPoolCustomis
 
 /// 创建读取连接池。
 ///
-/// `pool_size`：桌面端为 8，移动端为 2（由调用者决定）。
-/// 桌面端 8 的理由见 `lib.rs` 建池处:前台布局 + 可视区元数据 + 缩略图批与后台派生/AI
+/// `pool_size`：读取连接池上限（由调用者决定，桌面端取 8，见 `db::boot` 建池处）。
+/// 取 8 的理由见 `db::boot` 建池处:前台布局 + 可视区元数据 + 缩略图批与后台派生/AI
 /// 并发读,4 会让它们互相排队(布局被后台读饿死);WAL 下额外读连接开销很低（指锁竞争而非
 /// 内存）。但每个连接持有各自私有的 page cache（`cache_size=-64000` ≈ 64 MiB，见 PRAGMAS），
 /// 故并发打满时 pool_size=8 读池最多可占约 512 MiB page cache——这是瞬时占用（`min_idle(0)` +

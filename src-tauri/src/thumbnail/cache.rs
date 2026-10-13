@@ -1,16 +1,13 @@
-// src-tauri/src/thumbnail/cache.rs
 //! 尺寸分桶的缩略图缓存管理。
 //!
-//! 缓存布局（§ 8.2）：旧产物为 `{size}/{prefix}/{cache_key_hex}.webp`；
-//! Coordinator 新产物为 `{size}/family-{family_fingerprint}/{prefix}/{cache_key_hex}.webp`。
-//! e.g. `cache/thumbnails/300/a3/a3f4b2c1d0e9f7a1.webp`
-//! 例如 `cache/thumbnails/300/a3/a3f4b2c1d0e9f7a1.webp`
+//! 缓存布局：
+//! `{app_data_dir}/cache/thumbnails/{size}/{2-char-prefix}/{cache_key_hex}.webp`
+//! 例如 `cache/thumbnails/256/a3/a3f4b2c1d0e9f7a1.webp`
 
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::scheduler::OutputFingerprint;
 use crate::utils::hash::cache_key_to_hex;
 
 /// 构建缩略图文件的完整路径。
@@ -48,52 +45,12 @@ pub fn thumb_db_path(size: u32, cache_key: i64) -> String {
     format!("{size}/{prefix}/{hex}.webp")
 }
 
-/// 新任务的产物路径包含输出配置摘要，同源同档的不同质量不会争写同一文件。
-pub fn thumb_variant_path(
-    cache_dir: &Path,
-    size: u32,
-    cache_key: i64,
-    fingerprint: OutputFingerprint,
-) -> PathBuf {
-    debug_assert!(crate::thumbnail::generator::THUMB_TIERS.contains(&size));
-    let hex = cache_key_to_hex(cache_key);
-    cache_dir
-        .join("thumbnails")
-        .join(size.to_string())
-        .join(fingerprint.cache_namespace())
-        .join(&hex[..2])
-        .join(format!("{hex}.webp"))
-}
-
-/// 数据库相对路径；旧 `{size}/{prefix}/{hex}.webp` 文件仍由原路径助手读取。
-pub fn thumb_variant_db_path(size: u32, cache_key: i64, fingerprint: OutputFingerprint) -> String {
-    debug_assert!(crate::thumbnail::generator::THUMB_TIERS.contains(&size));
-    let hex = cache_key_to_hex(cache_key);
-    format!(
-        "{size}/{}/{}/{}.webp",
-        fingerprint.cache_namespace(),
-        &hex[..2],
-        hex
-    )
-}
-
-/// Short edge (px) of the AI-analysis cache. Covers every built-in CLIP model since analysis
-/// only ever downscales the short edge to `image_size` (B/16·L/14=224, L/14@336=336), never up.
-/// Kept here so both the derivation backend (`derive/image.rs`) and the thumbnail pipeline's
-/// one-decode-two-outputs path (`generator.rs`) agree on the size.
-/// AI 分析缓存短边（像素）。覆盖所有内置 CLIP 模型（分析只下采样短边到 image_size、绝不上采样）。
-/// 放此处使派生后端与缩略图「一次解码两份产物」路径对尺寸保持一致。
-/// 注:336 = 当前内置模型集的最大输入边(L/14@336),非随意魔数;但**绑定当前模型集**——
-/// 若将来接入需 >336 输入的模型,此值须同步上调,否则该模型的 AI 缓存会偏小(改它使全库 ai_cache 作废)。
+/// AI 分析缓存的默认短边（像素），覆盖当前内置模型的最大输入尺寸 336。
+/// 派生与缩略图管线共用默认值，运行时可由 ai_cache_short_edge 设置覆盖。
 pub const AI_CACHE_SHORT_EDGE: u32 = 336;
 
-/// Absolute path of the AI-analysis cache for an image: `cache/ai_thumbs/{prefix}/{hex}.webp`.
-/// A short-edge≥336 WebP that CLIP analysis decodes instead of the full-resolution original
-/// (keyed by `cache_key`, same prefix scheme as thumbnails). Lives in its own dir so the
-/// thumbnail LRU (`enforce_cache_limit`, which only walks `thumbnails/`) never evicts it.
-/// 图像 AI 分析缓存的绝对路径：`cache/ai_thumbs/{prefix}/{hex}.webp`。一份短边≥336 的 WebP，
-/// 供 CLIP 分析解码以替代全分辨率原图（按 `cache_key` 命名，与缩略图同前缀方案）。独立目录使
-/// 缩略图 LRU（`enforce_cache_limit` 只遍历 `thumbnails/`）不会误删它。
+/// 图像 AI 分析缓存的绝对路径：`cache/ai_thumbs/{prefix}/{hex}.webp`。
+/// 按配置短边缩小大图，小图不放大；与显示缩略图共用缓存预算和 LRU 驱逐。
 pub fn ai_cache_path(cache_dir: &Path, cache_key: i64) -> PathBuf {
     let hex = cache_key_to_hex(cache_key);
     let prefix = &hex[..2];
@@ -103,8 +60,6 @@ pub fn ai_cache_path(cache_dir: &Path, cache_key: i64) -> PathBuf {
         .join(format!("{hex}.webp"))
 }
 
-/// Relative DB path of the AI cache (relative to `cache_dir`): `"ai_thumbs/{prefix}/{hex}.webp"`.
-/// Stored in `media_derivations.payload_path`; the AI pipeline resolves it under `cache_dir`.
 /// AI 缓存的相对 DB 路径（相对 `cache_dir`）：`"ai_thumbs/{prefix}/{hex}.webp"`。
 /// 存入 `media_derivations.payload_path`；AI 流水线在 `cache_dir` 下解析。
 pub fn ai_cache_db_path(cache_key: i64) -> String {
@@ -122,20 +77,31 @@ pub fn ensure_ai_cache_dir(cache_dir: &Path, cache_key: i64) -> std::io::Result<
     Ok(())
 }
 
-/// 人脸分析缓存短边(像素)= YuNet detect_size(640)。T16-R2 方案 A:缩略图档位短边不足时,
+/// 人脸分析缓存短边(像素)= YuNet detect_size(640)。缩略图档位短边不足时,
 /// host 预解码(WIC 优先)一份短边 640 的 WebP,worker 只解这份小图——镜像 ai_cache 之于 CLIP。
 /// 注:绑定当前 face 模型集(yunet-sface);派发侧有防呆(detect_size 超此值即不吃缓存,
 /// 见 face_pipeline::face_cache_applies),但升值会使全库 face_thumbs 作废,须一并清理。
 pub const FACE_CACHE_SHORT_EDGE: u32 = 640;
 
-/// 人脸分析缓存的绝对路径:`cache/face_thumbs/{prefix}/{hex}.webp`(键与前缀方案同缩略图)。
-/// 与 ai_thumbs(336,CLIP)分目录:两者输入尺寸不同不能互用,独立目录也便于按类清理。
+/// 历史人脸缓存路径，仅用于清理；当前推理使用含源版本的 face_source_cache_path。
 pub fn face_cache_path(cache_dir: &Path, cache_key: i64) -> PathBuf {
     let hex = cache_key_to_hex(cache_key);
     let prefix = &hex[..2];
     cache_dir
         .join("face_thumbs")
         .join(prefix)
+        .join(format!("{hex}.webp"))
+}
+
+/// 人脸输入缓存按源版本隔离；旧缓存无版本证明，仅用于历史文件清理。
+pub fn face_source_cache_path(cache_dir: &Path, cache_key: i64, source_revision: i64) -> PathBuf {
+    let hex = cache_key_to_hex(cache_key);
+    cache_dir
+        .join("face_thumbs")
+        .join("v2")
+        .join(FACE_CACHE_SHORT_EDGE.to_string())
+        .join(&hex[..2])
+        .join(format!("r{source_revision}"))
         .join(format!("{hex}.webp"))
 }
 
@@ -220,19 +186,21 @@ pub fn ensure_sprite_dir(cache_dir: &Path, cache_key: i64) -> std::io::Result<()
     Ok(())
 }
 
-/// 被驱逐文件若属显示缩略图(`thumbnails/` 下),换算成 DB 相对路径(`{size}/{xx}/{hex}.webp`,
-/// 与 `media_items.thumb_path` 同构、正斜杠)供事件驱动复位(深审 defer ⑥);其余产物目录
-/// (ai/face 缓存等)返回 None——它们的命中判定只查存在性,缺失即自愈重建,不涉 thumb_status。
+/// 按 image_artifacts 的路径约定回传：display 相对 thumbnails，AI 相对缓存根。
+/// face/viewer 仍由各自的缺文件检查自愈，不纳入图片 artifact 的路径通知。
 fn evicted_thumb_db_path(cache_dir: &std::path::Path, path: &std::path::Path) -> Option<String> {
-    let rel = path.strip_prefix(cache_dir.join("thumbnails")).ok()?;
+    let rel = if let Ok(display) = path.strip_prefix(cache_dir.join("thumbnails")) {
+        display
+    } else if path.starts_with(cache_dir.join("ai_thumbs")) {
+        path.strip_prefix(cache_dir).ok()?
+    } else {
+        return None;
+    };
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// Enforce the thumbnail cache limit by LRU. Returns the **db-relative paths** of evicted
-/// display thumbnails so the caller can immediately reset the affected `media_items` rows
-/// (event-driven heal — the boot-time stat sweep becomes a rare fallback).
-/// 强制执行缩略图缓存大小限制 (LRU)。返回被驱逐**显示缩略图**的 DB 相对路径,供调用方
-/// 即时复位受影响的 `media_items` 行(事件驱动自愈——启动期全量 stat 扫描降级为兜底)。
+/// 执行共享缓存的 LRU 大小限制。返回被驱逐产物的 DB 路径，供调用方
+/// 同事务删除匹配 artifact 并复位受影响的展示引用。
 /// 按路径(而非 cache_key)返回:同 key 另一档位文件被驱逐时,现行 thumb_path 不受误伤。
 #[must_use = "被驱逐的缩略图路径须交 reset_thumbs_by_evicted_paths 复位,否则重现 LRU 驱逐永久 404(d503843)"]
 pub fn enforce_cache_limit(cache_dir: &std::path::Path, max_size_mb: u64) -> Vec<String> {
@@ -242,12 +210,7 @@ pub fn enforce_cache_limit(cache_dir: &std::path::Path, max_size_mb: u64) -> Vec
     let mut total_size = 0;
     let mut files: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
 
-    // Both the display thumbnails AND the AI-analysis caches share one cache budget and one LRU
-    // eviction pass. (Sprites / motion videos are deliberately excluded — they're tied to their
-    // source media's lifetime, not browse-recency.) viewer_color(B 线,2026-07-23)并入同一预算
-    // (2026-07-19 裁决延伸,方案 §0②):按 target_id/浏览近期性驱逐,行为与缩略图同构。
-    // 显示缩略图与 AI 分析缓存（ai_thumbs + face_thumbs）共用同一缓存预算和同一次 LRU 淘汰。
-    // （雪碧图/动态视频有意排除 —— 它们绑定源媒体生命周期，而非浏览近期性。）
+    // 显示、AI 分析和查看器色域产物共用预算与 LRU；雪碧图和动态视频随源媒体管理。
     let scan_dirs = [
         cache_dir.join("thumbnails"),
         cache_dir.join("ai_thumbs"),
@@ -258,7 +221,7 @@ pub fn enforce_cache_limit(cache_dir: &std::path::Path, max_size_mb: u64) -> Vec
         return Vec::new();
     }
 
-    // Use walkdir to iterate all files | 使用 walkdir 遍历所有文件
+    // 遍历参与共享预算的所有文件。
     for dir in scan_dirs.iter().filter(|d| d.exists()) {
         for entry in walkdir::WalkDir::new(dir)
             .into_iter()
@@ -292,7 +255,7 @@ pub fn enforce_cache_limit(cache_dir: &std::path::Path, max_size_mb: u64) -> Vec
         total_size / 1024 / 1024, max_size_mb, total_size / 1024 / 1024, max_size_mb
     );
 
-    // Sort ascending by modified time (oldest first) | 按修改时间升序排序（最旧的在前）
+    // 按修改时间升序，先处理最旧的文件。
     files.sort_by_key(|&(_, modified, _)| modified);
 
     let mut freed = 0;
@@ -361,20 +324,19 @@ pub struct CacheStats {
     /// 显示缩略图（`thumbnails/`，受 LRU 上限约束）。
     pub thumbnails: CacheCategoryStat,
     /// AI 分析缓存(`ai_thumbs/` + `face_thumbs/` 合并计;与缩略图共用 LRU 预算)。
-    /// face_thumbs(T16-R2)并入本类目:同属 AI 分析缓存,免动 CacheStats 的 IPC/前端面。
+    /// face_thumbs 与 ai_thumbs 同属 AI 分析缓存。
     pub ai_thumbs: CacheCategoryStat,
     /// 视频关键帧雪碧图（`sprites/`，绑定源媒体生命周期、不受 LRU 淘汰）。
     pub sprites: CacheCategoryStat,
     /// 动态视频缓存（`motion_videos/`，同上）。
     pub motion_videos: CacheCategoryStat,
-    /// 音频内嵌封面缓存(`audio_covers/`,同上;2026-07-06 审查 R5 纳入治理——此前游离于
-    /// 统计/清理/GC 之外,只增不减)。
+    /// 音频内嵌封面缓存(`audio_covers/`)，参与统计、清理与 GC。
     pub audio_covers: CacheCategoryStat,
-    /// 查看器渲染色域派生(`viewer_color/`,B 线,2026-07-23;与缩略图共用 LRU 预算,方案 §0②)。
+    /// 查看器渲染色域派生(`viewer_color/`)，与缩略图共用 LRU 预算。
     pub viewer_color: CacheCategoryStat,
     /// 全部类目总占用。
     pub total: CacheCategoryStat,
-    /// LRU 上限（MB，仅约束 thumbnails+ai_thumbs；供前端展示「占用/上限」）。
+    /// LRU 上限（MB，约束 thumbnails、ai_thumbs、face_thumbs 和 viewer_color）。
     pub limit_mb: u64,
 }
 
@@ -447,7 +409,7 @@ pub fn cache_subdirs_for_kind(kind: &str) -> &'static [&'static str] {
 /// 路径 → 永不重建。返回 (需退状态的 derivation kinds, 是否同时复位 media_items.thumb_status)。
 ///
 /// 映射依据(产物落盘位置):
-/// - thumbnails/ 同时存放照片缩略图(thumb_status)与 video_cover/doc_thumb 封面(经 encode_media_step
+/// - thumbnails/ 同时存放照片缩略图(thumb_status)与 video_cover/doc_thumb 封面(经快照编码入口
 ///   回填 thumb_status=1);故清 thumbnails → 复位 thumb_status + 两个封面 derivation。
 /// - motion_videos/ 无 derivation 行(get_companion_video_url 按需生成,已原子写),自愈,无需退状态。
 pub fn derivations_to_reset_for_kind(kind: &str) -> (&'static [&'static str], bool) {
@@ -508,12 +470,12 @@ pub fn audio_cover_cache_path(cache_dir: &Path, cache_key: i64, ext: &str) -> Pa
 /// 音频封面可能的全部扩展名（`audio::cover_from` 的映射域）。枚举清理时逐一尝试。
 pub const AUDIO_COVER_EXTS: [&str; 5] = ["jpg", "png", "gif", "bmp", "tiff"];
 
-/// 某 `cache_key` 对应的旧式确定性缓存产物绝对路径(5 档缩略图、AI 缓存、face 缓存、雪碧图、动态视频、
+/// 某 `cache_key` 对应的全部缓存产物绝对路径(5 档缩略图、AI 缓存、face 缓存、雪碧图、动态视频、
 /// 以及 5 种扩展名的音频封面——音频封面于 2026-07-06 审查 R5 纳入)。
 /// 单一事实源：硬删媒体即时清理孤儿（§3.3.2）按此枚举。纯函数——路径由 cache_key 确定，不查 DB
 /// （`media_derivations.payload_path` 会被 FK CASCADE 一并删除，故不可依赖；而路径方案是确定的）。
 ///
-/// **不含 viewer_color**(方案 §0②):其路径含 `target_id` 层(display-p3/dci-p3/icc-{id}),纯函数
+/// **不含新版 face 与 viewer_color**：路径包含动态源版本或 `target_id` 层，纯函数
 /// 无法完备枚举全部动态 target 目录;该类产物的孤儿一律归 [`reconcile_orphan_gc`] 的对账 GC 收敛。
 /// 故本枚举维持 14 条(测试 `enumerates_all_artifacts_for_key` 的 `len==14` 亦据此保持)。
 pub fn cache_files_for_key(cache_dir: &Path, cache_key: i64) -> Vec<PathBuf> {
@@ -531,22 +493,11 @@ pub fn cache_files_for_key(cache_dir: &Path, cache_key: i64) -> Vec<PathBuf> {
     paths
 }
 
-/// 删除某 `cache_key` 的全部已知缓存产物（best-effort）。新式缩略图的指纹须在媒体行
-/// 硬删之前从任务表读取，不能在 FK 级联删除后靠目录猜测。
+/// 删除某 `cache_key` 的全部缓存产物（best-effort）。返回成功删除的文件数。
 /// NotFound 属常态（多数产物本就不存在），不记日志；其它 IO 错误 warn 但不阻塞调用方。
-pub fn remove_cache_files_for_key(
-    cache_dir: &Path,
-    cache_key: i64,
-    fingerprints: &[OutputFingerprint],
-) -> usize {
+pub fn remove_cache_files_for_key(cache_dir: &Path, cache_key: i64) -> usize {
     let mut removed = 0;
-    let legacy = cache_files_for_key(cache_dir, cache_key);
-    let variants = fingerprints.iter().flat_map(|&fp| {
-        crate::thumbnail::generator::THUMB_TIERS
-            .into_iter()
-            .map(move |tier| thumb_variant_path(cache_dir, tier, cache_key, fp))
-    });
-    for p in legacy.into_iter().chain(variants) {
+    for p in cache_files_for_key(cache_dir, cache_key) {
         match std::fs::remove_file(&p) {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -657,4 +608,58 @@ pub fn reconcile_orphan_gc(
         );
     }
     (removed, freed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 唯一临时目录（按 tag + 进程号隔离并行测试），返回前清空。
+    fn unique_tmp(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "scrollery_cache_test_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_file(path: &Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; bytes]).unwrap();
+    }
+
+    /// 对账 GC:孤儿(不在 live 集)删除;在册文件、epoch 之后的新文件、非 16-hex 文件不动。
+    #[test]
+    fn orphan_gc_respects_liveset_epoch_and_naming() {
+        let dir = unique_tmp("gc");
+        let live_key = 0x11_i64;
+        let orphan_key = 0x22_i64;
+        write_file(&thumb_path(&dir, 64, live_key), 10);
+        write_file(&thumb_path(&dir, 64, orphan_key), 10);
+        write_file(&ai_cache_path(&dir, orphan_key), 10);
+        // 外来文件:文件名非 16 位 hex,任何情况下不触碰。
+        let alien = dir.join("thumbnails").join("readme.txt");
+        write_file(&alien, 5);
+        let live: std::collections::HashSet<i64> = [live_key].into_iter().collect();
+
+        // epoch = 远古 → 所有文件 mtime 都不早于它 → 一个不删(护栏①:会话内新文件保护)。
+        let past = std::time::SystemTime::UNIX_EPOCH;
+        assert_eq!(reconcile_orphan_gc(&dir, &live, past), (0, 0));
+        assert!(thumb_path(&dir, 64, orphan_key).exists());
+
+        // epoch = 未来 → 两个孤儿(64 档缩略图 + ai 缓存)删除;在册与外来文件保留。
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let (removed, freed) = reconcile_orphan_gc(&dir, &live, future);
+        assert_eq!(removed, 2);
+        assert_eq!(freed, 20);
+        assert!(thumb_path(&dir, 64, live_key).exists());
+        assert!(!thumb_path(&dir, 64, orphan_key).exists());
+        assert!(!ai_cache_path(&dir, orphan_key).exists());
+        assert!(alien.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

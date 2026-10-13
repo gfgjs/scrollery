@@ -1,9 +1,8 @@
-// src/themes/types.ts
-// 主题域运行期类型(方案 docs/designs/2026-09-16-主题配色全新设计.md §3/§4)。
+// 主题域运行期类型。
 //
 // 数据链只有一条:SettingsSeed(用户输入) → generateTheme(纯函数) → ThemePalette(用途明确的
 // 有限颜色集合) → CSS 变量 / Canvas。预设与“我的主题”都是完整 ThemeDefinition 的快照,
-// 不参与运行时继承;旧的 registry/strength 注册与浓度模型不在此表达。
+// 不参与运行时继承。
 
 /** 明暗槽位:只表示这套配色属于哪一档,与 appearance 的 system 无关。 */
 export type ThemeMode = 'light' | 'dark'

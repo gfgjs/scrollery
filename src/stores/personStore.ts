@@ -54,9 +54,11 @@ export const usePersonStore = defineStore('person', () => {
   async function rename(personId: number, name: string) {
     await invokeIpc(IPC.RENAME_FACE_PERSON, { personId, name })
     const trimmed = name.trim()
-    persons.value = persons.value.map((p) =>
-      p.id === personId ? { ...p, name: trimmed || null, isNamed: !!trimmed } : p,
-    )
+    const renamed = (p: PersonSummary) =>
+      p.id === personId ? { ...p, name: trimmed || null, isNamed: !!trimmed } : p
+    persons.value = persons.value.map(renamed)
+    // 误检桶共用命名入口，也要发布新数组使当前管理视图立即更新。
+    ignoredPersons.value = ignoredPersons.value.map(renamed)
   }
 
   /** 显示/隐藏；成功后发布新数组，失败交调用方提示。 */
@@ -109,18 +111,22 @@ export const usePersonStore = defineStore('person', () => {
     await load() // 簇/计数已变 → 重载
   }
 
-  // ── 批量审批（T10, §3.6.2）────────────────────────────────────────────────
+  // ── 批量审批 ────────────────────────────────────────────────
   // likely-match 分组：未确认脸按候选 person 分组，用户对整组/选中脸一次性确认/改派/移出/拒绝/建人。
   // 审批动作的副作用直接传播 invokeIpc 的 reject（含后端中文错误消息，如跨模型改派），由调用方 toast。
   const likelyMatches = ref<LikelyMatchGroup[]>([])
+  let likelyMatchesRequestSerial = 0
 
   /** 加载批量审批的 likely-match 分组。可选按 `personId` 聚焦 / `limit` 限量。 */
   async function loadLikelyMatches(personId?: number, limit?: number) {
+    const requestSerial = ++likelyMatchesRequestSerial
     await ensureCacheDir()
-    likelyMatches.value = await invokeIpc<LikelyMatchGroup[]>(IPC.LIST_LIKELY_FACE_MATCHES, {
+    const groups = await invokeIpc<LikelyMatchGroup[]>(IPC.LIST_LIKELY_FACE_MATCHES, {
       personId: personId ?? null,
       limit: limit ?? null,
     })
+    // 页面预加载可能晚于审批面板返回，不能覆盖新列表或恢复已处理的候选。
+    if (requestSerial === likelyMatchesRequestSerial) likelyMatches.value = groups
   }
 
   /** 乐观更新：从内存分组移除已处理的脸，并丢弃清空的组。重排新数组以触发响应式刷新。 */

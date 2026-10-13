@@ -1,12 +1,12 @@
 // src/composables/useOcr.ts
-// OCR 文字提取(B′ 路线,2026-07-23,T9):门控三分支 + 图片/视频帧提取 + 结果面板状态。
+// OCR 文字提取：门控三分支、图片/视频帧提取与结果面板状态。
 //
 // 模块级单例状态(先例 useExoticGate.ts:17-40 的模块缓存):busy/panelOpen/result/sourceLabel
 // 定义在模块作用域,ContentViewer(图片入口)与 VideoPlayer(视频帧入口)各自调用 useOcr() 时
 // 共享同一份状态——两态触发的结果自然落在同一个 OcrResultPanel 单例上,不需跨组件搭桥。
 //
 // 门控:先查 ocr_status(60s TTL 缓存,resetOcrStatusCache 供下载/激活成功后失效)——
-// 未授权/过期 → toast + 跳插件商店;模型未装 → toast + 跳设置页;通过才发起提取命令。
+// 未激活/过期 → toast + 跳插件商店;模型未装 → toast + 跳设置页;通过才发起提取命令。
 // 提取命令若仍返回门控类错误码(status 与实际操作之间的竞态,如授权刚过期),按 code 兜底分流,
 // 不假设 ensureGate 通过后命令必然成功。
 
@@ -17,6 +17,7 @@ import { IPC } from '../constants/ipc'
 import { invokeIpc, ipcErrorMessage, IpcError } from '../utils/ipc'
 import { useToastStore } from '../stores/toastStore'
 import { logger } from '../utils/logger'
+import { guideToModelDownload } from './useModelDownloadGuide'
 import { blobToBase64 } from './player/useVideoFrameCapture'
 import type { OcrResult, OcrStatus } from '../types/ocr'
 
@@ -28,7 +29,7 @@ let statusInflight: Promise<OcrStatus> | null = null
 /**
  * 缓存代际计数:resetOcrStatusCache 自增,令在途 loadOcrStatus 请求的回填/清理作废。
  * 无此计数则「reset 时已有旧请求在飞」的场景下,旧请求 resolve 后会把 statusCache 重新
- * 写回旧值(下载/激活成功后 60s 内门控仍误判缺失/未授权),且其 finally 会清掉此后新发起
+ * 写回旧值(下载/激活成功后 60s 内门控仍误判缺失/未激活),且其 finally 会清掉此后新发起
  * 请求的 statusInflight 引用,致重复 IPC。
  */
 let statusGen = 0
@@ -91,18 +92,17 @@ export function useOcr() {
       logger.error('[useOcr] ocr_status failed', { error: e })
       return false
     }
-    if (status.availability !== 'authorized') {
+    if (status.availability !== 'ready') {
       toast.addToast(
         'info',
-        status.availability === 'licenseExpired' ? t('ocr.licenseExpired') : t('ocr.unlicensed'),
+        t('ocr.unlicensed'),
       )
       void router.push('/plugins')
       return false
     }
     const tier = status.tiers.find((tr) => tr.id === status.activeTier)
     if (!tier?.manifestReady || !tier?.installed) {
-      toast.addToast('info', t('ocr.modelMissing'))
-      void router.push('/settings')
+      await guideToModelDownload('ocr')
       return false
     }
     return true
@@ -112,19 +112,14 @@ export function useOcr() {
   function handleExtractError(e: unknown): void {
     const code = e instanceof IpcError ? e.code : null
     switch (code) {
-      case 'ocr_unlicensed':
+      case 'ocr_inactive':
       case 'ocr_unavailable':
         toast.addToast('info', t('ocr.unlicensed'))
         void router.push('/plugins')
         break
-      case 'ocr_license_expired':
-        toast.addToast('info', t('ocr.licenseExpired'))
-        void router.push('/plugins')
-        break
       case 'ocr_model_missing':
       case 'ocr_manifest_unready':
-        toast.addToast('info', t('ocr.modelMissing'))
-        void router.push('/settings')
+        void guideToModelDownload('ocr')
         break
       default:
         toast.addToast('error', ipcErrorMessage(e))

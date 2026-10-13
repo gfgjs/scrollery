@@ -123,7 +123,6 @@ fn list_persons_by_ignored(
 // ── 隐藏根排除(V21 人物墙)────────────────────────────────────────────────────
 // 锁三件事:隐藏时封面不泄漏(cover_item_id/thumb 置空)、face_count 只算可见、
 // 可见脸为零的人物整簇隐去;无隐藏根时走原 SQL(反规范化 face_count)且 unhide 全量回归。
-
 /// 一张图中检测到的所有人脸，用于详情查看器叠加框（F6）。
 #[allow(clippy::items_after_test_module)]
 pub fn get_faces_for_item(

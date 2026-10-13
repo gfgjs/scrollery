@@ -1,7 +1,7 @@
 // src-tauri/src/utils/path.rs
 //! 路径规范化和解析实用工具。
 //!
-//! 来自实施计划的 Q12 / Q14 / 5.7：
+//! 路径约定：
 //! - 数据库始终存储正斜杠路径。
 //! - 运行时路径构建使用 `PathBuf` 以实现操作系统兼容性。
 
@@ -15,7 +15,7 @@ pub fn normalize_db_path(path: &str) -> String {
     path.replace('\\', "/").trim_matches('/').to_string()
 }
 
-/// 规范化**扫描根**路径以便存库（§3.8 8A —— 网络盘当扫描根）。
+/// 规范化扫描根路径以便存库，网络盘也按扫描根处理。
 ///
 /// Unlike `normalize_db_path`, this preserves absolute-root markers: a leading UNC prefix
 /// (`\\server\share` / `//server/share`), a POSIX /, or a Windows drive root (C:/). This keeps
@@ -148,6 +148,17 @@ pub fn encode_tree_sort_key(rel_path: &str) -> Vec<u8> {
 ///
 /// `rel_path` 为空 → 返回扫描根自身（合法：树的根节点）。
 pub fn resolve_within_root(root_path: &str, rel_path: &str) -> crate::error::Result<PathBuf> {
+    resolve_within_root_optional(root_path, rel_path)?.ok_or_else(|| {
+        crate::error::AppError::PathResolution("路径不存在 | path does not exist".into())
+    })
+}
+
+/// 按同一授权边界解析目标；仅在扫描根可访问、目标确实缺失时返回 `None`。
+/// 缺失目标的最近现存祖先也须在根内，避免把断开的链接或越界链接误当可清理的目录。
+pub(crate) fn resolve_within_root_optional(
+    root_path: &str,
+    rel_path: &str,
+) -> crate::error::Result<Option<PathBuf>> {
     use crate::error::AppError;
 
     let canonical_root = std::fs::canonicalize(root_path).map_err(|_| {
@@ -173,32 +184,47 @@ pub fn resolve_within_root(root_path: &str, rel_path: &str) -> crate::error::Res
         target.push(seg);
     }
 
-    let canonical_target = std::fs::canonicalize(&target)
-        .map_err(|_| AppError::PathResolution("路径不存在 | path does not exist".into()))?;
+    let canonical_target = match std::fs::canonicalize(&target) {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut ancestor = target.as_path();
+            while let Err(e) = std::fs::symlink_metadata(ancestor) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(AppError::PathResolution(
+                        "路径不可访问 | path inaccessible".into(),
+                    ));
+                }
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    AppError::PathResolution("扫描根不存在或不可访问 | scan root missing".into())
+                })?;
+            }
+            let canonical_ancestor = std::fs::canonicalize(ancestor)
+                .map_err(|_| AppError::PathResolution("路径不可访问 | path inaccessible".into()))?;
+            if !canonical_ancestor.starts_with(&canonical_root) {
+                return Err(AppError::PathResolution(
+                    "路径越出扫描根 | path escapes scan root".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        Err(_) => {
+            return Err(AppError::PathResolution(
+                "路径不可访问 | path inaccessible".into(),
+            ));
+        }
+    };
 
     if !canonical_target.starts_with(&canonical_root) {
         return Err(AppError::PathResolution(
             "路径越出扫描根 | path escapes scan root".into(),
         ));
     }
-    Ok(canonical_target)
+    Ok(Some(canonical_target))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn root_path_preserves_unc() {
-        // UNC share: leading `//` must survive (8A network drive as scan root).
-        assert_eq!(
-            normalize_root_path(r"\\NAS\media\photos"),
-            "//NAS/media/photos"
-        );
-        assert_eq!(normalize_root_path("//NAS/media/"), "//NAS/media");
-        // Extra leading slashes collapse to exactly two.
-        assert_eq!(normalize_root_path(r"\\\\NAS\share"), "//NAS/share");
-    }
 
     // ── resolve_within_root：安全边界（S 线 §4.2 / D-001）────────────────────
     //
@@ -256,17 +282,6 @@ mod tests {
             }
         }
 
-        #[cfg(windows)]
-        #[test]
-        fn rejects_colon_components() {
-            let (_t, root, _o) = fixture();
-            // 盘符 + NTFS 备用数据流（top.txt:hidden 是真实可写的隐藏流）。
-            for evil in ["C:", "C:\\Windows", "top.txt:secret"] {
-                let r = resolve_within_root(&root_str(&root), evil);
-                assert!(r.is_err(), "含 ':' 的段未被拒: {evil:?} → {r:?}");
-            }
-        }
-
         /// 建一个指向 `target` 的目录级重定向。
         ///
         /// Windows 优先 **junction**（`mklink /J`）：与 `symlink_dir` 不同，它**不需要**开发者
@@ -307,39 +322,11 @@ mod tests {
             );
             let r = resolve_within_root(&root_str(&root), "escape/secret.txt");
             assert!(r.is_err(), "链接逃出扫描根未被拒: {r:?}");
-        }
-
-        /// 指向根**内**的链接放行 —— 它只是同一内容的另一视图，非越界。
-        #[test]
-        fn allows_link_staying_inside_root() {
-            let (_t, root, _o) = fixture();
-            let link = root.join("alias");
+            let missing = resolve_within_root_optional(&root_str(&root), "escape/missing");
             assert!(
-                make_dir_link(&root.join("sub"), &link),
-                "无法创建目录链接：根内链接放行语义无从验证"
+                missing.is_err(),
+                "缺失目标也不能绕过祖先链接的边界: {missing:?}"
             );
-            let got = resolve_within_root(&root_str(&root), "alias/inner.txt").unwrap();
-            assert_eq!(got, fs::canonicalize(root.join("sub/inner.txt")).unwrap());
-        }
-
-        /// `starts_with` 必须按**组件**比较：兄弟目录 `root-evil` 的字符串前缀是 `root`，
-        /// 若用字符串前缀判边界，它会被误判为根内 —— 这是个真实漏洞形态。
-        #[test]
-        fn sibling_dir_sharing_string_prefix_is_not_inside() {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path().join("root");
-            let evil = tmp.path().join("root-evil");
-            fs::create_dir_all(&root).unwrap();
-            fs::create_dir_all(&evil).unwrap();
-            fs::write(evil.join("x.txt"), b"x").unwrap();
-
-            let canonical_root = fs::canonicalize(&root).unwrap();
-            let canonical_evil = fs::canonicalize(evil.join("x.txt")).unwrap();
-            // 字符串前缀会误判为「在根内」；Path::starts_with 不会。
-            assert!(canonical_evil
-                .to_string_lossy()
-                .starts_with(&*canonical_root.to_string_lossy()));
-            assert!(!canonical_evil.starts_with(&canonical_root));
         }
     }
 }

@@ -1,66 +1,80 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import { nextTick, watchEffect } from 'vue'
 import { IPC } from '../constants/ipc'
-import type { PersonSummary } from '../types/person'
-
-const mocks = vi.hoisted(() => ({ invoke: vi.fn() }))
-vi.mock('../utils/ipc', () => ({ invokeIpc: (...args: unknown[]) => mocks.invoke(...args) }))
-vi.mock('../utils/logger', () => ({ logger: { error: vi.fn() } }))
-vi.mock('../utils/thumbCacheDir', () => ({ getThumbCacheDir: () => Promise.resolve('/cache') }))
+import type { LikelyMatchGroup } from '../types/person'
 import { usePersonStore } from './personStore'
 
-function person(id: number): PersonSummary {
+const { invokeIpc } = vi.hoisted(() => ({ invokeIpc: vi.fn() }))
+vi.mock('../utils/ipc', () => ({ invokeIpc }))
+vi.mock('../utils/thumbCacheDir', () => ({
+  getThumbCacheDir: vi.fn().mockResolvedValue('/test-cache'),
+}))
+vi.mock('../utils/logger', () => ({ logger: { error: vi.fn() } }))
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
+function group(faceIds: number[]): LikelyMatchGroup {
   return {
-    id,
-    name: null,
-    faceCount: 1,
-    isNamed: false,
-    isHidden: false,
-    coverItemId: null,
-    coverThumbPath: null,
-    coverThumbStatus: null,
-    coverBbox: null,
+    personId: 1,
+    personName: null,
+    confidence: 0.9,
+    candidateFaces: faceIds.map((faceId) => ({
+      faceId,
+      itemId: faceId,
+      thumbPath: null,
+      thumbStatus: null,
+      bbox: [0, 0, 1, 1],
+      similarity: 0.9,
+    })),
   }
 }
 
 beforeEach(() => {
   setActivePinia(createPinia())
-  mocks.invoke.mockReset()
+  invokeIpc.mockReset()
 })
 
-describe('人物写失败的调用方契约', () => {
-  it('命名失败向调用者抛错且不改本地名称，重试成功才更新', async () => {
-    const store = usePersonStore()
-    store.persons = [person(1)]
-    let renderedName: string | null = null
-    const stop = watchEffect(() => { renderedName = store.persons[0].name })
-    const error = new Error('rename rejected')
-    mocks.invoke.mockRejectedValueOnce(error)
-    await expect(store.rename(1, ' Alice ')).rejects.toBe(error)
-    expect(store.persons[0]).toMatchObject({ name: null, isNamed: false })
-    await nextTick()
-    expect(renderedName).toBeNull()
-    mocks.invoke.mockResolvedValueOnce(undefined)
-    await store.rename(1, ' Alice ')
-    expect(store.persons[0]).toMatchObject({ name: 'Alice', isNamed: true })
-    await nextTick()
-    expect(renderedName).toBe('Alice')
-    stop()
-  })
+describe('personStore 审批候选加载', () => {
+  it('人物页旧请求晚于面板加载和审批完成时，不恢复已处理的候选', async () => {
+    const pageResponse = deferred<LikelyMatchGroup[]>()
+    const panelResponse = deferred<LikelyMatchGroup[]>()
+    invokeIpc
+      .mockReturnValueOnce(pageResponse.promise)
+      .mockReturnValueOnce(panelResponse.promise)
+      .mockResolvedValueOnce(undefined)
 
-  it('合并失败不刷新或移除源人物，重试成功后再加载权威列表', async () => {
     const store = usePersonStore()
-    store.persons = [person(1), person(2)]
-    const error = new Error('merge rejected')
-    mocks.invoke.mockRejectedValueOnce(error)
-    await expect(store.merge([1], 2)).rejects.toBe(error)
-    expect(mocks.invoke).toHaveBeenCalledTimes(1)
-    expect(store.persons.map((p) => p.id)).toEqual([1, 2])
-    const merged = { ...person(2), faceCount: 2 }
-    mocks.invoke.mockResolvedValueOnce(undefined).mockResolvedValueOnce([merged])
-    await store.merge([1], 2)
-    expect(mocks.invoke).toHaveBeenLastCalledWith(IPC.LIST_FACE_PERSONS)
-    expect(store.persons).toEqual([merged])
+    await store.ensureCacheDir()
+    // 重进人物页时保留上次候选，审批入口在页面请求尚未完成时仍可打开。
+    store.likelyMatches = [group([11, 12])]
+    const pageLoad = store.loadLikelyMatches(undefined, 50)
+    await Promise.resolve()
+    const panelLoad = store.loadLikelyMatches(undefined, 50)
+    await Promise.resolve()
+    expect(invokeIpc).toHaveBeenNthCalledWith(2, IPC.LIST_LIKELY_FACE_MATCHES, {
+      personId: null,
+      limit: 50,
+    })
+
+    panelResponse.resolve([group([11, 12])])
+    await panelLoad
+    await store.confirmFaces([11])
+    expect(invokeIpc).toHaveBeenNthCalledWith(3, IPC.CONFIRM_FACES, { faceIds: [11] })
+    expect(store.likelyMatches).toEqual([group([12])])
+
+    pageResponse.resolve([group([11, 12])])
+    await pageLoad
+    expect(store.likelyMatches).toEqual([group([12])])
+
+    // 后续主动加载仍应能正常发布新候选。
+    invokeIpc.mockResolvedValueOnce([group([12, 13])])
+    await store.loadLikelyMatches(undefined, 50)
+    expect(store.likelyMatches).toEqual([group([12, 13])])
   })
 })

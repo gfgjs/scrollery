@@ -1,11 +1,11 @@
 // src/composables/useLensFocusRestore.ts
-// 重复镜头排列切换的键盘焦点恢复（2026-09-02 方案 §8.1/§13 P2）。
+// 重复镜头排列切换的键盘焦点恢复。
 //
 // 切换 groups⇄folders 或开关「显示独有项」会整体重算布局：虚拟滚动把可视窗口整窗换血,原聚焦
 // 卡片随节点卸载消失,焦点掉到 body——键盘用户在重排后失位。本 composable 在切换边界捕获
 // 聚焦卡片的 item id 与屏幕偏移,待新布局落地后按 id 经 GET_ITEM_Y_BY_ID 恢复滚动位,把焦点移回
 // 该 id 的卡片；该 id 已不在新布局（如关闭独有项后原聚焦项是独有项）时回顶部并聚焦镜头状态条
-// 主标题（§8.1 明文）。机制按通用写,不假设 P1 只有 groups——P3 folders 排列切换直接生效。
+// 主标题。groups 与 folders 排列切换都使用同一恢复路径。
 //
 // bucket 换代先解析「reflow 锚点 → 镜头焦点锚点 → scrollCache」,再一次提交目标窗口。
 // 镜头项消失时明确返回顶部目标,确保旧缓存位不会覆盖产品规定的焦点回退。
@@ -16,7 +16,7 @@ import type { LayoutRestoreTarget } from './useBucketVirtualScroll'
 import { IPC } from '../constants/ipc'
 import { useDuplicateLensStore } from '../stores/duplicateLensStore'
 
-/** 镜头状态条主标题元素选择器:焦点项已不在新布局时的焦点落点（§8.1「聚焦新布局主标题」）。
+/** 镜头状态条主标题元素选择器：焦点项已不在新布局时的焦点落点。
  *  与 DuplicateLensStatusBar.vue 的 title span（id + tabindex="-1"）成对,勿单侧改名。 */
 export const LENS_STATUS_TITLE_SELECTOR = '#lens-status-title'
 

@@ -1,5 +1,5 @@
 // crates/exotic-workers/raw-worker/src/main.rs
-//! RAW 缩略图 Worker 主循环（RAW 支持线 阶段 C；骨架照抄 psd-worker）。
+//! RAW 缩略图 Worker 主循环。
 //!
 //! 契约：
 //!   - **stdout 只走协议帧**；任何日志只写 stderr（Host 视 stdout 前导非帧字节为协议损坏）。

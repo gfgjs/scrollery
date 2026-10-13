@@ -19,7 +19,7 @@
 //!   1. 独占创建暂存目录 → 复制并逐文件校验 → 得到「我们写出树」的内容凭据；
 //!   2. **把凭据写进阶段日志**（短 DB 阶段）；
 //!   3. rename 发布（暂存 → 目标）；
-//!   4. 删源；
+//!   4. Windows 固定句柄核验并清理源，Unix 保留源供手动处置；
 //!   5. 推进阶段为 published。
 //!
 //! 顺序不能调换：若先发布再落凭据，崩在 3 与 5 之间就会留下「源与目标都在、日志无凭据」的
@@ -30,7 +30,7 @@
 //!
 //!   - **目标不得覆盖**：目标物理存在（无论是否已索引）即拒绝，绝不合并不覆盖。
 //!   - **源原件不丢**：跨卷先复制到我们自己的独占暂存目录（create_dir 独占创建 + 标记文件）并逐
-//!     文件校验，再 rename 发布，发布成功后才删源；删源前必须证明源是目标内容的子集。
+//!     文件校验，再 rename 发布；Windows 清理须固定源与目标对象证明一致，Unix 保留源。
 //!   - **清理只碰自己的东西**：暂存目录清理前必须验标记文件；源残留清理前必须逐文件证明一致。
 //!
 //! ## 恢复的证明规则（不允许认领不确定的目标，也不丢恢复线索）
@@ -38,7 +38,7 @@
 //!   - 源与目标**同时存在**：只有日志里的 payload_digest 与目标现算摘要一致才认领；对不上或没有
 //!     凭据即保持冲突，不改库、不删源。
 //!   - 目标是 rename 产物（无凭据）：只有「源已不在」这一种物理状态才认定发布完成。
-//!   - 删源只在「源是目标内容的子集」时进行（逐文件比内容，尺寸相同不算数）。
+//!   - Windows 只删除已固定且逐文件核验的源对象和空目录；Unix 不自动删跨卷源。
 //!   - 扫描根**行确实不存在**（Ok(None)）才作废日志；**查询失败**一律保留线索。
 //!   - 两侧路径都判为「不在」时，只有两侧扫描根本身都可访问才敢认定「什么都没发生」；
 //!     否则（常见：卷离线让 NotFound 伪装成不存在）保留日志。
@@ -53,6 +53,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::db::queries as q;
 use crate::error::{AppError, Result};
@@ -81,6 +82,45 @@ const CHUNK: usize = 64 * 1024;
 
 /// 进程内暂存目录名去重序号（同进程两次移动生成不同路径）。
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, PartialEq)]
+enum SourceCleanup {
+    Removed,
+    #[cfg(windows)]
+    Changed,
+    #[cfg(not(windows))]
+    Manual,
+}
+
+fn cleanup_source(src: &Path, dst: &Path) -> Result<SourceCleanup> {
+    cleanup_source_with(src, dst, &mut |_, _| {})
+}
+
+// 测试在内容证明与删除之间引入真实外部操作，生产调用使用空回调。
+#[cfg(windows)]
+fn cleanup_source_with(
+    src: &Path,
+    dst: &Path,
+    after_verified: &mut impl FnMut(&Path, &Path),
+) -> Result<SourceCleanup> {
+    if !source_subset_of_target(src, dst)? {
+        return Ok(SourceCleanup::Changed);
+    }
+    source_cleanup::remove_verified(src, dst, after_verified)
+}
+
+#[cfg(not(windows))]
+fn cleanup_source_with(
+    _src: &Path,
+    _dst: &Path,
+    _after_verified: &mut impl FnMut(&Path, &Path),
+) -> Result<SourceCleanup> {
+    // Unix 通用接口无法排斥外部写入；保留源，由用户确认副本后手动处理。
+    Ok(SourceCleanup::Manual)
+}
+
+#[cfg(windows)]
+mod source_cleanup;
 
 // ════════════════════════════════════════════════════════════════════════════
 // 数据库触点：短阶段，不与文件 IO 交叠
@@ -192,7 +232,7 @@ pub struct MoveRecoveryReport {
     pub needs_retry: bool,
     /// 稳定短标签，供日志与 UI 分流：completed / absent / target_root_missing / target_missing /
     /// target_unverified / target_conflict / target_unresolved / source_leftover /
-    /// source_changed / staging_busy / payload_pending / published / unknown。
+    /// source_changed / source_cleanup_required / staging_busy / payload_pending / published / unknown。
     pub detail: &'static str,
 }
 
@@ -480,7 +520,7 @@ pub(crate) fn begin_physical_move(plan: &MovePlan) -> Result<PhysicalPhase> {
         }
         PathState::Absent => {}
     }
-    match std::fs::rename(&plan.src_abs, &plan.dst_abs) {
+    match crate::utils::fs::rename_no_replace(&plan.src_abs, &plan.dst_abs) {
         Ok(()) => Ok(PhysicalPhase::Renamed),
         Err(_) => Ok(PhysicalPhase::NeedsStaging),
     }
@@ -544,11 +584,12 @@ pub(crate) fn staging_reusable(plan: &MovePlan, expected_digest: &str) -> bool {
     }
 }
 
-/// 发布暂存目录：rename 落位 → 删源。返回源是否已删除（false = 残留，由重试清理）。
+/// 发布暂存目录：拒绝覆盖地落位 → 证明源内容已被目标包含 → 删源。
+/// 返回源是否已删除（false = 保留源与日志，Windows 可重试，Unix 需手动处置）。
 ///
 /// 调用前必须已把内容凭据写进阶段日志（本函数一旦 rename 成功，日志就是唯一的「目标属于我们」证明）。
 pub(crate) fn publish_staging(plan: &MovePlan) -> Result<bool> {
-    if let Err(e) = std::fs::rename(&plan.staging_abs, &plan.dst_abs) {
+    if let Err(e) = crate::utils::fs::rename_no_replace(&plan.staging_abs, &plan.dst_abs) {
         cleanup_own_staging(&plan.staging_abs);
         return Err(AppError::MoveFile(format!(
             "发布目标目录失败: {e} | publish failed"
@@ -556,11 +597,13 @@ pub(crate) fn publish_staging(plan: &MovePlan) -> Result<bool> {
     }
     // 目标已落位：记账用的兄弟标记文件到这里失去意义（不删会留在目标父目录里）。
     drop_staging_marker(&plan.staging_abs);
-    match std::fs::remove_dir_all(&plan.src_abs) {
-        Ok(()) => Ok(true),
+    // 已发布后不能传播为发布失败，否则调用方会删掉恢复日志；清理未完成仍继续 DB 收尾。
+    match cleanup_source(&plan.src_abs, &plan.dst_abs) {
+        Ok(SourceCleanup::Removed) => Ok(true),
+        Ok(_) => Ok(false),
         Err(e) => {
             tracing::warn!(
-                "dir_move: 删源失败，留待重试 source={} error={e}",
+                "dir_move: 发布后源清理未完成 source={} error={e}",
                 plan.src_abs.display()
             );
             Ok(false)
@@ -604,11 +647,73 @@ pub(crate) fn stage_and_persist(
     }
 }
 
+/// 目录复制的累计落盘进度；最终成功或失败由命令返回值决定。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryCopyProgress {
+    /// 本次复制的取消代次。
+    pub generation: u64,
+    /// 已完成写入和长度校验的普通文件数。
+    pub copied_files: usize,
+    /// 已写入暂存的累计字节数，包含尚未完成的文件。
+    pub copied_bytes: u64,
+    /// 已进入不可取消的发布段；仍须等待命令终态。
+    pub publishing: bool,
+}
+
+/// 仅普通目录复制启用；移动恢复沿用相同复制核心并继续生成内容凭据。
+pub(crate) struct DirectoryCopyControl<'a> {
+    cancel: &'a CancellationToken,
+    progress: DirectoryCopyProgress,
+    report: &'a mut dyn FnMut(DirectoryCopyProgress),
+}
+
+impl<'a> DirectoryCopyControl<'a> {
+    /// 发出初始代次，便于调用方在首个文件复制结束前取消。
+    pub(crate) fn new(
+        generation: u64,
+        cancel: &'a CancellationToken,
+        report: &'a mut dyn FnMut(DirectoryCopyProgress),
+    ) -> Self {
+        let mut control = Self {
+            cancel,
+            progress: DirectoryCopyProgress {
+                generation,
+                copied_files: 0,
+                copied_bytes: 0,
+                publishing: false,
+            },
+            report,
+        };
+        control.report();
+        control
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn report(&mut self) {
+        (self.report)(self.progress.clone());
+    }
+}
+
 /// 复制一棵目录树到目标位置：独占暂存 → 复制校验 → rename 发布。返回落盘的普通文件数。
 ///
 /// 目标路径已存在（无论是否已索引）一律拒绝，不合并；中途失败只清我们自己的暂存目录，目标位置
 /// 不会出现半棵树的中间态。入库由调用方随后触发重扫（结果带 needs_rescan）。
-pub(crate) fn copy_tree_published(src: &Path, dst: &Path, name: &str) -> Result<usize> {
+pub(crate) fn copy_tree_published(
+    src: &Path,
+    dst: &Path,
+    name: &str,
+    mut control: Option<&mut DirectoryCopyControl<'_>>,
+) -> Result<usize> {
+    if let Some(control) = &control {
+        control.check_cancelled()?;
+    }
     match path_state(src) {
         PathState::Exists => {}
         _ => {
@@ -634,21 +739,31 @@ pub(crate) fn copy_tree_published(src: &Path, dst: &Path, name: &str) -> Result<
         cleanup_own_staging(&staging);
         return Err(e);
     }
-    let payload = match copy_tree_verified(src, &staging) {
-        Ok(p) => p,
+    // 普通复制只需文件数；移动恢复才需要内容凭据，避免在这里计算后丢弃摘要。
+    let files = match copy_into(src, src, &staging, None, control.as_deref_mut()) {
+        Ok(files) => files,
         Err(e) => {
             cleanup_own_staging(&staging);
             return Err(e);
         }
     };
-    if let Err(e) = std::fs::rename(&staging, dst) {
+    if let Some(control) = control {
+        if let Err(error) = control.check_cancelled() {
+            cleanup_own_staging(&staging);
+            return Err(error);
+        }
+        // 此后进入不可取消的发布段，迟到取消不能把已经发布的完整目录报成取消。
+        control.progress.publishing = true;
+        control.report();
+    }
+    if let Err(e) = crate::utils::fs::rename_no_replace(&staging, dst) {
         cleanup_own_staging(&staging);
         return Err(AppError::CopyFile(format!(
             "发布目标目录失败: {e} | publish failed"
         )));
     }
     drop_staging_marker(&staging);
-    Ok(payload.files)
+    Ok(files)
 }
 
 /// 暂存目录打标记（清理前置条件）。
@@ -679,16 +794,29 @@ fn drop_staging_marker(staging: &Path) {
 /// 一边读一边写一边算摘要：不额外多读一遍磁盘；写入字节数不等于源长度即视为不完整。
 fn copy_tree_verified(src: &Path, dst: &Path) -> Result<Payload> {
     let mut acc = TreeAcc::default();
-    copy_into(src, src, dst, &mut acc)?;
+    copy_into(src, src, dst, Some(&mut acc), None)?;
     Ok(Payload {
         files: acc.files,
         digest: acc.finish(),
     })
 }
 
-fn copy_into(root: &Path, dir: &Path, dst: &Path, acc: &mut TreeAcc) -> Result<()> {
+fn copy_into(
+    root: &Path,
+    dir: &Path,
+    dst: &Path,
+    mut acc: Option<&mut TreeAcc>,
+    mut control: Option<&mut DirectoryCopyControl<'_>>,
+) -> Result<usize> {
+    if let Some(control) = &control {
+        control.check_cancelled()?;
+    }
+    let mut files = 0;
     let entries = std::fs::read_dir(dir).map_err(|e| AppError::CopyFile(e.to_string()))?;
     for entry in entries {
+        if let Some(control) = &control {
+            control.check_cancelled()?;
+        }
         let entry = entry.map_err(|e| AppError::CopyFile(e.to_string()))?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
@@ -697,25 +825,41 @@ fn copy_into(root: &Path, dir: &Path, dst: &Path, acc: &mut TreeAcc) -> Result<(
             .map_err(|e| AppError::CopyFile(e.to_string()))?;
         if ft.is_dir() {
             std::fs::create_dir_all(&to).map_err(|e| AppError::CopyFile(e.to_string()))?;
-            copy_into(root, &from, &to, acc)?;
+            files += copy_into(root, &from, &to, acc.as_deref_mut(), control.as_deref_mut())?;
         } else {
-            copy_file_verified(root, &from, &to, acc)?;
+            copy_file_verified(root, &from, &to, acc.as_deref_mut(), control.as_deref_mut())?;
+            files += 1;
+            if let Some(control) = &mut control {
+                control.progress.copied_files += 1;
+                control.report();
+            }
         }
     }
-    Ok(())
+    Ok(files)
 }
 
-fn copy_file_verified(root: &Path, from: &Path, to: &Path, acc: &mut TreeAcc) -> Result<()> {
-    let rel = rel_key(root, from);
+fn copy_file_verified(
+    root: &Path,
+    from: &Path,
+    to: &Path,
+    acc: Option<&mut TreeAcc>,
+    mut control: Option<&mut DirectoryCopyControl<'_>>,
+) -> Result<()> {
     let mut input = std::fs::File::open(from)
         .map_err(|e| AppError::CopyFile(format!("读取源文件失败({}): {e}", from.display())))?;
     let mut output = std::fs::File::create(to)
         .map_err(|e| AppError::CopyFile(format!("创建目标文件失败({}): {e}", to.display())))?;
-    let mut hasher = Sha256::new();
-    hasher.update(rel.as_bytes());
+    let mut hasher = acc.as_ref().map(|_| {
+        let mut hasher = Sha256::new();
+        hasher.update(rel_key(root, from).as_bytes());
+        hasher
+    });
     let mut buf = vec![0u8; CHUNK];
     let mut written = 0u64;
     loop {
+        if let Some(control) = &control {
+            control.check_cancelled()?;
+        }
         let n = input
             .read(&mut buf)
             .map_err(|e| AppError::CopyFile(e.to_string()))?;
@@ -725,8 +869,14 @@ fn copy_file_verified(root: &Path, from: &Path, to: &Path, acc: &mut TreeAcc) ->
         output
             .write_all(&buf[..n])
             .map_err(|e| AppError::CopyFile(e.to_string()))?;
-        hasher.update(&buf[..n]);
+        if let Some(hasher) = &mut hasher {
+            hasher.update(&buf[..n]);
+        }
         written += n as u64;
+        if let Some(control) = &mut control {
+            control.progress.copied_bytes += n as u64;
+            control.report();
+        }
     }
     output
         .flush()
@@ -743,7 +893,9 @@ fn copy_file_verified(root: &Path, from: &Path, to: &Path, acc: &mut TreeAcc) ->
             from.display()
         )));
     }
-    acc.add(&rel, written, hasher.finalize().into());
+    if let (Some(acc), Some(hasher)) = (acc, hasher) {
+        acc.add(written, hasher.finalize().into());
+    }
     Ok(())
 }
 
@@ -788,7 +940,7 @@ struct TreeAcc {
 }
 
 impl TreeAcc {
-    fn add(&mut self, _rel: &str, len: u64, digest: [u8; 32]) {
+    fn add(&mut self, len: u64, digest: [u8; 32]) {
         self.files += 1;
         self.bytes += len;
         for (slot, byte) in self.acc.iter_mut().zip(digest.iter()) {
@@ -824,8 +976,12 @@ fn to_hex(bytes: &[u8; 32]) -> String {
 /// 单文件内容摘要（含相对路径与长度）。
 fn file_digest(root: &Path, file: &Path) -> Result<([u8; 32], u64)> {
     let mut input = std::fs::File::open(file).map_err(|e| AppError::MoveFile(e.to_string()))?;
+    digest_input(&mut input, &rel_key(root, file))
+}
+
+fn digest_input(input: &mut impl Read, relative_key: &str) -> Result<([u8; 32], u64)> {
     let mut hasher = Sha256::new();
-    hasher.update(rel_key(root, file).as_bytes());
+    hasher.update(relative_key.as_bytes());
     let mut buf = vec![0u8; CHUNK];
     let mut len = 0u64;
     loop {
@@ -863,7 +1019,7 @@ fn digest_into(root: &Path, dir: &Path, acc: &mut TreeAcc) -> Result<()> {
             digest_into(root, &path, acc)?;
         } else {
             let (digest, len) = file_digest(root, &path)?;
-            acc.add(&rel_key(root, &path), len, digest);
+            acc.add(len, digest);
         }
     }
     Ok(())
@@ -871,15 +1027,15 @@ fn digest_into(root: &Path, dir: &Path, acc: &mut TreeAcc) -> Result<()> {
 
 /// 源是不是目标内容的**子集**：源里每个目录在目标里是目录，每个文件在目标里存在且内容一致。
 ///
-/// 这是删源的唯一依据（审查复核 2）：尺寸一致还不够（同尺寸改写发现不了），必须比内容。源里多出的
-/// 文件不参与判定——那些是用户后来放进去的东西，保留即可，只要源里**没有**目标缺失或不同的条目，
-/// 删掉源就不会丢掉任何尚未存在于目标的内容。
+/// 先拒绝已有差异，随后固定源与目标句柄重新核验并删除；本次比对自身不承担原子性。
+#[cfg(windows)]
 fn source_subset_of_target(src: &Path, dst: &Path) -> Result<bool> {
     let mut subset = true;
     walk_subset(src, src, dst, &mut subset)?;
     Ok(subset)
 }
 
+#[cfg(windows)]
 fn walk_subset(root: &Path, dir: &Path, dst: &Path, subset: &mut bool) -> Result<()> {
     let entries = std::fs::read_dir(dir).map_err(|e| AppError::MoveFile(e.to_string()))?;
     for entry in entries {
@@ -974,6 +1130,7 @@ pub(crate) fn apply_move_db(conn: &mut Connection, plan: &MovePlan) -> Result<Db
             .cloned()
             .unwrap_or_default();
         let new_key = compute_cache_key_with_mtime_ns(
+            m.directory_id,
             &dir_rel,
             &m.file_name,
             m.file_mtime,
@@ -1473,45 +1630,42 @@ pub(crate) fn finish_entry(
             keep(&mut report, "source_leftover");
         }
         PathState::Exists => {
-            if !allow_physical {
+            #[cfg(not(windows))]
+            {
                 set_stage(db, entry.id, q::STAGE_SOURCE_LEFTOVER);
                 report.stage = q::STAGE_SOURCE_LEFTOVER.to_string();
-                keep(&mut report, "source_leftover");
+                keep(&mut report, "source_cleanup_required");
                 return report;
             }
-            match source_subset_of_target(&plan.src_abs, &plan.dst_abs) {
-                Ok(true) => {
-                    cleanup_own_staging(&plan.staging_abs);
-                    match std::fs::remove_dir_all(&plan.src_abs) {
-                        Ok(()) => {
-                            let _ = db.with_conn(&mut |conn| q::delete(conn, entry.id));
-                            report.detail = "completed";
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "dir_move: 源残留清理失败 source={} error={e}",
-                                plan.src_abs.display()
-                            );
-                            set_stage(db, entry.id, q::STAGE_SOURCE_LEFTOVER);
-                            report.stage = q::STAGE_SOURCE_LEFTOVER.to_string();
-                            keep(&mut report, "source_leftover");
-                        }
-                    }
-                }
-                // 源里有目标没有的内容（含同尺寸改写）→ 绝不删，报冲突等用户处置。
-                Ok(false) => {
-                    set_stage(db, entry.id, q::STAGE_SOURCE_LEFTOVER);
-                    report.stage = q::STAGE_SOURCE_LEFTOVER.to_string();
-                    keep(&mut report, "source_changed");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "dir_move: 源残留比对失败 source={} error={e}",
-                        plan.src_abs.display()
-                    );
+            #[cfg(windows)]
+            {
+                if !allow_physical {
                     set_stage(db, entry.id, q::STAGE_SOURCE_LEFTOVER);
                     report.stage = q::STAGE_SOURCE_LEFTOVER.to_string();
                     keep(&mut report, "source_leftover");
+                    return report;
+                }
+                match cleanup_source(&plan.src_abs, &plan.dst_abs) {
+                    Ok(SourceCleanup::Removed) => {
+                        cleanup_own_staging(&plan.staging_abs);
+                        let _ = db.with_conn(&mut |conn| q::delete(conn, entry.id));
+                        report.detail = "completed";
+                    }
+                    // 源里有目标没有的内容（含同尺寸改写）→ 绝不删，报冲突等用户处置。
+                    Ok(SourceCleanup::Changed) => {
+                        set_stage(db, entry.id, q::STAGE_SOURCE_LEFTOVER);
+                        report.stage = q::STAGE_SOURCE_LEFTOVER.to_string();
+                        keep(&mut report, "source_changed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "dir_move: 源残留比对失败 source={} error={e}",
+                            plan.src_abs.display()
+                        );
+                        set_stage(db, entry.id, q::STAGE_SOURCE_LEFTOVER);
+                        report.stage = q::STAGE_SOURCE_LEFTOVER.to_string();
+                        keep(&mut report, "source_leftover");
+                    }
                 }
             }
         }
@@ -1655,6 +1809,8 @@ pub(crate) fn pending_report(entry: &q::MoveJournalEntry) -> MoveRecoveryReport 
         needs_retry: true,
         detail: if entry.stage == q::STAGE_INTENT {
             "staging_busy"
+        } else if entry.stage == q::STAGE_SOURCE_LEFTOVER && !cfg!(windows) {
+            "source_cleanup_required"
         } else {
             "source_leftover"
         },
@@ -1675,3 +1831,6 @@ pub(crate) fn reconcile_at_startup(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod copy_tests;

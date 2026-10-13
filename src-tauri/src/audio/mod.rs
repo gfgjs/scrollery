@@ -1,13 +1,6 @@
-// src-tauri/src/audio/mod.rs
-//! 音频元数据 / 封面图 / 歌词提取（P3，§3.6），基于 `lofty`（纯 Rust，符合轻量原则）。
+//! 基于 `lofty` 读取音频元数据、内嵌封面和歌词。
 //!
-//! 本模块是音频能力的纯函数层，供三处复用：
-//!  1. enricher（补全阶段）—— 回填 `audio_meta`（artist/album/track/year/genre + 时长 + 歌词来源）。
-//!  2. 派生 `audio_cover` —— 提取内嵌封面 → 复用缩略图编码/缓存（见 derive/audio.rs）。
-//!  3. `get_audio_detail` IPC —— 播放器按需读取完整标签 + 全分辨率封面 + 歌词文本（含 .lrc）。
-//!
-//! This is the pure-function layer for audio, reused by the enricher, the `audio_cover`
-//! derivation, and the `get_audio_detail` IPC.
+//! 富化、封面派生与播放器详情共用此处的读取和提取函数。
 
 use std::path::{Path, PathBuf};
 
@@ -31,8 +24,6 @@ pub struct AudioTags {
     pub lyrics: Option<String>,
 }
 
-/// Lyrics provenance for `audio_meta.lyrics_source`. `embedded` = in the tag; `lrc` = sibling
-/// `.lrc` file; `none` = neither. The detail view reads the actual text lazily by source.
 /// `audio_meta.lyrics_source` 的歌词来源。`embedded` = 标签内嵌；`lrc` = 同名 `.lrc`；`none` = 无。
 /// 详情视图按来源按需读取实际文本。
 pub fn lyrics_source(tags: &AudioTags, lrc: &Option<PathBuf>) -> &'static str {
@@ -71,39 +62,33 @@ fn codec_label(ft: lofty::file::FileType) -> &'static str {
     }
 }
 
-/// Read tags + properties for an audio file. Missing tags map to `None` (a file may carry no
-/// tag block at all — still returns codec/duration from the audio properties).
 /// 读取音频文件的标签 + 属性。缺失标签映射为 `None`（文件可能完全无标签块 —— 仍从音频属性返回
 /// 编解码/时长）。
 pub fn read_tags(path: &Path) -> Result<AudioTags> {
     Ok(tags_from(&open(path)?))
 }
 
-/// Embedded cover art as raw image bytes (`jpeg`/`png`/…), preferring the front-cover picture.
-/// Returns `(bytes, file_extension)`; `None` if the file carries no embedded picture.
 /// 内嵌封面图的原始字节（`jpeg`/`png`/…），优先取正面封面。返回 `(字节, 文件扩展名)`；
 /// 文件无内嵌图片则为 `None`。
 pub fn read_cover(path: &Path) -> Result<Option<(Vec<u8>, &'static str)>> {
     Ok(cover_from(&open(path)?))
 }
 
-/// Read tags AND cover art in a SINGLE file parse — used by `get_audio_detail`, which otherwise
-/// would parse the same file up to 3× (tags + lyrics + cover). 一次解析同时取标签与封面 ——
-/// 供 `get_audio_detail` 用，避免对同一文件解析多达 3 次（标签 + 歌词 + 封面）。
-// 返回 (标签, 可选封面(字节, MIME))，单次解析双产物的固有形状，抽别名收益有限。
+/// 一次解析同时取标签与封面，供 `get_audio_detail` 复用。
+// 返回（标签，可选封面（字节，文件扩展名）），一次解析得到两种结果。
 #[allow(clippy::type_complexity)]
 pub fn read_all(path: &Path) -> Result<(AudioTags, Option<(Vec<u8>, &'static str)>)> {
     let tagged = open(path)?;
     Ok((tags_from(&tagged), cover_from(&tagged)))
 }
 
-/// Open + decode a file's tags once. 一次性打开并解码文件标签。
+/// 一次性打开并解析文件标签。
 fn open(path: &Path) -> Result<lofty::file::TaggedFile> {
     read_from_path(path)
         .map_err(|e| AppError::AudioMetadata(format!("lofty read failed | 音频读取失败: {e}")))
 }
 
-/// Extract `AudioTags` from an already-parsed file. 从已解析的文件提取 `AudioTags`。
+/// 从已解析的文件提取 `AudioTags`。
 fn tags_from(tagged: &lofty::file::TaggedFile) -> AudioTags {
     let props = tagged.properties();
     let duration_ms = {
@@ -151,7 +136,7 @@ fn tags_from(tagged: &lofty::file::TaggedFile) -> AudioTags {
     out
 }
 
-/// Extract the cover picture from an already-parsed file. 从已解析的文件提取封面图片。
+/// 从已解析的文件提取封面图片。
 fn cover_from(tagged: &lofty::file::TaggedFile) -> Option<(Vec<u8>, &'static str)> {
     use lofty::picture::{MimeType, PictureType};
 
@@ -171,15 +156,13 @@ fn cover_from(tagged: &lofty::file::TaggedFile) -> Option<(Vec<u8>, &'static str
         Some(MimeType::Gif) => "gif",
         Some(MimeType::Bmp) => "bmp",
         Some(MimeType::Tiff) => "tiff",
-        // Jpeg / Unknown / None → default to jpg (the most common embedded format).
+        // 未识别的图片类型沿用 jpg 默认扩展名。
         _ => "jpg",
     };
     Some((pic.data().to_vec(), ext))
 }
 
-/// Locate a sibling `.lrc` lyrics file (same base name, same directory) — e.g. `song.mp3` →
-/// `song.lrc`. Tries the exact case and a lowercase `.lrc` extension.
-/// 查找同目录同名的 `.lrc` 歌词文件 —— 如 `song.mp3` → `song.lrc`。尝试原扩展名与小写 `.lrc`。
+/// 查找同目录同名的歌词文件，如 `song.mp3` → `song.lrc`；依次尝试 `.lrc` 与 `.LRC`。
 pub fn find_lrc(path: &Path) -> Option<PathBuf> {
     let lrc = path.with_extension("lrc");
     if lrc.exists() {
@@ -192,10 +175,6 @@ pub fn find_lrc(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve displayable lyrics for the player from ALREADY-READ tags + the file path: embedded
-/// lyrics first, then a sibling `.lrc`. Returns `(text, is_synced)` where `is_synced` is true if
-/// the text carries LRC `[mm:ss]` timestamps (the frontend then highlights/scrolls in sync). Takes
-/// pre-read tags so callers (e.g. `get_audio_detail`) don't parse the file again.
 /// 从**已读取**的标签 + 文件路径为播放器解析歌词：先内嵌，再同名 `.lrc`。返回 `(文本, 是否带时间轴)`
 /// —— 文本含 LRC `[mm:ss]` 时间标签则为 true。接收预读标签，使调用方（如 `get_audio_detail`）无需重复解析文件。
 pub fn lyrics_from_tags(tags: &AudioTags, path: &Path) -> (Option<String>, bool) {
@@ -204,7 +183,9 @@ pub fn lyrics_from_tags(tags: &AudioTags, path: &Path) -> (Option<String>, bool)
         return (Some(text.to_string()), is_synced_lrc(text));
     }
     if let Some(lrc) = find_lrc(path) {
-        if let Ok(text) = std::fs::read_to_string(&lrc) {
+        if let Ok(bytes) = std::fs::read(&lrc) {
+            // 复用文本解码以读取非 UTF-8 歌词，并剥离会遮住首行时间标签的 BOM。
+            let text = crate::reader::encoding::decode_bytes(&bytes, None).text;
             let synced = is_synced_lrc(&text);
             return (Some(text), synced);
         }
@@ -226,4 +207,46 @@ fn is_synced_lrc(text: &str) -> bool {
         }
         false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_bom_sidecar_lyrics_are_read_without_modifying_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("song.mp3");
+        let lrc = audio.with_extension("lrc");
+        let text = "[00:01.50]中文歌词🎵\r\n[00:03.00]第二行";
+        let bytes: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        std::fs::write(&audio, b"audio fixture").unwrap();
+        std::fs::write(&lrc, &bytes).unwrap();
+
+        let (lyrics, synced) = lyrics_from_tags(&AudioTags::default(), &audio);
+
+        assert_eq!(std::fs::read(&lrc).unwrap(), bytes);
+        assert_eq!(std::fs::read(&audio).unwrap(), b"audio fixture");
+        assert_eq!(lyrics.as_deref(), Some(text));
+        assert!(synced);
+    }
+
+    #[test]
+    fn utf8_bom_sidecar_first_timestamp_remains_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("song.mp3");
+        let text = "[00:01.50]唯一一行歌词";
+        let bytes = format!("\u{feff}{text}").into_bytes();
+        let lrc = audio.with_extension("lrc");
+        std::fs::write(&lrc, &bytes).unwrap();
+
+        let (lyrics, synced) = lyrics_from_tags(&AudioTags::default(), &audio);
+
+        assert_eq!(std::fs::read(&lrc).unwrap(), bytes);
+        assert!(synced, "BOM 不应遮住首行的时间标签");
+        assert_eq!(lyrics.as_deref(), Some(text));
+    }
 }

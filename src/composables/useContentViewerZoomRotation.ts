@@ -1,9 +1,6 @@
 // src/composables/useContentViewerZoomRotation.ts
-// 从 ContentViewer.vue 下沉(超长文件拆分方案 2.1):缩放比例 + 旋转(含持久化复原)。
-// 纯逻辑搬迁,不改变原调用点/参数/时序——见 docs/planning/2026-07-25-超长文件拆分方案/analysis/ContentViewer-vue.md。
-// 红线(风险章节):updateZoomRatio → onSizeReady(原内联调 recomputeFaceLayout)的隐式调用序不变;
-// pendingInitialRotation 复原时序不变——尺寸就绪(@load/@loadedmetadata 触发本 composable 的
-// updateZoomRatio)才落角且仅一次。
+// 查看器缩放比例 + 旋转(含持久化复原)。
+// 尺寸就绪后先更新缩放基准，再重算人脸框；待恢复旋转只在此时应用一次。
 
 import { ref, computed, watch, type Ref } from 'vue'
 import type { useMediaDetail } from './useMediaDetail'
@@ -15,20 +12,22 @@ export function useContentViewerZoomRotation(options: {
   state: ReturnType<typeof useMediaDetail>
   viewerRef: Ref<HTMLElement | null>
   currentImageElement: () => HTMLImageElement | null
+  /** 当前原图已完成加载；占位缩略图不能作为恢复旋转的尺寸基准。 */
+  isImageLoaded: () => boolean
   videoRef: Ref<InstanceType<typeof VideoPlayer> | null>
   detail: () => MediaDetail | null
   media: ReturnType<typeof useMediaStore>
   t: (key: string) => string
-  /** 原 updateZoomRatio 内联调 recomputeFaceLayout,拆分后由主组件把两个 composable 串起来,
-   *  调用顺序不变(先更新缩放基准、再重算人脸框投影)。 */
+  /** 缩放基准更新后通知主组件重算人脸框投影。 */
   onSizeReady: () => void
 }) {
-  const { state, viewerRef, currentImageElement, videoRef, detail, media, t, onSizeReady } = options
+  const { state, viewerRef, currentImageElement, isImageLoaded, videoRef, detail, media, t, onSizeReady } = options
 
   // 获取媒体真实宽高
   function getMediaDimensions() {
     const image = currentImageElement()
     if (image) {
+      if (!isImageLoaded()) return { w: 0, h: 0 }
       return { w: image.naturalWidth, h: image.naturalHeight }
     }
     const videoEl = videoRef.value?.videoEl
@@ -98,11 +97,11 @@ export function useContentViewerZoomRotation(options: {
 
   function updateZoomRatio() {
     if (!viewerRef.value || (!currentImageElement() && !videoRef.value?.videoEl)) return
-    const { w, h } = getMediaDimensions()
-    const iw = w || 1
-    const ih = h || 1
-    const cw = viewerRef.value.clientWidth || 1
-    const ch = viewerRef.value.clientHeight || 1
+    const { w: iw, h: ih } = getMediaDimensions()
+    const cw = viewerRef.value.clientWidth
+    const ch = viewerRef.value.clientHeight
+    // ResizeObserver 可能先于 load/元数据回调，零尺寸时保留待恢复角度。
+    if (!iw || !ih || !cw || !ch) return
     const base_w = Math.min(iw, cw, ch * (iw / ih))
     zoomRatio.value = base_w / iw
     // 尺寸就绪的首帧复原持久旋转:设角后按含旋转 auto 适应足迹,随即清 pending——只做一次,不干扰用户

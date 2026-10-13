@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import type { ScanRoot } from '../types/media'
-import { IPC } from '../constants/ipc'
+import { IPC, EVENTS } from '../constants/ipc'
 
 const operationIds = vi.hoisted(() => ({ next: 0 }))
 const invokeIpc = vi.fn((..._args: unknown[]) => Promise.resolve<unknown>(undefined))
@@ -192,48 +192,43 @@ describe('scanStore 根列表响应隔离', () => {
 
 describe('scanStore 同根 stop/restart 迟到响应隔离', () => {
 
-  it('STOP IPC 失败时恢复本地运行态并重新接受后续进度', async () => {
-    const stopResult = deferred<unknown>()
+  it('stop 完成后同 run 的迟到 Channel 进度与 completed 不得复活运行态', async () => {
     let channel: { onmessage?: (message: unknown) => void } | undefined
     invokeIpc.mockImplementation((cmd: unknown, args?: unknown) => {
       if (cmd === IPC.START_SCAN) {
         channel = (args as { onProgress: typeof channel })?.onProgress
-        return Promise.resolve(undefined)
       }
-      if (cmd === IPC.STOP_SCAN) return stopResult.promise
       return Promise.resolve(undefined)
     })
 
     const scan = useScanStore()
     await scan.startScan(7)
-    const stop = scan.stopScan(7)
+    await scan.stopScan(7)
     expect(scan.progressMap[7]?.isRunning).toBe(false)
-
-    stopResult.reject(new Error('stop failed'))
-    await expect(stop).rejects.toThrow('stop failed')
-    expect(scan.progressMap[7]).toMatchObject({
-      runId: 'test-run',
-      isRunning: true,
-      status: 'discovering',
-    })
 
     channel?.onmessage?.({
       type: 'progress',
       rootId: 7,
       runId: 'test-run',
-      scanned: 2,
-      total: 5,
-      processedBytes: 20,
-      totalBytes: 50,
-      currentDir: 'recovered',
+      scanned: 9,
+      total: 10,
+      processedBytes: 90,
+      totalBytes: 100,
+      currentDir: 'late',
       status: 'scanning',
     })
-    expect(scan.progressMap[7]).toMatchObject({
-      scanned: 2,
-      total: 5,
-      isRunning: true,
-      status: 'scanning',
+    channel?.onmessage?.({
+      type: 'completed',
+      rootId: 7,
+      runId: 'test-run',
+      totalItems: 10,
+      totalBytes: 100,
+      elapsedMs: 1,
+      markedMissing: 0,
     })
+
+    expect(scan.progressMap[7]?.isRunning).toBe(false)
+    expect(scan.progressMap[7]?.status).toBe('discovering')
   })
 
   it('startScan 与立即 stopScan 不丢失待启动的本地运行态', async () => {
@@ -292,26 +287,61 @@ describe('scanStore 同根 stop/restart 迟到响应隔离', () => {
     expect(stopArgs).toEqual({ rootId: 7, runId: 'old-run' })
     expect(scan.progressMap[7]).toMatchObject({ runId: 'new-run', isRunning: true })
   })
+})
 
-  it('旧 startScan 异常不清理已经安装的新运行态', async () => {
-    const oldStart = deferred<unknown>()
-    let startCount = 0
-    invokeIpc.mockImplementation((cmd: unknown) => {
-      if (cmd === IPC.START_SCAN) {
-        startCount += 1
-        return startCount === 1 ? oldStart.promise : Promise.resolve(undefined)
-      }
-      return Promise.resolve(undefined)
-    })
+describe('scanStore 缩略图生成命令的迟到响应隔离', () => {
+  it('取消终态先到并重启后，旧 stop 返回不能停止新生成任务', async () => {
+    const stopResult = deferred<unknown>()
+    invokeIpc.mockImplementation((cmd: unknown) =>
+      cmd === IPC.STOP_FULL_THUMBNAIL_GENERATION ? stopResult.promise : Promise.resolve(undefined),
+    )
     const scan = useScanStore()
-    const oldRun = scan.startScan(7)
-    await vi.waitFor(() => expect(startCount).toBe(1))
+    scan.scanRoots = [root(1, false)]
+    await scan.startIncrementalThumbnailGeneration()
+    const stop = scan.stopFullThumbnailGeneration()
+    eventListeners.get(EVENTS.THUMB_GEN_PROGRESS)?.({
+      payload: { generated: 2, total: 10, status: 'cancelled' },
+    })
+    expect(scan.thumbGenProgress.isRunning).toBe(false)
 
-    await scan.startScan(7)
-    expect(scan.progressMap[7]?.runId).toBe('test-run-2')
-    oldStart.reject(new Error('stale start failed'))
-    await expect(oldRun).rejects.toThrow('stale start failed')
+    // 侧栏在终态事件到达后已显示启动按钮，STOP 的 IPC 回包此时仍可在途。
+    await scan.startIncrementalThumbnailGeneration()
+    eventListeners.get(EVENTS.THUMB_GEN_PROGRESS)?.({
+      payload: { generated: 3, total: 20, status: 'running' },
+    })
+    stopResult.resolve(undefined)
+    await stop
+    expect(scan.thumbGenProgress).toMatchObject({
+      generated: 3, total: 20, isRunning: true, status: 'running',
+    })
 
-    expect(scan.progressMap[7]).toMatchObject({ runId: 'test-run-2', isRunning: true })
+    await scan.stopFullThumbnailGeneration()
+    expect(scan.thumbGenProgress).toMatchObject({ isRunning: false, status: 'cancelled' })
+  })
+
+  it('失败终态先到并重启后，旧 start 拒绝不能把新生成任务改成 error', async () => {
+    const oldStartResult = deferred<unknown>()
+    invokeIpc.mockImplementation((cmd: unknown) =>
+      cmd === IPC.START_FULL_THUMBNAIL_GENERATION ? oldStartResult.promise : Promise.resolve(undefined),
+    )
+    const scan = useScanStore()
+    scan.scanRoots = [root(1, false)]
+    const failure = new Error('候选快照失败')
+    const oldStart = expect(scan.startFullThumbnailGeneration()).rejects.toBe(failure)
+    await vi.waitFor(() => expect(invokeIpc).toHaveBeenCalledWith(IPC.START_FULL_THUMBNAIL_GENERATION))
+    // 后端候选读取失败先发布 error 事件，再由启动命令返回错误；二者没有跨通道顺序保证。
+    eventListeners.get(EVENTS.THUMB_GEN_PROGRESS)?.({
+      payload: { generated: 0, total: 0, status: 'error' },
+    })
+    expect(scan.thumbGenProgress.isRunning).toBe(false)
+    await scan.startIncrementalThumbnailGeneration()
+    eventListeners.get(EVENTS.THUMB_GEN_PROGRESS)?.({
+      payload: { generated: 4, total: 20, status: 'running' },
+    })
+    oldStartResult.reject(failure)
+    await oldStart
+    expect(scan.thumbGenProgress).toMatchObject({
+      generated: 4, total: 20, isRunning: true, status: 'running',
+    })
   })
 })

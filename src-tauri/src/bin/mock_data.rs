@@ -48,9 +48,9 @@ struct Options {
     file_size: i64,
     thumb_status: ThumbSeedStatus,
     reset_thumbs: bool,
-    /// 子目录数(=1 保持旧行为:全部条目直挂根目录)。T16 folder 分组压测用。
+    /// 子目录数；1 表示全部条目直挂根目录，供 folder 分组压测。
     dirs: i64,
-    /// sort_datetime 铺开的天数(=0 保持旧行为:逐条 +1 秒)。T16 date 分组压测用。
+    /// sort_datetime 铺开的天数；0 表示逐条递增 1 秒，供 date 分组压测。
     days: i64,
 }
 
@@ -287,7 +287,7 @@ fn ensure_root_directory(
 }
 
 /// 建/取 N 个子目录(folder_0000…),返回按 dir_index 排列的目录 id;--dirs 1 时退化为
-/// 根目录本身(旧行为)。幂等:重跑/加量只补缺,不重复建。
+/// 根目录本身。幂等：重跑或加量只补缺，不重复建。
 fn ensure_sub_directories(
     conn: &mut Connection,
     root_id: i64,
@@ -307,7 +307,7 @@ fn ensure_sub_directories(
         )?;
         for i in 0..opts.dirs {
             let name = format!("folder_{i:04}");
-            // 单段 rel_path=name;算 tree_sort_key(方案 B),否则 perf 库上 folder 键全空、
+            // 单段 rel_path=name；须计算 tree_sort_key，否则 perf 库上 folder 键全空、
             // 排序退化按 d.id,恰好测不出持久列特性。根目录(rel_path='')经列 DEFAULT X'' 取空键。
             let key = encode_tree_sort_key(&name);
             stmt.execute(params![root_id, root_dir_id, name, name, now, key])?;

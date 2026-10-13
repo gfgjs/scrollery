@@ -1,7 +1,6 @@
 <script setup lang="ts">
-// 单条日志行(日志能力重构 S4,方案 §5):级别徽标(颜色 + 文字双编码,WCAG 1.4.1)+ 时间戳 +
-// target + msg + 非空 attributes 紧凑展开。纯展示组件,状态(是否选中)由父级传入,点击只 emit
-// 事件不自持选中态(S5 P2「过滤命中↔原文上下文」双窗格,选中态由 logWindowStore.selectedSeq 单源)。
+// 单条日志行：级别徽标以颜色和文字双重表达，另展示时间戳与
+// target、msg 与非空 attributes。选中态由父级传入，点击时只发出事件。
 import { computed } from 'vue'
 import type { LogEntry } from '../../types/logEntry'
 
@@ -69,7 +68,7 @@ const shortTime = computed(() => {
   text-align: center;
   border-radius: var(--radius-xs);
 }
-/* 颜色 + 文字双编码(WCAG 1.4.1):不单靠色相区分级别,DEBUG/TRACE 用低饱和灰视觉降权(方案 §5)。 */
+/* 级别同时用颜色和文字表示；DEBUG/TRACE 使用低饱和灰降低视觉权重。 */
 .log-row__level--trace {
   color: var(--color-text-tertiary);
   opacity: 0.75;

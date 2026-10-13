@@ -1,5 +1,5 @@
 // src-tauri/src/derive/audio.rs
-//! Audio derivations (P3, §3.6). 音频派生（P3，§3.6）。
+//! 音频封面派生。
 //!
 //! `audio_cover`：用 `lofty`（纯 Rust，符合轻量）提取内嵌封面 → 复用缩略图编码器写入缩略图缓存，
 //! 流水线再把 `thumb_status/thumb_path/thumbhash` 回填到 `media_items`，`MediaThumb` 零改动即可显示
@@ -14,18 +14,15 @@ use crate::engine::traits::DecodedImage;
 use crate::error::{AppError, Result};
 use crate::thumbnail::generator::{encode_media_step_with_snapshot, snap_to_tier, ThumbConfig};
 
-/// 提取内嵌专辑封面并写为封面缩略图（P3，§3.6）。
+/// 提取内嵌专辑封面并写为封面缩略图。
 pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
     let (bytes, _ext) = crate::audio::read_cover(&ctx.abs_path)?
         .ok_or_else(|| AppError::AudioMetadata("no embedded cover art | 无内嵌封面".into()))?;
 
-    // Decode the embedded picture (jpeg/png/…) → RGBA, then reuse the thumbnail encoder:
-    // resize → WebP → write to thumb cache (by cache_key) → thumbhash. Identical to video cover.
     // 解码内嵌图片（jpeg/png/…）→ RGBA，再复用缩略图编码器：缩放 → WebP → 按 cache_key 写缓存 → thumbhash。
-    // 与视频封面完全一致。
-    let dynimg = crate::engine::image_rs::decode_image_bytes_bounded(&bytes, ctx.max_pixel_bytes)?;
-    let rgba = dynimg.into_rgba8();
-    drop(bytes);
+    let dynimg = image::load_from_memory(&bytes)
+        .map_err(|e| AppError::AudioMetadata(format!("cover decode failed | 封面解码失败: {e}")))?;
+    let rgba = dynimg.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
     let decoded = DecodedImage {
         pixels: rgba.into_raw(),
@@ -39,10 +36,10 @@ pub fn run_cover(ctx: &DerivationContext) -> Result<DerivationOutput> {
         size: snap_to_tier(ctx.thumb_size),
         skip_max_bytes: 0,
         strategy: String::new(),
+        gpu_engine: String::new(),
         ai_hq_cache: false, // 音频封面非 CLIP 分析对象，不产 AI 缓存
         webp_quality: ctx.webp_quality,
         ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
-        output_fingerprint: None,
     };
     let res = encode_media_step_with_snapshot(
         ctx.item_id,

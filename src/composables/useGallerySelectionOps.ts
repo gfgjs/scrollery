@@ -1,10 +1,10 @@
-// 画廊选区批量操作全集(自 MediaGrid.vue 结构拆分抽出,函数体与调用顺序逐字保留)。
+// 画廊选区批量操作全集。
 //
-// 🔴 时序契约(拆分方案 §3.2):
+// 🔴 时序契约:
 //   batchDelete → stageDeleted →(退出选择态 watcher)→ commitPendingReflow → fadeOutCells →
 //   flipReflow(async () => { compute(); updateVisible(); await whenSettled() })
 // 这条链的执行顺序是**用户反馈驱动的行为契约**(删除不立即重排,退出选择才一次性重排),
-// 连同 `watch(selection.isSelectionMode)` 一起整体搬运,不得拆开到不同文件。
+// 重排由退出选择态的 watcher 统一触发。
 import { ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { invokeIpc, ipcErrorMessage } from '../utils/ipc'
@@ -44,7 +44,7 @@ export interface GallerySelectionOpsDeps {
   patchVisibleRating: (ids: Set<number>, rating: number) => void
   patchVisibleFavorite: (ids: Set<number>, isFavorited: boolean) => void
   patchVisibleColorLabel: (ids: Set<number>, colorLabel: number) => void
-  patchVisibleSelected: (apply: (item: LayoutRowItem) => void) => void
+  captureSelectionPatch: () => (apply: (item: LayoutRowItem) => void) => Promise<void>
 }
 
 export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
@@ -63,45 +63,48 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
     mode: 'move' as 'move' | 'copy',
   })
 
+  function isFavoritesView(): boolean {
+    return filter.favoritedOnly ||
+      viewStore.activeSmartAlbum === 'favorites' ||
+      viewStore.activeCollection?.kind === 'system'
+  }
+
   async function handleFavorite(itemId: number) {
     // 切换收藏并获取新状态
     const newValue = await media.toggleFavorite(itemId)
     // 收藏（而非取消）时，提示加入收藏夹（需求7 §3.7）。
     if (newValue) collectionToast.showAddToCollection([itemId])
-    // 修补可见行中的项以即时反馈
-    deps.patchVisibleFavorite(new Set([itemId]), newValue)
-    // 在收藏视图（或系统收藏夹，本质是 类型 + is_favorited）中，重算布局以移除刚取消收藏的项。
-    if (
-      viewStore.activeSmartAlbum === 'favorites' ||
-      viewStore.activeCollection?.kind === 'system'
-    ) {
-      await deps.compute()
-    }
   }
 
   // 详情页 / 外部单项改 favorite·rating·colorLabel → 回灌画廊 visibleRows（修复:详情设色/评分/收藏
   // 后画廊缩略图不刷新、需手动刷新）。根因：visibleRows 由网格持有（经 fetchRowsByY 拉取），store 侧
   // 无行缓存可改（R2-2 已删 rowCache/patchRowItem 旁路），故由 itemPatchSignal 通知就地回灌 visibleRows。
-  // 仅做视觉回灌（幂等，与 in-grid 同步内联 patch 无冲突）；筛选剔除重算仍由各 in-grid handler 负责。
+  // 单项标记的图标和筛选剔除统一由信号驱动，底栏/查看器与网格入口一致；离屏重算由 compute 延后。
   watch(
     () => media.itemPatchSignal,
     (p) => {
       if (!p) return
       const ids = new Set([p.id])
-      if (p.field === 'rating') deps.patchVisibleRating(ids, p.value as number)
-      else if (p.field === 'colorLabel') deps.patchVisibleColorLabel(ids, p.value as number)
-      else if (p.field === 'isFavorited') deps.patchVisibleFavorite(ids, p.value as boolean)
+      if (p.field === 'rating') {
+        const rating = p.value as number
+        deps.patchVisibleRating(ids, rating)
+        if (filter.minRating > 0 && rating < filter.minRating) void deps.compute()
+      } else if (p.field === 'colorLabel') {
+        const colorLabel = p.value as number
+        deps.patchVisibleColorLabel(ids, colorLabel)
+        if (filter.colorLabel > 0 && colorLabel !== filter.colorLabel) void deps.compute()
+      } else if (p.field === 'isFavorited') {
+        deps.patchVisibleFavorite(ids, p.value as boolean)
+        if (isFavoritesView()) void deps.compute()
+      }
     },
+    // 信号只保存最后一项；同步消费每次发布，避免同一轮多项回执被 Vue 合并后漏刷。
+    { flush: 'sync' },
   )
 
-  // 缩略图 hover 快捷评分（单项）：落库 + 乐观刷新星级。
-  // 若「≥N 星」筛选激活且新评分跌破阈值，该项应离开视图 → 重算（镜像收藏视图取消收藏时的重算）。
+  // 缩略图 hover 快捷评分（单项）：落库后的信号统一刷新星级和筛选结果。
   async function handleRate(itemId: number, value: number) {
     await media.setRating(itemId, value)
-    deps.patchVisibleRating(new Set([itemId]), value)
-    if (filter.minRating > 0 && value < filter.minRating) {
-      await deps.compute()
-    }
   }
 
   // ── 选区批量操作的公共出入口（R1-2/S4）────────────────────────────────────────
@@ -116,12 +119,15 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
   // value=0 清除。镜像 batchFavorite + handleRate 的「按色筛选下改后不匹配则重算移除」。
   async function batchColor(value: number) {
     if (selection.selectedCount.value === 0) return
+    const patch = deps.captureSelectionPatch()
     const n = await media.batchSetColorLabel(selectionDescriptor(), value)
-    deps.patchVisibleSelected((it) => {
-      it.colorLabel = value
-    })
+    // 当前按色筛选必定要重算时直接读取,避免选区变化使捕获回写也重算一次。
     if (filter.colorLabel > 0 && value !== filter.colorLabel) {
       await deps.compute()
+    } else {
+      await patch((it) => {
+        it.colorLabel = value
+      })
     }
     toast.addToast(
       'success',
@@ -153,12 +159,13 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
 
   async function batchFavorite() {
     if (selection.selectedCount.value === 0) return
+    const patch = deps.captureSelectionPatch()
     // R1-2/S4：描述符直传（全选百万项 payload 恒定）;受影响计数以后端返回为准。
     const n = await invokeIpc<number>(IPC.BATCH_TOGGLE_FAVORITE, {
       selection: selectionDescriptor(),
       value: true,
     })
-    deps.patchVisibleSelected((it) => {
+    await patch((it) => {
       it.isFavorited = true
     })
     await media.loadStats()
@@ -167,13 +174,19 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
 
   async function batchUnfavorite() {
     if (selection.selectedCount.value === 0) return
+    const patch = deps.captureSelectionPatch()
     const n = await invokeIpc<number>(IPC.BATCH_TOGGLE_FAVORITE, {
       selection: selectionDescriptor(),
       value: false,
     })
-    deps.patchVisibleSelected((it) => {
-      it.isFavorited = false
-    })
+    // 筛选下直接重取,与捕获回写互斥,避免选区已变化时触发两次重算。
+    if (isFavoritesView()) {
+      await deps.compute()
+    } else {
+      await patch((it) => {
+        it.isFavorited = false
+      })
+    }
     await media.loadStats()
     toast.addToast('success', t('selection.unfavorited', { count: n }))
   }
@@ -199,8 +212,7 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
     // 即落库（进回收站），但不重排——仅置灰暂存，退出选择时统一重排。
     // 破坏性操作必须有失败反馈（审查 R0-5）：落库失败时绝不进暂存集（否则前端置灰、
     // 后端未删，退出选择时重排会「凭空消失」未删除的项），toast 告知后原样保留选区。
-    // R1-2 注：删除仍物化 id 后以 Explicit 描述符传参——暂存置灰集/撤销闭包/FLIP 重排都
-    // 需要具体 id，SelectAll 深迁移（对全选表达暂存态）属 T18 后续。
+    // 删除需具体 id 维护暂存置灰集、撤销闭包和 FLIP 重排，因此传 Explicit 描述符。
     try {
       await invokeIpc(IPC.SOFT_DELETE_ITEMS, { selection: { kind: 'explicit', ids } })
     } catch (e) {
@@ -381,14 +393,17 @@ export function useGallerySelectionOps(deps: GallerySelectionOpsDeps) {
     // 与拖图落点 performMediaDrop 同一路径（DRY）。history 内部 refresh() 已重载文件夹树（实时计数）
     // + 重算网格,故不再手动 compute/loadStats/计数调整;copy 走 _db 直接建行,无需再 startScan 重扫。
     const mode = moveCopyDialog.value.mode
+    const selectionEpoch = selection.selectionEpoch.value
     try {
       const n =
         mode === 'copy'
           ? await history.copyMedia(ids, targetNode.id, `复制 ${ids.length} 项`)
           : await history.moveMedia(ids, targetNode.id, `移动 ${ids.length} 项`)
       if (n > 0) {
-        // 移动后源项已离开当前视图 → 清选区;复制保留选区（项仍在原处）。
-        if (mode === 'move') selection.clearSelection()
+        // 移动期间仍可在画廊改选；旧操作只能清自己的选区，不能清掉用户后来的选择。
+        if (mode === 'move' && selection.selectionEpoch.value === selectionEpoch) {
+          selection.clearSelection()
+        }
         toast.addToast(
           'success',
           mode === 'copy'

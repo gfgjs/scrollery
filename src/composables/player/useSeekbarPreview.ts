@@ -39,6 +39,7 @@ export function useSeekbarPreview(itemId: Ref<number | null>) {
   const spriteCache = new Map<number, string>()
   const spriteMissAt = new Map<number, number>()
   let resolveToken = 0
+  let resolving = false
 
   async function resolveSprite(id: number): Promise<string> {
     const cached = spriteCache.get(id)
@@ -66,17 +67,25 @@ export function useSeekbarPreview(itemId: Ref<number | null>) {
     }
   }
 
+  function loadSprite(id: number) {
+    const myToken = resolveToken
+    resolving = true
+    void resolveSprite(id).then((url) => {
+      if (myToken !== resolveToken) return
+      resolving = false
+      spriteSrc.value = url
+    })
+  }
+
   // 切条目(边界 8 token 防御):迟到的旧条目解析结果按 token 丢弃。
   watch(
     itemId,
     (id) => {
-      const myToken = ++resolveToken
+      ++resolveToken
+      resolving = false
       spriteSrc.value = ''
       if (id == null) return
-      resolveSprite(id).then((url) => {
-        if (myToken !== resolveToken) return
-        spriteSrc.value = url
-      })
+      loadSprite(id)
     },
     { immediate: true },
   )
@@ -89,7 +98,18 @@ export function useSeekbarPreview(itemId: Ref<number | null>) {
    * 无 sprite 时返回 null——上层(VideoSeekBar)据此只留时间 tooltip。
    */
   function styleForRatio(ratio: number): Record<string, string> | null {
-    if (!spriteSrc.value) return null
+    if (!spriteSrc.value) {
+      const id = itemId.value
+      const missAt = id == null ? undefined : spriteMissAt.get(id)
+      // 后台生成或重建完成后，后续悬停／拖动可重试；渲染多次及加载期间不重复请求。
+      if (
+        id != null && !resolving && missAt !== undefined &&
+        Date.now() - missAt >= SPRITE_MISS_TTL_MS
+      ) {
+        loadSprite(id)
+      }
+      return null
+    }
     const cols = ui.videoKeyframeCount || KEYFRAME_COUNT_FALLBACK
     const clamped = Math.min(1, Math.max(0, ratio))
     const frame = cols > 1 ? Math.min(cols - 1, Math.floor(clamped * cols)) : 0

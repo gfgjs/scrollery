@@ -1,12 +1,12 @@
 // src/composables/useGalleryQuerySync.ts
-// Gallery 视图状态 ↔ URL query 双向同步(S2-b/S2-b2)。挂载于 App.vue(不随 KeepAlive 波动),仅画廊路由生效。
+// Gallery 视图状态与 URL query 双向同步；挂载于 App.vue，仅画廊路由生效。
 //
-// 同步维度:①filter(S2-b,全局态、零 persist;字段 types/favorite/live/rating/color/from/to)
-// ②view-pref(S2-b2,uiStore 经 app_config 持久化;字段 group/sort/order/layout)③search(S2-b2,
-// 恢复经 searchStore.apply 触发真实查询,含语义 IPC;字段 q/scope/mode)④duplicate lens(2026-09-02
-// 重复项方案 §10.1;字段 duplicates/duplicateUnique)。恢复顺序 filter→view-pref→search→lens,
+// 同步维度:①filter(全局态、不持久化;字段 types/favorite/live/rating/color/from/to)
+// ②view-pref(uiStore 持久化;字段 group/sort/order/layout)③search(
+// 恢复经 searchStore.apply 触发真实查询,含语义 IPC;字段 q/scope/mode/mixed)④duplicate lens
+// (字段 duplicates/duplicateUnique)。恢复顺序 filter→view-pref→search→lens,
 // 使 setMode 的语义 group 覆盖发生在 view-pref 之后,让 aiStore.previousGroupBy 捕获的是 URL/persist
-// 的真实 group 而非默认。**search 恢复触发 IPC 属真机验收重点**。
+// 的真实 group 而非默认。
 // **镜头键是唯一「URL 是事实源、store 是镜像」的键组**:水合之外的路由 query 变化也会回灌
 // duplicateLensStore(见下方 route.query watcher);其余键组维持「URL→store 仅初次水合」。
 //
@@ -132,7 +132,12 @@ export function useGalleryQuerySync(): void {
   }
 
   function searchSnapshot(): SearchSnapshot {
-    return { mode: search.mode, scope: search.scope, query: search.committedQuery }
+    return {
+      mode: search.mode,
+      scope: search.scope,
+      query: search.committedQuery,
+      mixedIndex: ai.activeMixedQueryType === 'normal' ? 1 : 0,
+    }
   }
 
   /**
@@ -144,7 +149,7 @@ export function useGalleryQuerySync(): void {
     const s = decodeSearch(query)
     if (s.mode !== undefined) search.setMode(s.mode)
     if (s.scope !== undefined) search.setScope(s.scope)
-    if (s.query !== undefined) search.apply(s.query)
+    if (s.query !== undefined) search.apply(s.query, { mixedIndex: s.mixedIndex })
   }
 
   /** route.query 与目标 flat map 是否等价（仅字符串键值,数组取首值）。 */
@@ -258,6 +263,7 @@ export function useGalleryQuerySync(): void {
       () => search.mode,
       () => search.scope,
       () => search.committedQuery,
+      () => ai.activeMixedQueryType,
     ],
     () => {
       if (hydrated) writeUrl()

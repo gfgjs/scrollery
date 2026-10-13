@@ -1,5 +1,5 @@
 // crates/exotic-workers/ai-worker/src/batch.rs
-//! EmbedBatch / FaceDetectEmbed 批处理(Part6 §3.2.1a 逐项化:项失败不连坐整批)。
+//! EmbedBatch / FaceDetectEmbed 批处理；单项失败不连坐整批。
 //!
 //! 载运契约(与 message.rs 文档一致,host 侧按此校验):
 //!   - 嵌入本体不进 JSON,走 Success 帧同帧 blob(f32 LE);
@@ -7,8 +7,8 @@
 //!   - FaceDetectEmbed blob 按 Ok 项顺序、项内按 faces 顺序,每脸 `face_embed_dim × 4` 字节;
 //!   - 维度不符 = EmbedDimMismatch(terminal,系统性错误必然全批皆错 → 整批 Failure)。
 //!
-//! 路径安全:worker 只凭 `cache_key` 拼 `{ai_cache_dir}/{key[..2]}/{key}.webp`,key 白名单
-//! 限定 ASCII 字母数字(无分隔符/无点)→ join 不可能越出缓存根(Part6 §3.2.1a ②)。
+//! 路径安全:EmbedBatch 可消费宿主指定的已提交 v2 产物；严格校验组件与缓存键，
+//! 通过共用授权打开固定句柄后读取。None 保留旧 cache_key 路径。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -23,6 +23,9 @@ use scrollery_ai_core::{clip, face, DecodedImage};
 
 use crate::session::SessionState;
 
+#[path = "../../../shared/authorized_file.rs"]
+mod authorized_file;
+
 /// source_path 回退解码的源文件字节上限(与 psd-worker 同值;拦巨文件吃满内存)。
 const MAX_SOURCE_FILE_BYTES: u64 = 512 << 20;
 
@@ -33,8 +36,7 @@ const MAX_SOURCE_FILE_BYTES: u64 = 512 << 20;
 /// `ResourceLimit`,不进入真正解码分配。
 const MAX_SOURCE_PIXELS: u64 = 100_000_000;
 
-/// 推理子批上限(T18.5b 流水重叠):推理侧从解码 channel 攒到即推,不等全批。
-/// 对动态/bN 导出保留组批效率;B/16 固定 batch=1 导出内部仍逐张,无行为差别。
+/// 动态模型的推理子批上限；固定模型按真实 batch 收集，仅尾批补齐。
 const INFER_SUB_BATCH: usize = 16;
 
 /// 实际解码线程数 = min(逻辑核数, 任务数)。并行度**探测机器核数、不设固定上限**
@@ -91,8 +93,7 @@ const MAX_TEXTS_PER_BATCH: usize = 64;
 /// 异常 host 用超长串把 worker 拖进无谓的分词开销)。
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 
-// WorkerLogLine 行协议输出(D-314 单一 schema:reviewer 深审揪出本文件曾漏收编,
-// 裸 eprintln 行会被 supervisor 以 WARN+unparsed 兜底转发,正常批诊断被抬成 WARN 噪音)。
+// WorkerLogLine 行协议输出；裸 eprintln 会被 supervisor 按未解析行告警转发。
 // 定级同 main.rs 原则:批诊断=info、推理/单项失败(worker 继续服务)=warn。
 fn log_info(msg: impl Into<String>) {
     exotic_protocol::emit_stderr_log("info", msg, serde_json::Map::new());
@@ -120,12 +121,79 @@ fn perf_enabled() -> bool {
 struct EmbedTiming {
     /// 主线程阻塞等首个可推理项(`rx.recv`)的累计时间 = 供料跟不上推理的空洞。
     wait_first_us: u64,
-    /// 非阻塞攒子批(`try_recv` 扫描)的累计时间;解码慢时恒接近 0(拿到多少推多少)。
+    /// 动态模型非阻塞攒子批的累计时间；固定模型的组批等待计入 wait_first_us。
     drain_us: u64,
     /// 组批复制:新建 [n,3,S,S] 张量 + 逐项平坦 memcpy。
     assemble_us: u64,
     /// 提交给编码的子批数。
     groups: u32,
+}
+
+/// 固定模型等齐真实 batch，动态模型只收已就绪张量；错误不占有效容量。
+fn collect_infer_group<T>(
+    rx: &std::sync::mpsc::Receiver<(usize, Result<T, WorkerErrorCode>)>,
+    errors: &mut [Option<WorkerErrorCode>],
+    clock: &mut clip::StageClock<'_, EmbedTiming>,
+    fixed_batch: Option<usize>,
+) -> Vec<(usize, T)> {
+    let cap = fixed_batch.unwrap_or(INFER_SUB_BATCH).max(1);
+    let mut pending = Vec::with_capacity(cap.min(errors.len()));
+    clock.begin();
+    loop {
+        match rx.recv() {
+            Ok((i, Ok(t))) => {
+                pending.push((i, t));
+                break;
+            }
+            Ok((i, Err(code))) => errors[i] = Some(code),
+            Err(_) => break,
+        }
+    }
+    clock.end(|t| &mut t.wait_first_us);
+    clock.begin();
+    while pending.len() < cap {
+        // 固定 batch 的提前推理会把暂未到达的有效项替换成填充，浪费设备计算。
+        if fixed_batch.is_some() {
+            match rx.recv() {
+                Ok((i, Ok(t))) => pending.push((i, t)),
+                Ok((i, Err(code))) => errors[i] = Some(code),
+                Err(_) => break,
+            }
+        } else {
+            match rx.try_recv() {
+                Ok((i, Ok(t))) => pending.push((i, t)),
+                Ok((i, Err(code))) => errors[i] = Some(code),
+                Err(_) => break,
+            }
+        }
+    }
+    if fixed_batch.is_some() {
+        clock.end(|t| &mut t.wait_first_us);
+    } else {
+        clock.end(|t| &mut t.drain_us);
+    }
+    pending
+}
+
+/// 单张直接交出张量；多张才复制到连续批张量，并保留原请求索引。
+fn assemble_infer_group(
+    mut pending: Vec<(usize, Array4<f32>)>,
+    side: usize,
+) -> (Vec<usize>, Array4<f32>) {
+    if pending.len() == 1 {
+        let (i, tensor) = pending.pop().expect("已确认单张");
+        return (vec![i], tensor);
+    }
+    let mut batch = Array4::<f32>::zeros((pending.len(), 3, side, side));
+    let dst = batch.as_slice_mut().expect("零初始化张量必为标准布局");
+    let stride = 3 * side * side;
+    let mut indices = Vec::with_capacity(pending.len());
+    for (bi, (i, tensor)) in pending.into_iter().enumerate() {
+        dst[bi * stride..(bi + 1) * stride]
+            .copy_from_slice(tensor.as_slice().expect("preprocess 输出为标准布局"));
+        indices.push(i);
+    }
+    (indices, batch)
 }
 
 /// 整批失败帧(逐项 Err 之外的系统性失败:批超限/推理错误/维度红线/blob 超限)。
@@ -161,6 +229,64 @@ fn load_cache_image(
         .map_err(|_| WorkerErrorCode::MalformedInput)
 }
 
+/// 解析 EmbedBatch 缓存路径；v2 只接受规范 short/revision 与对应的 16 位小写缓存键。
+fn embed_cache_path(ai_cache_dir: &Path, item: &EmbedItem) -> Option<PathBuf> {
+    let Some(relative) = item.cache_path.as_deref() else {
+        return cache_webp_path(ai_cache_dir, &item.cache_key);
+    };
+    let parts: Vec<_> = relative.split('/').collect();
+    if parts.len() != 5
+        || parts[0] != "v2"
+        || item.cache_key.len() != 16
+        || !item
+            .cache_key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || parts[2] != &item.cache_key[..2]
+        || parts[4] != format!("{}.webp", item.cache_key)
+    {
+        return None;
+    }
+    let short = parts[1].parse::<u32>().ok()?;
+    let revision = parts[3].strip_prefix('r')?.parse::<i64>().ok()?;
+    if short == 0
+        || parts[1] != short.to_string()
+        || revision <= 0
+        || parts[3] != format!("r{revision}")
+    {
+        return None;
+    }
+    Some(ai_cache_dir.join(relative))
+}
+
+/// 从授权缓存句柄解码，不回退到另一条路径，也不重新按路径读文件。
+fn load_embed_cache_image(
+    ai_cache_dir: &Path,
+    item: &EmbedItem,
+) -> Result<image::DynamicImage, WorkerErrorCode> {
+    use std::io::Read as _;
+    let path = embed_cache_path(ai_cache_dir, item).ok_or(WorkerErrorCode::MalformedInput)?;
+    let relative = path
+        .strip_prefix(ai_cache_dir)
+        .map_err(|_| WorkerErrorCode::MalformedInput)?;
+    let relative = relative
+        .to_str()
+        .ok_or(WorkerErrorCode::MalformedInput)?
+        .replace('\\', "/");
+    let mut file = authorized_file::open_relative(ai_cache_dir, &relative).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            WorkerErrorCode::MalformedInput
+        } else {
+            WorkerErrorCode::IoError
+        }
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| WorkerErrorCode::IoError)?;
+    image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP)
+        .map_err(|_| WorkerErrorCode::MalformedInput)
+}
+
 /// 把 `Vec<f32>` 嵌入按小端追加进 blob(布局契约见模块头)。
 fn append_embedding(blob: &mut Vec<u8>, emb: &[f32]) {
     blob.reserve(emb.len() * 4);
@@ -169,7 +295,7 @@ fn append_embedding(blob: &mut Vec<u8>, emb: &[f32]) {
     }
 }
 
-/// 处理 EmbedBatch:逐项并行解码(不连坐,T18.5)→ 组批一次推理 → 结果与 blob 按请求序装配。
+/// 处理 EmbedBatch：逐项并行解码，组批推理，结果与 blob 按请求序装配。
 pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -> Frame {
     if items.len() as u32 > sess.batch_size {
         return batch_failure(
@@ -183,7 +309,7 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
         );
     }
 
-    // 1-2. 解码/预处理与推理**流水重叠**(T18.5b):解码线程池喂有界 channel,本线程
+    // 解码/预处理与推理流水重叠：解码线程池喂有界 channel，本线程
     //      攒子批边收边推——CPU(解码)与 GPU(推理)同时有活。此前「先全解完再推」
     //      的相位交替使 GPU/CPU 利用率互为镜像(实测各仅 ~35%/50%),批耗时=两段之和;
     //      重叠后=两段取大。有界容量封顶在飞张量内存(600KB/张 × 2×threads)。
@@ -192,7 +318,7 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
     let threads = decode_threads(items.len());
     let pool = match sess.pool.clip_image_session.as_ref() {
         Some(p) => p,
-        // load() 已保证 clip_ready;此臂仅防御(池在运行期不会消失)。
+        // 按需会话可不含图像塔，交由 host 补载。
         None => {
             return batch_failure(
                 request_id,
@@ -234,7 +360,7 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
                     break;
                 }
                 let t_decode = perf.then(std::time::Instant::now);
-                let loaded = load_cache_image(&sess.ai_cache_dir, &items[i].cache_key);
+                let loaded = load_embed_cache_image(&sess.ai_cache_dir, &items[i]);
                 if let (Some(t0), Some(acc)) = (t_decode, decode_us.as_ref()) {
                     acc.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
@@ -253,51 +379,15 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
         }
         drop(tx); // 主线程不发;解码线程全退后 recv 得 Disconnected 即收尾
 
-        let mut done = false;
-        while !done {
-            // 阻塞等第一个可推理项(解码错误项就地记账,不占子批位)。
-            let mut pending: Vec<(usize, Array4<f32>)> = Vec::with_capacity(INFER_SUB_BATCH);
-            clock.begin();
-            loop {
-                match rx.recv() {
-                    Ok((i, Ok(t))) => {
-                        pending.push((i, t));
-                        break;
-                    }
-                    Ok((i, Err(code))) => item_err[i] = Some(code),
-                    Err(_) => {
-                        done = true;
-                        break;
-                    }
-                }
-            }
-            clock.end(|t| &mut t.wait_first_us);
-            // 非阻塞攒满子批(解码慢时不等,拿到多少推多少——重叠优先于批满)。
-            clock.begin();
-            while pending.len() < INFER_SUB_BATCH {
-                match rx.try_recv() {
-                    Ok((i, Ok(t))) => pending.push((i, t)),
-                    Ok((i, Err(code))) => item_err[i] = Some(code),
-                    Err(_) => break,
-                }
-            }
-            clock.end(|t| &mut t.drain_us);
+        loop {
+            let pending =
+                collect_infer_group(&rx, &mut item_err, &mut clock, sess.image_fixed_batch);
             if pending.is_empty() {
-                continue; // done 收尾轮无残批
+                break; // 所有生产线程结束且没有残余有效项。
             }
 
             clock.begin();
-            let n = pending.len();
-            let mut batch = Array4::<f32>::zeros((n, 3, side, side));
-            {
-                // 平坦 memcpy 拼子批(新建张量必为标准布局;逐元素 assign 是 dev 热点)。
-                let dst = batch.as_slice_mut().expect("零初始化张量必为标准布局");
-                let stride = 3 * side * side;
-                for (bi, (_, t)) in pending.iter().enumerate() {
-                    dst[bi * stride..(bi + 1) * stride]
-                        .copy_from_slice(t.as_slice().expect("preprocess 输出为标准布局"));
-                }
-            }
+            let (indices, batch) = assemble_infer_group(pending, side);
             clock.end(|t| &mut t.assemble_us);
             clock.count(|t| &mut t.groups);
             let enc_out = if perf { Some(&mut enc_timing) } else { None };
@@ -312,8 +402,8 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
                         ));
                         break;
                     }
-                    for ((i, _), v) in pending.iter().zip(vecs) {
-                        embeds[*i] = Some(v);
+                    for (i, v) in indices.into_iter().zip(vecs) {
+                        embeds[i] = Some(v);
                     }
                 }
                 Err(e) => {
@@ -349,7 +439,7 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
             "EMBED_PERF req={request_id} items={} ok={n_ok} err={} fail={} groups={} threads={threads} \
              wall_us={wall_us} decode_us={} preprocess_us={} wait_input_us={} drain_us={} \
              assemble_us={} enc_pool_us={} enc_prep_us={} enc_run_us={} enc_extract_us={} \
-             enc_runs={} ms_per_item={:.3}",
+             enc_runs={} fixed_batch={:?} ms_per_item={:.3}",
             items.len(),
             items.len() - n_ok,
             u8::from(batch_fail.is_some()),
@@ -364,6 +454,7 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
             enc_timing.run_us,
             enc_timing.extract_us,
             enc_timing.runs,
+            sess.image_fixed_batch,
             wall_us as f64 / 1000.0 / items.len() as f64,
         ));
     }
@@ -408,9 +499,9 @@ pub fn handle_embed(sess: &SessionState, request_id: u64, items: &[EmbedItem]) -
     Frame::with_blob(FrameType::Success, request_id, &body, blob).unwrap()
 }
 
-/// 处理 EncodeText(T17):逐条编码 → 全批原子(文本编码无逐项 IO 失败模式,任一失败
+/// 处理 EncodeText：逐条编码，全批原子（文本编码无逐项 IO 失败模式，任一失败
 /// 即整批 Failure)。blob 按 texts 顺序连续排布,每项 `embed_dim × f32(LE)`;文本塔 EP
-/// 恒 CPU(AiEnginePool 构建时已定,Part4 §8.6)。
+/// 恒为 CPU（由 AiEnginePool 构建时确定）。
 pub fn handle_encode_text(sess: &SessionState, request_id: u64, texts: &[String]) -> Frame {
     if texts.is_empty() || texts.len() > MAX_TEXTS_PER_BATCH {
         return batch_failure(
@@ -428,7 +519,7 @@ pub fn handle_encode_text(sess: &SessionState, request_id: u64, texts: &[String]
     }
     let pool = match sess.pool.clip_text_session.as_ref() {
         Some(p) => p,
-        // load() 已保证 clip_ready;此臂仅防御(与 handle_embed 的图像塔臂同构)。
+        // 按需会话可不含文本塔，交由 host 补载。
         None => {
             return batch_failure(
                 request_id,
@@ -438,9 +529,17 @@ pub fn handle_encode_text(sess: &SessionState, request_id: u64, texts: &[String]
         }
     };
 
+    let Some(tokenizer) = sess.tokenizer.as_ref() else {
+        return batch_failure(
+            request_id,
+            WorkerErrorCode::SessionExpired,
+            "CLIP 分词器不在会话中".into(),
+        );
+    };
+
     let mut blob: Vec<u8> = Vec::with_capacity(texts.len() * sess.profile.embed_dim * 4);
     for text in texts {
-        match clip::encode_text(pool, &sess.tokenizer, text, &sess.profile) {
+        match clip::encode_text(pool, tokenizer, text, &sess.profile) {
             Ok(emb) => {
                 // 维度红线(terminal):模型输出与契约不符是系统性错误,整批 Failure。
                 if emb.len() != sess.profile.embed_dim {
@@ -481,7 +580,36 @@ pub fn handle_encode_text(sess: &SessionState, request_id: u64, texts: &[String]
 
 /// 单项人脸源解码:cache_key 优先,source_path 回退(host 决定给哪个,协议 §FaceItem)。
 fn load_face_image(ai_cache_dir: &Path, item: &FaceItem) -> Result<DecodedImage, WorkerErrorCode> {
-    let img = if let Some(key) = &item.cache_key {
+    let img = if let Some(relative) = &item.cache_path {
+        use std::io::Read as _;
+        if item.source_path.is_some()
+            || item.cache_key.is_some()
+            || !(relative.starts_with("thumbnails/") || relative.starts_with("face_thumbs/v2/"))
+        {
+            return Err(WorkerErrorCode::MalformedInput);
+        }
+        let root = ai_cache_dir
+            .parent()
+            .ok_or(WorkerErrorCode::MalformedInput)?;
+        let file = authorized_file::open_relative(root, relative).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                WorkerErrorCode::MalformedInput
+            } else {
+                WorkerErrorCode::IoError
+            }
+        })?;
+        if file.metadata().map_err(|_| WorkerErrorCode::IoError)?.len() > MAX_SOURCE_FILE_BYTES {
+            return Err(WorkerErrorCode::ResourceLimit);
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_SOURCE_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| WorkerErrorCode::IoError)?;
+        if bytes.len() as u64 > MAX_SOURCE_FILE_BYTES {
+            return Err(WorkerErrorCode::ResourceLimit);
+        }
+        decode_face_bytes(&bytes)?
+    } else if let Some(key) = &item.cache_key {
         load_cache_image(ai_cache_dir, key)?
     } else if let Some(src) = &item.source_path {
         // 信任语义同 Thumbnail.source_path(host 提供绝对路径);读盘前 stat 拦巨文件,
@@ -491,18 +619,8 @@ fn load_face_image(ai_cache_dir: &Path, item: &FaceItem) -> Result<DecodedImage,
             return Err(WorkerErrorCode::ResourceLimit);
         }
         let bytes = std::fs::read(src).map_err(|_| WorkerErrorCode::IoError)?;
-        // 只解头拿声明尺寸(不解像素数据):超限在真正解码分配之前拦下。
-        let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
-            .with_guessed_format()
-            .map_err(|_| WorkerErrorCode::MalformedInput)?
-            .into_dimensions()
-            .map_err(|_| WorkerErrorCode::MalformedInput)?;
-        if (w as u64) * (h as u64) > MAX_SOURCE_PIXELS {
-            return Err(WorkerErrorCode::ResourceLimit);
-        }
-        image::load_from_memory(&bytes).map_err(|_| WorkerErrorCode::MalformedInput)?
+        decode_face_bytes(&bytes)?
     } else {
-        // cache_key/source_path 至少给一(协议约定);都缺 = host bug。
         return Err(WorkerErrorCode::MalformedInput);
     };
     let rgba = img.to_rgba8();
@@ -511,8 +629,21 @@ fn load_face_image(ai_cache_dir: &Path, item: &FaceItem) -> Result<DecodedImage,
         pixels: rgba.into_raw(),
         width,
         height,
-        icc: None, // AI worker 子进程解码仅供推理,ICC 与此无关
+        icc: None,
     })
+}
+
+fn decode_face_bytes(bytes: &[u8]) -> Result<image::DynamicImage, WorkerErrorCode> {
+    // 只解头拿声明尺寸：超限在真正解码分配之前拦下。
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| WorkerErrorCode::MalformedInput)?
+        .into_dimensions()
+        .map_err(|_| WorkerErrorCode::MalformedInput)?;
+    if (w as u64) * (h as u64) > MAX_SOURCE_PIXELS {
+        return Err(WorkerErrorCode::ResourceLimit);
+    }
+    image::load_from_memory(bytes).map_err(|_| WorkerErrorCode::MalformedInput)
 }
 
 /// 处理 FaceDetectEmbed:整批并行领活，每项在线程内跑完 解码→letterbox→检测→对齐→嵌入
@@ -553,13 +684,9 @@ pub fn handle_face(
         );
     }
 
-    // 全并行(2026-07-03 修订,GUI 人脸批超时根因之二):每项在线程内跑完
-    // 解码→letterbox→检测→嵌入 整链;GPU session 由池锁自串行(与进程内 rayon par_iter
-    // 同构)。原「并行解码、串行推理」把 letterbox(全尺寸→640 缩放,dev 构建单张秒级)
-    // 留在串行段,批耗时被它主导。
-    // 并行度=探测核数(T16-R2 方案 C):host 三级定源(方案 A)后,人脸源恒为 640 级
-    // 小图(RGBA ~1.6-2.5MB/张)或短边 ≤640 的小原图,原 FACE_DECODE_CHUNK=4 的驻留
-    // 封顶(为全尺寸原图 ~100MB/张 而设)失义,已撤销。
+    // 每项在线程内完成解码→letterbox→检测→嵌入，避免预处理滞留串行段；
+    // GPU session 由池锁串行。人脸源已由 host 限为 640 级小图或小原图，
+    // 因此按探测核数并行，不再用全尺寸原图的驻留上限约束批大小。
     let batch_t0 = std::time::Instant::now();
     let mut results = Vec::with_capacity(items.len());
     let mut blob: Vec<u8> = Vec::new();
@@ -675,4 +802,73 @@ pub fn handle_face(
         ..Default::default()
     };
     Frame::with_blob(FrameType::Success, request_id, &body, blob).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assembled_inputs_keep_arrival_and_output_index_mapping() {
+        let a = Array4::from_shape_vec((1, 3, 1, 1), vec![1., 2., 3.]).unwrap();
+        let b = Array4::from_shape_vec((1, 3, 1, 1), vec![4., 5., 6.]).unwrap();
+        let (indices, batch) = assemble_infer_group(vec![(7, a), (2, b)], 1);
+        assert_eq!(indices, vec![7, 2]);
+        assert_eq!(batch.dim(), (2, 3, 1, 1));
+        assert_eq!(batch.as_slice().unwrap(), &[1., 2., 3., 4., 5., 6.]);
+    }
+
+    #[test]
+    fn infer_group_returns_before_a_live_slow_producer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((0, Ok(7))).unwrap();
+        let mut errors = vec![None];
+        assert_eq!(
+            collect_infer_group(&rx, &mut errors, &mut clip::StageClock::new(None), None),
+            vec![(0, 7)]
+        );
+        drop(tx);
+    }
+
+    // 每例只清理自己以 create_new 创建的文件，不递归删除临时目录。
+
+    fn face_item_source(path: &Path) -> FaceItem {
+        FaceItem {
+            item_id: 1,
+            cache_key: None,
+            cache_path: None,
+            source_path: Some(path.to_string_lossy().into_owned()),
+            fingerprint: "fp".into(),
+        }
+    }
+
+    #[test]
+    fn face_cached_path_uses_authorized_root_and_rejects_mixed_or_traversal_input() {
+        let root = std::env::temp_dir().join(format!("ai-face-cache-{}", std::process::id()));
+        let thumbs = root.join("thumbnails");
+        std::fs::create_dir_all(&thumbs).unwrap();
+        let path = thumbs.join("test.webp");
+        image::RgbaImage::new(2, 3)
+            .save_with_format(&path, image::ImageFormat::WebP)
+            .unwrap();
+        let mut item = face_item_source(&path);
+        item.source_path = None;
+        item.cache_path = Some("thumbnails/test.webp".into());
+        let img = load_face_image(&root.join("ai_thumbs"), &item).unwrap();
+        assert_eq!((img.width, img.height), (2, 3));
+        item.source_path = Some(path.to_string_lossy().into_owned());
+        assert_eq!(
+            load_face_image(&root.join("ai_thumbs"), &item).unwrap_err(),
+            WorkerErrorCode::MalformedInput
+        );
+        item.source_path = None;
+        item.cache_path = Some("thumbnails/../test.webp".into());
+        assert_eq!(
+            load_face_image(&root.join("ai_thumbs"), &item).unwrap_err(),
+            WorkerErrorCode::MalformedInput
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(thumbs).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }

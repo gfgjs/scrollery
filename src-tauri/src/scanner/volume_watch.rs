@@ -1,5 +1,5 @@
 // src-tauri/src/scanner/volume_watch.rs
-//! 卷插拔监听（poll 轮询，Part2 T2 / C5 Piece B）。
+//! 卷插拔轮询。
 //!
 //! 后台线程定期对账「已知卷」的在线态，实时维护 `volumes.is_online` 与
 //! `media_items.availability`(online↔offline)，**不必等扫描**。拔盘 ≤15s 画廊变灰「离线」，
@@ -7,10 +7,9 @@
 //!
 //! **正交铁律**：监听只切 availability(online↔offline)，**绝不碰 `is_deleted`、绝不动 `'missing'`**。
 //! `offline` 是卷级（可自动恢复），`missing` 是扫描差集的文件级结论，二者不互转——离线卷重连后
-//! 由扫描恢复 missing，监听只管 online/offline（Part1 §3.3c 硬规则「离线≠删除」的运行期落点）。
+//! 由扫描恢复 missing，监听只管 online/offline。
 //!
-//! 机制选择：plan §3.1.2-3 既定「15s 轮询兜底」即作 v1 主机制——跨平台、零原生 FFI、最简。
-//! 未来可叠加 Windows `WM_DEVICECHANGE` 仅作「提前唤醒轮询」，对账逻辑不变。
+//! 使用跨平台 15 秒轮询对账。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -105,48 +104,12 @@ pub fn spawn(app: AppHandle, state: Arc<AppState>) -> tauri::async_runtime::Join
             // 2026-07-06 审查 R7:对账含整卷 UPDATE(bulk_set_availability,可达百万行)且 lock()
             // 会等在途扫描批写释放——整段下沉 spawn_blocking,不占 runtime 线程(rusqlite 硬化条款)。
             let state_c = Arc::clone(&state);
-            let result = tokio::task::spawn_blocking(move || -> Result<Vec<VolumeChange>> {
-                let Some(epoch) = state_c.current_database_epoch() else {
-                    return Ok(Vec::new());
-                };
-                let (changes, volumes) = {
-                    let conn = match state_c.db_writer.lock() {
-                        Ok(conn) => conn,
-                        Err(_) => {
-                            tracing::warn!("volume_watch: db_writer 锁毒化，跳过本轮");
-                            return Ok(Vec::new());
-                        }
-                    };
-                    (
-                        run_once(&conn, &PathProber, now_unix())?,
-                        q::list_volumes(&conn)?,
-                    )
-                };
-                // 设备查询可能等待系统 IO，不能持数据库锁或进入缩略图逐项热路径。
-                let devices = volumes
-                    .into_iter()
-                    .filter(|volume| {
-                        volume.is_online
-                            && matches!(
-                                volume.kind,
-                                crate::db::models::VolumeKind::Local
-                                    | crate::db::models::VolumeKind::Removable
-                            )
-                    })
-                    .filter_map(|volume| {
-                        super::hdd_io::storage_device(
-                            volume.last_mount_path.as_deref()?,
-                            Some(&volume.stable_id),
-                        )
-                        .map(|device| (volume.id, device))
-                    })
-                    .collect();
-                state_c.with_database_lifecycle_read(epoch, || {
-                    state_c
-                        .background_volume_io_budget
-                        .publish_devices(epoch, devices);
-                });
-                Ok(changes)
+            let result = tokio::task::spawn_blocking(move || match state_c.db_writer.lock() {
+                Ok(conn) => run_once(&conn, &PathProber, now_unix()),
+                Err(_) => {
+                    tracing::warn!("volume_watch: db_writer 锁毒化，跳过本轮");
+                    Ok(Vec::new())
+                }
             })
             .await
             .unwrap_or_else(|e| {

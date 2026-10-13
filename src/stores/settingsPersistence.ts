@@ -25,6 +25,14 @@ const DEBOUNCE_IDLE_MS = 300
 /** 连续操作的最长等待:持续拖动也会每 1s 落盘一次(ms)。 */
 const DEBOUNCE_MAX_MS = 1000
 
+/** 修改未提交或已被重置取消；消费方不得执行保存成功后的副作用。 */
+export class SettingsNotSavedError extends Error {
+  constructor(readonly reason: 'not_ready' | 'resetting' | 'cancelled') {
+    super(`Settings not saved: ${reason}`)
+    this.name = 'SettingsNotSavedError'
+  }
+}
+
 /** 一次等待回执的消费者(一个批次可能被多次写入共享,故是一组)。 */
 interface Deferred {
   resolve: () => void
@@ -91,6 +99,7 @@ let pendingSince = 0
 /** 发送队列与串行 drain。 */
 const sendQueue: QueuedBatch[] = []
 let drainPromise: Promise<void> | null = null
+let activeBatch: QueuedBatch | null = null
 
 /**
  * 写盘失败计数与最近一次失败值。flush 在等待窗口的起止各取一次计数:
@@ -221,7 +230,7 @@ function clearPendingTimer(): void {
 }
 
 /**
- * 取消未发送的待提交集合:取消不是保存失败,故对其等待者 resolve(而非 reject)。
+ * 取消未发送的待提交集合:拒绝等待者，取消不计入磁盘失败或触发告警。
  * 重置、或跨窗口重置事件带来新代次时调用——旧代次的预览不得写回,也不得继续显示。
  */
 function cancelPendingEdits(): void {
@@ -231,7 +240,7 @@ function cancelPendingEdits(): void {
   pendingGeneration = 0
   pendingDeferreds = []
   pendingSince = 0
-  settleOk({ deferreds })
+  settleErr({ deferreds }, new SettingsNotSavedError('cancelled'))
 }
 
 /** 丢弃代次已变化的排队批次(尚在发送中的那个由 drain 在回执后按代次判定,不在此移除)。 */
@@ -240,7 +249,7 @@ function dropStaleQueuedBatches(): void {
     const batch = sendQueue[i]
     if (batch.generation === currentGeneration) continue
     sendQueue.splice(i, 1)
-    settleOk(batch)
+    settleErr(batch, new SettingsNotSavedError('cancelled'))
   }
 }
 
@@ -272,10 +281,11 @@ function drain(): Promise<void> {
         // 发送前复核代次:重置后队列里的旧批次直接丢弃,不占用一次写盘。
         if (batch.generation !== currentGeneration) {
           sendQueue.shift()
-          settleOk(batch)
+          settleErr(batch, new SettingsNotSavedError('cancelled'))
           rebuildDisplayedValues()
           continue
         }
+        activeBatch = batch
         try {
           const change = await invokeIpc<SettingsChange>(IPC.SET_APP_SETTINGS, {
             patch: batch.patch,
@@ -284,7 +294,7 @@ function drain(): Promise<void> {
           removeQueued(batch)
           // 回执期间代次可能已被重置事件推进:此时该回执针对的是已作废的旧配置,只作取消处理。
           if (batch.generation !== currentGeneration) {
-            settleOk(batch)
+            settleErr(batch, new SettingsNotSavedError('cancelled'))
           } else {
             // 过期响应丢弃:只有不低于当前 revision 的回执才被采纳。
             if (change.snapshot.revision >= currentRevision) applyChange(change)
@@ -294,7 +304,7 @@ function drain(): Promise<void> {
           removeQueued(batch)
           if (batch.generation !== currentGeneration) {
             // 重置已使该批次作废:后端拒绝不算保存失败,不提示、不回滚。
-            settleOk(batch)
+            settleErr(batch, new SettingsNotSavedError('cancelled'))
           } else {
             logger.error('settings write failed', { keys: Object.keys(batch.patch), error: e })
             failureCount += 1
@@ -303,6 +313,8 @@ function drain(): Promise<void> {
             errorReporter?.(formatWriteFailure())
             settleErr(batch, e)
           }
+        } finally {
+          activeBatch = null
         }
         // 批次已离开队列:重算展示值——未确认预览只保留仍在队列/待提交中的那些,
         // 被丢弃的回执或失败的批次不会把值留在展示层。
@@ -341,6 +353,7 @@ function schedulePending(): void {
  *
  * 返回值在**该批真正落盘完成**时 resolve(防抖写入同样如此,便于统一 `.catch` 收口);
  * 保存失败时 reject,同时已按最后确认值回滚并给出可见提示。
+ * 未就绪、重置中或已取消时以 SettingsNotSavedError 拒绝，不报告磁盘失败。
  *
  * @param patch 键 → 规范文本。
  * @param options.debounce 连续操作(拖动/滑块)传 true:合并进待提交集合,空闲 300ms / 最长 1s 落盘。
@@ -349,20 +362,20 @@ export function writeSettings(
   patch: Record<string, string>,
   options?: { debounce?: boolean },
 ): Promise<void> {
+  const { promise, deferred } = createDeferred()
   if (!settingsReady.value) {
     // 快照未到达:此刻的改动基于占位默认值,写回会覆盖用户真实偏好——按契约不采集、不提交。
-    logger.warn('writeSettings before settings ready, ignored', { keys: Object.keys(patch) })
-    return Promise.resolve()
+    deferred.reject(new SettingsNotSavedError('not_ready'))
+    return promise
   }
   if (resetInProgress !== null) {
     // 重置期间暂停采集:此刻的写入属于被重置掉的那份配置,采集它会把旧值带进新代次。
-    logger.warn('writeSettings during reset, ignored', { keys: Object.keys(patch) })
-    return Promise.resolve()
+    deferred.reject(new SettingsNotSavedError('resetting'))
+    return promise
   }
 
   if (Object.keys(pendingPatch).length === 0) pendingGeneration = currentGeneration
   pendingPatch = { ...pendingPatch, ...patch }
-  const { promise, deferred } = createDeferred()
   pendingDeferreds.push(deferred)
 
   // 本地即时预览:先更新展示值(在 pending 并入之后重算),UI 立刻跟手。
@@ -392,13 +405,10 @@ export async function flushSettings(): Promise<void> {
     return
   }
   const failuresBefore = failureCount
-  let guard = 0
   // 每轮都把待提交集合发出,并重新检查它——收拢等待窗口内新产生的防抖写入。
   while (
-    (sendQueue.length > 0 || drainPromise !== null || Object.keys(pendingPatch).length > 0) &&
-    guard < 1000
+    sendQueue.length > 0 || drainPromise !== null || Object.keys(pendingPatch).length > 0
   ) {
-    guard += 1
     enqueuePending()
     const current = drainPromise
     if (current) await current
@@ -408,14 +418,19 @@ export async function flushSettings(): Promise<void> {
 }
 
 /**
- * 恢复默认设置:暂停采集,取消尚未发送的防抖预览,等待已发出的请求结束,再整份重置。
+ * 恢复默认设置:暂停采集,取消尚未发送的修改,等待已发出的请求结束,再整份重置。
  * 重置期间重复调用共享同一 Promise(去重);失败回退到最后确认快照并原样抛出。
  */
 export function resetSettings(): Promise<SettingsChange> {
   resetInProgress ??= (async () => {
     try {
-      // 1) 取消尚未发送的预览(它的值即将被重置掉),再等已发出的请求结束。
+      // 1) 防抖区和发送队列中的未发送修改均已被重置意图取代，不能再触发保存及运行时副作用。
       cancelPendingEdits()
+      for (const batch of [...sendQueue]) {
+        if (batch === activeBatch) continue
+        removeQueued(batch)
+        settleErr(batch, new SettingsNotSavedError('cancelled'))
+      }
       rebuildDisplayedValues()
       while (drainPromise !== null) await drainPromise
       // 2) 整份重置(后端按 schema 生成默认模板,原子替换一次)。
@@ -512,7 +527,7 @@ export function ensureSettingsBridge(): Promise<void> {
   if (listenersPromise !== null) return listenersPromise
   // listen 是异步的(内部要注册回调),事件总线不可用(无 Tauri runtime 的浏览器/测试环境)时
   // 以拒绝的形式失败——故必须挂 .catch,否则成为未处理拒绝。此路失败不影响设置读写本身,
-  // 只是没有跨窗口热同步;注册句柄保留,便于测试复位后重试。
+  // 只是没有跨窗口热同步;失败后清掉缓存,允许启动重试重新注册。
   listenersPromise = listenAppEvent<ConfigFileChangedPayload>(
     EVENTS.CONFIG_FILE_CHANGED,
     (event) => {
@@ -528,6 +543,7 @@ export function ensureSettingsBridge(): Promise<void> {
   )
     .then(() => {})
     .catch((e) => {
+      listenersPromise = null
       logger.warn('settings bridge unavailable, cross-window sync disabled', { error: e })
     })
   return listenersPromise
@@ -551,6 +567,7 @@ export function resetSettingsModuleStateForTests(): void {
   pendingSince = 0
   sendQueue.length = 0
   drainPromise = null
+  activeBatch = null
   failureCount = 0
   lastFailure = null
   resetInProgress = null

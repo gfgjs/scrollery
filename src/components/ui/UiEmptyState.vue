@@ -1,9 +1,5 @@
 <script setup lang="ts">
-// UiEmptyState — 空状态原语（S1 UI primitive,设计 §9）：icon + title + description + 可选动作。
-// 收敛各空场景的统一外壳,落实设计 §7.1「所有 empty state 都包含下一步」;同构包裹全局
-// .empty-state* 类,视觉全交由全局 index.css,原语只管结构 + API。
-// icon / actions 走具名插槽(消费方传定尺寸图标与 UiButton);title / description 走 props——
-// 替代此前把「标题\n说明」两行塞进一个 i18n 串再按 '\n' 切分的脆弱约定(翻译须保留换行、单行键静默丢说明)。
+// 空状态的图标和动作由插槽提供，标题与说明由 props 提供；视觉使用全局 .empty-state 样式。
 defineProps<{
   /** 标题(必填,总是渲染)。 */
   title: string
@@ -20,7 +16,7 @@ defineProps<{
     <div v-if="$slots.icon" class="empty-state__icon"><slot name="icon" /></div>
     <div class="empty-state__title">{{ title }}</div>
     <div v-if="description" class="empty-state__desc">{{ description }}</div>
-    <!-- 动作区(§9 primary+secondary):横向排布,可容 primary + secondary 两动作;容器样式见全局 index.css。 -->
+    <!-- 动作区可并排放置主次动作。 -->
     <div v-if="$slots.actions" class="empty-state__actions"><slot name="actions" /></div>
   </div>
 </template>

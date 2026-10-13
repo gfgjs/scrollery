@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/coordinator.rs
-//! 冷门格式插件 · Coordinator（v3 Part2 §4.1）。
+//! 冷门格式插件的任务协调器。
 //!
 //! 单一调度器：接收扫描/安装/激活/配置/重试时钟等事件，**幂等**唤醒**唯一**一条 Pipeline。
 //!
@@ -30,42 +30,35 @@ use crate::exotic::worker::{WorkerConfig, WorkerSpec};
 use crate::exotic::ExoticHost;
 use crate::state::AppState;
 
-/// 首发唯一插件 + 能力（Part2）。
+/// PSD 插件标识。
 pub const PSD_PLUGIN_ID: &str = "exotic-image-psd";
 /// RAW 图像缩略图解码插件（builtin 叠加豁免，见 catalog.rs CommonFormatConflict 例外）。
 pub const RAW_PLUGIN_ID: &str = "exotic-image-raw";
 /// 视频格式扩展插件（builtin+free，design.md §4.1）。**Service 型 worker**：remux/转码/
 /// 缩略图均由 host 侧 `VideoWorkerService` 直持 supervisor（同 OCR/Enhance 先例，§2.1）。
 ///
-/// D-444③ A4 裁决(单轨收敛):rmvb/vob 已入 `utils::format` 注册表(classify=video),其缩略图
+/// rmvb/vob 已入 `utils::format` 注册表(classify=video)，其缩略图
 /// 走**常规 video 派生链**(video_cover/video_keyframes → `backend_for` → V5 `WorkerVideoBackend`
 /// ffmpeg 桥),不经 exotic 任务化——`fast_scan::seed_gate_admits` 掐掉 builtin+video 的 exotic
 /// 播种,避免与派生链双写 `thumb_path`。故 video-extended 的 exotic 缩略图任务实际恒零。
 ///
-/// 尽管如此,video-extended 仍以 **Thumbnail 能力**进 `plugin_descriptors`、并保留
-/// [`VideoThumbnailFactory`]（派发前先 `VideoSessionInit` 建 ffmpeg 会话）——作为 offering
-/// 声明 thumbnail 能力的**一致性面可达实现**(路径可达可测;若播种侧未来放开即刻生效),
-/// 非当前缩略图的实际产出方。
+/// video-extended 仍以 Thumbnail 能力进入 `plugin_descriptors`；[`VideoThumbnailFactory`]
+/// 保留对应的派发路径，当前缩略图由常规 video 派生链产出。
 pub const VIDEO_PLUGIN_ID: &str = "video-extended";
 /// video-worker 握手期望的 ReadyBody.worker_id（design.md §2.2）。
 pub const VIDEO_WORKER_ID: &str = "video-worker";
-// T13 后调度路径全走注册表(descriptor),此常量仅测试作 shorthand。
+// 调度路径使用注册表；此常量仅供测试使用。
 
-/// per-op 请求超时表(Part4 D3 §5/T13:常量集中一处,Supervisor 请求执行按 op 取值)。
-/// 起步值,实测再调。SESSION_INIT/SESSION_CLOSE/EMBED_BATCH/ENCODE_TEXT 由
-/// `ai::worker_client`(T17 派发)消费。
+/// per-op 请求超时表。Supervisor 按 op 取值；AI 相关超时由 `ai::worker_client` 使用。
 pub(crate) mod op_timeouts {
     use std::time::Duration;
     /// thumbnail 单请求(原 pipeline::TASK_TIMEOUT 同值收拢至此)。
     pub const THUMBNAIL: Duration = Duration::from_secs(30);
-    /// SessionInit **静默限时**(2026-07-11 加固批 A-2 语义变更:worker 装载期发
-    /// Progress 阶段帧+10s 心跳,收帧即重置本计时;总上界另见 worker.rs
-    /// PROGRESS_TOTAL_CAP)。旧值 300s 是「猜冷加载总时长」——与 worker 单段 600s
-    /// 后备预算倒挂,宿主恒先杀。现在 90s = 九拍心跳全丢才判死,只量「进程还活着吗」
-    /// 而非「装载要多久」;进程握手仍 5s 不动——模型加载不在握手(D3 §2)。
+    /// SessionInit 静默限时：worker 装载期发 Progress 阶段帧与 10 秒心跳，收帧即重置计时。
+    /// 90 秒用于检测失联；总上界见 worker.rs 的 PROGRESS_TOTAL_CAP。
     pub const SESSION_INIT: Duration = Duration::from_secs(90);
     /// SessionClose:健康 worker 卸载即 drop(毫秒级);上界只兜「驱动释放 VRAM 慢」,
-    /// 超时即 kill 回收,会话随进程消亡(T17)。
+    /// 超时即 kill 回收，会话随进程消亡。
     pub const SESSION_CLOSE: Duration = Duration::from_secs(30);
     /// EmbedBatch 一批(D3 §5 起步值)。
     pub const EMBED_BATCH: Duration = Duration::from_secs(120);
@@ -89,7 +82,7 @@ pub(crate) mod op_timeouts {
     /// ⚠180s flat 系保守估计,无实测依据——ocr_bench 落位后回填冷载耗时;慢机 server 档
     /// (~190MB)若两 attempt 均撞冷载墙,按档位分预算(mobile/server 各钉各的)。
     pub const OCR_SESSION_INIT: Duration = Duration::from_secs(180);
-    /// OcrBatch 一批:基础 60s + 单项 30s(交互恒单图;批口面向未来,det+cls+rec 全链
+    /// OcrBatch 一批：基础 60s + 单项 30s（det+cls+rec 全链
     /// CPU、大图经 limit_side_len 降采样后秒级,宽松即可——「假死检测器」非性能指标)。
     pub fn ocr_batch(items: usize) -> Duration {
         Duration::from_secs(60) + Duration::from_secs(30) * (items as u32)
@@ -105,7 +98,7 @@ pub(crate) mod op_timeouts {
     pub const ENHANCE_SILENCE: Duration = Duration::from_secs(300);
 }
 
-/// 单插件运行描述(Part6 §3.3 C1/T13):调度循环按注册表逐项评估与运行,不再写死 PSD。
+/// 单插件运行描述；调度循环按注册表逐项评估与运行。
 pub(crate) struct PluginDescriptor {
     pub plugin_id: String,
     /// 握手校验的 ReadyBody.worker_id 期望值。
@@ -114,12 +107,11 @@ pub(crate) struct PluginDescriptor {
     pub capabilities: Vec<Capability>,
     /// 进程握手超时(per-plugin;模型加载不在握手,ai/face 也保持 5s,D3)。
     pub handshake_timeout: Duration,
-    /// 是否占 GPU 令牌(AppState.gpu_token):psd=false;ai/face descriptor 随 T15
-    /// 加入时=true(发批前先 CPU permit 后 GPU 令牌,D2 顺序天条)。
+    /// 是否占 GPU 令牌（`AppState.gpu_token`）。
     pub uses_gpu: bool,
 }
 
-/// 运行注册表(Part6 §3.3):capabilities/worker_id/uses_gpu 全部取自 Catalog 的显式声明
+/// 运行注册表：capabilities/worker_id/uses_gpu 取自 Catalog 的显式声明
 /// (单一事实来源;P17 起无 Rust 侧硬编码 fallback)。新插件加入 = 在 Catalog 中声明
 /// worker_id/uses_gpu，调度代码无需再改。
 fn plugin_descriptors(snap: &crate::exotic::catalog::CatalogSnapshot) -> Vec<PluginDescriptor> {
@@ -164,7 +156,7 @@ pub enum WakeReason {
     ScanCommitted,
     CatalogBackfill,
     PluginInstalled,
-    LicenseActivated,
+    FeatureActivated,
     ConfigChanged,
     RetryDue,
     /// 用户显式要求处理（start_exotic_processing / retry 命令）。绕过 `exotic_auto_process` 门控。
@@ -317,9 +309,7 @@ async fn run_capability_until_drained(
     if cooldown_active(cooldowns, &desc.plugin_id, force_reconcile, Instant::now()) {
         return;
     }
-    // T15 接缝:目前仅 thumbnail 能力有 pipeline 实装;embedding/face_detect_embed 的
-    // 批派发随推理核心迁移(T15)落地——届时在此按能力分派 EmbedWorker 管线,并按
-    // desc.uses_gpu 走「先 CPU permit 后 GPU 令牌」双取(D2)。
+    // exotic 任务协调器只派发 thumbnail；嵌入与人脸批量推理由 AI 流水线派发。
     if capability != Capability::Thumbnail {
         debug!(
             "{} 能力 {} 的 pipeline 未实装(T15),跳过",
@@ -403,9 +393,6 @@ async fn run_capability_until_drained(
     let handshake_timeout = desc.handshake_timeout;
 
     let result = tokio::task::spawn_blocking(move || {
-        let Some(database_epoch) = state_run.current_database_epoch() else {
-            return crate::exotic::pipeline::PipelineStats::default();
-        };
         let (cache_dir, requested_size) = {
             let cfg = state_run
                 .thumb_config
@@ -421,7 +408,7 @@ async fn run_capability_until_drained(
         let cfg = WorkerConfig {
             handshake_timeout,
             host_version: env!("CARGO_PKG_VERSION").to_string(),
-            max_blob_len: crate::exotic::worker::default_thumbnail_limits().max_blob_len,
+            max_blob_len: exotic_protocol::MAX_BLOB_LEN,
         };
         // video-extended:任务化 Thumbnail 无 session/ffmpeg 路径,用 VideoThumbnailFactory
         // 在派发前先建 ffmpeg 会话(D-444③)。ffmpeg 就绪已在 worker_available 门控,此处
@@ -450,9 +437,6 @@ async fn run_capability_until_drained(
         let deps = PipelineDeps {
             writer: &state_run.db_writer,
             limiter: &state_run.background_heavy_limiter,
-            workset_budget: Arc::clone(&state_run.background_workset_budget),
-            volume_io_budget: Arc::clone(&state_run.background_volume_io_budget),
-            database_epoch,
             token: &token,
             items_cache: &state_run.layout_items_cache,
             cache_dir,
@@ -569,15 +553,12 @@ pub(crate) fn evaluate_run(
     q::has_ready_exotic_task(conn, plugin_id, capability.as_str(), now).unwrap_or(false)
 }
 
-/// exotic（冷门格式插件）Coordinator 启动期装配（Part2 §4.1）。
+/// 冷门格式插件 Coordinator 的启动期装配。
 ///
-/// 单一调度器：接扫描/安装/激活/配置/重试事件，幂等唤醒唯一 Pipeline。Part2 无真实
-/// License → 默认门控为不可领取（除 dev fixture）；有 Worker + 授权时自动出图。
-///
-/// 自 `lib.rs::run()` 的 setup 段 p 迁出(D-450 纯结构移动,行为不变)。
+/// 单一调度器接扫描/安装/激活/配置/重试事件，幂等唤醒唯一 Pipeline。
 /// 顺序不变量:必须在 `app.manage(app_state)` 之后调用。
 pub fn bootstrap(app: AppHandle, state: Arc<AppState>) {
-    // 运行期 Host：catalog + 只读连接池安装真相 + keyring 授权真相（Part3 §5）。
+    // 运行期 Host 合并 catalog、安装记录与授权状态。
     let host = Arc::new(state.exotic_host());
     let coord = ExoticCoordinator::start(app, state.clone(), host);
     state.set_exotic_coordinator(coord);

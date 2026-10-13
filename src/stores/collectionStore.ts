@@ -1,5 +1,5 @@
 // src/stores/collectionStore.ts
-// 收藏夹状态（需求7, §3.7）。
+// 收藏夹状态。
 // 由后端 albums/album_items 承载。系统夹（4 个播种类型夹）虚拟（类型 + is_favorited）；
 // 用户夹存实体成员。
 
@@ -15,23 +15,30 @@ export const useCollectionStore = defineStore('collection', () => {
   /** 已软删除的用户夹（回收站）。与 `collections` 是同一批夹的**不重不漏划分**（后端按 deleted_at 取反）。 */
   const deleted = ref<Collection[]>([])
   const isLoading = ref(false)
+  // 正列表与回收站会并发刷新，各自只接纳最新读取，避免旧快照覆盖写入后的结果。
+  let loadGeneration = 0
+  let deletedLoadGeneration = 0
 
   /** 加载全部收藏夹（系统夹在前，用户夹在后）。 */
   async function load() {
+    const generation = ++loadGeneration
     isLoading.value = true
     try {
-      collections.value = await invokeIpc<Collection[]>(IPC.LIST_COLLECTIONS)
+      const result = await invokeIpc<Collection[]>(IPC.LIST_COLLECTIONS)
+      if (generation === loadGeneration) collections.value = result
     } catch (e) {
       logger.error('[CollectionStore] load failed', { error: e })
     } finally {
-      isLoading.value = false
+      if (generation === loadGeneration) isLoading.value = false
     }
   }
 
   /** 加载已软删除的用户夹（回收站读路径）。 */
   async function loadDeleted() {
+    const generation = ++deletedLoadGeneration
     try {
-      deleted.value = await invokeIpc<Collection[]>(IPC.LIST_DELETED_COLLECTIONS)
+      const result = await invokeIpc<Collection[]>(IPC.LIST_DELETED_COLLECTIONS)
+      if (generation === deletedLoadGeneration) deleted.value = result
     } catch (e) {
       logger.error('[CollectionStore] loadDeleted failed', { error: e })
     }
@@ -67,6 +74,8 @@ export const useCollectionStore = defineStore('collection', () => {
       await Promise.all([load(), loadDeleted()])
     } catch (e) {
       logger.error('[CollectionStore] remove failed', { error: e })
+      // 写入失败须交给调用方，避免登记未发生的删除或错误推进撤销/重做栈。
+      throw e
     }
   }
 
@@ -77,6 +86,7 @@ export const useCollectionStore = defineStore('collection', () => {
       await Promise.all([load(), loadDeleted()])
     } catch (e) {
       logger.error('[CollectionStore] restore failed', { error: e })
+      throw e
     }
   }
 
@@ -97,7 +107,8 @@ export const useCollectionStore = defineStore('collection', () => {
       return await invokeIpc<number>(IPC.ADD_TO_COLLECTION, { albumId, itemIds })
     } catch (e) {
       logger.error('[CollectionStore] addItems failed', { error: e })
-      return 0
+      // 零插入可能只是全部已在收藏夹，不能用它掩盖真实写入失败。
+      throw e
     }
   }
 

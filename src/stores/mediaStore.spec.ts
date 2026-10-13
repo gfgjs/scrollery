@@ -4,16 +4,10 @@ import { createPinia, setActivePinia } from 'pinia'
 const { invokeIpc } = vi.hoisted(() => ({ invokeIpc: vi.fn() }))
 vi.mock('../utils/ipc', () => ({ invokeIpc }))
 vi.mock('./uiStore', () => ({ useUiStore: () => ({ thumbInfoElements: [] }) }))
+vi.mock('../utils/logger', () => ({ logger: { error: vi.fn(), warn: vi.fn() } }))
 
-import { buildLayoutContentKey, useMediaStore } from './mediaStore'
+import { useMediaStore } from './mediaStore'
 import type { LayoutSummary } from '../types/layout'
-import type { AppStats, MediaDetail } from '../types/media'
-import { IPC } from '../constants/ipc'
-import { useViewIds } from '../composables/useViewIds'
-
-function detail(id: number): MediaDetail {
-  return { id } as MediaDetail
-}
 
 function layoutSummary(version: number): LayoutSummary {
   return {
@@ -27,19 +21,6 @@ function layoutSummary(version: number): LayoutSummary {
   }
 }
 
-function appStats(totalItems: number): AppStats {
-  return {
-    totalItems,
-    totalImages: totalItems,
-    totalVideos: 0,
-    totalAudios: 0,
-    totalDocuments: 0,
-    totalFavorited: 0,
-    totalDeleted: 0,
-    totalLivePhotos: 0,
-  }
-}
-
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>((done) => {
@@ -48,120 +29,64 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-describe('mediaStore 统计取数 single-flight', () => {
-  beforeEach(() => {
-    setActivePinia(createPinia())
-    invokeIpc.mockReset()
-  })
-
-  it('失败时同批调用者共享同一拒绝,已排的尾随被丢弃,槽位释放后后续调用照常', async () => {
-    invokeIpc.mockRejectedValueOnce(new Error('stats down'))
-    const store = useMediaStore()
-    // fire-and-forget 形态(扫描进度的调用点):合并进同一 drain,共用同一次拒绝。
-    const fireAndForget = store.loadStats().catch(() => {})
-    await expect(store.loadStats()).rejects.toThrow('stats down')
-    await fireAndForget
-    // 失败路径不保证尾随新快照:整个 drain 拒绝,尾随请求不再发出。
-    expect(invokeIpc).toHaveBeenCalledTimes(1)
-
-    invokeIpc.mockResolvedValueOnce(appStats(4))
-    await store.loadStats()
-    expect(store.stats?.totalItems).toBe(4)
-  })
-})
-
 describe('mediaStore 详情请求时序', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     invokeIpc.mockReset()
   })
 
-  it('较晚返回的旧 openDetail 不得覆盖较新的条目', async () => {
-    const first = deferred<MediaDetail>()
-    const second = deferred<MediaDetail>()
-    invokeIpc.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
-    const store = useMediaStore()
-
-    const openFirst = store.openDetail(1)
-    const openSecond = store.openDetail(2)
-    second.resolve(detail(2))
-    await openSecond
-    first.resolve(detail(1))
-    await openFirst
-
-    expect(store.detailItem?.id).toBe(2)
-    expect(store.isDetailOpen).toBe(true)
-  })
-
-  it('连续 resize 计算只提交最新结果,旧布局在最新结果完成前保持可见', async () => {
-    const first = deferred<LayoutSummary>()
-    const second = deferred<LayoutSummary>()
-    invokeIpc.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
-    const store = useMediaStore()
-    store.layoutSummary = layoutSummary(10)
-    store.layoutSemanticKey = buildLayoutContentKey({ filters: {} })
+  it('排队请求被替代时明确结束，最新请求失败不提交中间布局且释放槽位', async () => {
     vi.stubGlobal('window', { devicePixelRatio: 1 })
-
-    const firstCompute = store.computeLayout({ containerWidth: 800 })
-    const queuedCompute = store.computeLayout({ containerWidth: 1000 })
-    let queuedFinished = false
-    void queuedCompute.then(() => { queuedFinished = true })
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(queuedFinished).toBe(false)
-    expect(invokeIpc).toHaveBeenCalledTimes(1)
-
-    first.resolve(layoutSummary(11))
-    expect(await firstCompute).toBe('superseded')
+    const store = useMediaStore()
+    const first = deferred<LayoutSummary>()
+    invokeIpc.mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error('query failed'))
+    const initial = store.computeLayout({ containerWidth: 800 })
+    const replaced = store.computeLayout({ containerWidth: 900 })
+    const latest = store.computeLayout({ containerWidth: 1000 })
+    expect(await replaced).toBe('superseded')
+    first.resolve(layoutSummary(10))
+    expect(await initial).toBe('superseded')
+    expect(await latest).toBe('failed')
+    expect(store.layoutSummary).toBeNull()
+    expect(store.isComputingLayout).toBe(false)
     expect(invokeIpc).toHaveBeenCalledTimes(2)
-    expect(store.layoutSummary?.layoutVersion).toBe(10)
-    expect(queuedFinished).toBe(false)
 
-    second.resolve(layoutSummary(12))
-    await firstCompute
-    await queuedCompute
-    expect(queuedFinished).toBe(true)
+    invokeIpc.mockResolvedValueOnce(layoutSummary(12))
+    expect(await store.computeLayout({ containerWidth: 1100 })).toBe('committed')
     expect(store.layoutSummary?.layoutVersion).toBe(12)
   })
 
-  it('新的查询意图尚未发出布局时，旧计算完成也不能重新开放旧全集', async () => {
-    vi.stubGlobal('window', { devicePixelRatio: 1 })
+  it('当前布局取行失效只触发一次重算，恢复后新版本仍可自行恢复', async () => {
     const store = useMediaStore()
-    const ids = useViewIds()
-    const response = deferred<LayoutSummary>()
-    invokeIpc.mockReturnValueOnce(response.promise)
-    const pending = store.computeLayout({ containerWidth: 800 })
-    // 模拟语义查询启动/离屏切条件，新条件尚未达到布局入口。
-    store.invalidateViewOrder()
-    response.resolve(layoutSummary(80))
-    await pending
-    invokeIpc.mockResolvedValueOnce([7, 8])
-    await ids.ensureFresh(80)
-    expect(ids.isReady()).toBe(false)
-    expect(invokeIpc).not.toHaveBeenCalledWith(IPC.GET_VIEW_IDS, expect.anything())
+    const stale = { code: 'LayoutNotReady', message: '布局已失效' }
+    store.layoutSummary = layoutSummary(10)
+    invokeIpc.mockRejectedValue(stale)
+    await expect(store.fetchRowsByY(0, 200)).rejects.toBe(stale)
+    await expect(store.fetchBucketRows(0, 200)).rejects.toBe(stale)
+    expect(store.layoutDirty).toBe(true)
+    expect(store.layoutDirtyRevision).toBe(1)
+    // 重算失败时不让后续滚动产生无穷重试；成功换代后允许恢复新版本。
+    store.consumeLayoutDirty()
+    await expect(store.fetchRowsByY(200, 400)).rejects.toBe(stale)
+    expect(store.layoutDirtyRevision).toBe(1)
+    store.layoutSummary = layoutSummary(11)
+    await expect(store.fetchBucketRows(200, 400)).rejects.toBe(stale)
+    expect(store.layoutDirtyRevision).toBe(2)
   })
 
-  it('watchdog 后新会话接管时丢弃旧 IPC 的迟到结果', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('window', { devicePixelRatio: 1 })
-    const first = deferred<LayoutSummary>()
-    const second = deferred<LayoutSummary>()
-    invokeIpc.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+  it('旧布局迟到的失败和普通读取错误不撤销当前布局', async () => {
     const store = useMediaStore()
-
-    const firstCompute = store.computeLayout({ containerWidth: 800 })
-    void store.computeLayout({ containerWidth: 900 })
-    await vi.advanceTimersByTimeAsync(30000)
-    expect(invokeIpc).toHaveBeenCalledTimes(2)
-    expect(await firstCompute).toBe('superseded')
-
-    second.resolve(layoutSummary(32))
-    await Promise.resolve()
-    await Promise.resolve()
-    first.resolve(layoutSummary(31))
-    await firstCompute
-
-    expect(store.layoutSummary?.layoutVersion).toBe(32)
-    vi.useRealTimers()
+    store.layoutSummary = layoutSummary(10)
+    let reject!: (error: unknown) => void
+    invokeIpc.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+    const reading = store.fetchBucketRows(0, 200)
+    const failed = expect(reading).rejects.toMatchObject({ code: 'LayoutNotReady' })
+    store.layoutSummary = layoutSummary(11)
+    reject({ code: 'LayoutNotReady', message: '旧布局已失效' })
+    await failed
+    invokeIpc.mockRejectedValueOnce(new Error('read failed'))
+    await expect(store.fetchRowsByY(0, 200)).rejects.toThrow('read failed')
+    expect(store.layoutDirty).toBe(false)
+    expect(store.layoutDirtyRevision).toBe(0)
   })
 })

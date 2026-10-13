@@ -1,10 +1,9 @@
-// src/themes/snapshot.ts
-// 首帧缓存(方案 docs/designs/2026-09-16-主题配色全新设计.md §7):只取**后端已确认**配置
+// 首帧缓存只取**后端已确认**配置
 // 生成的完整 CSS 变量与外观偏好,供阻塞式 public/theme-bootstrap.js 在样式解析前恢复,消除首帧闪色。
 //
-// 三条硬约束:
+// 缓存约束:
 //  - 只由已确认快照写入(settingsConfirmedValues / onSettingsApplied);草稿与未确认写入不得进缓存。
-//  - 新键新结构:不读旧的 scrollery.themeSnapshot.v1,结构只接受当前版本,失效即回默认主题 CSS。
+//  - 只接受当前结构版本，失效即回默认主题 CSS。
 //  - 缓存是可丢弃的派生值:任何情况下都不得反向恢复用户偏好,损坏只损失首帧加速。
 
 import type { AppearanceMode } from '../types/ui'
@@ -12,7 +11,7 @@ import { THEME_PALETTE_VARS, paletteToCssVars } from './generate'
 import type { ThemeMaterial, ThemePalette, ThemeVisualStyle } from './types'
 import { THEME_VISUAL_STYLES } from './visualStyles'
 
-/** 缓存键(与旧 scrollery.themeSnapshot.v1 无关;bootstrap 内是同一字面量,由契约测试钉住)。 */
+/** 缓存键；bootstrap 使用同一字面量。 */
 export const THEME_CACHE_KEY = 'scrollery.themeCache.v3'
 /** 缓存结构版本;读写双方都只接受这一版,不向前兼容。 */
 export const THEME_CACHE_VERSION = 3

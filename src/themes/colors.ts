@@ -1,5 +1,5 @@
 // src/themes/colors.ts
-// 主题色数学的纯函数集合(方案 §4.2):解析、通道混色、亮度、对比度与黑白选择。
+// 主题色数学的纯函数集合：解析、通道混色、亮度、对比度与黑白选择。
 //
 // 解析与 WCAG 对比度复用 utils/color.ts 的既有实现——那是全库唯一的 CSS 颜色解析器与
 // 对比度口径(阅读主题门禁、shiki 选深浅都在用),此处不写第二套。本文件只补主题生成所需
@@ -156,7 +156,7 @@ export function mixUntilContrast(
 
 /**
  * 保证 color 在全部 bases 上达到 ratio:已达标原样返回,否则朝与承载面相反的一端调整。
- * 用于强调色文字(方案 §4.2「以 accent 为起点,必要时向黑／白调整以改善可读性」)。
+ * 用于强调色文字：以 accent 为起点，必要时向黑或白调整以改善可读性。
  */
 export function ensureContrast(
   color: string,

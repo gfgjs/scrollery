@@ -19,8 +19,6 @@ export interface SettingsGroup {
   titleKey: string
   keys: readonly SettingKey[]
   defaultOpen?: boolean
-  desktopOnly?: boolean
-  windowsOnly?: boolean
 }
 
 export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
@@ -31,7 +29,7 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
     keys: ['titlebarMerged', 'toolbarAlign', 'selectionBarDocked', 'selectionBarAlign', 'autoHideChromeWindowed'],
   },
   { id: 'galleryBehavior', section: 'gallery', titleKey: 'settings.galleryInteractionGroup', keys: ['hoverScale', 'hoverAutoplay'] },
-  { id: 'viewerColor', section: 'gallery', titleKey: 'settings.viewerColorGroup', keys: ['viewerColorTarget', 'viewerIccManager'], desktopOnly: true },
+  { id: 'viewerColor', section: 'gallery', titleKey: 'settings.viewerColorGroup', keys: ['viewerColorTarget', 'viewerIccManager'] },
   {
     id: 'galleryTimeline', section: 'gallery', titleKey: 'settings.timelineGroup', defaultOpen: false,
     keys: ['timelineAxisWidth', 'timelineScrollWidth', 'scrollThumbMinHeight', 'axisViewportOpacity'],
@@ -41,14 +39,13 @@ export const SETTINGS_GROUPS: readonly SettingsGroup[] = [
     id: 'thumbnails', section: 'media', titleKey: 'settings.thumbnailGenerationGroup',
     keys: ['thumbDecodeStrategy', 'thumbSize', 'thumbWebpQuality', 'thumbSkipMaxKb', 'fullThumbGen'],
   },
-  {
-    id: 'thumbnailPerformance', section: 'media', titleKey: 'settings.thumbnailPerformanceGroup',
-    keys: ['thumbFastThreads', 'thumbTailThreads', 'thumbGpuInflight', 'thumbGpuPerAdapter', 'thumbProcessMemoryMb', 'thumbTotalMemoryMb', 'thumbWorksetMb'],
-    windowsOnly: true, defaultOpen: false,
-  },
   { id: 'thumbnailCache', section: 'media', titleKey: 'settings.thumbnailCacheGroup', keys: ['thumbCacheDir', 'thumbCacheMaxMb', 'cacheStats'] },
   { id: 'video', section: 'media', titleKey: 'settings.video', keys: sectionSettingKeys('video') },
   { id: 'aiModels', section: 'ai', titleKey: 'settings.aiModels', keys: sectionSettingKeys('aiModels') },
+  {
+    id: 'experimental', section: 'advanced', titleKey: 'settings.experimentalGroup',
+    keys: sectionSettingKeys('experimental'), defaultOpen: true,
+  },
   { id: 'debug', section: 'advanced', titleKey: 'sidebar.debugSettings', keys: sectionSettingKeys('debug') },
   { id: 'danger', section: 'advanced', titleKey: 'settings.dangerZone', keys: sectionSettingKeys('danger'), defaultOpen: false },
   { id: 'reading', section: 'gallery', titleKey: 'settings.reading', keys: [] },

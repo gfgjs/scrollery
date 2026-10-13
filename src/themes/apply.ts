@@ -1,5 +1,4 @@
-// src/themes/apply.ts
-// 色板 → 文档根(方案 §6:apply.ts = 色板 → CSS 变量;单次主题发布)。
+// 色板到文档根 CSS 变量的单次发布。
 //
 // 变量名全部来自 generate.ts 的 PALETTE_CSS_VARS(唯一映射),本模块不另立第二张表、不含颜色
 // 算法;写入的都是 hex/rgb/rgba 实色,不向任何消费者传 var()/color-mix() 表达式。

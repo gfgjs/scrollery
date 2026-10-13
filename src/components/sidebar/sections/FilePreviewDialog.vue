@@ -19,9 +19,8 @@
     </template>
 
     <template #footer>
-      <!-- 逃生口:预览满足不了(要编辑/看全文)时去文件管理器。移动端 opener 不支持 reveal
-           (D-001),按钮整个不渲染,与树内双击的门同姿态。 -->
-      <UiButton v-if="!isMobilePlatform && request" variant="secondary" @click="revealInManager">
+      <!-- 需要编辑或查看全文时，可在文件管理器中定位。 -->
+      <UiButton v-if="request" variant="secondary" @click="revealInManager">
         {{ t('sidebar.previewReveal') }}
       </UiButton>
       <UiButton variant="primary" @click="emit('close')">{{ t('common.close') }}</UiButton>
@@ -40,7 +39,6 @@ import UiButton from '../../ui/UiButton.vue'
 import { invokeIpc } from '../../../utils/ipc'
 import { logger } from '../../../utils/logger'
 import { IPC } from '../../../constants/ipc'
-import { isMobilePlatform } from '../../../utils/platform'
 import { useToastStore } from '../../../stores/toastStore'
 
 /** 预览目标:三元组全部取自后端产出的 DirFile/父节点字段,前端不推导(D-013)。 */

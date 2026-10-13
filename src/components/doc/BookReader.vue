@@ -33,12 +33,9 @@
 </template>
 
 <script setup lang="ts">
-// 统一渲染器（阅读器方案 R2）：包 vendored foliate-js 的 <foliate-view> 自定义元素，
-// EPUB / txt 共用同一渲染管线（md 待 R2-4b）。对齐现有 ReaderApi 契约（next/prev/getScrollEl），
-// 进度用 "cfi:<epubcfi>" 前缀（epub 及 txt 合成 book 的 foliate 原生 CFI 均走此路，存量兼容）。
-//
-// 已交付：epub（R2-2，真机验平价）；txt 经 SyntheticBook 入统一管线（R2-4，textSource prop）。
-// 待做：md 感知分章（R2-4b）；fraction 页脚/scrolled 双流/TOC 面板（R2-3）；排版/主题注入（R2-5）。
+// 统一渲染器：封装 vendored foliate-js 的 <foliate-view> 自定义元素，
+// EPUB、txt、md 共用渲染管线；遵循 ReaderApi 的 next/prev/getScrollEl 契约。
+// 阅读进度使用 "cfi:<epubcfi>" 前缀，兼容已保存的定位值。
 import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ChevronLeft, ChevronRight } from '@lucide/vue'
@@ -64,7 +61,10 @@ import {
 } from '../../utils/readerStyles'
 import { getReaderTheme, READER_THEME_FOLLOW } from '../../themes/readerThemes'
 import { useThemeStore } from '../../stores/themeStore'
-import type { TextBookIndex, TextChapterContent, ZhConvertConfig } from '../../types/reader'
+import { useToastStore } from '../../stores/toastStore'
+import { decorateMarkdownCodeCopy } from './markdownCodeCopy'
+import { hashTextSource } from '../../utils/textSourceAnchor'
+import type { TextBookIndex, TextChapterContent, TextSourceAnchor, ZhConvertConfig } from '../../types/reader'
 import type {
   FoliateView,
   FoliateBook,
@@ -80,7 +80,7 @@ const props = defineProps<{
   textSource?: { itemId: number; isMarkdown: boolean; reflow?: boolean }
   /** 上次阅读位置（"cfi:<cfi>"）。 */
   initial: string | null
-  /** 替换规则函数（§5.2）；每章文档载入后对其文本节点就地应用。 */
+  /** 替换规则函数；每章文档载入后对其文本节点就地应用。 */
   replacer?: (t: string) => string
   /** 阅读流：'paginated' 书卷翻页（默认）/ 'scrolled' 连续滚动。foliate paginator 原生支持，txt/epub 统一。 */
   flow?: 'paginated' | 'scrolled'
@@ -106,7 +106,7 @@ const props = defineProps<{
     titleScale?: number
     paragraphSpacingEm?: number
   }
-  /** 简繁转换档位(R4,§5.10):缺省=关(不转换)。纯显示层,txt/md/epub 通用;切换由父层 remount 生效(转换不可逆)。 */
+  /** 简繁转换档位；缺省为关闭。仅作用于显示层，切换时由父层重新挂载。 */
   zhConvert?: ZhConvertConfig
   /** 自动翻页（R4）：开启后按 autoScrollSec 间隔自动 next()（分页流=翻页，滚动流=下移一屏）。 */
   autoScroll?: boolean
@@ -136,6 +136,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'ready'): void
+  (e: 'document-link', href: string): void
   (e: 'progress', pos: string): void
   /** 位置变化（R2-3）：全书进度 0..1 + 当前章标题，供页脚百分比 / 章名显示。 */
   (e: 'locate', v: { fraction: number; tocLabel: string; tocHref: string }): void
@@ -214,6 +215,7 @@ defineExpose({
   clearSearch,
   getCurrentLocation,
   goToLocator,
+  getCurrentSourceAnchor,
 })
 
 // 滚轮翻页（节流）：分页流无原生滚动，foliate paginator 只自管 touchstart 滑动、不管 wheel，
@@ -235,7 +237,10 @@ function applyFlow() {
 }
 watch(
   () => props.flow,
-  () => applyFlow(),
+  () => {
+    applyFlow()
+    applyReaderStyles()
+  },
 )
 
 // 沉浸残留 chrome 治理(2026-07-17):去 foliate 头/脚带。'margin' 是 paginator observedAttribute
@@ -320,13 +325,14 @@ function applyReaderStyles() {
   const typo = props.typography ?? {}
   // 竖排（R5）：段落规则改逻辑属性 + 关首行缩进（见 buildReaderCSS）。writing-mode 本身由 onLoad 注入文档根。
   const vertical = (props.vertical ?? 'off') !== 'off'
+  const paginated = effectiveFlow() !== 'scrolled'
   if ((props.styleMode ?? 'book') === 'reader') {
     view?.renderer?.setStyles([
       '',
-      buildReaderCSS(colors, typo, { override: true, texture, vertical }),
+      buildReaderCSS(colors, typo, { override: true, texture, vertical, paginated }),
     ])
   } else {
-    view?.renderer?.setStyles([buildReaderCSS(colors, typo, { texture, vertical }), ''])
+    view?.renderer?.setStyles([buildReaderCSS(colors, typo, { texture, vertical, paginated }), ''])
   }
 }
 // 栏宽（max-inline-size）经 renderer 属性施加（observedAttributes 含之，setAttribute 即触发 render() 重排）。
@@ -362,11 +368,19 @@ watch(
 )
 
 // 章文档载入（等价 epub.js hooks.content 的挂点）：对其 body 就地应用替换规则，再按档位施加简繁转换。
-// 顺序遵 §5.13「替换 → 简繁 → 渲染」：替换是同步纯函数先施加；简繁走后端 IPC 异步，随后 fire-and-forget。
+// 按替换、简繁转换、渲染的顺序处理：替换同步执行，简繁转换经后端 IPC 异步完成。
 function onLoad(e: Event) {
   const detail = (e as CustomEvent<FoliateLoadDetail>).detail
   const doc = detail?.doc
   if (!doc?.body) return
+  if (props.textSource?.isMarkdown) {
+    decorateMarkdownCodeCopy(doc, {
+      label: t('doc.copyCode'),
+      onResult: (success) => {
+        if (!destroyed) useToastStore().addToast(success ? 'success' : 'error', t(success ? 'ocr.copied' : 'ocr.failed'))
+      },
+    })
+  }
   // 键盘桥（2026-07-16）：iframe 的键盘事件不跨界冒泡到父窗口 → 焦点一进书里，父页所有 window 级
   // 键位全失灵（按住 Esc 退全屏、方向键翻页、F11…）。在此把它们中继出去，见 utils/keyRelay 顶注。
   // 挂在本钩子而非别处：paginator 每节**新建**一个 View/iframe（#createView 无复用），故只有
@@ -416,10 +430,22 @@ function onRelocate(e: Event) {
   }
 }
 
+function onDocumentLink(event: Event) {
+  const detail = (event as CustomEvent<{ a: HTMLAnchorElement; href: string }>).detail
+  if (!props.textSource?.isMarkdown || !detail?.a.hasAttribute('data-document-link')) return
+  event.preventDefault()
+  emit('document-link', detail.a.getAttribute('href') ?? '')
+}
+
 // TOC 跳转（R2-3）：view.goTo 解析 href（txt/md=章号、epub=章内 href）→ 定位并翻至该章。
 // 搜索命中跳转（R4）亦复用此路：foliate 的 goTo 对 CFI 与 href 均可解析。
-function goToHref(href: string) {
-  view?.goTo(href)
+async function goToHref(href: string): Promise<void> {
+  // foliate 会吞掉解析异常；宿主先校验标题，以便缺失目标时明确反馈。
+  if (props.textSource && href.startsWith('#')) {
+    if (!props.textSource.isMarkdown) throw new Error('Text document has no heading anchors')
+    view?.book?.resolveHref?.(href)
+  }
+  await view?.goTo(href)
 }
 
 // 书内搜索（R4）：返回 foliate 原生 search 异步生成器（全书流式，逐章 yield {label,subitems}，命中同时
@@ -440,6 +466,27 @@ function getCurrentLocation(): { locator: string; label: string; fraction: numbe
   if (!lastCfi) return null
   return { locator: `cfi:${lastCfi}`, label: lastLabel, fraction: lastFraction }
 }
+
+/** 读取源段落属性，显示替换和简繁转换不会改变这些映射。 */
+function getCurrentSourceAnchor(): TextSourceAnchor | null {
+  if (!props.textSource) return null
+  const range = view?.lastLocation?.range
+  if (!range) return null
+  const node = range.startContainer
+  const element = node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement
+  const mapped = element?.closest('[data-source-line], [data-source-offset]')
+    ?? Array.from(node.ownerDocument?.querySelectorAll('[data-source-line], [data-source-offset]') ?? [])
+      .find(candidate => range.intersectsNode(candidate))
+  if (!mapped) return null
+  const sourceHash = mapped.closest('[data-source-hash]')?.getAttribute('data-source-hash')
+  if (!sourceHash) return null
+  if (mapped.hasAttribute('data-source-offset')) {
+    const offset = Number(mapped.getAttribute('data-source-offset'))
+    return Number.isSafeInteger(offset) && offset >= 0 ? { offset, sourceHash } : null
+  }
+  const line = Number(mapped.getAttribute('data-source-line'))
+  return Number.isSafeInteger(line) && line >= 0 ? { line, sourceHash } : null
+}
 // 跳到书签位置：剥去 "cfi:" 前缀后交 view.goTo。
 function goToLocator(locator: string) {
   const target = locator.startsWith('cfi:') ? locator.slice(4) : locator
@@ -451,11 +498,13 @@ async function resolveOpenTarget(): Promise<FoliateBook | string> {
   const ts = props.textSource
   if (ts) {
     if (ts.isMarkdown) {
-      // md：取生效版本全文（GET_DOCUMENT_TEXT，含版本/编码解析）→ 零依赖 renderMarkdownBlocks →
+      // md：取生效版本全文（GET_DOCUMENT_TEXT，含版本/编码解析）→ renderMarkdownBlocks →
       // 按块分片多 section(2026-07-17 内存爆炸修复:整篇单 section 在 paginated multicol 下
       // 是 GB 级放大灾难,分片使 paginated 只 columnize 当前 ~24K 片)。
       const text = await invokeIpc<string>(IPC.GET_DOCUMENT_TEXT, { itemId: ts.itemId })
-      let blocks = renderMarkdownBlocks(text ?? '')
+      const sourceOffsets: number[] = []
+      const sourceHash = hashTextSource(text ?? '')
+      let blocks = renderMarkdownBlocks(text ?? '', { documentUrl: props.url, sourceOffsets })
       // 代码块语法高亮（R4，shiki JS 引擎懒载）：按当前**生效阅读背景**明暗选 github 主题（R3：夜间阅读
       // 主题即使在浅色界面也取暗色码主题）；逐块施加,无围栏的块在 highlightMarkdownHtml 内短路,
       // 全篇无围栏则整段跳过(连 shiki chunk 都不拉)。主题在开卷时定，换主题不重新高亮
@@ -466,7 +515,7 @@ async function resolveOpenTarget(): Promise<FoliateBook | string> {
         for (const b of blocks) highlighted.push(await highlightMarkdownHtml(b, dark))
         blocks = highlighted
       }
-      builtBook = buildMarkdownSyntheticBook({ blocks })
+      builtBook = buildMarkdownSyntheticBook({ blocks, sourceOffsets, sourceHash: await sourceHash ?? undefined })
       // 护栏(D-002):分片后仍存在超限单片(仅「单块超预算独占一片」可能,如巨型代码围栏)→
       // 强制 scrolled。须在 open 前置位:onMounted 的 applyFlow 在 resolveOpenTarget 之后运行。
       if (hasOversizedSection(builtBook.sections)) {
@@ -532,18 +581,15 @@ onMounted(async () => {
     view = document.createElement('foliate-view') as unknown as FoliateView
     // 监听须在 open/init 之前挂，否则首章的 load / 首次 relocate 会漏。
     view.addEventListener('load', onLoad)
+    view.addEventListener('link', onDocumentLink)
     view.addEventListener('relocate', onRelocate)
     hostEl.value?.appendChild(view as unknown as HTMLElement)
 
     await view.open(target)
     if (destroyed) return
 
-    // 「脚本化 EPUB 不支持」——设计 §4.8 的**规范性**裁决。2026-07-16 安全审查查明：此前它只是一句
-    // 声明，代码里没有任何东西在执行它。上游为此预留的 seam（epub.js loadItem 派发的 'load' 事件带
-    // isScript/allow）**全仓零订阅**，于是 allow 恒真、EPUB 里的 <script src> 一路走到可用的 blob URL。
-    // 而该 blob iframe 与父页**同源**（blob URL 继承创建者的源），父页持有 Tauri IPC 桥。
-    // 挂点必须在此：open() 只建 book、renderer.open() 只存 sections（都不载章），首章载入由下方
-    // restorePosition() 触发的 goTo 发起 —— 早一步则 book 还不存在，晚一步则漏掉首章。
+    // EPUB 的 blob iframe 与父页同源，必须在载入首章前禁用脚本资源。
+    // open() 后 book 才存在；restorePosition() 会触发首章载入，因此在两者之间设置拦截。
     denyScriptResources(view.book)
 
     applyFlow() // 首渲前设好 flow，使初次布局即按当前阅读流（避免先翻页再跳滚动的闪烁）。
@@ -573,12 +619,15 @@ onBeforeUnmount(() => {
   curlEl.value?.removeEventListener('animationend', onCurlEnd)
   try {
     view?.removeEventListener('load', onLoad)
+    view?.removeEventListener('link', onDocumentLink)
     view?.removeEventListener('relocate', onRelocate)
     view?.close() // 内部 renderer.destroy() 会 unload 各 section（回收已加载章的 URL）
     ;(view as unknown as HTMLElement | null)?.remove()
-    builtBook?.destroy?.() // 再回收 SyntheticBook 剩余未 unload 的 blob URL（幂等）
   } catch {
     /* ignore teardown errors */
+  } finally {
+    // 首章未就绪时 foliate 关闭可能抛错，自有资源仍须释放并禁止迟到章节创建 URL。
+    builtBook?.destroy?.()
   }
   view = null
   builtBook = null

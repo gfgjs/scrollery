@@ -1,11 +1,11 @@
-//! 导出整理成果 IPC 命令(方案 A §3/§4 app 接线)。
+//! 导出整理成果 IPC 命令。
 //!
-//! 纯导出引擎在 `crate::export`;本模块负责:选区解析、批量元数据取值、文件任务门闩获取、
+//! 导出引擎在 `crate::export`;本模块负责:选区解析、批量元数据取值、文件任务门闩获取、
 //! 分离任务执行(webview 关闭也跑到底、门闩必释放)、进度事件 + 快照 + `export_status` 查询
 //! (同 `backup_commands` 姿态:Channel 随发起它的 webview 死,故用 app 级事件 + AppState 快照)。
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -427,25 +427,100 @@ fn finalize_payload(
     }
 }
 
-/// `stop_export` 的核对逻辑(纯函数,便于不依赖 `State` 单测)。仅 job_id 匹配不够——终态快照
-/// 沿用旧 job_id,旧任务终态落地后、新任务 `begin()` 与新 running 快照发布之间存在窗口;此窗口内
-/// 携旧 job_id 的迟到 stop 若只核对 job_id,会命中旧任务的**终态**快照,进而错误取消新任务刚装的
-/// token(审查 P1)。加 `status == "running"` 核对堵死此窗口。
-fn should_cancel_export(current: Option<&ExportProgressPayload>, job_id: &str) -> bool {
-    current.is_some_and(|p| p.job_id == job_id && p.status == "running")
+/// 核对运行任务并执行取消；终态沿用旧 job_id，不能仅按标识取消当前令牌。
+fn cancel_matching_export(
+    progress: &Mutex<Option<ExportProgressPayload>>,
+    job_id: &str,
+    cancel: impl FnOnce(),
+) {
+    let current = progress.lock().unwrap_or_else(|e| e.into_inner());
+    if current
+        .as_ref()
+        .is_some_and(|p| p.job_id == job_id && p.status == "running")
+    {
+        // 持锁到取消完成，阻止旧任务发布终态、释放门闩后被新任务替换。
+        cancel();
+    }
 }
 
 /// 取消当前导出(只清本 job 的 staging,已落名的旧正式目录不碰)。`job_id` 须匹配当前运行任务,
 /// 不匹配则视为过期引用、静默忽略(方案 §3.1:「停止只能取消匹配任务」)。
 #[tauri::command]
 pub fn stop_export(job_id: String, state: State<'_, Arc<AppState>>) -> Result<()> {
-    let current = state
-        .export_progress
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if should_cancel_export(current.as_ref(), &job_id) {
-        drop(current);
-        state.cancel_export();
-    }
+    cancel_matching_export(&state.export_progress, &job_id, || state.cancel_export());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_failure_terminal_is_failed_with_stable_code() {
+        let terminal = finalize_payload(
+            "cleanup-job".into(),
+            Ok(Err(AppError::Export {
+                code: "export_cleanup_failed",
+                message: "cleanup failed".into(),
+            })),
+        );
+        assert_eq!(
+            serde_json::to_value(terminal).unwrap(),
+            serde_json::json!({
+                "jobId": "cleanup-job",
+                "status": "failed",
+                "code": "export_cleanup_failed"
+            })
+        );
+    }
+
+    #[test]
+    fn clean_cancellation_terminal_remains_cancelled() {
+        let terminal = finalize_payload(
+            "cancel-job".into(),
+            Ok(Err(AppError::Export {
+                code: CODE_CANCELLED,
+                message: "export cancelled".into(),
+            })),
+        );
+        assert_eq!(
+            serde_json::to_value(terminal).unwrap(),
+            serde_json::json!({
+                "jobId": "cancel-job",
+                "status": "cancelled",
+                "code": CODE_CANCELLED
+            })
+        );
+    }
+
+    /// job_id 不匹配(过期引用)→ 不取消,与快照状态无关。
+    #[test]
+    fn cancel_matching_export_rejects_mismatched_job_id() {
+        let progress = Mutex::new(Some(ExportProgressPayload::running("job1".into(), 1, 10)));
+        cancel_matching_export(&progress, "job-other", || panic!("取消了不匹配的任务"));
+    }
+
+    #[test]
+    fn cancel_matching_export_rejects_terminal_job() {
+        let mut completed = ExportProgressPayload::running("job1".into(), 1, 1);
+        completed.status = "completed".into();
+        let progress = Mutex::new(Some(completed));
+        cancel_matching_export(&progress, "job1", || panic!("终态旧任务取消了新令牌"));
+    }
+
+    #[test]
+    fn cancel_matching_export_holds_progress_lock_until_cancelled() {
+        let progress = Mutex::new(Some(ExportProgressPayload::running("job1".into(), 1, 10)));
+        let mut cancelled = false;
+        cancel_matching_export(&progress, "job1", || {
+            // 取消执行前必须仍阻止终态发布；否则旧任务可释放门闩并让新任务换入。
+            assert!(matches!(
+                progress.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            cancelled = true;
+        });
+        assert!(cancelled);
+        assert!(progress.try_lock().is_ok());
+    }
 }

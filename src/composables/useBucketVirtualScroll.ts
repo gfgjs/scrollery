@@ -1,40 +1,29 @@
-// src/composables/useBucketVirtualScroll.ts
-// T16 方案 B(B1.5):bucket 分段虚拟滚动——等高算术分段 + 有界最新优先取数管线。
+// bucket 分段虚拟滚动：等高算术分段与有界最新视口优先取数。
 //
-// 机制:废弃「单 spacer + 行级坐标压缩」——容器总高 = 真实逻辑总高,每段(bucket)一个
-// 绝对定位 div(top=seg.start、height=段真实高),段内行以 (row.y - seg.start) 定位。
-// 滚动/惯性/滚动条全走浏览器原生,**零坐标平移、零每帧补偿**(方案 A 平移模式不顺滑的
-// 根因即「原生滚动 + JS 反向补偿」的双步差帧,本引擎从结构上消除它,见 T16 评估文档 §2)。
+// 未映射态容器总高 = 真实逻辑总高，每段(bucket)一个绝对定位 div
+// (top=seg.start、height=段真实高)，段内行以 (row.y - seg.start) 定位。
+// 映射态由下述 spacer 上限封顶，并对段的物理 top 重锚。
+// 滚动/惯性/滚动条走浏览器原生路径，不做每帧坐标补偿。
 //
-// B1.5 重构(2026-07-04,真机四根因修复;原 B1 语义边界 + IntersectionObserver 方案已废):
 // - **等高算术分段**:段边界 = 0, S, 2S, …(与日期/目录语义无关)。get_bucket_rows 的
 //   半开区间归属保证任意边界下每行恰属一段 → 三种分组(date/folder/none)统一覆盖,
 //   段大小恒定 → 「超大单桶」(Immich #28861)从构造上消失。
-// - **可见段 = 纯算术**(scrollTop/S 两次除法)→ 不再需要 IntersectionObserver,也不再
-//   渲染全量占位 div(原方案数百段 div × 内联函数 ref × 每滚动帧重渲染 = 每帧数千次
-//   observe churn,真机根因 C);只渲染愿望窗口内的 2-3 个段。
+// - **可见段 = 纯算术**(scrollTop/S)，只渲染愿望窗口内的少量段。
 // - **愿望清单 + 最新视口优先取数**:常态仍单飞;若唯一在途段已因远跳离开愿望集,
 //   允许 1 个最新目标段旁路(总在途硬上限 2),不让陈旧 IPC 阻塞当前视口。出队按「距
 //   视口中心最近」重选,应答落地前复核「该段仍被需要且仍是同一对象」——飞掠应答
 //   仍会丢弃,也不会形成无界并发或幽灵挂载。
 //
-// B3 段级坐标映射(2026-07-04):总高 > 物理 spacer 上限(16M,WebView2 2^24 钳制留余量)
+// 总高 > 物理 spacer 上限(16M,WebView2 2^24 钳制留余量)
 // 时进入「映射态」——spacer 封顶,段以 (seg.start − anchorDelta) 物理定位。滚动语义按
-// **输入源分类**(B3.1,2026-07-04 真机回报修复,见 onScroll/onWheel):
+// **输入源分类**(见 onScroll/onWheel):
 //  - **滚轮/触摸/滚动键**(有 1:1 印记):局部 1:1——1 物理 px = 1 逻辑 px,零补偿零重锚;
 //    物理钉边后原生不再产生 scroll 事件,由 onWheel 推锚差续滚到**真正的逻辑边缘**;
 //  - **滚动条拖动/轨道点击/Home/End**(无印记的滚动链,或单事件巨跳):**逐事件**全局
 //    线性重锚——拇指位置 ≈ 库内比例(滚动条的用户心智模型),拖到边 = 逻辑边,构造上
-//    无钉住(B3 初版只认单事件巨跳,慢拖被误判 1:1 → 拖到底逻辑远未到底);
+//    无钉住;
 //  - **压缩债**(局部 1:1 令拇指渐失真):仅在滚动**停稳**时原子偿还——同帧改
-//    delta+scrollTop,内容零位移、仅拇指悄然归位。手势进行中绝不写 scrollTop(B3 初版
-//    「钉边立即偿债」与拖拽/惯性互搏,真机表现为到边后一跳一跳还能继续滚,已废)。
-// 与方案 A 行级每帧补偿的本质区别:1:1 路径零干预,重锚只发生在拖动/远跳/停稳这些
-// 低频或本就非连续的事件上。
-//
-// 与方案 A 的关系:P22 收敛后本引擎是画廊唯一虚拟滚动实现(方案 A 线性平移引擎及其
-// enabled 开关已删)——其 SAFE_MAX 平移态由本引擎的 B3 段级映射态覆盖,且本引擎额外覆盖
-// 滚轮/键盘/触摸的输入源分类。
+//    delta+scrollTop,内容零位移、仅拇指归位。手势进行中绝不写 scrollTop，以免与惯性或拖拽互搏。
 
 import {
   shallowRef,
@@ -53,13 +42,12 @@ import { canvasPrefetchCoveragePx } from '../utils/galleryPrefetchWindow'
 
 const LOG = '[BucketScroll]'
 
-/// 物理 spacer 上限(px):低于 WebView2 单元素高度钳制(2^24 = 16,777,216)的保守值。
-/// 总高 ≤ 此值 → 纯原生(零映射,B1.5 形态);总高 > 此值 → B3 映射态(spacer 封顶,段级重锚)。
+/** 物理 spacer 上限(px)：低于 WebView2 单元素高度钳制(2^24 = 16,777,216)的保守值。
+ * 总高 ≤ 此值走原生滚动；超出后封顶 spacer 并按段重锚。 */
 export const BUCKET_NATIVE_MAX = 16_000_000
 
-/// dev-only:localStorage['scrollery.debug.bucketSpacer'] 覆盖 spacer 上限(镜像方案 A 的
-/// debug.safeMax 先例)——调小(如 2_000_000)即可用中小库在真机触发 B3 映射态验收,
-/// 免造百万项库。模块加载时读一次(零每帧开销),改值刷新生效、清除恢复默认。
+/** 开发环境可用 localStorage['scrollery.debug.bucketSpacer'] 覆盖 spacer 上限。
+ * 调小（如 2_000_000）可用中小库触发映射态。模块加载时读一次，改值后刷新生效。 */
 export function resolveBucketSpacerCap(): number {
   try {
     if (import.meta.env.DEV) {
@@ -89,8 +77,8 @@ export const SCROLL_CHAIN_MS = 100
 /// 1:1 分类;窗口外新起的滚动链只能来自滚动条拖动/轨道点击 → 按全局比例逐事件重锚。
 export const ONE_TO_ONE_STICKY_MS = 250
 
-/// 1:1 印记适格的滚动键。Home/End **有意不含**——其语义是文档边界,走巨跳兜底按全局
-/// 比例重锚,恰好精确落到逻辑边界。
+/// 1:1 印记适格的滚动键。Home/End 表示文档边界，由 onKeydown 主动断开局部手势链，
+/// 让下一次原生滚动按全局比例重锚，不依赖物理跳转是否足够大。
 const ONE_TO_ONE_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', ' '])
 
 /// 段高上限/默认(px):既是懒加载取数单元(一次 IPC),也是挂载粒度。**现为上限**——实际段高
@@ -455,6 +443,8 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
   }
 
   async function rebuild() {
+    // 新高度可能已钳制物理 scrollTop；换代恢复必须保留上一代记录的逻辑位置。
+    const previousY = generation === 0 ? (opts.containerRef()?.scrollTop ?? 0) : logicalScrollTop.value
     const previous = new Map(segments.value.map((seg) => [seg.index, seg]))
     const myGeneration = ++generation
     const version = opts.layoutVersion()
@@ -476,11 +466,10 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     }
     // 行高变(→relayout→layoutVersion→本函数)时重算段高:段高与布局版本同源、一代内恒定。
     segPx = clampSegmentPx(opts.rowHeight())
-    anchorDelta.value = Math.min(anchorDelta.value, Math.max(0, opts.totalHeight() - SPACER_CAP))
     const el = opts.containerRef()
-    const y = Math.min(Math.max(0, target?.y ?? ((el?.scrollTop ?? 0) + anchorDelta.value)), geometry().logMax)
+    const y = Math.min(Math.max(0, target?.y ?? previousY), geometry().logMax)
     const physical = geometry().mapped ? Math.round(globalPhysical(y)) : y
-    if (target) anchorDelta.value = y - physical
+    anchorDelta.value = y - physical
     logicalScrollTop.value = y
     scrollVelocityPxMs = 0
     lastVelocityTs = 0
@@ -492,14 +481,14 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
     } finally {
       rebuildSeed = null
     }
-    if (target && el) {
+    if (el) {
       await nextTick()
-      if (!isCurrent() || target.isCurrent?.() === false) return
+      if (!isCurrent() || target?.isCurrent?.() === false) return
       internalScroll = el.scrollTop !== physical
       el.scrollTop = physical
       lastP = physical
       lastScrollTs = -Infinity
-      target.afterRestore?.()
+      target?.afterRestore?.()
     }
     flushSettled()
   }
@@ -620,7 +609,23 @@ export function useBucketVirtualScroll(opts: UseBucketVirtualScrollOptions) {
 
   /// 宿主 @keydown 转发入口(B3.1):滚动键盖 1:1 印记(与滚轮同权)。
   function onKeydown(e: KeyboardEvent) {
-    if (ONE_TO_ONE_KEYS.has(e.key)) oneToOneUntil = Date.now() + ONE_TO_ONE_STICKY_MS
+    if (restoring || disposed) return
+    if (e.key === 'Home' || e.key === 'End') {
+      // 边界键的物理跳转可能不足巨跳阈值，必须主动清除前一轮滚轮/触摸的分类。
+      oneToOneUntil = -Infinity
+      lastScrollTs = -Infinity
+      const g = geometry()
+      const el = opts.containerRef()
+      if (g.mapped && el && (e.key === 'Home' ? el.scrollTop <= 0 : el.scrollTop >= g.physMax)) {
+        // 物理已钉边时浏览器不会再派发 scroll；直接把当前窗口锚到真正的逻辑边界。
+        const y = e.key === 'Home' ? 0 : g.logMax
+        anchorDelta.value = y - el.scrollTop
+        logicalScrollTop.value = y
+        syncDesired()
+      }
+    } else if (ONE_TO_ONE_KEYS.has(e.key)) {
+      oneToOneUntil = Date.now() + ONE_TO_ONE_STICKY_MS
+    }
   }
 
   /// 宿主 @touchmove.passive 转发入口(B3.1):触屏平移盖 1:1 印记(平移中持续刷新,

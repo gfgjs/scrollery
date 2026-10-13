@@ -12,12 +12,7 @@
 //! - `id` **同时是 `faces.model_name` 主键**：换 id = 换一套向量空间，不同模型向量不可互比，
 //!   切换后须对该空间缺失向量的项重新检测+嵌入（同 `ai_embeddings.model_name` 之于 CLIP）。
 //!
-//! # 阶段
-//! - F1（本文件）：只立**契约 + 注册表**（数据），供引擎按文件名加载 session 插槽。
-//! - F2：`face.rs` 按 `DetectorKind`/`EmbedderKind` 分派检测后处理（YuNet 格式 vs SCRFD anchor）
-//!   与嵌入预处理（对齐模板 + 归一化）。新增枚举变体会让分派 `match` 非穷尽编译报错，强制补全。
-//! - F7+：默认轨 `assets` 已填已校验直链（可一键下载）；SCRFD 轨 `assets` 仍留空（无校验值 +
-//!   非商用 = 仅手动导入）。
+//! 默认轨的资产可下载；SCRFD 轨没有内置校验资产，仅供手动导入。
 
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +25,7 @@ pub enum DetectorKind {
     /// YuNet（OpenCV Zoo，MIT）：输出 bbox + 5 关键点 + score，priors/strides 解码 + NMS。
     YuNet,
     /// SCRFD（InsightFace，权重非商用）：多 stride(8/16/32) anchor，distance2bbox/kps + NMS。
-    /// Part4-T1:仅 face-noncommercial build 编译——变体的 serde 字面量("scrfd")也不进商业二进制。
+    /// 仅在 `face-noncommercial` 构建中存在，商业构建不包含其序列化字面量。
     #[cfg(feature = "face-noncommercial")]
     Scrfd,
 }
@@ -42,7 +37,7 @@ pub enum EmbedderKind {
     /// SFace（OpenCV Zoo，Apache-2.0）：128 维。
     SFace,
     /// ArcFace（InsightFace，权重非商用）：512 维，`(x-127.5)/127.5` 归一化。
-    /// Part4-T1:仅 face-noncommercial build 编译(同 DetectorKind::Scrfd)。
+    /// 仅在 `face-noncommercial` 构建中存在。
     #[cfg(feature = "face-noncommercial")]
     ArcFace,
 }
@@ -52,7 +47,7 @@ pub enum EmbedderKind {
 #[serde(rename_all = "snake_case")]
 pub enum FaceNorm {
     /// `(x-127.5)/127.5`，RGB（ArcFace 标准）。
-    /// Part4-T1:仅 face-noncommercial build 编译(唯一消费者是 ArcFace 轨)。
+    /// 仅在 `face-noncommercial` 构建中存在。
     #[cfg(feature = "face-noncommercial")]
     ArcFaceStd,
     /// SFace：RGB、0-255、无归一化（F8 对拍坐实：feature() 内部 swapRB=true，喂 RGB→cosine 1.0）。

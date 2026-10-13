@@ -131,11 +131,14 @@ pub(in crate::db::queries::layout) fn canonical_layout_sql(
     // 随缩略图/富化回填变胖后实测 6.6s（页缓存 64MB 全程颠簸）。压制后退化为顺序全表
     // 扫（每页只读一遍）；选择性视图（目录/收藏/类型等）不命中本后缀，各自索引照常
     // （计划锁定测试在环）。基准序由内存置换排序补齐，与原 SQL 序逐项等价。
-    const BROAD_BASE: &str = "WHERE m.is_deleted=0 AND m.companion_of IS NULL";
+    const BROAD_BASE: &str =
+        "WHERE m.is_deleted=0 AND m.companion_of IS NULL AND m.availability!='missing'";
     if sql.ends_with(BROAD_BASE) {
         let base_at = sql.len() - BROAD_BASE.len();
         sql.truncate(base_at);
-        sql.push_str("WHERE +m.is_deleted=0 AND +m.companion_of IS NULL");
+        sql.push_str(
+            "WHERE +m.is_deleted=0 AND +m.companion_of IS NULL AND m.availability!='missing'",
+        );
     }
     // 隐藏根排除（V21）在 `+` 抑制**之后**追加：BROAD_BASE 检测只看筛选谓词（免受排除子句干扰），
     // 广域默认视图 + 有隐藏根时仍施 `+` 抑制（保顺序全表扫，不回退 idx_media_sort 随机回表），

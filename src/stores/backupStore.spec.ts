@@ -42,4 +42,31 @@ describe('backupStore 进度恢复', () => {
     expect(store.progress.status).toBe('completed')
     expect(store.progress.path).toContain('done.scrollerybackup')
   })
+
+  it('新备份 running 事件先到时迟到的旧 completed 快照不能隐藏停止入口', async () => {
+    let resolveSnapshot!: (value: unknown) => void
+    const snapshot = new Promise<unknown>((resolve) => { resolveSnapshot = resolve })
+    let notifyRequested!: () => void
+    const requested = new Promise<void>((resolve) => { notifyRequested = resolve })
+    invokeIpc.mockImplementation((cmd: unknown) => {
+      if (cmd === IPC.BACKUP_STATUS) {
+        notifyRequested()
+        return snapshot
+      }
+      return Promise.resolve(undefined)
+    })
+    const store = useBackupStore()
+    const restore = store.restoreBackupProgress()
+    await requested
+    expect(invokeIpc).toHaveBeenCalledWith(IPC.BACKUP_STATUS)
+
+    listeners.get(EVENTS.BACKUP_PROGRESS)?.({ payload: { status: 'running', kind: 'auto' } })
+    resolveSnapshot({ status: 'completed', kind: 'backup', path: 'D:/old.scrollerybackup' })
+    await restore
+
+    expect(store.isRunning).toBe(true)
+    expect(store.progress).toEqual({ status: 'running', kind: 'auto' })
+    await store.stopBackup()
+    expect(invokeIpc).toHaveBeenLastCalledWith(IPC.STOP_BACKUP)
+  })
 })

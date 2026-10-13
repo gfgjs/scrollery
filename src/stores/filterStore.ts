@@ -18,7 +18,7 @@ export const useFilterStore = defineStore('filter', () => {
   const livePhotoOnly = ref(false)
   const favoritedOnly = ref(false)
   const minRating = ref(0)
-  const colorLabel = ref(0) // 0=不按色筛选 / 1-7 色档（T16）
+  const colorLabel = ref(0) // 0=不按色筛选 / 1-7 色档
   const dateFrom = ref<number | null>(null)
   const dateTo = ref<number | null>(null)
 
@@ -78,13 +78,15 @@ export const useFilterStore = defineStore('filter', () => {
       minRating: minRating.value > 0 ? minRating.value : undefined,
       colorLabel: colorLabel.value > 0 ? colorLabel.value : undefined,
       dateRange:
-        dateFrom.value && dateTo.value ? { from: dateFrom.value, to: dateTo.value } : undefined,
+        dateFrom.value !== null && dateTo.value !== null
+          ? { from: dateFrom.value, to: dateTo.value }
+          : undefined,
     }
   }
 
   /**
    * `toApiFilter()` 的稳定序列化 —— 供 `useJustifiedLayout` 当重算 watch 的唯一筛选源，
-   * 取代原先手工枚举各筛选字段的写法（枚举漏项不报错，`colorLabel` 已经漏过一次，T16 遗留）。
+   * 遍历全部筛选字段，避免手工枚举漏项。
    * 用 JSON 而非对象是因为 `watch` 按 `Object.is` 比对非 deep 源，`toApiFilter()` 每次返回
    * 新对象会恒不等；序列化后按值比对，键序由字面量顺序固定，稳定可比。
    * 有意行为变化：只填日期一端时不再触发重算（此前会触发一次空转）。

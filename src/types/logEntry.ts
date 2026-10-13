@@ -1,11 +1,8 @@
 // src/types/logEntry.ts
-// 日志窗口(日志能力重构 S4,方案 §5)的信封条目类型。
+// 日志窗口的信封条目类型。
 //
-// 字段刻意保持后端 JSONL 信封的原样 snake_case(方案 §3.3:`ts/level/target/session_id/
-// operation_id/msg/attributes`),而非本仓其余 IPC 层惯用的 camelCase——因为这些字段来自
-// `Vec<serde_json::Value>`(log:batch 事件负载 / read_log_file_page 历史页),不经过任何
-// `#[serde(rename_all = "camelCase")]` struct,原样透传自 JSONL 文件的字面字段名(与 agent
-// 直接 `rg`/`jq` 该文件时看到的键名一致,前后端两侧对同一份数据无需两套字段名心智负担)。
+// 字段保留后端 JSONL 信封的 snake_case：`ts/level/target/session_id/
+// operation_id/msg/attributes`。事件与历史页直接透传 JSONL 字段。
 export interface LogEntry {
   ts: string
   level: string

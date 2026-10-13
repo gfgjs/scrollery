@@ -5,7 +5,7 @@
 //!   - [`tiling`]:纯几何(零 ort),永远可用;
 //!   - [`chain`]:执行链(ort/image 依赖),门控 `inference` feature——同 clip/ocr 门法。
 //!
-//! 模型契约(几何/文件名/scale/task)全部取自 [`crate::enhance_profile`](批 1 产物)。
+//! 模型契约（几何/文件名/scale/task）全部取自 [`crate::enhance_profile`]。
 //! `EnhanceChainRequest.steps` **严格按序执行,chain 不重排**——执行序(降噪→去伪影→超分)
 //! 是 host 责任,core 只忠实执行给定顺序。
 

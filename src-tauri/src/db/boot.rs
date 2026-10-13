@@ -1,12 +1,10 @@
 // src-tauri/src/db/boot.rs
 //! 启动期数据库装配:恢复交换 → 写连接 + 结构初始化(含恢复回滚分支)→ 恢复收尾 → 读池,
-//! 以及 tracing 就绪后才能跑的启动期自愈。
+//! 以及 tracing 就绪后才能跑的启动期自愈四项。
 //!
-//! 自 `lib.rs::run()` 的 setup 段 c/e/f/g/l 迁出(D-450 纯结构移动,行为不变)。
-//!
-//! 顺序不变量(拆分方案 §3.1,改动前必读):
+//! 顺序不变量:
 //! 1. `perform_swap_at_boot` 必须先于 `create_write_connection`/`create_read_pool`;
-//! 2. `initialize_schema` 与 `ConfigManager::load_or_init` 之间已无先后依赖(P24 起配置不再读 DB)。
+//! 2. `initialize_schema` 与 `ConfigManager::load_or_init` 之间无先后依赖。
 //! 3. 结构初始化失败 + 恢复场景的回滚分支必须先 `drop(db_writer)` 释放 Windows 文件句柄,
 //!    才能物理回滚 old→current,再重新开连接 + 重新初始化——不可简化这个 drop/重开时序;
 //! 4. [`run_startup_reconciliation`] 必须在 tracing subscriber 就绪**之后**调用,
@@ -25,6 +23,16 @@ use crate::db::schema::initialize_schema;
 use crate::db::{create_read_pool, create_write_connection, DbPool, DbWriter};
 use crate::StartupFailure;
 
+// 缓存身份修复与结构校验都属于启动就绪条件；恢复库失败时共用原有回滚路径。
+fn initialize_database(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+    initialize_schema(conn)?;
+    let repaired = crate::db::cache_identity::reconcile_cache_key_collisions(conn)?;
+    if repaired > 0 {
+        info!("[Startup] 已隔离 {repaired} 项冲突缓存 | repaired colliding media cache identities");
+    }
+    Ok(())
+}
+
 /// [`init`] 的产出:后续 `AppState::new` 与自愈所需的全部 DB 侧句柄。
 pub struct DbBoot {
     /// 活库路径(`<app_data_dir>/scrollery.db`)。
@@ -39,7 +47,7 @@ pub fn init(app_data_dir: &Path) -> Result<DbBoot, StartupFailure> {
 
     // ── 恢复启动交换（方案 B §6.2）─────────────────────────────────────
     // **须在 DB 写连接/读池创建之前**：staged 库/documents 在此原子换入活库位置。
-    // 无 pending-restore 标记 → 立即返回、对正常启动零开销。返回 Some(backupId) 表示
+    // 持恢复锁检查 pending-restore 标记，无标记即返回。返回 Some(backupId) 表示
     // 已装入待 verify（下方结构初始化成功即视为 verified，收尾清理）。交换失败给可诊断提示：
     // marker 记录已完成相位，重启可幂等续做（不裸 panic）。
     let mut restore_applied = crate::backup::perform_swap_at_boot(app_data_dir)
@@ -56,14 +64,12 @@ pub fn init(app_data_dir: &Path) -> Result<DbBoot, StartupFailure> {
     // 结构初始化换入库(恢复场景下 staged 库已在 restore_stage 校验为当前格式,此处通常为 no-op)。
     let schema_err = {
         let conn = db_writer.lock().unwrap_or_else(|e| e.into_inner());
-        initialize_schema(&conn).err()
+        initialize_database(&conn).err()
     };
     if let Some(e) = schema_err {
         match &restore_applied {
-            // ── §#3:换入库结构初始化失败但本次是恢复 → 回滚到原始库 ─────────────────
-            // 原实现在此直接 fatal 退出,而 Installed marker 仍在 → 每次启动都换入坏库、
-            // 结构初始化再失败、再 fatal,形成**永久 boot-loop**,原始数据(在 restore-old)永不启用。
-            // 修复:drop 写连接(释放文件句柄,Windows 占用文件不可删/移)→ 从 old 逆向回滚 →
+            // 换入库结构初始化失败时，须回滚到原始库，避免 Installed marker 导致重复启动失败。
+            // drop 写连接(释放文件句柄,Windows 占用文件不可删/移)→ 从 old 逆向回滚 →
             // 重开原始库并初始化(原库此前正常运行,应成功)。
             Some(backup_id) => {
                 tracing::error!(
@@ -81,7 +87,7 @@ pub fn init(app_data_dir: &Path) -> Result<DbBoot, StartupFailure> {
                 })?;
                 {
                     let conn = db_writer.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(e2) = initialize_schema(&conn) {
+                    if let Err(e2) = initialize_database(&conn) {
                         // 原始库也初始化失败=真正不可恢复(回滚包 restore-rollback 仍保留供人工兜底)。
                         return Err(StartupFailure::new(
                             "回滚后原始库结构初始化失败 / original db schema initialization failed after rollback",
@@ -91,7 +97,7 @@ pub fn init(app_data_dir: &Path) -> Result<DbBoot, StartupFailure> {
                 }
                 // marker 已在回滚中清除,勿再 finalize;标记恢复未生效。
                 restore_applied = None;
-                // TODO(§#5 同批后续):经启动事件向前端提示「恢复失败已回滚」,当前先记 error 日志。
+                // 回滚结果写入 error 日志。
             }
             // ── 非恢复场景:结构不兼容 / 初始化失败照旧给可诊断提示(事务化,重启可安全重跑)──────────
             None => {
@@ -103,7 +109,7 @@ pub fn init(app_data_dir: &Path) -> Result<DbBoot, StartupFailure> {
         }
     }
 
-    // ── 恢复 verify + 收尾（方案 B §6.2.5）─────────────────────────────
+    // ── 恢复 verify + 收尾 ──────────────────────────────
     // 新库已打开 + 结构初始化成功 = 恢复已生效（quick_check 亦在 restore_stage 阶段做过）→
     // 写 Verified 并清理 old/staging/marker（回滚包保留 ≥7 天，UI 手动清理）。
     if let Some(backup_id) = &restore_applied {
@@ -129,7 +135,7 @@ pub fn init(app_data_dir: &Path) -> Result<DbBoot, StartupFailure> {
     })
 }
 
-/// 启动期 WAL 截断与自愈(setup 段 l)。
+/// 启动期 WAL 截断 + 三项自愈(setup 段 l)。
 ///
 /// **调用时机是硬约束**:tracing subscriber 就绪之后(否则日志静默丢弃)、后台派生管线
 /// 拉起之前(无并发读者,TRUNCATE 可截干净、自愈可一次性收敛)。
@@ -174,31 +180,6 @@ pub fn run_startup_reconciliation(db_writer: &DbWriter, db_path: &Path, cache_di
             ),
             Err(e) => tracing::warn!(
                 "[Startup] 视频可播在途复位失败（不致命） | video_playable in-flight reset failed: {}",
-                e
-            ),
-        }
-
-        // Coordinator 的处理队列只在本进程内存在。重启后旧租约已无执行者，
-        // 须在新任务入队前复位，否则全库阶段会等待租约最长一小时才可续跑。
-        match crate::db::queries::reset_image_thumbnail_leases(&conn) {
-            Ok(0) => {}
-            Ok(n) => info!(
-                "[Startup] 图片缩略图孤儿租约复位 {} 项 | reset {} orphaned image thumbnail leases",
-                n, n
-            ),
-            Err(e) => tracing::warn!(
-                "[Startup] 图片缩略图孤儿租约复位失败 | image thumbnail lease reset failed: {}",
-                e
-            ),
-        }
-        match crate::db::queries::reset_native_video_cover_leases(&conn) {
-            Ok(0) => {}
-            Ok(n) => info!(
-                "[Startup] 原生视频封面孤儿租约复位 {} 项 | reset {} orphaned native video cover leases",
-                n, n
-            ),
-            Err(e) => tracing::warn!(
-                "[Startup] 原生视频封面孤儿租约复位失败 | native video cover lease reset failed: {}",
                 e
             ),
         }

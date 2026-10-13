@@ -1,10 +1,8 @@
-// src-tauri/src/video/playback_policy.rs
-//! 视频可播性判定表(视频格式扩展子系统 design.md §5.1)。
+//! 视频可播性判定表。
 //!
-//! **纯函数、无 IO**:host 侧集中策略,worker 只出流事实(「host 不信任 worker」)。输入为
-//! 归一化后的容器扩展名 + 视频 codec/profile/位深 + 音轨列表,输出五态
-//! [`PlaybackVerdict`]。判定表(§5.1)逐行硬编 + 单测钉死;HEVC 一项由前端
-//! `MediaCapabilities.decodingInfo` 实测覆盖修正(D-444 ④)。
+//! **纯函数、无 IO**：host 侧集中策略，worker 提供流事实。输入为
+//! 容器扩展名 + 视频 codec/profile/位深 + 音轨列表，codec 由本模块归一化，输出五态
+//! [`PlaybackVerdict`]。HEVC 能力由前端 `MediaCapabilities.decodingInfo` 实测覆盖。
 
 /// Chromium/WebView2 原生可解容器(文件扩展名,小写)。§5.1 表首行。
 const DIRECT_CONTAINERS: &[&str] = &["mp4", "m4v", "webm", "ogv"];
@@ -18,9 +16,9 @@ const DIRECT_ACODECS: &[&str] = &["aac", "mp3", "opus", "vorbis", "flac"];
 /// 五态判定结果(design.md §5.1)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackVerdict {
-    /// 现状路径,零改动——容器+视频+音频均 webview 可解。
+    /// 容器、视频与音频均可由 WebView 解码，直接播放。
     DirectPlay,
-    /// mp4/mov 装 HEVC:前端实测系统硬解,可解→直播,不可解→引导装扩展或转码(§10 开放问题 4)。
+    /// mp4/mov 中的 HEVC 由前端实测；不可解时引导安装扩展或转码。
     NeedsHevcExt,
     /// 容器改封(`-c copy`,秒级):视频+音频 webview 可解,仅容器不认。
     Remux,

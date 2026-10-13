@@ -1,16 +1,14 @@
-// src/stores/faceStore.ts
-// 人脸 store（F5）——人脸识别分析状态 + 流水线控制。
-// 镜像 aiStore 的分析管理部分（状态轮询 + 开始/暂停/停止/重启 + 自动续传）。
-// 搜索/人物墙 UI 留待 F6。
+// 人脸识别分析状态与流水线控制；分析管理委托 useAnalysisController。
 
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { Channel } from '@tauri-apps/api/core'
-import { invokeIpc, ipcErrorMessage } from '../utils/ipc'
+import { invokeIpc, ipcErrorMessage, parseAppError } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import { IPC } from '../constants/ipc'
 import { useToastStore } from './toastStore'
 import { useAnalysisController } from '../composables/useAnalysisController'
+import { guideToModelDownload } from '../composables/useModelDownloadGuide'
 import type { FaceStatusSummary, FaceModelInfo, FaceModelDownloadProgress } from '../types/face'
 
 export const useFaceStore = defineStore('face', () => {
@@ -30,8 +28,8 @@ export const useFaceStore = defineStore('face', () => {
     waitingOn: [],
   })
 
-  // 分析管理半部委托共享控制器（S6 去重，与 aiStore 共用 useAnalysisController）。face 专属:
-  // start/restart 出错走 toast（模型未下载 / 与 CLIP 互斥被拒需用户可见）、pause/stop 走 console；
+  // 与 aiStore 共用分析控制器。face 专属:
+  // start/restart 缺模型时定位下载处，其他错误走 toast；pause/stop/自动续传只记日志。
   // analyzedCount 取 processedItems（含失败项，故进度条仍到 100%）；无 onStarted。
   const analysis = useAnalysisController<FaceStatusSummary>({
     status,
@@ -45,9 +43,12 @@ export const useFaceStore = defineStore('face', () => {
     analyzedCount: () => status.value.processedItems,
     logTag: '[Face]',
     onError: (action, e) => {
-      // start/restart 的后端错误（模型未下载 / 与 CLIP 互斥）须用户可见 → toast；其余记 logger。
-      // 文案走 ipcErrorMessage（2026-07-10 审查 U7）:String(e) 会带 "IpcError: " 前缀。
       if (action === 'start' || action === 'restart') {
+        // 与 AI 共用错误码，但人脸入口必须引导到独立的人脸模型卡片。
+        if (parseAppError(e).code === 'AiModelNotLoaded') {
+          void guideToModelDownload('face')
+          return
+        }
         useToastStore().addToast('error', ipcErrorMessage(e))
       } else {
         logger.error(`[Face] ${action} 分析出错 | analysis error`, { error: e })

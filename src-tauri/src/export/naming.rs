@@ -1,6 +1,6 @@
-//! 导出文件命名档与文件名合规化(方案 A §2.3)。纯函数,无 IO/DB,便于单测穷举边界。
+//! 导出文件命名档与文件名合规化；不读写 IO/DB。
 
-/// 命名档(方案 §2.3)。
+/// 导出命名档。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum NamingScheme {
@@ -98,10 +98,12 @@ pub fn build_file_name(
 /// 大小写不敏感文件系统(Windows/macOS 默认)去重:同名(忽略大小写)时按冲突策略处理。
 /// 返回 `None` 表示应跳过(policy=Skip 命中冲突);`Some(name)` 是最终落盘用文件名。
 /// `used`(小写化)由调用方在成功落盘后 `insert`。
+/// `next_suffixes` 与只增不减的 `used` 属于同一次导出，复用已排除的后缀范围。
 pub fn resolve_conflict(
     candidate: &str,
     used: &std::collections::HashSet<String>,
     allow_rename: bool,
+    next_suffixes: &mut std::collections::HashMap<String, usize>,
 ) -> Option<String> {
     let key = candidate.to_lowercase();
     if !used.contains(&key) {
@@ -115,11 +117,77 @@ pub fn resolve_conflict(
         Some(i) if i > 0 => (&candidate[..i], &candidate[i..]),
         _ => (candidate, ""),
     };
-    for n in 2..10_000 {
+    // 大批同名项不必每次从 -2 重扫；找到的空位仍保留，复制失败时下次可继续使用。
+    let n = next_suffixes.entry(key).or_insert(2);
+    loop {
         let attempt = format!("{stem}-{n}{ext}");
         if !used.contains(&attempt.to_lowercase()) {
             return Some(attempt);
         }
+        *n += 1;
     }
-    None // 理论不可达(近万次同名冲突);兜底当作 Skip
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_conflict;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn failed_copy_does_not_consume_available_suffix() {
+        let mut next_suffixes = HashMap::new();
+        let mut used = HashSet::from([
+            "photo.jpg".to_string(),
+            "photo-2.jpg".to_string(),
+            "photo-3.jpg".to_string(),
+        ]);
+        let first = resolve_conflict("PHOTO.JPG", &used, true, &mut next_suffixes).unwrap();
+        assert_eq!(first, "PHOTO-4.JPG");
+        // 第一次复制失败，没有提交名称，下次必须继续使用同一个空位。
+        assert_eq!(
+            resolve_conflict("PHOTO.JPG", &used, true, &mut next_suffixes),
+            Some(first.clone())
+        );
+        used.insert(first.to_lowercase());
+        assert_eq!(
+            resolve_conflict("photo.jpg", &used, true, &mut next_suffixes),
+            Some("photo-5.jpg".into())
+        );
+    }
+
+    #[test]
+    fn generated_names_and_original_suffix_names_share_collision_space() {
+        let mut next_suffixes = HashMap::new();
+        let mut used = HashSet::from(["photo.jpg".to_string()]);
+        let next = resolve_conflict("photo.jpg", &used, true, &mut next_suffixes).unwrap();
+        assert_eq!(next, "photo-2.jpg");
+        used.insert(next.to_lowercase());
+        let suffixed = resolve_conflict("photo-2.jpg", &used, true, &mut next_suffixes).unwrap();
+        assert_eq!(suffixed, "photo-2-2.jpg");
+        used.insert(suffixed.to_lowercase());
+        let next = resolve_conflict("PHOTO.jpg", &used, true, &mut next_suffixes).unwrap();
+        assert_eq!(next, "PHOTO-3.jpg");
+        used.insert(next.to_lowercase());
+        assert_eq!(
+            resolve_conflict("photo.jpg", &used, true, &mut next_suffixes),
+            Some("photo-4.jpg".into())
+        );
+    }
+
+    #[test]
+    fn rename_continues_after_9999_occupied_names() {
+        let mut next_suffixes = HashMap::new();
+        // 大库汇集不同目录的同名原图时，重命名策略不能因固定次数耗尽而漏导出。
+        let mut used: HashSet<String> = (2..10_000).map(|n| format!("photo-{n}.jpg")).collect();
+        used.insert("photo.jpg".to_string());
+
+        assert_eq!(
+            resolve_conflict("photo.JPG", &used, true, &mut next_suffixes),
+            Some("photo-10000.JPG".to_string())
+        );
+        assert_eq!(
+            resolve_conflict("photo.JPG", &used, false, &mut next_suffixes),
+            None
+        );
+    }
 }

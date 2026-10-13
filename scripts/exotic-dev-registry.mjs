@@ -1,8 +1,7 @@
-// 插件商店 dev registry 生成器(开发期专用;Part8 D1 签发端的本地原型)。
-// 签名/打包原语已抽至 lib/exotic-signing.mjs(2026-07-05,与内测生成器/license 签发共用)。
+// 插件商店开发期 registry 生成器，签名与打包原语由 lib/exotic-signing.mjs 提供。
 //
 // 产出(全部落 <repo>/.dev-registry/,已 gitignore,cargo clean 不波及):
-//   dev-release.pem / dev-license.pem  Ed25519 私钥(仅本机 dev 用,勿外传)
+//   dev-release.pem  Ed25519 私钥(仅本机 dev 用,勿外传)
 //   dev-keyset.json                    公钥集(host 经 PICASA_EXOTIC_DEV_KEYSET 注入,debug-only)
 //   exotic-image-psd.zip               插件包(package-manifest.json+sig+plugin-manifest+psd-worker.exe)
 //   index.json / index.sig             签名 Registry index(package_url=file:///…,debug-only 放行)
@@ -23,7 +22,6 @@ import {
   buildPluginZip,
   ensureKey,
   keysetEntry,
-  loadOfficialProduct,
   nextSeq,
   sha256hex,
   signIndex,
@@ -33,16 +31,14 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = path.join(repo, '.dev-registry');
 fs.mkdirSync(out, { recursive: true });
 
-// 授权主体单源:registry 条目 SKU 与 license token 取自同一份官方版配置,
-// 否则商店展示的 SKU 会与实际能验过的 token 不一致(2026-09-22 统一授权)。
-const product = loadOfficialProduct(repo);
 
 const PLUGIN_ID = process.env.EXOTIC_PLUGIN_ID || 'exotic-image-psd';
 const TARGET = process.env.EXOTIC_TARGET || 'x86_64-pc-windows-msvc';
 const MEDIA_KIND = process.env.EXOTIC_MEDIA_KIND || 'image';
 const FORMATS = (process.env.EXOTIC_FORMATS || 'psd').split(',').map((s) => s.trim()).filter(Boolean);
 const CAPABILITIES = (process.env.EXOTIC_CAPABILITIES || 'thumbnail').split(',').map((s) => s.trim()).filter(Boolean);
-const SKU = product.sku;
+// 保留签名 registry 的 schema 1 元数据字段，不参与功能激活。
+const SKU = process.env.EXOTIC_SKU || PLUGIN_ID;
 const MIN_HOST_VERSION = process.env.EXOTIC_MIN_HOST_VERSION || '0.1.0';
 const COMPLIANCE_REVIEW_ID = process.env.EXOTIC_COMPLIANCE_REVIEW_ID || 'dev-local';
 const WORKER_NAME = process.env.EXOTIC_WORKER_NAME || 'psd-worker.exe';
@@ -51,13 +47,11 @@ const WORKER_PATH = process.env.EXOTIC_WORKER_PATH || path.join(repo, 'target', 
 
 // ── 1. 密钥对(存在即复用,保证 keyset 稳定) ─────────────────────────────────
 const releaseKey = ensureKey(path.join(out, 'dev-release.pem'));
-const licenseKey = ensureKey(path.join(out, 'dev-license.pem'));
 
 const keyset = {
   schema: 1,
   keys: [
     keysetEntry('dev-release-local', 'release', releaseKey),
-    keysetEntry('dev-license-local', 'license', licenseKey),
   ],
 };
 fs.writeFileSync(path.join(out, 'dev-keyset.json'), JSON.stringify(keyset, null, 2));
@@ -136,7 +130,6 @@ console.log(`dev registry 已生成(seq=${seq}, version=${version})
   $env:PICASA_EXOTIC_DEV_FILE_URLS = '1'
   $env:PICASA_EXOTIC_DEV_KEYSET = '${path.join(out, 'dev-keyset.json')}'
   $env:PICASA_REGISTRY_BASE = '${regBase}'
-需要授权 gate 也放行时(激活/运行付费插件),dev 构建加 feature:
-  npm run tauri dev -- -- --features exotic-dev-fixtures
+在应用中点击对应功能的“免费激活”即可保存本机状态。
 产物自检(生产同套校验器):
   $env:PICASA_EXOTIC_DEV_FILE_URLS='1'; cargo test -p scrollery --lib dev_registry_artifacts -- --ignored`);

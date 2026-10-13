@@ -77,7 +77,7 @@
 </template>
 
 <script setup lang="ts">
-// 替换规则管理面板（§5.2）。两套作用域：本文档（item）与全局（global）。任何增删改后 emit
+// 替换规则管理面板有本文档（item）与全局（global）两种作用域。任何增删改后 emit
 // 'changed'，由 DocumentViewer 重新拉取生效规则并重渲染。
 import { ref, reactive, watch } from 'vue'
 import { X, Trash2, Plus } from '@lucide/vue'
@@ -140,7 +140,7 @@ async function save(r: ReplacementRule) {
   }
 }
 async function toggleEnabled(r: ReplacementRule, v: boolean) {
-  // P1-16:先改 UI 后 await,失败须回滚,否则开关显示已启用而 DB 未改(UI/DB 分叉)。
+  // 先改 UI 后等待写入，失败须回滚，避免开关状态与数据库分叉。
   const prev = r.enabled
   r.enabled = v
   try {

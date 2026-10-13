@@ -1,4 +1,3 @@
-// src/main.ts
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -13,7 +12,7 @@ import { dismissStartupLayer } from './utils/startupLayer'
 import { useThemeStore } from './stores/themeStore'
 import './assets/styles/index.css'
 
-// 前端日志桥全局兜底(日志能力重构 S3,方案 §4/§9.4):越早挂越好,覆盖 mount 前抛出的错误。
+// 尽早安装全局错误监听，覆盖挂载前的错误。
 installGlobalErrorHandlers()
 
 // 兜底:防 FOUC 的首帧着色由 index.html 的阻塞脚本负责(按缓存恢复已生成变量 + 解析系统明暗,
@@ -26,13 +25,7 @@ if (!document.documentElement.hasAttribute('data-color-scheme')) {
   )
 }
 
-// 独立日志窗口(S4,方案 §5「主体是独立日志窗口」):按 Tauri 窗口 label 分流,跳过主窗口的
-// AppShell/路由整套——日志窗口只需要一个能挂 Pinia+i18n 的干净根。browser UI harness 没有
-// Tauri 窗口 API,恒走主路径(isUiHarness 判断本就是本仓既有的环境守卫惯例)。
-// isTauri 兜底(reviewer 深审 2026-07-20 修复):不带 ?ui-harness= 的裸浏览器打开 vite dev
-// server 时 isUiHarness 为假,但 __TAURI_INTERNALS__ 同样不存在——getCurrentWindow() 会同步
-// 抛错,整段脚本中断、白屏。此前该场景本就靠这条兜底路径挂载真实 shell(见下方注释「DEV
-// browser 场景仍挂载真实 shell」),故此路径必须能正常跑通,不能被新引入的窗口分流带崩。
+// 按窗口 label 分流；普通浏览器没有 Tauri API，须先判定运行环境再读取窗口 label。
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 const windowLabel = isUiHarness || !isTauri ? 'main' : getCurrentWindow().label
 
@@ -58,9 +51,7 @@ if (isUiHarness && !isTauri) {
 }
 
 if (windowLabel === 'logs') {
-  // 日志窗口不经 App.vue,但它的 preset 列表同样是全局设置(log_filter_presets)。取回权威快照与
-  // 「读取失败要可见可重试」都由 LogWindowView 自己负责(onMounted 调 initializeSettings),故此处
-  // 不再抢跑一次并静默吞掉失败——那会让用户以为 preset 已保存。
+  // LogWindowView 自行读取设置并呈现读取失败；此处只安装退出 flush 协议。
   // 退出 flush 协议必须**每个窗口各装一次**(幂等):后端退出前向全部存活窗口要一次 flush 回执,
   // 日志窗口持有全局 preset 设置,不装就收不到请求、回执永远少一员,后端只能等超时按未完成处理。
   // 与主窗口 App.vue 的装配互不影响(各窗口有独立的模块状态)。
@@ -92,7 +83,7 @@ if (windowLabel === 'logs') {
   if (uiHarnessScene === 'settings') void router.isReady().then(() => router.replace('/settings'))
   if (uiHarnessScene === 'viewer') void router.isReady().then(() => router.replace('/view/1'))
 
-  // 命令注册表(顶栏重构 L3):装入内建命令,供右键菜单 / 上下文工具栏 / 命令面板消费。
+  // 注册内建命令，供右键菜单和上下文工具栏消费。
   // 仅填充命令定义(标题惰性、图标 markRaw),不实例化 store,故可在 mount 前安全调用。
   registerBuiltins()
 

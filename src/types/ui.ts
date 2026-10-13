@@ -1,9 +1,7 @@
-// src/types/ui.ts
 // 仅 UI 的状态类型
 
 /**
- * 外观模式(多主题 S1 起与「主题包」正交):亮/暗/跟随系统。
- * 具体落到哪套主题由 uiStore 的 lightThemeId/darkThemeId 槽位决定。
+ * 外观模式：亮/暗/跟随系统。实际主题色板由 themeStore 按明暗槽位决定。
  */
 export type AppearanceMode = 'dark' | 'light' | 'system'
 

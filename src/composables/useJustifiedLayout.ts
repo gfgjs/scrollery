@@ -95,7 +95,7 @@ export function useJustifiedLayout(
 
     const directoryId = viewStore.activeDirectoryId
 
-    // ── 重复镜头(2026-09-02 方案 §1/§4.1):镜头激活时暂停普通筛选 ──────────────────
+    // ── 重复镜头激活时暂停普通筛选 ──────────────────
     // 镜头的集合是「全库可见范围内的精确重复成员」,与普通筛选/视图维度**不交集**(避免隐藏组内
     // 成员),故 scope 维度(directoryId/personId/albumId/智能相册)、filterStore 筛选、searchQuery/
     // 语义参数全部不下发;groupBy/sortWithinGroup/sortOrder/seamless 也不传——镜头内集合与顺序由
@@ -175,7 +175,7 @@ export function useJustifiedLayout(
       groupBy: ui.groupBy,
       sortWithinGroup: ui.sortWithinGroup,
       sortOrder: ui.sortOrder,
-      // 布局模式（T20）：'grid' 走后端均匀宫格排版，否则等高行。后端产出同一 LayoutRow 枚举。
+      // 布局模式：'grid' 走后端均匀宫格排版，否则等高行；后端产出同一 LayoutRow 枚举。
       // 扫描期经 effectiveLayoutMode 强制宫格(见上),扫毕自动回用户选择。
       layoutMode: effectiveLayoutMode.value,
       // 无缝分组(#1):排序仍按 groupBy 聚合,打包无分隔符、行跨组。

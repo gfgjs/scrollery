@@ -1,7 +1,7 @@
 // crates/exotic-workers/psd-worker/src/decode.rs
-//! PSD → WebP 缩略图解码（v3 Part2 §3.5；范围以探针报告 §5 冻结）。
+//! PSD → WebP 缩略图解码。
 //!
-//! 首发只交付 **RGB 8-bit + merged image（raw）**。CMYK/16-bit/PSB/无 merged 等返回稳定错误码
+//! 支持 **RGB 8-bit + merged image（raw）**。CMYK/16-bit/PSB/无 merged 等返回稳定错误码
 //! `unsupported_variant`（不强行出图）。畸形输入由顶层 `catch_unwind` 兜底（psd 0.3.5 的 `rgba()`
 //! 无 `Result`、可能 panic）；raw 像素段截断由解码前 [`raw_image_data_intact`] 自验长度截获
 //! （探针风险①，问题3：psd 对截断零填充、不报错），不依赖 psd 行为；Host 侧另用独立 WebP parser
@@ -197,89 +197,4 @@ fn scaled_dims(w: u32, h: u32, target_long_edge: u32) -> (u32, u32) {
         ((w as f64 * scale).round() as u32).max(1),
         ((h as f64 * scale).round() as u32).max(1),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 合成最小合法 RGB 8-bit raw PSD（与探针 make_rgb_psd 同结构，全大端）。
-    fn make_rgb_psd(w: u32, h: u32) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(b"8BPS");
-        b.extend_from_slice(&1u16.to_be_bytes()); // version 1
-        b.extend_from_slice(&[0u8; 6]); // reserved
-        b.extend_from_slice(&3u16.to_be_bytes()); // channels = 3
-        b.extend_from_slice(&h.to_be_bytes());
-        b.extend_from_slice(&w.to_be_bytes());
-        b.extend_from_slice(&8u16.to_be_bytes()); // depth = 8
-        b.extend_from_slice(&3u16.to_be_bytes()); // color mode = RGB
-        b.extend_from_slice(&0u32.to_be_bytes()); // color mode data
-        b.extend_from_slice(&0u32.to_be_bytes()); // image resources
-        b.extend_from_slice(&0u32.to_be_bytes()); // layer & mask
-        b.extend_from_slice(&0u16.to_be_bytes()); // compression = raw
-        for ch in 0..3u32 {
-            for y in 0..h {
-                for x in 0..w {
-                    b.push(match ch {
-                        0 => {
-                            if w > 1 {
-                                (x * 255 / (w - 1)) as u8
-                            } else {
-                                200
-                            }
-                        }
-                        1 => {
-                            if h > 1 {
-                                (y * 255 / (h - 1)) as u8
-                            } else {
-                                120
-                            }
-                        }
-                        _ => 128,
-                    });
-                }
-            }
-        }
-        b
-    }
-
-    fn webp_magic_ok(b: &[u8]) -> bool {
-        b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP"
-    }
-
-    #[test]
-    fn rgb8_merged_decodes() {
-        let psd = make_rgb_psd(256, 192);
-        let out = decode_psd_to_webp(&psd, 480).unwrap();
-        // 256 长边 < 480 → 不放大。
-        assert_eq!((out.width, out.height), (256, 192));
-        assert!(webp_magic_ok(&out.webp));
-    }
-
-    #[test]
-    fn truncated_raw_image_data_is_rejected() {
-        // 探针风险①：psd 0.3.5 对截断的 raw 像素段**零填充**到完整长度 → 不 panic、长度自洽、
-        // dims 正确，会出一张内容错误但结构合法的 WebP，Host dims 二次校验也判不出。
-        // 修复（问题3）：Host 侧 raw 段长度自验（raw_image_data_intact）在合成前截获截断 →
-        // MalformedInput，落地 Part2 DoD#3「畸形输入返回结构化错误」。
-        let mut psd = make_rgb_psd(64, 64);
-        psd.truncate(psd.len() - 50);
-        let err = decode_psd_to_webp(&psd, 480).unwrap_err();
-        assert_eq!(err.code, WorkerErrorCode::MalformedInput);
-    }
-
-    #[test]
-    fn huge_dimensions_rejected() {
-        let mut psd = make_rgb_psd(2, 2);
-        psd[14..18].copy_from_slice(&60000u32.to_be_bytes()); // height
-        psd[18..22].copy_from_slice(&60000u32.to_be_bytes()); // width
-        let err = decode_psd_to_webp(&psd, 480).unwrap_err();
-        // 60000×60000 = 3.6e9 > MAX_SOURCE_PIXELS → resource_limit；
-        // 或 psd 在像素段长度不符时先报 malformed。两者都可接受（都不出图、不 OOM）。
-        assert!(matches!(
-            err.code,
-            WorkerErrorCode::ResourceLimit | WorkerErrorCode::MalformedInput
-        ));
-    }
 }

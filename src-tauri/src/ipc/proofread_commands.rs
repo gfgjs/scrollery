@@ -23,6 +23,18 @@ fn keyring_entry() -> Result<keyring::Entry> {
         .map_err(|e| AppError::internal("凭据库访问失败 | keyring access failed", e))
 }
 
+// 两个读取入口共用分类，避免配置探测与实际校对给出不同判断。
+fn read_proofread_key(entry: Result<keyring::Entry>) -> Result<Option<String>> {
+    match entry?.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(AppError::internal(
+            "读取凭据失败 | credential read failed",
+            error,
+        )),
+    }
+}
+
 /// 暴露给 UI 的校对配置。key 本身绝不返回 —— 仅返回是否已设置。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,14 +53,10 @@ pub async fn get_proofread_config(state: State<'_, Arc<AppState>>) -> Result<Pro
     let base_url = state.config.get("proofread_base_url").unwrap_or_default();
     let model = state.config.get("proofread_model").unwrap_or_default();
     let has_key = tokio::task::spawn_blocking(|| {
-        // key 是否存在：能取到密码即视为已设置（NoEntry → 未设置）。
-        keyring_entry()
-            .ok()
-            .and_then(|e| e.get_password().ok())
-            .is_some()
+        read_proofread_key(keyring_entry()).map(|key| key.is_some())
     })
     .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?;
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
     Ok(ProofreadConfigDto {
         base_url,
         model,
@@ -114,7 +122,7 @@ pub async fn proofread_chunk(text: String, state: State<'_, Arc<AppState>>) -> R
     }
     let (base_url, model, key) =
         tokio::task::spawn_blocking(move || -> Result<(String, String, String)> {
-            let key = keyring_entry()?.get_password().map_err(|_| {
+            let key = read_proofread_key(keyring_entry())?.ok_or_else(|| {
                 AppError::System("未设置 API Key | proofread API key not set".into())
             })?;
             Ok((b, m, key))
@@ -124,4 +132,53 @@ pub async fn proofread_chunk(text: String, state: State<'_, Arc<AppState>>) -> R
 
     let cfg = ProofreadConfig { base_url, model };
     proofread_remote(&cfg, &key, &text).await
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    fn entry() -> keyring::Entry {
+        keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()))
+    }
+
+    #[test]
+    fn absent_key_is_none() {
+        assert!(read_proofread_key(Ok(entry())).unwrap().is_none());
+    }
+
+    #[test]
+    fn stored_key_remains_available() {
+        let entry = entry();
+        entry.set_password("test-key").unwrap();
+        assert_eq!(
+            read_proofread_key(Ok(entry)).unwrap(),
+            Some("test-key".into())
+        );
+    }
+
+    #[test]
+    fn keyring_creation_failure_is_not_absence() {
+        assert!(read_proofread_key(Err(AppError::System("keyring unavailable".into()))).is_err());
+    }
+
+    #[test]
+    fn credential_read_failure_is_reported_without_secret_details() {
+        let entry = entry();
+        entry
+            .get_credential()
+            .downcast_ref::<keyring::mock::MockCredential>()
+            .unwrap()
+            .set_error(keyring::Error::PlatformFailure(Box::new(
+                std::io::Error::other("private secret"),
+            )));
+        let error = read_proofread_key(Ok(entry)).unwrap_err();
+        let payload = serde_json::to_value(error).unwrap();
+        assert_eq!(payload["code"], "System");
+        assert!(payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("credential read failed"));
+        assert!(!payload.to_string().contains("private secret"));
+    }
 }

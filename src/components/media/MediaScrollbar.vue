@@ -83,7 +83,7 @@ const dragging = ref(false)
 /// 线右端锚在轨道右缘(right:0,用户定样式):全宽 = 画廊宽,恰好延伸到画廊左缘。
 const lineFullWidth = computed(() => Math.max(0, wrapperW.value))
 
-/// 显形滞回(B3.2.1 真机回报修复):active(宿主 isScrolling)在滚动收尾会抖动——
+/// 显形滞回：active(宿主 isScrolling)在滚动收尾会抖动——
 /// 惯性尾梢的稀疏滚动事件(间隔超过宿主 150ms 复位阈值)与停稳偿债的内部 scrollTop
 /// 写各翻转一轮 false→true→false,拇指随 opacity/颜色过渡明暗频闪。显形立即、
 /// 隐没延迟合并:短暂重激活并入同一次可见期,任凭信号抖动也只有一次淡出。

@@ -1,7 +1,5 @@
 // src-tauri/src/logging.rs
-//! 日志内核(日志能力重构线,方案 docs/designs/2026-07-20-日志能力重构方案.md)。
-//! S1:JSONL 信封格式化器(§9.3-A)+ 会话 id 生成 + 日志目录大小兜底(§3.5)。
-//! S4:UI 环形缓冲 Layer(§9.3-D)——独立日志窗口的实时流数据源。
+//! 日志内核：JSONL 格式化、会话标识、目录大小兜底与 UI 环形缓冲。
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -87,7 +85,7 @@ pub fn enforce_size_budget(log_dir: &Path, max_bytes: u64) -> PurgeSummary {
 /// `scrollery::pipeline=warn,reqwest=warn`——四条高频流水线(缩略图/AI/人脸/派生-视频)的调用点已改挂
 /// `target: "scrollery::pipeline::{thumb,ai,face,video}"`,用户切到 debug/trace 诊断态时这条后缀
 /// 仍能把它们摁在 warn 门槛之上,不随全局级别一起放开刷屏。
-/// 用户选 warn/error 时不追加(reviewer 深审发现的真实 bug 修复):tracing-subscriber 的 EnvFilter
+/// 用户选 warn/error 时不追加：tracing-subscriber 的 EnvFilter
 /// 按 target 特异性择优取最具体的一条 directive,不比较宽松/严格——若用户选了比 warn 更严格的
 /// error 档,无脑追加 `scrollery::pipeline=warn` 会让 pipeline target 反而比用户选择更啰嗦。
 /// off 档必须保持纯 `"off"`——§7 Q1「完全关闭」不容许任何 target 例外,追加后缀会让 pipeline target
@@ -265,9 +263,8 @@ impl Visit for FieldCollector {
     }
 }
 
-/// 收集单条事件并组装成信封 JSON 值(方案 §3.3):`ts/level/target/session_id/operation_id/msg/attributes`。
-/// 供 [`EnvelopeFormat`](JSONL 文件层)与 [`RingBufferLayer`](UI 环形缓冲层,S4)共用同一套字段收集逻辑,
-/// 防两处手写漂移(如 S2 曾踩过的 error_chain/frontend_context 特判只改一处的隐患)。
+/// 收集单条事件并组装成信封 JSON 值：`ts/level/target/session_id/operation_id/msg/attributes`。
+/// [`EnvelopeFormat`] 与 [`RingBufferLayer`] 共用字段收集逻辑，避免两处处理结果漂移。
 fn build_envelope(event: &Event<'_>, session_id: &str) -> serde_json::Value {
     let mut visitor = FieldCollector::default();
     event.record(&mut visitor);
@@ -385,27 +382,21 @@ impl<S: Subscriber> Layer<S> for RingBufferLayer {
     }
 }
 
-/// span 计时守卫的级别(方案 docs/worklogs/2026-07-21-span埋点与worker日志汇入 D-311):只分
-/// info(流水线 run 级/任务型 IPC command)与 debug(视口/滚动热路径查询)两档,不做更细分级——
-/// 与既有 logLevel 阈值语义对齐,off 档下两档均被顶层 EnvFilter 挡住(§9.1 护栏 #7 off 全关)。
+/// span 计时守卫的级别：流水线与低频命令用 info，热路径查询用 debug。
+/// off 档由顶层 EnvFilter 阻断两档事件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanLevel {
     Info,
     Debug,
 }
 
-/// 手动计时的 span 守卫(D-311:弃 tracing span 机制/`#[instrument]`/`FmtSpan`,改「手动计时 +
-/// 普通结构化事件」)。构造后持有到作用域结束(可跨 `.await`,`SpanTimer: Send`——字段全是
-/// `&'static str`/`String`/`Instant`/枚举,天然 Send,无需显式实现),`Drop` 时按 `duration_ms`
-/// 发一条 `target: "scrollery::span"` 的固定字面量 `"span_close"` 事件(§9.1 护栏 #6:禁动态插值
-/// 进 message,时长/名称等全部走结构化字段)。
+/// 手动计时守卫，作用域结束时发出 `span_close` 结构化事件。
+/// 时长与名称保存在字段中，message 使用固定字面量。
 ///
-/// 为什么不用 tracing span(`info_span!`/`#[instrument]`)+ `FmtSpan::CLOSE`:`FmtSpan` 合成的
+/// `FmtSpan::CLOSE` 合成的
 /// close 事件只在 `fmt::Layer` 内部走 `FormatEvent`,不经过全局 dispatcher——本仓的
-/// `RingBufferLayer`(UI 实时流)与其它自建 `Layer` 完全收不到(方案 findings.md F-028)。span 也
-/// 不跨 `spawn_blocking`/`thread::spawn`(D-304 已定型,本仓贯穿 operation_id 走显式参数而非
-/// span 上下文),两条理由叠加,普通事件 + 手动计时是唯一能让 JSONL 文件层 + UI 环形缓冲层同时
-/// 免费收到的路径。
+/// `RingBufferLayer` 与其它自建 `Layer` 收不到。operation_id 通过显式参数跨线程传递，
+/// 普通事件可同时送达 JSONL 文件层与 UI 环形缓冲层。
 pub struct SpanTimer {
     name: &'static str,
     level: SpanLevel,
@@ -414,7 +405,7 @@ pub struct SpanTimer {
 }
 
 impl SpanTimer {
-    /// info 档:流水线 run 级、任务型/低频 IPC command(D-312)。
+    /// info 档：流水线运行与低频 IPC 命令。
     pub fn info(name: &'static str) -> Self {
         Self {
             name,
@@ -424,7 +415,7 @@ impl SpanTimer {
         }
     }
 
-    /// debug 档:视口/滚动热路径查询 IPC command(D-312)——默认 info 级不被刷屏,诊断态可见。
+    /// debug 档：视口与滚动热路径查询，避免默认 info 日志刷屏。
     pub fn debug(name: &'static str) -> Self {
         Self {
             name,
@@ -442,12 +433,10 @@ impl SpanTimer {
         self
     }
 
-    /// 实际发事件的逻辑抽成关联函数(而非只内联在 `Drop::drop` 里):单测「panic 路径
-    /// `panicked=true`」需要在 `catch_unwind` 内构造+panic 触发 `Drop`,若 `Drop` 与测试基建
-    /// 冲突可退化为直接调用本函数验证同一逻辑(方案任务清单 W1.4-d 的预留退路)。
+    /// 发出包含耗时与 panic 状态的结构化结束事件。
     fn emit_span_close(&self) {
         // f64 毫秒(非整毫秒截断):debug 档热路径查询缓存命中常 <1ms,as_millis 截断会让
-        // 该档 TopN 的 totalMs/avgMs 恒 0 失真(reviewer 深审建议);FieldCollector::record_f64
+        // 该档 TopN 的 totalMs/avgMs 会被截成 0；FieldCollector::record_f64
         // 落 JSON number,前端 `typeof === 'number'` 判据不受影响。
         let duration_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         let panicked = std::thread::panicking();
@@ -492,9 +481,7 @@ pub struct LoggingBoot {
 /// 日志子系统装配:目录大小兜底 → RollingFileAppender → non_blocking → EnvFilter(可 reload)
 /// → 文件层(JSONL 信封)+ UI 环形缓冲层(+ dev 控制台层)→ 全局 subscriber + panic hook。
 ///
-/// 自 `lib.rs::run()` 的 setup 段 j+k 迁出(D-450 纯结构移动,行为不变)。
-///
-/// 顺序不变量(拆分方案 §3.1 第 4 条):本函数返回前,一切错误只能走 `eprintln!`/原生对话框;
+/// 本函数返回前，一切错误只能走 `eprintln!`/原生对话框；
 /// 启动期 DB 自愈等需要日志可见的步骤必须排在本函数**之后**。
 pub fn init_subscriber(
     log_dir: &Path,
@@ -521,9 +508,7 @@ pub fn init_subscriber(
     // 会话 id(方案 §3.3):一次运行的全部日志行共享同一 id,可用它一把 rg 抓出整段运行。
     let session_id = generate_session_id();
 
-    // RollingFileAppender(daily + max_log_files=14,方案 §3.1)取代旧 RealTimeDailyAppender——
-    // 后者每条 open+append+fsync 是为「资源管理器实时看到文件增长」服务的,有了应用内 UI
-    // 实时视图(S4)后此需求消失;fsync 在高频流水线下是吞吐瓶颈(§3.2)。
+    // RollingFileAppender 每日轮转并保留最多 14 个文件；高频流水线避免逐条 fsync。
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("scrollery")

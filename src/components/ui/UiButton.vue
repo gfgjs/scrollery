@@ -1,8 +1,6 @@
 <script setup lang="ts">
-// UiButton — 全局 `.btn` 体系的类型化包裹（S1 UI primitive）。
-// 消费方用 `variant` 语义而非裸 class 字符串,杜绝拼写漂移与 scoped 遮蔽
-// (此前 SettingsView 的 scoped `.btn[data-v]` 会盖住全局变体,index.css:115-117 记)。
-// 样式复用已过 contrast 门禁的全局 `.btn` / `.btn-{variant}`,本组件只加类型化 API + loading 契约。
+// 类型化按钮，复用全局 `.btn` 样式。
+// 消费方通过 `variant` 选择样式；loading 态显示 spinner 并禁用按钮。
 // @click 等原生属性经 fallthrough 落到根 button;外部 class 由 Vue 合并到全局 class 上。
 
 withDefaults(

@@ -75,8 +75,8 @@
   --sidebar-min-width: 180px;
   --sidebar-max-width: 400px;
 
-  /* 自绘标题栏(顶栏重构 L1,设计文档 §3.2)。
-     --titlebar-height:与工具栏同为 40px,更近原生标题栏观感(真机可调)。
+  /* 自绘标题栏。
+     --titlebar-height:与工具栏同为 40px。
      --titlebar-controls-inset:窗口三键 / mac 红绿灯的占位宽,供标题栏内容左右避让——
        mac ≈78px 让红绿灯、Windows = 自绘三键宽,由 WindowChrome 运行时按平台/窗口态覆写;
        此处 0px 默认(未挂 chrome 的降级态不留白)。 */
@@ -100,7 +100,7 @@
   /* ── Component contracts ────────────────────────────────────── */
   --control-size-compact: 28px;
   --control-size-default: 32px;
-  --control-size-touch: 44px;
+  --control-size-large: 44px;
   --control-padding-inline: 12px;
   --control-focus-ring: 0 0 0 2px color-mix(in srgb, var(--color-accent) 22%, transparent);
 

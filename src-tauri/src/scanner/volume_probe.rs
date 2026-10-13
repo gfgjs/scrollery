@@ -1,12 +1,10 @@
 // src-tauri/src/scanner/volume_probe.rs
-//! 卷在线判定（缺失检测最小闭环所需的最小实现）。
+//! 卷在线判定与卷身份解析。
 //!
-//! 缺失检测的入口守门（§3.1.3）与 TOCTOU 复查（§3.2.2）只需回答一个问题：**这个 scan_root 的
+//! 缺失检测的入口守门与 TOCTOU 复查需要回答：**这个 scan_root 的
 //! 根路径现在是否在场（在线）？** 故本模块只提供「路径可访问性」级别的在线判定。
 //!
-//! ⚠️ **范围声明**：完整的跨平台**卷稳定 ID 枚举 + 插拔热感知**（Win `GetVolumeNameForVolumeMountPoint`
-//! 取卷 GUID / mac DiskArbitration `DAVolumeUUID`，让同一物理卷换盘符仍能复认）是 Part2 **T1/T2** 的
-//! 完整实现——缺失检测最小闭环**用不到**，故此处刻意只做路径兜底级在线判定，原生枚举后续单独落。
+//! `PathProber` 只判定根路径是否可访问；卷身份由各平台的 `VolumeResolver` 实现处理。
 //!
 //! 抽象成 `trait` 的目的：让缺失检测的入口守门 / 写删前复查**可注入 mock**，从而单测「扫描中途拔盘
 //! → 不误删」这一最高危场景（否则真实拔盘无法在测试里复现）。
@@ -50,12 +48,9 @@ pub struct ResolvedVolume {
     pub mount_path: String,
 }
 
-/// 卷身份解析抽象。生产用 [`PathVolumeResolver`]（路径派生、无原生依赖、跨平台）。
+/// 卷身份解析抽象。生产用 [`PlatformVolumeResolver`]，按平台选择原生解析或路径派生。
 ///
-/// ⚠️ **范围**：路径派生**不抗盘符重映射**——真正稳定的卷 ID 需原生 API（Win
-/// `GetVolumeNameForVolumeMountPoint` 取卷 GUID / mac DiskArbitration `DAVolumeUUID`），
-/// 属后续 T2 完整实现。届时仅换本 trait 的实现即可、**不动 add_scan_root**；且因数据模型
-/// 按「卷根」并卷（非每根一卷），原生 GUID 只是升级既有卷行的 stable_id，无需合并迁移。
+/// 路径派生的身份不抗盘符重映射；平台实现可用原生卷标识。
 pub trait VolumeResolver: Send + Sync {
     fn resolve(&self, root_path: &str) -> ResolvedVolume;
 }

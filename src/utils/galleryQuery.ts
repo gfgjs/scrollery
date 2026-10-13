@@ -1,5 +1,5 @@
 // src/utils/galleryQuery.ts
-// Gallery 视图的 URL query 编解码（S2-b）。纯函数,无 Vue/store 依赖,便于单测。
+// Gallery 视图筛选的 URL query 编解码，无 Vue/store 依赖。
 //
 // 职责:把 filterStore 的筛选状态在「store 快照」与「URL query」之间双向映射。decode 处理的是
 // 外部输入（URL 可被用户手改/深链传入）,必须防御式解析——白名单枚举、clamp 数值、拒绝非法,
@@ -8,7 +8,7 @@
 import type { LocationQuery } from 'vue-router'
 import type { MediaType } from '../types/media'
 
-/** 本模块管理的 query 键。writeUrl 只覆写这些键,其余键（未来 search/pref）原样保留。 */
+/** 本模块管理的 query 键。writeUrl 只覆写这些键，其余 query 键原样保留。 */
 export const FILTER_QUERY_KEYS = [
   'types',
   'formats',

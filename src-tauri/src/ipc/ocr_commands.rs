@@ -57,25 +57,16 @@ fn random_hex(n_bytes: usize) -> String {
 
 // ── 门控 ─────────────────────────────────────────────────────────────────────
 
-/// 门控 helper（D-OCR-6）：availability 非 Authorized 时映射稳定码。四态：
-/// `AvailableUninstalled`（未激活）/ `InstalledUnlicensed`（catalog 误配安装态但未授权，
-/// builtin offering 理论不落此态，防御性同归激活引导，2026-07-23 深审#2）→ `ocr_unlicensed`；
-/// `LicenseExpired` → `ocr_license_expired`；其余（平台/版本/安装态不满足）→ `ocr_unavailable`。
-/// message 不含绝对路径/内部串。
-fn ensure_ocr_authorized(state: &AppState) -> Result<()> {
+/// 门控 helper（D-OCR-6）：availability 非 Ready 时映射稳定码。四态：
+/// 未激活返回 ocr_inactive；平台、版本和安装条件不满足返回 ocr_unavailable。
+fn ensure_ocr_activated(state: &AppState) -> Result<()> {
     let resolution = state.exotic_host().resolve_format("ocr");
     match resolution.availability {
-        Availability::Authorized => Ok(()),
-        Availability::LicenseExpired => Err(AppError::Ocr {
-            code: "ocr_license_expired",
-            message: "OCR 插件授权已过期，请续订".into(),
+        Availability::Ready => Ok(()),
+        Availability::AvailableUninstalled | Availability::Inactive => Err(AppError::Ocr {
+            code: "ocr_inactive",
+            message: "OCR 插件尚未激活".into(),
         }),
-        Availability::AvailableUninstalled | Availability::InstalledUnlicensed => {
-            Err(AppError::Ocr {
-                code: "ocr_unlicensed",
-                message: "OCR 插件尚未激活".into(),
-            })
-        }
         _ => Err(AppError::Ocr {
             code: "ocr_unavailable",
             message: "OCR 功能当前不可用".into(),
@@ -116,7 +107,6 @@ pub struct OcrTierDto {
 #[serde(rename_all = "camelCase")]
 pub struct OcrStatusDto {
     pub availability: Availability,
-    pub store_url: Option<String>,
     pub active_tier: String,
     pub tiers: Vec<OcrTierDto>,
 }
@@ -219,7 +209,10 @@ fn run_ocr_batch(state: &AppState, spec: &OcrSessionSpec, item: OcrItem) -> Resu
 pub async fn ocr_status(state: State<'_, Arc<AppState>>) -> Result<OcrStatusDto> {
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || -> Result<OcrStatusDto> {
-        crate::official::entitlement(state.entitlement_provider().as_ref())?;
+        {
+            let conn = state.db_read_pool.get().map_err(AppError::from)?;
+            crate::feature_activation::status(&conn, "exotic-ocr")?;
+        }
         let resolution = state.exotic_host().resolve_format("ocr");
         let models_dir = crate::ai::runtime_config::models_dir(&state);
         let tiers = ocr_profiles()
@@ -239,7 +232,6 @@ pub async fn ocr_status(state: State<'_, Arc<AppState>>) -> Result<OcrStatusDto>
             .collect();
         Ok(OcrStatusDto {
             availability: resolution.availability,
-            store_url: resolution.store_url,
             active_tier: active_ocr_tier(&state),
             tiers,
         })
@@ -257,7 +249,7 @@ pub async fn ocr_extract_image(
 ) -> Result<OcrResultDto> {
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || -> Result<OcrResultDto> {
-        ensure_ocr_authorized(&state)?;
+        ensure_ocr_activated(&state)?;
         let spec = build_ocr_session_spec(&state)?;
         ensure_ocr_model_ready(&spec)?;
 
@@ -292,7 +284,7 @@ pub async fn ocr_extract_frame(
 ) -> Result<OcrResultDto> {
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || -> Result<OcrResultDto> {
-        ensure_ocr_authorized(&state)?;
+        ensure_ocr_activated(&state)?;
         let spec = build_ocr_session_spec(&state)?;
         ensure_ocr_model_ready(&spec)?;
 
@@ -382,12 +374,8 @@ fn purge_stale_ocr_frames(frames_dir: &std::path::Path) {
 /// 姿态）：`ocr_assets` 查不到该 profile 的钉定资产时恒 `None` → `ocr_manifest_unready`
 /// （边界14，fail-closed；2026-07-23 起两档均已钉定，正常路径不会触发）。
 ///
-/// **有意不过 `ensure_ocr_authorized` 门（J8 认领，2026-07-23 深审）**：本命令只落模型字节，
-/// 不触发识别。允许「先下后购」——未授权用户可预下载模型，购买/激活后零等待即可用（识别态
-/// 提示见 `OcrModelSection.vue` 顶部授权态提示）。`ensure_ocr_authorized` 保护的是识别能力
-/// （`ocr_extract_image`/`ocr_extract_frame` 已过此门），不是模型字节本身——PP-OCRv5 是公开
-/// ONNX 权重，加门也拦不住用户自行下载，门在这里防不住东西、只会拖慢正当的预下载体验。
-/// 后续 review 请勿再对此报「授权命令遗漏门控」。
+/// **有意不过 `ensure_ocr_activated` 门（J8 认领，2026-07-23 深审）**：本命令只落模型字节，
+/// 只准备模型，免费激活与模型下载互相独立；识别入口统一检查激活状态。
 #[tauri::command]
 pub async fn download_ocr_models(
     tier: String,

@@ -1,8 +1,7 @@
 export type UiHarnessScene = 'gallery' | 'settings' | 'viewer'
 
 // Vitest node 环境无 window;本模块被 appWindow/appEvents 等适配层传递 import,顶层取值必须环境守卫。
-const params =
-  typeof window === 'undefined' ? null : new URLSearchParams(window.location.search)
+const params = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search)
 
 const requestedScene = params?.get('ui-harness') ?? null
 
@@ -88,3 +87,10 @@ export const uiHarnessRenderMode: 'dom' | 'canvas' | null =
   isUiHarness && (params?.get('render') === 'dom' || params?.get('render') === 'canvas')
     ? (params.get('render') as 'dom' | 'canvas')
     : null
+
+/**
+ * `&hoverCards=1` — 缩略图悬停卡验证的显式 opt-in。仅认字面量 '1',默认关闭;不开时所有样本
+ * 与现有主题截图/性能场景完全一致。开启后 ipcFixtures 把前若干条换成一组固定样本(在线无缩略图
+ * MD、missing 无缩略图 MD、正常图片、视频),配合评分/收藏与长文件名核对悬停卡信息行碰撞。
+ */
+export const uiHarnessHoverCards: boolean = isUiHarness && params?.get('hoverCards') === '1'

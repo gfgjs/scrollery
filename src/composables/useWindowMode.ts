@@ -1,19 +1,7 @@
-// src/composables/useWindowMode.ts
 // 窗口三态(normal / maximized / fullscreen)的**唯一所有者**。模块级单例(非 per-component 状态):
 // 窗口只有一个,其模式也只该有一份真相。
 //
-// 为什么要有这个模块(2026-07-16 真机 round11 #8 根因):此前窗口态**无主**,三个碎片各持一角、
-// 互不知情 ——
-//   ① uiStore.isFullscreen:只写 ref,无 OS 回同步(转换失败/OS 侧改变全屏都不会纠正它);
-//   ② WindowChrome.isMaximized:局部 ref,DOM resize 驱动,不知全屏;
-//   ③ useWindowDrag:两者都不知,无条件 startDragging() / toggleMaximize()。
-// 没有主 → 没人写下「三态互斥」这条不变量 → 真机四个症状全是它的直接推论:
-//   · 全屏态仍能按住标题栏把窗口拖着走(①③ 失联);
-//   · 最大化 + F11 → 窗口铺满但底部一条黑边(未先卸最大化态就转全屏,见 setFullscreen 注);
-//   · 拖拽把窗口拽出全屏后再也贴不了顶最大化(isFullscreen 停在臆测的 true,与 OS 脱钩);
-//   · 全屏仍留标题栏(全屏从未接过沉浸态)。
-// 故本模块的职责不是「多一层封装」,而是**让三态互斥成为结构上唯一可表达的形状**:
-// mode 是单一 computed,isFullscreen / isMaximized 都从它派生,不存在「既全屏又最大化」的可表示状态。
+// mode 是单一 computed，isFullscreen / isMaximized 均从它派生，保证三态互斥。
 
 import { computed, type ComputedRef } from 'vue'
 import { ref } from 'vue'

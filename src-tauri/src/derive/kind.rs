@@ -137,8 +137,6 @@ impl DerivationKind {
 
 /// 某 kind 的 `run` 产出其产物所需的一切，由消费者一次性解析好。
 pub struct DerivationContext {
-    /// 根据本次已取得的共享工作集折算，嵌入封面在解码前检查真实像素。
-    pub max_pixel_bytes: u64,
     pub item_id: i64,
     pub kind: DerivationKind,
     /// 源媒体文件的绝对路径。
@@ -193,7 +191,7 @@ pub fn run(ctx: &DerivationContext) -> Result<DerivationOutput> {
     }
 }
 
-/// 各桩 kind 共用的「本次构建尚未实现」错误。
+/// 未接入通用流水线的 kind 共用的无后端错误。
 pub(crate) fn not_implemented(kind: DerivationKind) -> AppError {
     AppError::Internal(format!(
         "derivation kind '{}' has no backend in this build | 该派生 kind 在本次构建中无后端",

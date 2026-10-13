@@ -1,8 +1,7 @@
 // crates/exotic-workers/psd-probe/src/main.rs
-//! PSD 技术探针（Part1 P0）。
+//! PSD 解码技术探针。
 //!
-//! 目标（v3 总纲 §10「不得跳过 PSD 技术探针」+ Part1 §0.1 + 勘误 R12）：
-//!   在冻结 Catalog/manifest 的「支持范围」之前，用**可执行的实测**回答：
+//! 通过可执行检查确认：
 //!     1. `psd 0.3.5` 能否把一张合成 RGB 8-bit composite 解出正确尺寸 + RGBA；
 //!     2. 解出的像素能否走 缩放 → WebP 编码 这条与主程序一致的后处理链；
 //!     3. 畸形输入（截断 / 随机字节 / 错 magic / 超大尺寸字段）是否 **不 panic、不越界、稳定失败**。

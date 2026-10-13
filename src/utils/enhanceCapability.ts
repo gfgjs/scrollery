@@ -3,7 +3,7 @@ import type { EnhanceErrorCode, EnhanceReadiness, EnhanceStatus } from '../types
 const BLOCK_CODE: Record<Exclude<EnhanceReadiness, 'ready'>, EnhanceErrorCode> = {
   workerMissing: 'enhance_worker_missing',
   manifestUnready: 'enhance_manifest_unready',
-  unlicensed: 'enhance_unlicensed',
+  inactive: 'enhance_inactive',
   modelMissing: 'enhance_model_missing',
 }
 

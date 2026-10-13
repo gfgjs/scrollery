@@ -1,5 +1,5 @@
-// Canvas 网格图像缓存/加载/失败收口 + 视口外预取(idle+draw 尾双通道),从
-// MediaGridCanvas.vue 下沉(方案 2.2 ⑤)。工厂在宿主 <script setup> 顶层只调用一次;
+// Canvas 网格图像缓存、加载、失败收口与视口外预取(idle + draw 尾双通道)。
+// 工厂在宿主 <script setup> 顶层只调用一次；
 // draw()/drawCell 热路径只调用已绑定好的函数引用,不得在 rAF 回调或逐格循环内重新
 // 构造闭包或再次调用本工厂(§3.1 红线)。
 import { buildThumbUrl } from './useThumbLoader'
@@ -58,6 +58,8 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
   // 生成尚无 URL，不占位图 loading 槽；单独限制为两批，避免密集视口一次排入数千项。
   const MAX_THUMB_REQUESTS = DEFAULTS.THUMB_BATCH_SIZE * 2
   const thumbRequests = new Map<number, Promise<void>>()
+  // 去重跟随本轮可见需求，落定后仍保留；离屏/失活时释放，允许失败项重新入屏再请求。
+  const thumbRequestIds = new Set<number>()
   const visibleIds = new Set<number>()
   /** stale 可续画升级的让位余量:槽接近满时把最后若干槽留给真正缺图的冷格(升级靠后)。 */
   const STALE_UPGRADE_HEADROOM = 8
@@ -230,7 +232,8 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
       if (purpose === 'prefetch' || isThumbLoadDeferred()) return cached
       if (thumbRequests.has(id) || thumbRequests.size >= MAX_THUMB_REQUESTS) return cached
       // status 0(待生成)/ status 3 无路径 → 上抛一次请求(父层生成/解析后回填 → sig 变 → 自动重载)。
-      if ((item.thumbStatus === 0 || item.thumbStatus === 3) && thumbState.requestThumbOnce(id)) {
+      if ((item.thumbStatus === 0 || item.thumbStatus === 3) && thumbState.requestThumbOnce(id, sig)) {
+        thumbRequestIds.add(id)
         const request = opts.onRequestThumb(id)
         thumbRequests.set(id, request)
         const settle = () => {
@@ -252,18 +255,19 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
       abortable: true,
       epoch: pipelineEpoch,
     }
-    thumbState.markLoading(id)
+    thumbState.markLoading(id, sig)
     thumbLoads.set(id, load)
     void loadBitmap(id, url, sig, renderSig, item.w, item.h, bucketH, item.thumbStatus, load)
     return cached
   }
 
   function cancelThumbRequests(keep?: ReadonlySet<number>): void {
-    for (const id of thumbRequests.keys()) {
+    for (const id of thumbRequestIds) {
       if (keep?.has(id)) continue
-      thumbRequests.delete(id)
+      thumbRequestIds.delete(id)
+      const inFlight = thumbRequests.delete(id)
       thumbState.cancelThumbRequest(id)
-      opts.onCancelThumb(id)
+      if (inFlight) opts.onCancelThumb(id)
     }
   }
 
@@ -339,6 +343,8 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
       }
       let out: ImageBitmap
       try {
+        // 源解码期间可能已失活或换代；立即由 finally 释放整图，不再启动无主的裁剪。
+        if (!isCurrentLoad(id, load)) return
         const p = bitmapPrepParams(full.width, full.height, cellW, cellH, bucketH)
         out =
           p.outW !== null && p.outH !== null
@@ -391,12 +397,12 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
   }
 
   /**
-   * 可见需求优先(S1/S2),每帧绘制前调用一次,输出两件事:
+   * 可见需求优先，每帧绘制前调用一次，输出两件事:
    *  ① 重建 visibleDemand 账本——本帧可见、无位图可画、有可加载源、尚未起载的格子。预取/idle
    *     分片据此**保留**空槽,而不是等槽满了再取消;否则「完成回调 → 下一 draw」之间 idle 仍
    *     能把 64 槽重新填满,新入屏的冷格整轮等不到服务。
    *  ② 槽满时只为**真实缺图**的可见项数量腾槽:可见全热、或只剩 stale 可续画升级时一个也不
-   *     取消(S1 旧实现按可见格数腾槽,「可见全热 + 槽满」也会取消 64 个前向任务)。腾槽对象
+   *     取消。腾槽对象
    *     排除可见在途项与前后近带(各 0.5 屏)内的在途预取,只取消更外侧、已无近期价值的
    *     fetch;已进入解码的任务不可中止,本就不在取消范围内,不因腾槽被伪释放。
    * 若近带 64 项全是在途预取,可让位者为零,冷格只能等它们落定——只保护,不承诺严格不等槽。
@@ -410,7 +416,7 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
       if (row.rowType !== 'normal') continue
       for (const item of row.items) {
         const id = item.id
-        if (thumbRequests.has(id)) visibleIds.add(id)
+        if (thumbRequestIds.has(id)) visibleIds.add(id)
         // 先按当前 status/path 对账:旧签名留下的缓存/失败标记会把「换了源的真冷项」误判成
         // 有位图可画,于是既不腾槽也不记账。签名与 getImage 同源(itemDataSig)。
         thumbState.syncSig(id, itemDataSig(item))
@@ -521,8 +527,8 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
 
   // ── 视口外预取(对齐 DOM「挂载窗口大于视口」的隐式预载)────────────────────────────
   // 「像素余量 × 自适应条目预算」双约束:开闸态前方约 1.25 屏、后方约 0.5 屏;关闸态
-  // (飞掠/拖拽)收缩为仅前向(1.25 屏)、后方 0——2026-07-17 阶段 6 实测(headless 基准,
-  // burst 速度剖面)证明「关闸=停一切视口外预取」正是稍快速滚动可见换图波的根因(滞回带
+  // (飞掠/拖拽)收缩为仅前向(1.25 屏)、后方 0。headless burst 速度剖面显示，
+  // 关闸时停止全部视口外预取会造成稍快速滚动的可见换图波(滞回带
   // 让闸门整段钉住,格子进视口才起载,一个加载时延后才逐格弹出)。前向宽度实测定档
   // (1.0 屏余 ~939 冷格·帧、1.25 屏余 ~530,基线 4911),故与开闸态同宽;真飞掠期的浪费
   // 上界仍由 64 全局在途槽 + prioritizeVisibleThumbLoads 的旧 fetch 取消兜底。
@@ -615,7 +621,7 @@ export function useCanvasThumbPipeline(opts: CanvasThumbPipelineOptions) {
 
   /**
    * 沿计划游标推进一片(idle 与 draw 尾两通道共用):预算按**新启动数**计——暖项
-   * (已缓存/在途)走查交给墙钟上限,不再吃掉启动预算(阶段 6 根因之二)。
+   * (已缓存/在途)走查交给墙钟上限，不再吃掉启动预算。
    */
   function walkPlan(
     plan: PrefetchPlan,

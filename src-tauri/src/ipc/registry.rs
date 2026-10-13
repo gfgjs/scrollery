@@ -1,8 +1,4 @@
-//! IPC 命令注册清单(U-P1-a,2026-07-16 从 lib.rs 下沉)。
-//!
-//! 此后**新增 IPC 命令只碰本文件 + 对应命令文件**,lib.rs 退出高频冲突面。
-//! 清单从 lib.rs `invoke_handler` 宏调用逐行原样搬迁,分组注释保留;
-//! 迁移前后已做命令路径集合对拍(U 设计 §8 专项结构门)。
+//! IPC 命令注册清单。新增命令须在此处和对应命令模块登记。
 
 use crate::ipc;
 
@@ -10,7 +6,7 @@ use crate::ipc;
 ///
 /// `generate_handler!` 展开为无捕获 `move` 闭包(tauri-macros 2.6.3
 /// src/command/handler.rs),满足 `Fn(Invoke<R>) -> bool + Send + Sync + 'static`;
-/// 命令名取路径末段,搬迁不改变前端可见的命令集合。
+/// 命令名取路径末段，决定前端可见的命令名。
 ///
 /// Runtime 收敛为具体 `Wry` 而非泛型 `R`:多个命令签名直接收 `AppHandle`
 /// (默认 `AppHandle<Wry>`),泛型形态满足不了它们的 `CommandArg<R>` 约束;
@@ -94,6 +90,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::backup_commands::backup_status,
         ipc::backup_commands::list_backups,
         ipc::backup_commands::restore_stage,
+        ipc::backup_commands::restore_discard,
         ipc::backup_commands::restore_arm,
         ipc::backup_commands::relaunch_app,
         // 导出整理成果（方案 A §3/§4）
@@ -101,10 +98,9 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::export_commands::start_export,
         ipc::export_commands::export_status,
         ipc::export_commands::stop_export,
-        ipc::official_commands::get_official_entitlement,
+        ipc::official_commands::get_feature_activation,
+        ipc::official_commands::activate_feature,
         ipc::official_commands::list_feature_offerings,
-        ipc::official_commands::activate_official_license,
-        ipc::official_commands::deactivate_official_license,
         // 图片简单编辑（方案 C §6）
         ipc::edit_commands::get_edit_preview,
         ipc::edit_commands::save_edited_image,
@@ -117,7 +113,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::exotic_commands::list_exotic_format_resolutions,
         ipc::exotic_commands::get_exotic_item_state,
         ipc::exotic_commands::list_installed_exotic_plugins,
-        ipc::exotic_commands::get_plugin_entitlement,
+        ipc::exotic_commands::get_plugin_availability,
         // exotic 处理控制命令（Part2 §4.5）
         ipc::exotic_commands::start_exotic_processing,
         ipc::exotic_commands::pause_exotic_processing,
@@ -256,6 +252,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::doc_commands::list_versions,
         ipc::doc_commands::get_current_version,
         ipc::doc_commands::get_document_text,
+        ipc::doc_commands::resolve_document_link,
         ipc::doc_commands::save_version,
         ipc::doc_commands::set_current_version,
         ipc::doc_commands::delete_version,
@@ -293,6 +290,7 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Syn
         ipc::file_ops_commands::remove_media_items_hard,
         ipc::file_ops_commands::move_directory,
         ipc::file_ops_commands::copy_directory,
+        ipc::file_ops_commands::cancel_directory_copy,
         ipc::file_ops_commands::delete_directory_to_trash,
         // 目录移动半完成状态的读取与重试（审查 §7.1-B）
         ipc::file_ops_commands::list_pending_directory_moves,

@@ -1,4 +1,4 @@
-// 设置页自定义 ICC 导入/枚举/删除(方案 B §0④,SettingsView 特例行「viewerIccManager」),从
+// 设置页自定义 ICC 导入/枚举/删除（SettingsView 特例行「viewerIccManager」），从
 // SettingsView.vue 下沉(超长文件拆分方案 tierB-2 §SettingsView.vue ②)。返回值名与模板
 // 现有绑定逐一同名、ref 本体不解包不改名(§③ 最大风险红线)。
 import { ref } from 'vue'
@@ -7,7 +7,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { invokeIpc, ipcErrorMessage } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import { useToastStore } from '../stores/toastStore'
-import { useConfigStore } from '../stores/configStore'
+import { refreshSettingsFromBackend, writeSettings } from '../stores/settingsPersistence'
 import { IPC } from '../constants/ipc'
 
 interface IccProfileInfo {
@@ -27,7 +27,6 @@ const ICC_IMPORT_ERROR_KEY_BY_CODE: Record<string, string> = {
 
 export function useIccProfileManager() {
   const toast = useToastStore()
-  const config = useConfigStore()
   const { t } = useI18n()
 
   const iccProfiles = ref<IccProfileInfo[]>([])
@@ -61,8 +60,7 @@ export function useIccProfileManager() {
     await refreshIccProfiles()
     try {
       // 导入后即选用(减少「导入了却忘记切档位」的多一步操作)。
-      await config.setViewerColorCustomId(info.id)
-      await config.setViewerColorTarget('custom')
+      await selectIccProfile(info.id)
       toast.addToast('success', t('settings.viewerIccImportSuccess', { name: info.name }))
     } catch (e) {
       // 导入本身已成功(profile 已入库+已刷新列表),这里失败的只是「设为当前」这一步,
@@ -75,17 +73,17 @@ export function useIccProfileManager() {
   }
 
   async function selectIccProfile(id: string) {
-    await config.setViewerColorCustomId(id)
-    await config.setViewerColorTarget('custom')
+    // ID 与色域属于同一次选择；拆成两次 await 会让旧续体覆盖用户后来选择的色域。
+    await writeSettings({ viewer_color_custom_id: id, viewer_color_target: 'custom' })
   }
 
   async function deleteIccProfile(id: string) {
     try {
       await invokeIpc(IPC.DELETE_ICC_PROFILE, { profileId: id })
       await refreshIccProfiles()
-      // 删除当前选中项时后端会复位 viewer_color_target=srgb 并清 custom_id(方案 B §0④);
+      // 删除当前选中项时后端会复位 viewer_color_target=srgb 并清 custom_id；
       // 前端只需从后端重取一遍配置,不在此臆测是否恰是当前选中项。
-      await config.refreshFromBackend()
+      await refreshSettingsFromBackend()
     } catch (e) {
       toast.addToast('error', t('settings.viewerIccDeleteFailed', { error: ipcErrorMessage(e) }))
     }

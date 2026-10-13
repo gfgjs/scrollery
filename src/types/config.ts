@@ -19,6 +19,14 @@ export interface SettingsSnapshot {
   generation: number
 }
 
+/** Canvas 画廊的实验性融合参数，宽度和半径为 px，强度为百分比。 */
+export interface GalleryBlendSettings {
+  enabled: boolean
+  edgeWidth: number
+  blurRadius: number
+  strength: number
+}
+
 /**
  * 一次配置提交(UI 批量写入 / 外部编辑热应用 / 恢复默认)的统一回执。
  *

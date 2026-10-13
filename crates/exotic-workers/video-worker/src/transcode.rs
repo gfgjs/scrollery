@@ -241,3 +241,20 @@ fn transcode_inner<W: Write>(
     };
     Ok(Frame::control(FrameType::Success, request_id, &body).unwrap())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ladder_aborts_on_source_terminal() {
+        let ladder = vec!["a".to_string(), "b".to_string()];
+        let mut tried = Vec::new();
+        let r = run_encoder_ladder(&ladder, |e| {
+            tried.push(e.to_string());
+            Err::<(), _>(VideoError::Malformed("坏源".into()))
+        });
+        assert!(matches!(r, Err(VideoError::Malformed(_))));
+        assert_eq!(tried, vec!["a"], "源侧终态应止于首枚,不试后续");
+    }
+}

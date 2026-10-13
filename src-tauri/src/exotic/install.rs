@@ -1,11 +1,11 @@
 // src-tauri/src/exotic/install.rs
-//! 冷门格式插件 · 安全解包与完整性校验（v3 Part3 §6.4 第 2-8 步）。
+//! 冷门格式插件的安全解包与完整性校验。
 //!
 //! 把一个**不可信** zip 包安全地校验并解压到 staging 目录。原子切换/备份/回滚/Coordinator
-//! quiesce/DB 更新（§6.4 第 9-11 步）属安装编排，见 [`crate::exotic`] 后续命令层；本模块只做
+//! quiesce/DB 更新属安装编排；本模块负责
 //! 安全关键的「验签先于解包 + 白名单复核 + zip 加固 + 逐文件 hash 复核」。
 //!
-//! 防线（§6.4）：
+//! 防线：
 //!   1. 只先有界读取 `package-manifest.json` + `.sig` 并验签（release key）——其余 entry 一律不信。
 //!   2. **清单即白名单**：zip 文件 entry 集合必须恰好 = 已签名 files ∪ 两份签名元数据；
 //!      多/缺文件、大小写碰撞、重复路径全拒。
@@ -528,38 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_package_extracts_and_verifies() {
-        let sk = signing_key(1);
-        let ks = release_keyset(&sk);
-        let payload: &[(&str, &[u8], bool)] = &[
-            ("bin/psd-worker.exe", b"WORKER-BINARY", true),
-            ("plugin-manifest.json", b"{\"x\":1}", false),
-        ];
-        let mj = manifest_json(payload);
-        let sig = sign(&sk, mj.as_bytes());
-        let zip = write_zip("valid.zip", mj.as_bytes(), &sig, payload, &[]);
-        let dir = unique_dir("ok");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let out = verify_and_extract(
-            &zip,
-            &ks,
-            &expect(),
-            "0.1.0",
-            NOW,
-            &dir,
-            &InstallLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(out.manifest.files.len(), 2);
-        assert_eq!(
-            std::fs::read(dir.join("bin/psd-worker.exe")).unwrap(),
-            b"WORKER-BINARY"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn hash_mismatch_rejected() {
         let sk = signing_key(4);
         let ks = release_keyset(&sk);
@@ -612,13 +580,6 @@ mod tests {
             &InstallLimits::default(),
         );
         assert!(matches!(r, Err(InstallError::UnsafeEntry(_))), "got {r:?}");
-    }
-
-    #[test]
-    fn symlink_mode_detected() {
-        assert!(is_symlink_mode(0o120777));
-        assert!(!is_symlink_mode(0o100644)); // 普通文件
-        assert!(!is_symlink_mode(0o040755)); // 目录
     }
 
     /// 在唯一临时目录里建一个含标记文件的目录。

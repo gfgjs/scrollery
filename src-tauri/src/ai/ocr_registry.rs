@@ -1,5 +1,5 @@
 // src-tauri/src/ai/ocr_registry.rs
-//! OCR 模型元数据 + 下载清单（T4；资产源已钉定，2026-07-23）。
+//! OCR 模型元数据与下载清单。
 //!
 //! 主源 = RapidAI/RapidOCR ModelScope v3.9.2 resolve 直链（`docs/planning/2026-07-23-OCR文字提取/
 //! model-assets.md` 定案）。[`PINNED_ASSETS`] 的 sha256/字节数均为本机对 ModelScope 服务器直接
@@ -8,11 +8,6 @@
 //! `ppocrv5_dict.txt` 官方清单无 sha256 字段，本机下载后自算，并核实 mobile/server 两档字节级
 //! 完全一致（74012 字节，18383 行）。镜像 = GreatV/oar-ocr GitHub Release v0.3.0（det/rec/dict
 //! 三类有对应文件；cls 无镜像，两档 cls 下载失败仅能重试主源）。
-//!
-//! # 临时性（用户 2026-07-23 明示）
-//! 本源为过渡方案，用户后续会切至自有仓库托管；届时只需替换 [`PINNED_ASSETS`] 表内的
-//! `url`/`mirror_url` 字段（sha256/size_bytes 若仓库内容不变则无需重算），拼装/校验逻辑
-//! 不必再动。
 //!
 //! 文件名/落地路径单源仍取自 `scrollery_ai_core::ocr_profile::OcrProfile`——本文件只负责
 //! 「往哪下 + 校验多少」。

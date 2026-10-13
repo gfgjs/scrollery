@@ -1,5 +1,4 @@
-// src/types/reader.ts
-// 阅读器文本管线类型（阅读器完善方案 R1，§6.3）。对应 Rust doc_commands 的 DTO。
+// 阅读器文本管线类型，对应 Rust doc_commands 的 DTO。
 
 /** 编码检测置信度来源。`lossy` = U+FFFD 替换率超阈,UI 据此提示「编码可能误判」。 */
 export type ReaderEncodingConfidence = 'bom' | 'detected' | 'manual' | 'lossy'
@@ -24,11 +23,22 @@ export interface TextChapterContent {
   title: string
   /** 已分段的段落文本(缩进/段间距由渲染层 CSS 施加,不在文本内)。 */
   paragraphs: string[]
+  /** 原文按 LF 计数的绝对零基行号；未提供映射时仅支持阅读。 */
+  paragraphSourceLines?: number[]
+  titleSourceLine?: number | null
+  /** 解码原文的 UTF-8 SHA-256，保留原始换行以核对 LF 行号。 */
+  sourceHash?: string
 }
 
+/** 阅读中的段首位置，必须与相同内容快照配合使用。 */
+export type TextSourceAnchor = { sourceHash: string } & (
+  | { line: number; offset?: never }
+  | { offset: number; line?: never }
+)
+
 /**
- * 简繁转换档位(convert_chinese 的 config 参数,§5.10)。首发档位:关(前端不调) / t2s / s2t / s2tw / s2twp;
- * 其余为 ferrous-opencc 内置项,备扩展。前端在应用替换规则之后按章批量调用。
+ * 简繁转换档位(convert_chinese 的 config 参数)。关闭时前端不调用；
+ * 启用时在替换规则之后按章批量转换。
  */
 export type ZhConvertConfig =
   | 's2t' // 简 → 繁
@@ -44,9 +54,11 @@ export type ZhConvertConfig =
   | 't2hk'
   | 'hk2t'
 
+/** Markdown 阅读与编辑引擎。 */
+export type MarkdownEngine = 'native' | 'vditor' | 'markdown-editor'
+
 /**
- * 每书阅读偏好(reader_book_prefs.prefs 的版本化 JSON,§6.1)。只存与全局默认的 diff,读时 merge。
- * R1 阶段仅用到 `encoding`(手动编码覆盖,§5.1);R3 起扩充竖排/主题/字号等,故字段多为可选 + 版本号。
+ * 每书阅读偏好(reader_book_prefs.prefs 的版本化 JSON)。只存与全局默认的差异，读取时合并。
  */
 export interface ReaderBookPrefs {
   /** JSON 结构版本(迁移用)。 */
@@ -59,7 +71,8 @@ export interface ReaderBookPrefs {
   zhConvert?: ZhConvertConfig
   /** 每书阅读主题 id(R3)。纯显示层(只改注入 CSS 的正文/背景色),后端忽略;缺省/'' = 跟随全局槽。 */
   theme?: string
-  // R3+ 续扩:vertical?/… —— 加字段即可,后端只读取需要的字段。
+  /** 每篇 Markdown 的阅读/编辑引擎；缺省使用标准阅读器。 */
+  markdownEngine?: MarkdownEngine
 }
 
 /**

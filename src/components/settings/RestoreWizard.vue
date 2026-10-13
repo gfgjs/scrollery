@@ -10,7 +10,12 @@
     max-height="84vh"
     @close="closeWizard"
   >
-    <div v-if="phase === 'validating'" class="restore-busy">
+    <div v-if="closing" class="restore-busy">
+      <span class="spinner" />
+      <strong>{{ bt('backup.restoreDiscarding') }}</strong>
+    </div>
+
+    <div v-else-if="phase === 'validating'" class="restore-busy">
       <span class="spinner" />
       <div>
         <strong>{{ bt('backup.restoreValidating') }}</strong>
@@ -112,28 +117,28 @@
     </div>
 
     <template #footer>
-      <template v-if="phase === 'summary'">
-        <UiButton @click="closeWizard">{{ $t('common.cancel') }}</UiButton>
-        <UiButton variant="primary" :disabled="!summaryConfirmed" @click="phase = 'confirm'">
+      <template v-if="!closing && phase === 'summary'">
+        <UiButton :disabled="busy" @click="closeWizard">{{ $t('common.cancel') }}</UiButton>
+        <UiButton variant="primary" :disabled="busy || !summaryConfirmed" @click="phase = 'confirm'">
           {{ bt('backup.restoreContinue') }}
         </UiButton>
       </template>
-      <template v-else-if="phase === 'confirm'">
-        <UiButton @click="phase = 'summary'">{{ $t('common.back') }}</UiButton>
+      <template v-else-if="!closing && phase === 'confirm'">
+        <UiButton :disabled="busy" @click="phase = 'summary'">{{ $t('common.back') }}</UiButton>
         <UiButton
           variant="danger"
-          :disabled="typedConfirmation !== bt('backup.restoreConfirmWord')"
+          :disabled="busy || typedConfirmation !== bt('backup.restoreConfirmWord')"
           @click="armAndRestart"
         >
           {{ bt('backup.restoreAndRestart') }}
         </UiButton>
       </template>
-      <template v-else-if="phase === 'error'">
-        <UiButton v-if="!armed" @click="closeWizard">{{ $t('common.close') }}</UiButton>
+      <template v-else-if="!closing && phase === 'error'">
+        <UiButton v-if="!armed" :disabled="busy" @click="closeWizard">{{ $t('common.close') }}</UiButton>
         <UiButton v-if="armed" variant="primary" @click="retryRelaunch">
           {{ bt('backup.restoreRetryRestart') }}
         </UiButton>
-        <UiButton v-else variant="primary" @click="validatePackage">
+        <UiButton v-else variant="primary" :disabled="busy" @click="validatePackage">
           {{ bt('backup.retryValidation') }}
         </UiButton>
       </template>
@@ -142,13 +147,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useBackupI18n } from '../../i18n/backupMessages'
 import UiButton from '../ui/UiButton.vue'
 import UiCheckbox from '../ui/UiCheckbox.vue'
 import UiDialog from '../ui/UiDialog.vue'
 import { useBackupStore, type RestoreStageResult } from '../../stores/backupStore'
+import { useToastStore } from '../../stores/toastStore'
 import { IpcError } from '../../utils/ipc'
 import { restoreErrorKey } from '../../utils/backupPresentation'
 
@@ -157,6 +163,7 @@ const emit = defineEmits<{ close: [] }>()
 const { locale } = useI18n()
 const { t: bt } = useBackupI18n()
 const backup = useBackupStore()
+const toast = useToastStore()
 
 type RestorePhase = 'validating' | 'summary' | 'confirm' | 'arming' | 'error'
 const phase = ref<RestorePhase>('validating')
@@ -165,51 +172,115 @@ const summaryConfirmed = ref(false)
 const typedConfirmation = ref('')
 const errorCode = ref<string>()
 const armed = ref(false)
+const closing = ref(false)
+// summary 属于当前界面；暂存所有权独立保留，切包和关闭不能把待清理结果遗忘。
+let ownedStage: RestoreStageResult | null = null
+let stageWork = Promise.resolve()
+let generation = 0
+let disposed = false
+let armInFlight = false
 const errorKey = computed(() =>
   armed.value ? 'backup.restoreErrorRelaunch' : restoreErrorKey(errorCode.value),
 )
-const busy = computed(() => phase.value === 'validating' || phase.value === 'arming' || armed.value)
+const busy = computed(() => closing.value || phase.value === 'validating' || phase.value === 'arming' || armed.value)
 const packageName = computed(() => props.packagePath.split(/[\\/]/).pop() || props.packagePath)
 
 watch(
   () => [props.open, props.packagePath] as const,
   ([open]) => {
     if (open) void validatePackage()
+    else void releaseSession()
   },
+  { immediate: true },
 )
+
+onBeforeUnmount(() => {
+  disposed = true
+  void releaseSession()
+})
+
+function isCurrent(request: number): boolean {
+  return !disposed && props.open && request === generation
+}
+
+function reportError(error: unknown) {
+  const code = error instanceof IpcError ? error.code : 'unknown'
+  if (!disposed && props.open) {
+    errorCode.value = code
+    phase.value = 'error'
+  } else {
+    toast.addToast('error', bt(armed.value ? 'backup.restoreErrorRelaunch' : restoreErrorKey(code)))
+  }
+}
+
+async function discardOwnedStage(): Promise<boolean> {
+  if (!ownedStage) return true
+  // arm 在途时后端可能已经写入 pending；成功后所有权完全交给启动恢复流程。
+  if (armInFlight || armed.value) return false
+  try {
+    await backup.restoreDiscard(ownedStage)
+    ownedStage = null
+    return true
+  } catch (error) {
+    // 保留暂存所有权并停掉已排队的验证，等用户明确重试，不自动循环争抢文件任务闸门。
+    generation++
+    reportError(error)
+    return false
+  }
+}
+
+function releaseSession(): Promise<void> {
+  const request = ++generation
+  summary.value = null
+  stageWork = stageWork.then(async () => {
+    if (request === generation) await discardOwnedStage()
+  })
+  return stageWork
+}
 
 function resetConfirmation() {
   summaryConfirmed.value = false
   typedConfirmation.value = ''
   errorCode.value = undefined
-  armed.value = false
 }
 
-async function validatePackage() {
-  if (!props.open || !props.packagePath) return
+function validatePackage(): Promise<void> {
+  if (disposed || !props.open || !props.packagePath || armInFlight || armed.value) return Promise.resolve()
+  const request = ++generation
+  const packagePath = props.packagePath
   resetConfirmation()
   summary.value = null
   phase.value = 'validating'
-  try {
-    summary.value = await backup.restoreStage(props.packagePath)
-    phase.value = 'summary'
-  } catch (error) {
-    errorCode.value = error instanceof IpcError ? error.code : 'unknown'
-    phase.value = 'error'
-  }
+  // 同一向导只运行一条预检/释放链；旧成功结果由下一次切包或关闭工作负责清理。
+  stageWork = stageWork.then(async () => {
+    if (!isCurrent(request) || !await discardOwnedStage() || !isCurrent(request)) return
+    try {
+      ownedStage = await backup.restoreStage(packagePath)
+      if (!isCurrent(request)) return
+      summary.value = ownedStage
+      phase.value = 'summary'
+    } catch (error) {
+      if (isCurrent(request)) reportError(error)
+    }
+  })
+  return stageWork
 }
 
 async function armAndRestart() {
-  if (!summary.value || typedConfirmation.value !== bt('backup.restoreConfirmWord')) return
+  if (busy.value || disposed || !props.open || !summary.value || !ownedStage || typedConfirmation.value !== bt('backup.restoreConfirmWord')) return
+  armInFlight = true
   phase.value = 'arming'
   errorCode.value = undefined
   try {
-    await backup.restoreArm(summary.value)
+    await backup.restoreArm(ownedStage)
+    ownedStage = null
     armed.value = true
     await backup.relaunchApp()
   } catch (error) {
-    errorCode.value = error instanceof IpcError ? error.code : 'unknown'
-    phase.value = 'error'
+    reportError(error)
+  } finally {
+    armInFlight = false
+    if (!armed.value && (disposed || !props.open)) void releaseSession()
   }
 }
 
@@ -230,9 +301,20 @@ function formatCreatedAt(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString(locale.value)
 }
 
-function closeWizard() {
+async function closeWizard() {
   if (busy.value) return
-  emit('close')
+  closing.value = true
+  const request = ++generation
+  try {
+    stageWork = stageWork.then(async () => {
+      if (request !== generation || !await discardOwnedStage() || !isCurrent(request)) return
+      summary.value = null
+      emit('close')
+    })
+    await stageWork
+  } finally {
+    closing.value = false
+  }
 }
 </script>
 

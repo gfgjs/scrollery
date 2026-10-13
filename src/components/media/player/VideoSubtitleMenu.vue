@@ -1,7 +1,5 @@
 <script setup lang="ts">
-// VideoSubtitleMenu — 字幕菜单(UiPopover 形态,仿 VideoRateMenu.vue):关闭 / 内挂轨 / 外挂字幕
-// 单选,「加载字幕文件…」入口;ass/ssa/mkv 内嵌轨暂不支持——固定展示提示文案(纯 UI,不做格式
-// 判定,业务态全在上层 useVideoSubtitles)。
+// 字幕菜单提供关闭、内挂轨、外挂字幕和加载文件入口。格式判定与选择状态由 useVideoSubtitles 负责。
 import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Captions } from '@lucide/vue'

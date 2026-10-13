@@ -1,4 +1,4 @@
-//! 系统级命令（§ 6.1 — 系统）。
+//! 系统级命令。
 
 use std::sync::Arc;
 
@@ -15,13 +15,8 @@ use crate::utils::path::resolve_media_path;
 
 /// 在系统文件管理器中显示媒体项（选中该项）。
 ///
-/// 实现统一走 [`crate::ipc::reveal::reveal_path`]（F-015）。此前这里手写三平台
-/// `Command::spawn`，与 `tree_commands::reveal_tree_entry` 并存为两套，且行为不等价 ——
-/// Linux 分支只 `xdg-open` 父目录、**不选中**目标文件。统一后 Linux 走 D-Bus
-/// `FileManager1.ShowItems`，与 Windows/macOS 一致。
-///
-/// 顺带的行为变化：旧的 `.spawn()` 发射后不管，打开器起不来也返回 `Ok`；opener 同步等结果，
-/// 故本命令现在**可能真的返回错误**（映射为稳定码 `reveal_failed` / `unsupported_platform`）。
+/// 通过 [`crate::ipc::reveal::reveal_path`] 调用系统打开器，并把失败映射为
+/// 稳定码 `reveal_failed` / `unsupported_platform`。
 ///
 /// 路径由 DB 行拼出、不经 WebView，故走 `resolve_media_path` 即可，无需 `resolve_within_root`
 /// 的根边界校验（那是给 WebView 传入的 `rel_path` 用的）。
@@ -29,16 +24,14 @@ use crate::utils::path::resolve_media_path;
 pub async fn show_in_explorer(item_id: i64, state: State<'_, Arc<AppState>>) -> Result<()> {
     let (root, rel, name) = read_blocking(&state, move |c| get_item_path_info(c, item_id)).await?;
     // resolve_media_path 返回正斜杠字符串；Windows 上 opener 内部先过 GetFullPathNameW
-    // 规范化分隔符再 ILCreateFromPathW，故无需像旧代码那样手动 replace('/', "\\")。
+    // 规范化分隔符再 ILCreateFromPathW。
     let abs_path = resolve_media_path(&root, &rel, &name);
     info!("show_in_explorer: {abs_path} | 在资源管理器中显示: {abs_path}");
     reveal_path(std::path::PathBuf::from(abs_path)).await
 }
 
-/// 校验:path 必须解析为一个**存在的真实目录**,不接受任意字符串(2026-07-16 安全审查 #5)。
-/// 此前 `open_directory` 零校验直呼三家 OS 打开器——它们都会把「不是真实文件系统路径的形态」
-/// 转发给已注册的协议处理器:`explorer.exe http://evil` 会启动默认浏览器打开该 URL,
-/// `open`/`xdg-open` 同理可被指向任意已注册 URL scheme handler。canonicalize + is_dir 同时挡三类:
+/// 校验 path 必须解析为存在的真实目录。系统打开器可能把 URL 转交协议处理器；
+/// canonicalize + is_dir 同时挡三类:
 ///   ① URL(http://…、ms-settings:…等):不是文件系统路径,canonicalize 直接失败;
 ///   ② 不存在的路径:同样 canonicalize 失败;
 ///   ③ 存在但是文件而非目录(如可执行文件):canonicalize 成功但 is_dir() 为假,单独拒。

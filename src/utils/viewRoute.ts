@@ -1,7 +1,6 @@
-// src/utils/viewRoute.ts
-// 视图维度 ↔ URL path 的映射（S2-c 视图路由化）。纯函数、无 Vue/store 依赖,便于单测。
+// 视图维度与 URL path 的映射，无 Vue/store 依赖。
 //
-// 设计要点(见 findings 会话续23):
+// 路由约定:
 // - smart-album(5 档)与 folder 筛选态(模式B,groupBy≠folder)各自占一条可寻址路径 → 深链/刷新可恢复。
 // - folder 滚动锚点态(模式A,groupBy=folder 点文件夹设 pendingScrollDirId)**不进 URL**——它是全库单列表
 //   内的滚动位置而非视图,进 URL 会「每滚一下改一次 history」。故本模块只表达 smart-album + folder 筛选。
@@ -54,8 +53,7 @@ export function routeToView(path: string): RouteView | null {
 
 /**
  * 「主库血统」画廊路由判据 = 能被 routeToView 解析的路径(smart-album + folder 筛选)。
- * 这恰是 S2-c 拆分前全部停在 '/' 的视图集合——供 SemanticSearchPanel 等原先绑 `route.path === '/'`
- * 的 UI 平移到新的多路径结构而行为不变(collection/person 详情此前即非 '/'、不在此列)。
+ * SemanticSearchPanel 等主库入口据此识别多条主库路径；collection/person 详情不在此列。
  */
 export function isPrimaryGalleryRoute(path: string): boolean {
   return routeToView(path) !== null

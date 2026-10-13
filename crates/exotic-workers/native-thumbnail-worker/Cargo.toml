@@ -1,0 +1,29 @@
+[package]
+name = "native-thumbnail-worker"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+# 非 Windows 保留原来的 Unsupported 入口；Windows 复用与宿主相同的图像依赖。
+[target.'cfg(windows)'.dependencies]
+crossbeam-channel = "0.5.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+scrollery-ai-core = { path = "../../scrollery-ai-core", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff"] }
+webp = { version = "0.3", default-features = false }
+fast_image_resize = "4"
+thumbhash = "0.1"
+moxcms = "0.8.1"
+kamadak-exif = "0.5"
+# 与宿主统一 feature 集，避免同一次发布为 windows crate 再生成一套不同的产物。
+windows = { version = "0.58", features = ["implement", "Win32_Graphics_Imaging", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus",
+    "Win32_System_JobObjects",
+    "Foundation_Numerics", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Dxgi_Common",
+    "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3"

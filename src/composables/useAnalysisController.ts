@@ -1,14 +1,7 @@
-// src/composables/useAnalysisController.ts
-// 分析管理控制器（S6/T19 去重）。aiStore 与 faceStore 的"分析管理半部"此前是显式镜像复制
-// （faceStore 注释「Mirrors aiStore's analysis-management half」）：2s 轮询 + start/pause/
-// restart/stop + 自动续传 + providerLabel + 进度，逻辑雷同，仅端点 / 状态字段 / 错误处理不同。
+// AI 与人脸分析共用的控制器：轮询、启停、自动续传与进度由参数化 IPC 命令驱动。
+// 各 store 持有自己的状态与专属逻辑。
 //
-// 本控制器把这条共享控制流参数化:差异收敛为「静态配置（5 个 IPC 命令 + logTag）+ 进度字段
-// getter + 2 个回调（onError / onStarted）」,无运行时耦合、无 state 外漏——故是真 DRY,而非
-// 把耦合搬成长参数列表。各 store 只持自己的 status ref 与专属逻辑（搜索 / 模型库等），分析半部
-// 委托本控制器。
-//
-// P1-1（共享会话竞争 / 自动续跑）:AI 与人脸共用唯一 GPU 分析会话槽,启动批并行自动续跑时必有一
+// AI 与人脸共用唯一 GPU 分析会话槽，启动批并行自动续跑时必有一
 // 方被拒。被拒方不再当错误上报,而是进「资源等待」——按稳定 code(AnalysisBusy)分流、有界重试、
 // 对端释放即续跑;用户暂停/停止则撤回等待意图,并等本控制器在途起步命令收尾后才发 cancel
 // (后端 start 在同步段之后才 launch,cancel 抢跑会被旧起步反超)。等待态与「运行中让步等待」

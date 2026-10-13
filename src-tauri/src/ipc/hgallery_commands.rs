@@ -1,4 +1,4 @@
-//! H-Lab(横向画廊实验)IPC 命令(docs/designs/2026-07-02-horizontal-gallery-lab.md §4)。
+//! 横向画廊 IPC 命令。
 //! 与生产 layout_commands 平行:同款「查询 + CPU 布局同入一个 spawn_blocking」纪律、
 //! 同款 AppError 错误契约;缓存/版本完全独立,互不可见。
 
@@ -13,7 +13,7 @@ use crate::layout::hcache::{get_h_blocks_by_x as cache_get_blocks, store_h_layou
 use crate::layout::horizontal::{compute_horizontal_layout, HBlock, HLayoutMode, HLayoutParams};
 use crate::state::AppState;
 
-/// H 布局计算参数。filters/directory_id 预留视图镜像能力,实验 v1 前端不传(全库)。
+/// 横向布局计算参数；filters/directory_id 可限制查询范围。
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComputeHLayoutParams {

@@ -70,6 +70,7 @@ pub fn pair_live_photos(conn: &Connection, root_id: i64) -> Result<u64> {
              JOIN directories d ON d.id = m.directory_id
              WHERE d.root_id = ?1
                AND m.is_deleted = 0
+               AND m.availability != 'missing'
                AND m.file_format IN ('jpg','jpeg','heic','heif','mov','mp4')
              ORDER BY m.directory_id, m.file_name",
         )?;
@@ -244,6 +245,9 @@ pub fn pair_live_photos(conn: &Connection, root_id: i64) -> Result<u64> {
         tx.execute(
             "UPDATE media_items
                 SET source_revision=source_revision+1,
+                    thumb_status=CASE WHEN media_type='image' THEN 0 ELSE thumb_status END,
+                    thumb_path=CASE WHEN media_type='image' THEN NULL ELSE thumb_path END,
+                    thumbhash=CASE WHEN media_type='image' THEN NULL ELSE thumbhash END,
                     is_live_photo=CASE
                         WHEN ?2 <> 0 THEN 1
                         WHEN has_embedded_video <> 0 THEN is_live_photo

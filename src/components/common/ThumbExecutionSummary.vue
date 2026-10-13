@@ -17,7 +17,9 @@ const scan = useScanStore()
 <style scoped>
 .thumb-execution {
   font-size: var(--font-size-xs);
-  color: var(--text-secondary);
+  color: var(--color-text-secondary);
+  min-width: 0;
+  line-height: 1.5;
   overflow-wrap: anywhere;
 }
 summary { cursor: pointer; }

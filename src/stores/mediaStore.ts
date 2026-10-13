@@ -85,8 +85,8 @@ export const useMediaStore = defineStore('media', () => {
   const layoutDirtyRevision = ref(0)
 
   // 单项标量改动信号（详情页 / 外部就地改 favorite / rating / colorLabel 时发出）。
-  // 画廊显示的 visibleRows 由 MediaGrid 持有（经 fetchRowsByY 拉取），store 侧无行缓存（R2-2 已删
-  // rowCache/patchRowItem 旁路）。MediaGrid 监听本信号把改动回灌它持有的 visibleRows。seq 单调自增，保证即便
+  // 画廊显示的 visibleRows 由 MediaGrid 持有（经 fetchRowsByY 拉取），store 侧无行缓存。
+  // MediaGrid 监听本信号把改动回灌它持有的 visibleRows。seq 单调自增，保证即便
   // (id,field,value) 重复也触发 watch。in-grid 操作另有同步内联 patch（即时反馈），与本信号的
   // 回灌幂等无冲突。
   type ItemFieldPatch = {
@@ -388,6 +388,18 @@ export const useMediaStore = defineStore('media', () => {
       }
   }
 
+  let lastStaleLayoutVersion: number | undefined
+
+  function recoverStaleLayout(error: unknown, version: number | undefined) {
+    if (version === undefined || version !== layoutSummary.value?.layoutVersion ||
+      version === lastStaleLayoutVersion || !error || typeof error !== 'object' ||
+      !('code' in error) || error.code !== 'LayoutNotReady') return
+    // 后端已撤销的布局不能靠重取旧版本恢复；走现有前台重算闸门。
+    // 多段并发失败合并为一次，重算仍失败时不随滚动无限重试。
+    lastStaleLayoutVersion = version
+    invalidateLayout()
+  }
+
   async function fetchRowsByY(topY: number, bottomY: number): Promise<LayoutRow[]> {
     const version = layoutSummary.value?.layoutVersion
 
@@ -399,6 +411,7 @@ export const useMediaStore = defineStore('media', () => {
       })
       return rows
     } catch (e) {
+      recoverStaleLayout(e, version)
       logger.error(`[MediaStore] fetchRowsByY(${topY}, ${bottomY}) FAILED`, { error: e })
       throw e
     }
@@ -415,6 +428,7 @@ export const useMediaStore = defineStore('media', () => {
         layoutVersion: version,
       })
     } catch (e) {
+      recoverStaleLayout(e, version)
       logger.error(`[MediaStore] fetchBucketRows(${startY}, ${endY}) FAILED`, { error: e })
       throw e
     }
@@ -593,7 +607,7 @@ export const useMediaStore = defineStore('media', () => {
     if (stats.value) {
       stats.value.totalFavorited += newVal ? 1 : -1
     }
-    // 详情页切收藏 → 通知画廊回灌 visibleRows（in-grid 收藏另走同步内联 patch，幂等无冲突）。
+    // 网格和详情页共用此信号，由画廊统一回灌图标及刷新受影响的收藏筛选。
     signalItemPatch(id, 'isFavorited', newVal)
     return newVal
   }

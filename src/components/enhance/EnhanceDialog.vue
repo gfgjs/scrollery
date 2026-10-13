@@ -1,7 +1,7 @@
-<!-- 影像增强对话框（降噪/超分子系统 P0 批 5，design.md §F）：任务勾选 + 每任务模型档 + 强度滑杆 +
+<!-- 影像增强对话框：任务选择、模型档位、强度滑杆及
      前后对比预览 + 输出格式/尺寸预估 + 门控引导。执行序固定 降噪→去伪影→超分（host 排序契约），
-     UI 明示该固定序。授权/模型下载门控走 D-OCR-6 同型：按钮常显，点击后按态引导（未授权→插件商店、
-     未下载→设置分节）。预览 P0 后端返 enhance_not_implemented → 分割拖杆显示占位态，不阻塞主流程。 -->
+     UI 明示该固定序。授权和模型下载按钮常显，点击后按状态引导至插件商店或设置页。
+     后端返回 enhance_not_implemented 时分割拖杆显示占位，不阻塞主流程。 -->
 <template>
   <UiDialog
     :open="open"
@@ -19,7 +19,7 @@
         <button v-if="selectionBlock === 'enhance_model_missing'" class="enh__ghost-btn" @click="router.push('/settings')">
           {{ $t('enhance.gateModelMissing') }}
         </button>
-        <button v-else-if="selectionBlock === 'enhance_unlicensed'" class="enh__ghost-btn" @click="router.push('/plugins')">
+        <button v-else-if="selectionBlock === 'enhance_inactive'" class="enh__ghost-btn" @click="router.push('/plugins')">
           {{ $t('enhance.gateUnlicensed') }}
         </button>
       </p>
@@ -84,7 +84,7 @@
         </div>
       </section>
 
-      <!-- ── 前后对比预览（P0 占位容错）─────────────────────────────────── -->
+      <!-- 前后对比预览；数据源未就绪时显示占位。 -->
       <section class="enh__section">
         <div class="enh__preview-head">
           <h3 class="enh__section-title">{{ $t('enhance.previewTitle') }}</h3>
@@ -176,7 +176,7 @@ const outputFormat = ref<EnhanceOutputFormat>('follow_source')
 
 const submitting = ref(false)
 
-// ── 预览态（P0 数据源容错）───────────────────────────────────────────────────
+// 预览态与数据源容错。
 const beforeSrc = ref<string | null>(null)
 const afterSrc = ref<string | null>(null)
 const previewLoading = ref(false)
@@ -340,7 +340,7 @@ async function generatePreview() {
     beforeSrc.value = `${resolveAssetUrl(res.beforePath)}?v=${revision}`
     afterSrc.value = `${resolveAssetUrl(res.afterPath)}?v=${revision}`
   } catch (e) {
-    // P0：后端返 enhance_not_implemented → 显示占位，不当错误弹。其余错误也降级为占位提示。
+    // 后端返回 enhance_not_implemented 时显示占位；其他预览错误也显示占位提示。
     const code = e instanceof IpcError ? e.code : null
     beforeSrc.value = null
     afterSrc.value = null
@@ -367,7 +367,7 @@ async function submit() {
     emit('close')
   } catch (e) {
     const code = e instanceof IpcError ? e.code : null
-    if (code === 'enhance_unlicensed') {
+    if (code === 'enhance_inactive') {
       toast.addToast('info', t('enhance.errUnlicensed'))
       void router.push('/plugins')
     } else if (code === 'enhance_model_missing') {

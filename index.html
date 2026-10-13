@@ -12,9 +12,7 @@
     <style>
       /* 样式刻意自包含：模块样式表在 HTML 首帧之后才到达，静态层必须先覆盖恢复后的完整主窗口。 */
       :root {
-        /* 启动层与应用窗口同底:颜色一律取主题色板变量——默认值来自构建期注入的默认主题 CSS
-           (:root / html[data-color-scheme='dark']),有首帧缓存时由 bootstrap 以 inline 变量覆盖。
-           此处不再有六套主题分支与浓度表达式,故启动层不会先露旧主题再跳到新主题。 */
+        /* 与应用共用主题变量：默认值由构建期 CSS 注入，首帧缓存由 bootstrap 覆盖。 */
         --startup-bg: var(--color-bg-primary);
         --startup-text: var(--color-text-primary);
         --startup-muted: var(--color-text-secondary);

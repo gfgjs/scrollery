@@ -43,7 +43,7 @@
 </template>
 
 <script setup lang="ts">
-// 书签面板（阅读器方案 R4，§6.2）。纯展示：列出某书书签（章名 + 全书百分比，按进度升序，
+// 书签面板列出某书书签（章名 + 全书百分比，按进度升序，
 // 后端已排序）。头部「+」添加当前位置（emit 'add'），点击条目 emit 'navigate'(locator) 跳转，
 // 垃圾桶 emit 'delete'(id) 删除。数据加载/持久化在 DocumentViewer。
 import { X, BookmarkPlus, Trash2 } from '@lucide/vue'
@@ -161,8 +161,9 @@ const { t } = useI18n()
   opacity: 0;
   transition: opacity var(--transition-fast);
 }
-/* 悬停条目才显删除键，避免误删 + 视觉整洁。 */
-.bm-item:hover .bm-item__del {
+/* 键盘进入条目时同样显示删除键，避免焦点落在不可见的操作上。 */
+.bm-item:hover .bm-item__del,
+.bm-item:focus-within .bm-item__del {
   opacity: 1;
 }
 .bm-item__del:hover {

@@ -1,9 +1,5 @@
 // crates/scrollery-ai-core/src/embedding.rs
-//! 嵌入向量的纯字节序/归一化工具(T16 准备:自 clip.rs 外移)。
-//!
-//! 本模块**永远可用**(不在 `inference` feature 门内):host 在 T16 删 ort 后仍需
-//! 读写 DB 里的向量字节(vector_store/聚类/搜索打分),这些与推理无关。
-//! 路径兼容:clip.rs 以 `pub use` 原位再导出,既有 `clip::embedding_to_bytes` 引用不变。
+//! 嵌入向量的字节序与归一化工具；无需 `inference` feature。
 
 /// 就地 L2 归一化向量（返回修改后的输入）。
 pub fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {

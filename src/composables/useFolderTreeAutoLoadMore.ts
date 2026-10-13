@@ -1,6 +1,5 @@
 // src/composables/useFolderTreeAutoLoadMore.ts
-// 「加载更多」自动接力(T2 单目录分页免手点)——从 FoldersSection.vue 域 14 迁出(见
-// docs/planning/2026-07-25-超长文件拆分方案/analysis/FoldersSection-vue.md §2.1)。
+// 「加载更多」自动接力(单目录分页免手点)。
 //
 // more 行进入渲染窗口(含 buffer,相当于就近预取)即自动追加下一页;一页完成后拍平行变化、
 // 窗口重算,行若仍在窗口内则继续接力,直到该目录取尽或行滚出窗口。防线:

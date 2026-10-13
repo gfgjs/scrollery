@@ -9,7 +9,7 @@ export const PERFORMANCE_SPAN_NAMES = [
   'gallery.draw',
   'gallery.bitmapLoad',
   'gallery.imageFallback',
-  // Canvas 缩略图分段(密集缩略图方案 §7.3):候选等槽 → 字节 → 源解码 → 裁剪缩放 → 入屏首绘代理。
+  // Canvas 缩略图分段：候选等槽 → 字节 → 源解码 → 裁剪缩放 → 入屏首绘代理。
   'gallery.thumbWait',
   'gallery.thumbFetch',
   'gallery.thumbSourceDecode',

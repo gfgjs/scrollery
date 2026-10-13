@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// 提取 CHANGELOG.md 中指定版本小节(Part7-T17 oss-release 发布说明硬门)。
+// 提取 CHANGELOG.md 中指定版本小节，供公开版发布说明使用。
 // 用法:node scripts/extract-changelog.mjs <version> [changelog-path]
 //   <version> 不带 v 前缀(如 0.1.0);正文写 stdout。
 // 缺小节 / 小节为空 → exit 1(发布失败):公开仓历史是 squash 同步提交,发布说明
-// 唯一事实源就是 CHANGELOG 的版本小节,提不出来 = 发布纪律未走完,宁红不糊。
+// 取自 CHANGELOG 的版本小节；提取失败时中止发布。
 
 import { readFileSync } from 'node:fs';
 

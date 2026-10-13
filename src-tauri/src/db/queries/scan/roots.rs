@@ -1,9 +1,8 @@
 //! 扫描根(scan_roots)域:CRUD + 后端绑定 + 隐藏根 + 卷绑定 + relink 改路径 + 抽样。
-//! (D 线从 `scan.rs` 拆出,SQL/事务边界不变。)
 
 use rusqlite::{params, Connection, Row};
 
-use crate::db::models::ScanRoot;
+use crate::db::models::{NewVolume, ScanRoot};
 use crate::error::{AppError, Result};
 
 fn map_scan_root(row: &Row<'_>) -> rusqlite::Result<ScanRoot> {
@@ -32,6 +31,154 @@ pub fn insert_scan_root(conn: &Connection, path: &str, alias: Option<&str>) -> R
     Ok(conn.last_insert_rowid())
 }
 
+/// 待迁移子根及其相对新父根的路径；调用方须先 canonicalize 并验证真实包含关系。
+pub struct ScanRootMergeSource {
+    /// 预检时确认的现存子根 ID。
+    pub root_id: i64,
+    /// canonicalize 后的子根相对父根路径，使用正斜杠。
+    pub relative_path: String,
+}
+
+fn merge_conflict() -> AppError {
+    AppError::Scan {
+        code: "scan_merge_conflict",
+        message: "根目录重叠或目标已存在，未合并 | Conflicting scan roots; nothing merged".into(),
+    }
+}
+
+/// 在同一事务中添加父根并迁移子根的目录归属，保留媒体 ID、用户状态和缓存键。
+///
+/// 调用方须持有扫描根重组闸门，保证输入根集合与文件系统预检期间不发生根管理操作。
+/// 本函数不访问文件或取消扫描；成功返回后，调用方才可撤销旧根的扫描令牌。
+pub fn merge_scan_root_children(
+    conn: &mut Connection,
+    parent_path: &str,
+    alias: Option<&str>,
+    volume: &NewVolume,
+    sources: &[ScanRootMergeSource],
+) -> Result<ScanRoot> {
+    let tx = conn.transaction()?;
+    let existing = list_scan_roots(&tx)?;
+    if existing.iter().any(|root| root.path == parent_path) {
+        return Err(merge_conflict());
+    }
+    let mut hidden = None;
+    let mut prefixes = Vec::with_capacity(sources.len());
+    for source in sources {
+        let root = get_scan_root(&tx, source.root_id)?;
+        // 跨卷移动的遗留日志靠旧根 ID 继续恢复；只要仍有日志，就不能删掉其恢复依据。
+        let has_pending_move: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM directory_move_journal WHERE source_root_id=?1 OR target_root_id=?1)",
+            [source.root_id], |row| row.get(0),
+        )?;
+        if has_pending_move {
+            return Err(AppError::Scan {
+                code: "scan_merge_pending_move",
+                message: "文件夹仍有待恢复的移动操作，未合并 | Pending directory move must be recovered before merging".into(),
+            });
+        }
+        if hidden.is_some_and(|previous| previous != root.is_hidden) {
+            return Err(AppError::Scan {
+                code: "scan_merge_visibility_conflict",
+                message: "显示与隐藏的文件夹不能合并，原库未改动 | Visible and hidden roots cannot be merged".into(),
+            });
+        }
+        hidden = Some(root.is_hidden);
+        // 嵌套子根可能索引了同一实体；不能靠删除冲突行融合，否则会丢用户关联。
+        let prefix = if cfg!(windows) {
+            source.relative_path.to_lowercase()
+        } else {
+            source.relative_path.clone()
+        };
+        if prefix.is_empty()
+            || prefixes.iter().any(|other: &String| {
+                prefix == *other
+                    || prefix.starts_with(&format!("{other}/"))
+                    || other.starts_with(&format!("{prefix}/"))
+            })
+        {
+            return Err(merge_conflict());
+        }
+        prefixes.push(prefix);
+    }
+
+    let parent_id = insert_scan_root(&tx, parent_path, alias)?;
+    let volume_id = super::super::upsert_volume(&tx, volume)?;
+    set_scan_root_volume(&tx, parent_id, Some(volume_id))?;
+    set_scan_root_hidden(&tx, parent_id, hidden.unwrap_or(false))?;
+    let parent_name = alias.unwrap_or_else(|| {
+        std::path::Path::new(parent_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+    });
+    let top_id = super::upsert_directory(&tx, parent_id, None, "", parent_name, 0, None)?;
+    for source in sources {
+        let directories = {
+            let mut statement = tx.prepare(
+                "SELECT id, rel_path FROM directories WHERE root_id=?1 ORDER BY length(rel_path), id",
+            )?;
+            let rows = statement
+                .query_map([source.root_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        if !directories.iter().any(|(_, path)| path.is_empty()) {
+            return Err(merge_conflict());
+        }
+        let parts = source.relative_path.split('/').collect::<Vec<_>>();
+        let mut ancestor_id = top_id;
+        let mut ancestor_path = String::new();
+        for part in &parts[..parts.len() - 1] {
+            if !ancestor_path.is_empty() {
+                ancestor_path.push('/');
+            }
+            ancestor_path.push_str(part);
+            ancestor_id = super::upsert_directory(
+                &tx,
+                parent_id,
+                Some(ancestor_id),
+                &ancestor_path,
+                part,
+                crate::utils::path::path_depth(&ancestor_path),
+                None,
+            )?;
+        }
+        for (id, old_path) in directories {
+            let path = if old_path.is_empty() {
+                source.relative_path.clone()
+            } else {
+                format!("{}/{}", source.relative_path, old_path)
+            };
+            let depth = crate::utils::path::path_depth(&path);
+            let tree_key = crate::utils::path::encode_tree_sort_key(&path);
+            if old_path.is_empty() {
+                tx.execute(
+                    "UPDATE directories SET root_id=?1,rel_path=?2,depth=?3,tree_sort_key=?4,parent_id=?5,name=?6 WHERE id=?7",
+                    params![parent_id, path, depth, tree_key, ancestor_id, parts[parts.len() - 1], id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE directories SET root_id=?1,rel_path=?2,depth=?3,tree_sort_key=?4 WHERE id=?5",
+                    params![parent_id, path, depth, tree_key, id],
+                )?;
+            }
+        }
+        // 所有目录已改归新根，删除空壳不会触发任何目录或媒体的级联删除。
+        delete_scan_root(&tx, source.root_id)?;
+    }
+    let total: i64 = tx.query_row(
+        "SELECT count(*) FROM media_items m JOIN directories d ON d.id=m.directory_id WHERE d.root_id=?1",
+        [parent_id], |row| row.get(0),
+    )?;
+    update_scan_root_status(&tx, parent_id, "idle", 0, total)?;
+    let root = get_scan_root(&tx, parent_id)?;
+    tx.commit()?;
+    Ok(root)
+}
+
 /// 设置扫描根的显隐（V21，设置页库级排除）。`hidden=true` 时该根媒体从画廊/时间轴/搜索/统计/
 /// 树/全选全部排除。仅改本行标志——排除靠查询侧条件子查询（`hidden_root_ids` + `push_root_exclusion`），
 /// 不反规范化到 media_items（避免 move/copy/rescan 多点同步）。调用方须随后 `bump_data_version` 使
@@ -52,7 +199,7 @@ pub fn hidden_root_ids(conn: &Connection) -> Result<Vec<i64>> {
     rows.map(|r| r.map_err(AppError::from)).collect()
 }
 
-// 「隐藏根排除」静态谓词(V21 后续:派生流水线侧)。缩略图/AI/人脸三条**全表状态列排空**
+// 「隐藏根排除」静态谓词。缩略图/AI/人脸三条**全表状态列排空**
 // 流水线据此跳过被隐藏根下的媒体——用户隐藏一个根即不再为其花缩略图/CLIP/人脸算力。
 //
 // 与画廊侧(`push_root_exclusion`,layout.rs)走绑参不同,这里用**全静态不相关子查询**:
@@ -93,7 +240,7 @@ pub fn set_scan_root_volume(conn: &Connection, root_id: i64, volume_id: Option<i
     Ok(())
 }
 
-/// 改写扫描根的绝对路径（#7 方案A「文件夹已迁移」）。
+/// 改写迁移后扫描根的绝对路径。
 ///
 /// 整根迁移后目录结构与 mtime 不变，而 `directories.rel_path` / `media_items.file_name`
 /// 全是相对根的，缩略图 cache_key 也不含盘符（`utils::hash::compute_cache_key`）——
@@ -202,3 +349,7 @@ pub fn finish_scan_root(conn: &Connection, id: i64, total: i64) -> Result<()> {
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "root_merge_tests.rs"]
+mod root_merge_tests;

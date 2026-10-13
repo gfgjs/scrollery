@@ -94,7 +94,7 @@
       @keydown="onKeydown"
     >
       <div class="hlab__canvas" :style="{ width: canvasWidth + 'px' }">
-        <!-- 渲染层不感知布局模式:HItem 均为全局绝对坐标,直接 flatMap 定位(plan §2-2)。
+        <!-- 渲染层不感知布局模式：HItem 均为全局绝对坐标，直接定位。
              left/top 定位而非 translate3d——后者逐格提升合成层是横向掉帧主因之一。 -->
         <div
           v-for="it in visibleItems"
@@ -136,10 +136,8 @@
 </template>
 
 <script setup lang="ts">
-// H-Lab 横向画廊实验室(docs/designs/2026-07-02-horizontal-gallery-lab.md)。
-// 定位:多种横向布局候选的真人调研载体——仅布局 + 滚动,多选/收藏/详情等附加能力显式推迟。
-// 与生产 MediaGrid 完全平行:独立路由、独立后端缓存、独立滚动 composable,零共享可变状态;
-// 唯二复用 = MediaThumb(缩略图状态机)与 useRequestQueue(批量请求,槽位生命周期已测锁定)。
+// 横向画廊实验页：独立路由、后端缓存和滚动状态，只处理布局与滚动。
+// 缩略图显示和请求分别复用 MediaThumb、useRequestQueue。
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ArrowLeft } from '@lucide/vue'
@@ -164,7 +162,7 @@ const MODE_OPTIONS: { kind: HLayoutModeKind; labelKey: string }[] = [
   { kind: 'columns', labelKey: 'hlab.modeColumns' },
 ]
 
-// ── 实验参数(默认值=调研起点;lanes 为当前倾向方案故作默认)────────────────────
+// 实验参数；默认使用 lanes 模式。
 const modeKind = ref<HLayoutModeKind>('lanes')
 const pageFactor = ref(1.2)
 const targetRowHeight = ref(200)
@@ -232,7 +230,7 @@ async function compute() {
         mode: currentMode(),
       },
     })
-    // 几何整体换代 → 回到起点重取(实验期不做锚点保持,plan §6)。
+    // 几何整体换代时回到起点重取；此页不保持滚动锚点。
     hv.scrollToStart()
     await hv.updateVisible(true)
   } catch (e) {
@@ -264,7 +262,7 @@ const visibleItems = computed<HItem[]>(() => hv.visibleBlocks.value.flatMap((b) 
 const canvasWidth = computed(() => Math.max(summary.value?.totalWidth ?? 0, 0))
 
 // ── 缩略图请求:批量队列 + 就地 patch(同 MediaGrid onRequestThumb 模式)。
-// h 缓存有意不接生产回写,滚回后靠「已生成快路径」自愈(plan §2-4)。
+// 横向布局缓存不接生产回写；滚回后通过已生成缩略图的快路径补齐。
 const queue = useRequestQueue()
 
 async function onRequestThumb(id: number) {
@@ -428,7 +426,7 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-/* 超出实验滚动上限告警(plan §2-3:未移植坐标压缩的已知限制) */
+/* 超出实验页滚动上限时显示告警。 */
 .hlab__cap {
   padding: 4px 12px;
   background: rgba(220, 53, 69, 0.18);
@@ -454,7 +452,7 @@ onBeforeUnmount(() => {
   height: 100%;
 }
 
-/* 性能纪律(2026-07-02 掉帧修复):left/top 定位、无 transform/will-change——
+/* 格子使用 left/top 定位，不逐格使用 transform/will-change——
    逐格 translate3d 会给每个可见格子(约 40-50 个)各提升一个合成层,滚动时层树
    开销远超生产网格(生产仅逐「行」提层,约 10-15 个)。改为绘入滚动内容层后,
    滚动全程由合成器搬运,零逐格层。contain: strict(格子有显式尺寸)隔离重排/重绘。 */
@@ -468,7 +466,7 @@ onBeforeUnmount(() => {
   pointer-events: none;
 }
 
-/* 实验范围裁剪(plan §2-4):隐藏 MediaThumb 的交互 overlay(收藏/评分/勾选),
+/* 隐藏 MediaThumb 的交互 overlay(收藏/评分/勾选)，
    仅保留缩略图本体与状态角标——「无附加能力」是范围决定,不 fork 组件。 */
 .hlab__cell :deep(.media-thumb__fav),
 .hlab__cell :deep(.media-thumb__rating-slot),

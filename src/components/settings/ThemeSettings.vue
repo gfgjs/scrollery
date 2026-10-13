@@ -82,8 +82,12 @@
       </ul>
     </section>
 
-    <details class="theme-settings__customize">
+    <details
+      class="theme-settings__customize"
+      @toggle="customizeMounted = customizeMounted || ($event.target as HTMLDetailsElement).open"
+    >
       <summary>{{ t('settings.themeCustomize') }}</summary>
+      <template v-if="customizeMounted">
     <!-- 两张配色卡共用同一份草稿,可来回调整;窄屏纵排、宽屏并排。 -->
     <div class="theme-settings__cards">
       <ThemePaletteCard
@@ -140,6 +144,7 @@
       <p class="theme-settings__hint">{{ t('settings.windowMaterialDraftHint') }}</p>
     </section>
 
+      </template>
     </details>
 
     <p v-if="contrastWarningModes.length" class="theme-settings__warning">
@@ -207,7 +212,7 @@
 </template>
 
 <script setup lang="ts">
-// 外观主题设置面板(方案 §2):外观模式 → 主题选择 → 浅／深配色卡 → 窗口材质 → 应用／取消／保存。
+// 外观主题设置面板管理模式、浅深配色、窗口材质与草稿操作。
 // 草稿、预览与提交全部由 themeStore 持有;本组件只做展示与命名操作编排,不自持状态副本。
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -239,6 +244,8 @@ import type { AppearanceMode } from '../../types/ui'
 
 const { t } = useI18n()
 const theme = useThemeStore()
+// 收起的定制区不计算额外色板；首次展开后保留控件与草稿交互状态。
+const customizeMounted = ref(false)
 const toast = useToastStore()
 
 const modeOptions: { value: AppearanceMode; icon: typeof Sun; labelKey: string }[] = [

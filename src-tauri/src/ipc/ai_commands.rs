@@ -77,12 +77,8 @@ fn variant_fixed_batch(image_file: &str) -> Option<u32> {
 }
 
 /// 变体文件未就位 → 稳定 code `AiModelNotLoaded` + 可操作的下载指引。供命令与单测共用。
-fn require_variant_installed(
-    models: &std::path::Path,
-    image_file: &str,
-    text_file: &str,
-) -> Result<()> {
-    if variant_installed(models, image_file, text_file) {
+fn require_image_variant_installed(models: &std::path::Path, image_file: &str) -> Result<()> {
+    if crate::ai::runtime_config::image_variant_installed(models, image_file) {
         return Ok(());
     }
     Err(AppError::AiModelNotLoaded(format!(
@@ -95,7 +91,7 @@ fn require_variant_installed(
 /// GPU 分析槽不占用——此前缺失只在 worker 派发线程里退化成一条日志，前端静默无感。
 fn require_active_clip_assets(state: &AppState) -> Result<()> {
     let profile = active_profile(state);
-    require_variant_installed(&models_dir(state), &profile.image_file, &profile.text_file)
+    require_image_variant_installed(&models_dir(state), &profile.image_file)
 }
 
 /// get_status 的「资源等待」原因键（P1-1）：本端未运行、仍有剩余，而共享 GPU 分析会话被对端
@@ -273,7 +269,9 @@ pub async fn semantic_search_cmd(
         }
         // T16 收束:查询向量恒经 ai-worker 的 EncodeText op 生成(host 零 ort/tokenizers)。
         // 首次搜索会触发 SessionInit(模型冷加载,与旧进程内懒加载语义一致)。
-        let spec = crate::ai::worker_client::build_session_spec(&state, prof.clone(), None);
+        let spec = crate::ai::worker_client::build_session_spec(
+            &state, prof.clone(), crate::ai::worker_client::SessionPurpose::Text,
+        );
         let mut vecs = {
             let mut client = state.ai_worker.lock().unwrap_or_else(|p| p.into_inner());
             client.encode_text(&spec, std::slice::from_ref(&query), &|| false)?
@@ -838,17 +836,9 @@ pub async fn set_active_model(
     Ok(())
 }
 
-// ── Model download (Layer B) ────────────────────────────────────────────────────
-// ── 模型下载（Layer B）────────────────────────────────────────────────────────────
-// 共享下载编排(DownloadProgress/download_assets/落盘名白名单)已迁兄弟模块
-// `ipc::model_download`(U-P2-b):它同时服务本文件与 face_commands,不该寄居
-// 单一命令文件。本文件只留 download_model 命令(资产清单构建 = 在线发现)。
+// ── 模型下载 ─────────────────────────────────────────────────────────────
+// 共享下载编排在 `ipc::model_download`，此处负责模型资产清单构建与下载命令。
 
-/// Download all assets for a model into the models dir, with per-file resume (HTTP Range),
-/// size + sha256 verification, mirror fallback, and progress streamed over `on_progress`.
-/// Files are written to a `.part` sidecar then atomically renamed, so an interrupted download
-/// never leaves a truncated model in place. Already-correct files (size + sha256) are skipped,
-/// making this also a "repair" action.
 /// 下载某模型的全部资产到 models 目录：逐文件断点续传（HTTP Range）、大小 + sha256 校验、镜像回退、
 /// 进度经 `on_progress` 流式推送。先写 `.part` 旁路文件再原子改名，使中断不会留下截断的模型；已正确
 /// 文件（大小 + sha256）跳过，故此命令同时是「修复」动作。

@@ -1,15 +1,18 @@
-// crates/scrollery-ai-core/src/profile.rs
-//! AI 模型契约（`ModelProfile`）+ 内置模型注册表。
-//! 把推理路径与具体模型解耦：图像尺寸、嵌入维度、归一化、张量 I/O 名、分词器类型、
-//! 下载资产全部来自 profile 而非写死常量 —— 使「换模型」变成换数据而非改代码。
+//! AI 模型契约与内置注册表：统一预处理、张量 I/O、分词器和下载资产。
 //!
-//! # 不变量（务必保持）
-//! - `id` **同时是 `ai_embeddings.model_name` 主键**：换 id = 换一套向量空间，不同模型
-//!   的向量不可互比，切换后需对缺该模型向量的项重新分析（见 `sync_ai_status_for_model`）。
-//! - 默认 profile（`cn-clip-vit-b16`）必须保持嵌入维度、预处理和归一化契约稳定；
-//!   张量 I/O 名跟随当前 ONNX 导出，并由运行时按实际 session 输入兜底。
+//! id 是 ai_embeddings.model_name 的向量空间键；不同模型的向量不可互比。
+//! 切换模型后需重新分析缺少该模型向量的项，见 sync_ai_status_for_model。
+//! 默认 profile 保持维度、预处理与归一化稳定；张量名按实际 Session 输入兼容旧导出。
 
 use serde::{Deserialize, Serialize};
+
+/// 本次需要装载的 CLIP 编码器；人脸角色由独立的 FaceProfile 声明。
+/// 主进程与推理 worker 共用此契约，不依赖 `inference` feature。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClipRoles {
+    pub image: bool,
+    pub text: bool,
+}
 
 /// 文本编码器所需的分词器后端。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,7 +26,6 @@ pub enum TokenizerKind {
         /// 词表完整性下限：低于此值判定为错误词表（如英文 BPE）→ 立即报错。
         min_vocab: usize,
     },
-    // 第二阶段（异构模型）预留：Bpe { merges_file, vocab_file }、SentencePiece { model_file } …
 }
 
 /// 一个可下载资产（模型权重主文件 / 外部权重 / 词表）。
@@ -39,7 +41,7 @@ pub struct ModelAsset {
     /// 预期字节数（进度/粗校验；0=未知）。
     #[serde(default)]
     pub size_bytes: u64,
-    /// 预期 sha256（小写 hex；None=暂不校验，待清单完善）。
+    /// 预期 SHA-256（小写 hex）；None 表示不做哈希校验。
     #[serde(default)]
     pub sha256: Option<String>,
 }
@@ -82,16 +84,16 @@ pub struct ModelProfile {
     pub commercial_ok: bool,
     /// 体积提示（MB，UI 展示；0=未知）。
     pub size_mb: u32,
-    /// 下载资产；**空 = 仅支持手动导入**（尚无现成 ONNX 托管，待 Layer B 填充已校验直链）。
+    /// 下载资产；空列表表示仅支持手动导入。
     pub assets: Vec<ModelAsset>,
 }
 
-/// 默认（且历史）profile id —— 其嵌入向量须永久有效。
+/// 默认 profile id，保持稳定以兼容已有嵌入向量。
 pub const DEFAULT_PROFILE_ID: &str = "cn-clip-vit-b16";
 
 const VOCAB_FILE: &str = "vocab.txt";
 
-/// CLIP/Chinese-CLIP 标准 ImageNet 归一化（全族共用）。
+/// CLIP/Chinese-CLIP 共用的图像归一化参数。
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
@@ -117,9 +119,8 @@ fn cn_clip_b16_asset(file: &str, size_bytes: u64, sha256: &str) -> ModelAsset {
     }
 }
 
-/// 全族共用的 vocab.txt（OFA-Sys bert-base-chinese，21128 token）。各 onnx 仓库都不含 vocab，
-/// 且绝不可用 eisneim 仓库的英文 BPE 词表（见 clip.rs 坑1/坑8）。体积小、非 LFS → 仅按大小校验，
-/// 运行时再校验 vocab_size ≥ min_vocab 双保险。
+/// 共用的 bert-base-chinese WordPiece 词表，不能替换为英文 BPE。
+/// 下载按大小校验，运行时再检查 vocab_size >= min_vocab。
 pub fn vocab_asset() -> ModelAsset {
     ModelAsset {
         url: "https://huggingface.co/OFA-Sys/chinese-clip-vit-base-patch16/resolve/main/vocab.txt"
@@ -276,9 +277,8 @@ pub fn default_profile() -> ModelProfile {
 
 /// 静态 fp16 B/16 的已校验下载清单（托管在 eisneim，非新仓库）。
 ///
-/// 已校验（2026-06-16 核对 HF 仓库实际文件/大小/LFS sha256）：FP16 **外部数据格式**——小 `.onnx`
-/// 头 + 同名 `.extra_file` 权重，须同目录共存；vocab.txt 取自 OFA-Sys（绝不可用 eisneim 的英文词表，
-/// 见 clip.rs 坑1/坑8）。
+/// FP16 外部数据的 .onnx 头与同名 .extra_file 权重须同目录共存。
+/// vocab.txt 使用 OFA-Sys 的中文 WordPiece 词表，不能替换为 eisneim 的英文词表。
 pub fn static_fp16_b16_assets() -> Vec<ModelAsset> {
     vec![
         cn_clip_b16_asset(

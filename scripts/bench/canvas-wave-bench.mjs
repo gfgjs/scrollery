@@ -1,5 +1,4 @@
-// Canvas 画廊「换图波」基准驱动器(2026-07-17 防闪烁线沉淀;源自该线阶段 6 的根因定位与 A/B 工具;
-// 2026-08-16 缩略图性能线阶段 0 扩展:五场景 + 指标时序化 + 进程内存采样 + --out 落盘)。
+// Canvas 画廊「换图波」基准驱动器：多场景录制、指标时序和进程内存采样。
 // headless Chrome + 裸 CDP(node ≥22 内置 WebSocket,零依赖):
 //   1. 打开 ?ui-harness=gallery 场景(canvas 渲染模式经 localStorage 预置,行高/条目数/引擎经 URL 参数);
 //   2. 启动落定后开网络仿真(禁缓存 + 每请求 latency)模拟逐图 IO 延迟;
@@ -15,19 +14,19 @@
 //        [--scenario=cold|warm|ungenned|offline|missing|selectanim] [--availRatio=0.8]
 //        [--out=<path.json>] [--pid=<n>]
 //   --v 单位 px/ms;--profile=burst 模拟滚轮连拨(450ms 周期:150ms 峰 v×2 + 300ms 谷 v×0.45)。
-//   --scenario(审查报告 §6 五场景,默认 cold):
+//   --scenario(默认 cold):
 //     cold       已生成·LRU 冷的首次进入(默认;fresh profile + 禁网络缓存);
 //     warm       LRU 全热连续滚动——同剖面先滚一遍预热(不入样本),回顶落定后再录;
 //     ungenned   未生成冷库首览(&thumbStatus=0,fixture 模拟批量生成逐项回填);
 //     offline    offline 高占比(&avail=offline,比例 --availRatio 默认 0.8);
 //     missing    missing 高占比(&avail=missing,同上);
 //     selectanim 大范围选中动画期间滚动(Ctrl+点格进选择态 → Ctrl+A 全选 → 滚动)。
-//   --pid 采样指定进程的工作集(阶段 1 真机配合用;缺省采样本脚本拉起的 headless Chrome)。
+//   --pid 采样指定进程的工作集；缺省采样本脚本拉起的 headless Chrome。
 //
-// 评估边界(诚实标注,详见 worklogs/2026-07-17-Canvas快速拖动防闪烁优化/findings.md 阶段 6):
+// 评估边界:
 //   dev server 每主机 6 连接 ≈150 req/s 吞吐钳制——恒速 ≥12px/ms 真飞掠域与 60px 极密域的
 //   结论不可用(真机 asset 协议无此限);对比实验须同脚本同参数跑 A/B,不跨域外推。
-//   headless Chrome 非 WebView2:绝对值仅作分层定位与 A/B 相对比较,真机终裁在阶段 1。
+//   headless Chrome 非 WebView2:绝对值仅作分层定位与 A/B 相对比较。
 import { execFile, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -177,7 +176,7 @@ async function main() {
     setTimeout(() => reject(new Error('等 DevTools ws 超时')), 15000)
   })
 
-  // 进程内存采样:--pid 指定则采外部进程(阶段 1 真机),否则采本 headless Chrome 子进程。
+  // --pid 指定则采外部进程，否则采本 headless Chrome 子进程。
   const memSampler = startProcMemSampler(Number(externalPid ?? child.pid))
   const startedAtEpoch = Date.now()
 

@@ -1,11 +1,10 @@
-// src-tauri/examples/edit_memory_probe.rs
-//! 图片编辑内存基准探针(方案 C §5 P0 内存门槛用,2026-07-19 施工对拍,不进产品包)。
+//! 图片编辑内存基准探针。
 //!
 //! 单次进程只测一个 (format, width, height, mode) 组合——Windows `PeakWorkingSetSize`
 //! 是进程生命周期内单调不减的历史峰值,同进程连测多组会让小尺寸读到大尺寸的残留峰值,
-//! 因此调用方需要每组各起一个新进程(见 findings.md 的调用脚本)。
+//! 因此每组需各起一个新进程。
 //!
-//! **进程内合成源的伪影(F-003 第二层)**:即便每组独立进程,setup 阶段在测量进程内合成
+//! **进程内合成源的伪影**：即便每组独立进程，setup 阶段在测量进程内合成
 //! 源图(RgbImage ≈3 B/px + encoder 缓冲)也会把同量级页面提前计入 peak_before,measure
 //! 阶段 allocator 复用这些已提交页,delta 被系统性压低约一个像素缓冲。诚实测法是两段进程:
 //! 先 `--emit-source` 生成源文件,另起进程用 `--source-path` 测量(setup 只读文件字节)。
@@ -20,8 +19,8 @@
 //! mode=decode:只解码(不 apply_orientation,合成源没有真实 EXIF 方向)。
 //! mode=full:decode → rotate90 → fliph → flipv → crop(居中裁一半)→ encode(JPEG q92),
 //!   对应方案 §5「operation 组合最坏峰值」。
-//! mode=full_v2(2026-07-20,阶段 7 D-008 复跑,v2 设计 §3 测法升级):直接调用
-//!   `scrollery_lib::editing::{geometry,adjust}` 生产函数(非重实现)回放 D-107 全链最坏组合——
+//! mode=full_v2：直接调用
+//!   `scrollery_lib::editing::{geometry,adjust}` 生产函数回放全链组合——
 //!   decode → apply_geometry(90° 合并旋转 + 双向 flip + 45° fine rotate 展开+内接裁,
 //!   crop:None 保留展开后最大像素量)→ adjust(三滑杆非零,ICC 传入 srgb_profile_bytes()
 //!   强制走 moxcms 分条 CMS 有标签路径而非 untagged 快路径)→ encode(JPEG q92)。
@@ -65,7 +64,7 @@ fn main() {
         return;
     }
 
-    // Phase 0:取得源字节。--source-path 只读文件(诚实模式,setup 峰值仅压缩字节量级);
+    // 取得源字节。--source-path 只读文件，setup 峰值仅压缩字节量级；
     // 否则进程内合成(遗留模式,delta 被 setup 预提交页面压低,见模块文档)。
     let setup_start = Instant::now();
     let source_bytes = match arg_value(&args, "--source-path") {

@@ -1,7 +1,6 @@
 // src/composables/useContentViewerKeyboard.ts
-// 从 ContentViewer.vue 下沉(超长文件拆分方案 2.1):键盘快捷键。自带 mounted/unmounted 生命周期
+// 查看器键盘快捷键。自带 mounted/unmounted 生命周期
 // (模式同既有 useTauriListen),组件侧不再手写 onMounted/onBeforeUnmount 里的 keydown 两行。
-// 纯逻辑搬迁,不改变原调用点/参数/时序——见 docs/planning/2026-07-25-超长文件拆分方案/analysis/ContentViewer-vue.md。
 
 import { onMounted, onBeforeUnmount, type Ref } from 'vue'
 import { requestDiscardEdits, type useImageEditor } from './useImageEditor'
@@ -37,7 +36,7 @@ export function useContentViewerKeyboard(options: {
     )
       return
     if (!media.detailItem) return
-    // 编辑中(方案 §7):禁翻页/其余快捷键,仅接管 Esc(有改动二次确认)与裁剪框键盘微调。
+    // 编辑中禁翻页及其余快捷键，仅接管 Esc（有改动时二次确认）与裁剪框键盘微调。
     if (editor.status.value !== 'idle') {
       if (editor.status.value === 'saving') return // 保存中不响应任何按键(含 Esc)
       if (e.key === 'Escape') {
@@ -72,8 +71,8 @@ export function useContentViewerKeyboard(options: {
       else close()
       return
     }
-    // 键位同源(P5-6):缩放/翻页/信息/旋转等交注册表按 command.keybinding 分发——与 tooltip 同一
-    // 来源,杜绝「显示≠行为」漂移;命中即消费。原散点 if (e.key === '+'/'i'/'ArrowLeft'…) 收敛于此。
+    // 缩放/翻页/信息/旋转等交注册表按 command.keybinding 分发，与 tooltip 同一
+    // 来源，避免显示键位与实际行为不一致；命中即消费。
     if (dispatchKeybinding(e, buildCommandContext())) e.preventDefault()
   }
 

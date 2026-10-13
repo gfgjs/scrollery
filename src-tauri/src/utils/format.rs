@@ -1,16 +1,14 @@
 // src-tauri/src/utils/format.rs
 //! 媒体格式分类。
 //!
-//! **单一事实源（S 线 D-007）**：[`BUILTIN_FORMATS`] 是内置已注册格式的唯一定义表，
-//! [`classify_media_type`]、[`is_phase1_image`]、[`doc_subtype`] 全部由它派生 —— 此前它们是三个
-//! 平行 `match`，各自重列扩展名，新增格式漏改一处即静默漂移（如新增文档格式却忘了给
-//! `doc_subtype` 加 arm → 落库 `"other"`）。
+//! [`BUILTIN_FORMATS`] 是内置已注册格式的定义表；[`classify_media_type`]、
+//! [`is_phase1_image`]、[`doc_subtype`] 均由此派生，避免格式分类口径漂移。
 //!
 //! 新增**内置**格式只改本表；**冷门格式**走 exotic Catalog（`exotic::catalog`，装载期已拒绝与
 //! 内置表撞名，见 `CatalogError::CommonFormatConflict`）。扫描期的 common-first 并集见
 //! `scanner::walker::classify_scanned_file`。
 //!
-//! 表内 `group` 只是 **UI 显示分组**（一个 UI 概念对应多个物理扩展名，S 线 §7.3）：DB、IPC 与 URL
+//! 表内 `group` 只是 UI 显示分组（一个分组对应多个物理扩展名）：DB、IPC 与 URL
 //! 状态**始终存具体扩展名**，group 不落库。
 
 use serde::{Deserialize, Serialize};

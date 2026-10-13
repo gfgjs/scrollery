@@ -1,12 +1,13 @@
 <script setup lang="ts">
 // ViewerColorMenu — 大图查看器底栏「渲染色域」切换菜单(D-414 GUI 入口)。
-// 三固定目标(sRGB/Display P3/DCI-P3)+ 已导入的自定义 ICC 列表,选中即写 configStore,
+// 三固定目标(sRGB/Display P3/DCI-P3)+ 已导入的自定义 ICC 列表,选中即经中央设置服务保存,
 // 换源逻辑已由 useViewerColorSource 的 watch 自理,本组件只管选择态与 UI。
 import { onBeforeUnmount, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import UiIconButton from '../ui/UiIconButton.vue'
 import UiPopover from '../ui/UiPopover.vue'
 import { useConfigStore } from '../../stores/configStore'
+import { useIccProfileManager } from '../../composables/useIccProfileManager'
 import { invokeIpc } from '../../utils/ipc'
 import { IPC } from '../../constants/ipc'
 import { logger } from '../../utils/logger'
@@ -20,6 +21,7 @@ interface IccProfileInfo {
 
 const { t } = useI18n()
 const config = useConfigStore()
+const { selectIccProfile } = useIccProfileManager()
 
 const open = ref(false)
 const btnRef = ref<InstanceType<typeof UiIconButton>>()
@@ -59,11 +61,9 @@ async function selectFixed(val: 'srgb' | 'display-p3' | 'dci-p3'): Promise<void>
   open.value = false
 }
 
-// 次序契约(configStore.ts:232 同源):自定义 ICC 须先落 customId 再切 target='custom',
-// 反序会让 GET_VIEWER_COLOR_URL 以旧 customId 渲染一帧错色。
+// 与设置页共用一次提交 ID 和色域的入口，避免旧选择续体覆盖后续色域操作。
 async function selectCustom(id: string): Promise<void> {
-  await config.setViewerColorCustomId(id)
-  await config.setViewerColorTarget('custom')
+  await selectIccProfile(id)
   open.value = false
 }
 </script>

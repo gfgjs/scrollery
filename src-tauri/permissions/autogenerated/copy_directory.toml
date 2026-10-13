@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-copy-directory"
+description = "Enables the copy_directory command without any pre-configured scope."
+commands.allow = ["copy_directory"]
+
+[[permission]]
+identifier = "deny-copy-directory"
+description = "Denies the copy_directory command without any pre-configured scope."
+commands.deny = ["copy_directory"]

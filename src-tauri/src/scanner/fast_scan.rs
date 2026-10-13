@@ -1,12 +1,7 @@
 // src-tauri/src/scanner/fast_scan.rs
-//! 阶段 1 快速扫描：轻量级单文件操作，立即插入数据库。
+//! 快速扫描：流式遍历文件，分批提取尺寸并写入数据库。
 //!
-//! 单文件工作（全部为 CPU 密集型，由 rayon 处理）：
-//!   1. `image::image_dimensions()` → 从文件头获取宽度/高度（无解码）
-//!   2. JPEG：读取方向标签（前 ~1KB）→ 如果需要则交换宽高
-//!   3. TIFF：应用 50ms 超时保护
-//!   4. `compute_cache_key`
-//!   5. 批量 INSERT 到 `media_items`（500 行/事务）
+//! 图像尺寸和方向从文件头读取；每批最多 `BATCH_SIZE` 项，避免持有全量扫描结果。
 //!
 //! 完成后，通过 Tauri 频道发送 `ScanCompletedPayload`。
 
@@ -28,17 +23,19 @@ use crate::db::queries::{
     cleanup_scan_temp_tables_for_run, finish_scan_root, get_config, init_seen_table_for_run,
     invalidate_exotic_tasks_for_item, load_directory_mtime_snapshot,
     mark_missing_preloaded_for_run, resolve_suspect_change, seed_exotic_tasks_for_item, set_config,
-    set_directory_media_counts, update_scan_root_status, upsert_directory, upsert_fast_scan_item,
-    FastScanItem, SeenWriter, UpsertOutcome,
+    set_directory_media_counts, update_scan_root_status, upsert_directory, FastScanItem,
+    SeenWriter, UpsertOutcome,
 };
 use crate::error::{AppError, Result};
 use crate::exotic::catalog::CatalogSnapshot;
 use crate::scanner::metadata::{
     read_header_buf_for_ext, read_image_dimensions, read_image_dimensions_buf,
 };
+use crate::scanner::reconcile::{self, MoveCandidate};
 use crate::scanner::volume_probe::{PathProber, VolumeOnlineCheck};
 use crate::scanner::walker::{MediaWalker, WalkedFile};
 use crate::state::AppState;
+use crate::utils::file_identity::read_physical_key;
 use crate::utils::format::{classify_media_type, is_phase1_image, MediaType};
 use crate::utils::hash::compute_cache_key_with_mtime_ns;
 use crate::utils::path::{dir_rel_path, normalize_db_path, path_depth};
@@ -65,28 +62,34 @@ struct FileInfo {
     walked: WalkedFile,
     width: i64,
     height: i64,
+    physical_key: Option<Vec<u8>>,
+    moved: Option<MoveCandidate>,
 }
 
-/// 阶段 2 媒体（音频/文档/视频）的廉价、无需读文件的占位尺寸。
-/// 阶段 1 图像返回 `None`（需要真实读取文件头）。
+type DirectoryIdentity = (Option<Vec<u8>>, Option<MoveCandidate>);
+
+/// 音频/文档/视频使用无需读文件的占位尺寸；图像返回 `None`，须读取文件头。
 ///
-/// 按类型给「默认宽高」，避免非图片项以 0×0 进入 Justified Layout 导致布局错乱（§2.1）。
+/// 按类型给默认宽高，避免非图片项以 0×0 进入 Justified Layout 导致布局错乱。
 /// `query_layout_geometry` 对所有类型读取 width/height，0×0 会让布局把整屏算崩。
 /// 真实宽高随后在补全/派生阶段回填（视频走 MF probe + rotation 修正、音频走 lofty、
 /// 文档走子类型探测），这里只保证「先有一个合理的占位比例」。
-fn cheap_phase2_dimensions(walked: &WalkedFile) -> Option<(i64, i64)> {
-    if is_phase1_image(walked.extension.as_str()) {
+pub(super) fn cheap_phase2_dimensions(
+    media_type: MediaType,
+    extension: &str,
+) -> Option<(i64, i64)> {
+    if is_phase1_image(extension) {
         return None;
     }
     // 穷举所有变体（不用 `_`）：将来新增类型时编译器会强制处理默认尺寸。
-    Some(match walked.media_type {
+    Some(match media_type {
         // 视频默认 16:9，补全后回填真实值（含 rotation 交换，竖拍视频否则会躺倒）。
         MediaType::Video => (1280, 720),
         // 音频用方形封面位。
         MediaType::Audio => (400, 400),
         // 文档：PDF 用 A4 比例（595×842），其它（svg/txt/md/office…）用方形占位。
         MediaType::Document => {
-            if walked.extension == "pdf" {
+            if extension == "pdf" {
                 (595, 842)
             } else {
                 (400, 400)
@@ -97,13 +100,13 @@ fn cheap_phase2_dimensions(walked: &WalkedFile) -> Option<(i64, i64)> {
     })
 }
 
-/// 单文件的真实尺寸（阶段 2 → 廉价常量；阶段 1 图像 → 经方向校正的文件头读取）。
+/// 单文件尺寸：非图像用占位值，图像从文件头读取并校正方向。
 ///
-/// 阶段5:eager 路径对非 TIFF 图像先读一次 HeaderBuf,尺寸 + JPEG orientation 共用,
+/// eager 路径对非 TIFF 图像先读一次 HeaderBuf，尺寸与 JPEG orientation 共用，
 /// 消除旧路径「尺寸 open 一次 + orientation 再 open 一次」;TIFF 保持原路径(IFD 任意
 /// 偏移 + 超时守卫)。头读失败回退旧路径,正确性不变。
 fn extract_dimensions(walked: &WalkedFile) -> (i64, i64) {
-    if let Some(dims) = cheap_phase2_dimensions(walked) {
+    if let Some(dims) = cheap_phase2_dimensions(walked.media_type, &walked.extension) {
         return dims;
     }
     let ext = walked.extension.as_str();
@@ -190,6 +193,7 @@ fn ensure_dir_chain(
     dir_cache: &mut std::collections::HashMap<String, i64>,
     root_name: &str,
     dir_mtime_cache: &std::collections::HashMap<String, Option<i64>>,
+    identities: &std::collections::HashMap<String, DirectoryIdentity>,
 ) -> Result<i64> {
     if let Some(&id) = dir_cache.get(rel_path) {
         return Ok(id);
@@ -209,6 +213,7 @@ fn ensure_dir_chain(
             dir_cache,
             root_name,
             dir_mtime_cache,
+            identities,
         )?)
     };
 
@@ -229,6 +234,15 @@ fn ensure_dir_chain(
     // （同大小 EXIF/评分写回）与**孙级**变化——故仅供 opt-in「快速扫描」剪枝、默认全量扫描不据此跳。
     let dir_mtime = dir_mtime_cache.get(rel_path).copied().flatten();
 
+    if let Some((key, moved)) = identities.get(rel_path) {
+        reconcile::upsert_observed_directory(
+            tx,
+            root_id,
+            rel_path,
+            key.as_deref(),
+            moved.as_ref(),
+        )?;
+    }
     let id = upsert_directory(
         tx, root_id, parent_id, rel_path, &dir_name, depth, dir_mtime,
     )?;
@@ -242,7 +256,7 @@ fn read_dir_mtime(dir_abs: &Path) -> Option<i64> {
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
 }
 
 /// 为一个文件所在目录及其祖先预取 mtime；所有文件系统读取发生在 DB 写锁之外。
@@ -271,8 +285,7 @@ fn prefetch_dir_mtimes(
     }
 }
 
-/// 目录级剪枝判定(阶段3 walker 前置版):入参改为**目录绝对路径**,供 walker 在
-/// per-file `metadata()` 之前询问。判定语义与旧 `decide_dir_pruned` 完全一致。
+/// 目录级剪枝判定，供 walker 在逐文件 `metadata()` 前询问。
 fn decide_dir_pruned_at(
     conn: &Connection,
     root_id: i64,
@@ -294,6 +307,11 @@ fn decide_dir_pruned_at(
         Some(id) => id,
         None => return Ok(false), // 快照命中但活行已消失（理论不应发生），保守不剪枝
     };
+    // 新升级的库先为存活文件建立物理身份，不能把未建基线目录直接剪掉。
+    let lacks_identity: bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM media_items WHERE directory_id=?1 AND is_deleted=0 AND physical_key IS NULL)",[dir_id],|r|r.get(0))?;
+    if lacks_identity {
+        return Ok(false);
+    }
 
     // 当前目录 FS mtime 已由调用方在 writer mutex 外读取；读不到 → 保守处理。
     if current_mtime != Some(old_mtime) {
@@ -846,6 +864,8 @@ fn run_fast_scan_inner(
     // 目录 mtime 预取缓存；所有 metadata 读取均在 writer mutex 外完成。
     let mut dir_mtime_cache: std::collections::HashMap<String, Option<i64>> =
         std::collections::HashMap::new();
+    let mut directory_identities: std::collections::HashMap<String, DirectoryIdentity> =
+        std::collections::HashMap::new();
     // T17a：每目录「直接媒体计数」累积器（dir_id → 本次扫描在该目录直接命中的媒体文件数）。
     // 跨批累积，收尾时随根状态/基线标记同事务写回 directories.media_count 作增量剪枝基线
     // （详见 set_directory_media_counts）。
@@ -901,9 +921,11 @@ fn run_fast_scan_inner(
                 let (width, height) = if i < eager {
                     eager_dims[i]
                 } else {
-                    cheap_phase2_dimensions(&walked).unwrap_or((0, 0))
+                    cheap_phase2_dimensions(walked.media_type, &walked.extension).unwrap_or((0, 0))
                 };
                 FileInfo {
+                    physical_key: read_physical_key(root, &walked.abs_path).ok().flatten(),
+                    moved: None,
                     walked,
                     width,
                     height,
@@ -915,10 +937,37 @@ fn run_fast_scan_inner(
         // 可疑变更(mtime 变 size 同,§3.3.2)攒批:指纹计算是文件 IO,绝不进写事务——
         // 本批提交、写锁释放后,在事务外算指纹、逐项短写定案。
         let mut suspects: Vec<(i64, FastScanItem, std::path::PathBuf)> = Vec::new();
-        for fi in &file_infos {
+        let mut file_infos = file_infos;
+        for fi in &mut file_infos {
             let rel_path = dir_rel_path(root, &fi.walked.abs_path);
             let rel_path_norm = normalize_db_path(&rel_path);
             prefetch_dir_mtimes(root, &rel_path_norm, &mut dir_mtime_cache);
+            let candidate = {
+                let conn = writer.lock().unwrap_or_else(|e| e.into_inner());
+                reconcile::candidate(&conn, root_id, fi.physical_key.as_deref(), false)?
+            };
+            fi.moved = reconcile::absent_candidate(root, candidate);
+            let mut rel = rel_path_norm;
+            loop {
+                if !directory_identities.contains_key(&rel) {
+                    let key = read_physical_key(root, &root.join(&rel)).ok().flatten();
+                    let candidate = {
+                        let conn = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        reconcile::candidate(&conn, root_id, key.as_deref(), true)?
+                    };
+                    directory_identities.insert(
+                        rel.clone(),
+                        (key, reconcile::absent_candidate(root, candidate)),
+                    );
+                }
+                if rel.is_empty() {
+                    break;
+                }
+                rel = Path::new(&rel)
+                    .parent()
+                    .map(|p| normalize_db_path(&p.to_string_lossy()))
+                    .unwrap_or_default();
+            }
         }
         // 生产路径把 generation 检查和本批事务放进同一根级闸门；新轮安装后旧轮
         // 只能在闸门外被拒绝，不能再把本批快照写回活行。
@@ -942,6 +991,7 @@ fn run_fast_scan_inner(
                     &mut dir_cache,
                     root_name,
                     &dir_mtime_cache,
+                    &directory_identities,
                 )?;
                 // T17a：每发现一个该目录的直接媒体文件 +1（口径＝walker 已分类媒体，与 T17b 剪枝时
                 // 现算 read_dir 分类计数一致）。Inserted/Unchanged/SourceChanged 一律计入——它们都是
@@ -949,6 +999,7 @@ fn run_fast_scan_inner(
                 *dir_media_counts.entry(dir_id).or_insert(0) += 1;
 
                 let cache_key = compute_cache_key_with_mtime_ns(
+                    dir_id,
                     &rel_path_norm,
                     &fi.walked.file_name,
                     fi.walked.file_mtime,
@@ -971,7 +1022,13 @@ fn run_fast_scan_inner(
                 };
 
                 // 传本根卷 id：新项据此入库、历史 NULL 项顺带治愈 → 新数据可参与缺失检测守门1。
-                let outcome = upsert_fast_scan_item(&tx, &fast_item, volume_id)?;
+                let outcome = reconcile::upsert_observed_item(
+                    &tx,
+                    &fast_item,
+                    volume_id,
+                    fi.physical_key.as_deref(),
+                    fi.moved.as_ref(),
+                )?;
                 // 🔴 必须在下方 exotic `continue` 之前收 seen：Unchanged 也要进 seen，
                 // 否则未变更文件会被 mark_missing 误判为「本次未出现」而误删（Part2 §3.4/T5）。
                 // 插入失败会让本批事务失败、扫描终止——绝不静默丢 seen(那是误标 missing 的方向)。
@@ -1035,7 +1092,7 @@ fn run_fast_scan_inner(
         timings.suspects += suspects.len();
         for (sid, s_item, abs_path) in suspects {
             let fp = match crate::utils::hash::content_fingerprint(&abs_path, s_item.file_size) {
-                Ok(h) => Some(h),
+                Ok(h) => h,
                 Err(e) => {
                     // 读失败(竞态删除/权限):无法证明内容未变 → 交 resolve 保守失效。
                     warn!(
@@ -1045,36 +1102,30 @@ fn run_fast_scan_inner(
                     None
                 }
             };
-            let outcome =
-                match with_scan_db_write(writer, write_state, root_id, generation, |conn| {
-                    resolve_suspect_change(conn, sid, &s_item, volume_id, fp.as_deref())
-                })? {
-                    Some(outcome) => outcome,
-                    None => return Err(AppError::Cancelled),
-                };
-            timings.suspect_commits += 1;
-            if matches!(outcome, UpsertOutcome::SourceChanged(_)) {
-                // 与主循环 SourceChanged 分支同款 exotic 处理(失效旧任务 + 补种能力)。
-                // 同样跳过 builtin offering(见上方主循环注释)。
-                // 同上方主循环判据(合成标记 vs 真实扩展名叠加 builtin)。
-                if let Some(off) = catalog
-                    .resolve_format(&s_item.file_format)
-                    .filter(|o| seed_gate_admits(o, &s_item.file_format))
-                {
-                    match with_scan_db_write(writer, write_state, root_id, generation, |conn| {
-                        invalidate_exotic_tasks_for_item(conn, sid)?;
-                        let caps: Vec<String> = off
-                            .capabilities
-                            .iter()
-                            .map(|c| c.as_str().to_string())
-                            .collect();
-                        seed_exotic_tasks_for_item(conn, sid, &off.plugin_id, &caps)
-                    })? {
-                        Some(result) => result,
-                        None => return Err(AppError::Cancelled),
-                    }
+            let committed = with_scan_db_write(writer, write_state, root_id, generation, |conn| {
+                // 源基线与所有派生必须一起提交；否则末尾失败后，新 mtime 会让重扫走
+                // Unchanged，旧派生再也不会失效。指纹 I/O 已在事务外完成。
+                let tx = conn.unchecked_transaction()?;
+                let outcome = resolve_suspect_change(&tx, sid, &s_item, volume_id, fp.as_deref())?;
+                if let Some(off) = catalog.resolve_format(&s_item.file_format).filter(|o| {
+                    matches!(outcome, UpsertOutcome::SourceChanged(_))
+                        && seed_gate_admits(o, &s_item.file_format)
+                }) {
+                    // 与批量 SourceChanged 分支使用同一播种规则，并纳入本次失效事务。
+                    invalidate_exotic_tasks_for_item(&tx, sid)?;
+                    let caps: Vec<String> = off
+                        .capabilities
+                        .iter()
+                        .map(|c| c.as_str().to_string())
+                        .collect();
+                    seed_exotic_tasks_for_item(&tx, sid, &off.plugin_id, &caps)?;
                 }
+                Ok(tx.commit()?)
+            })?;
+            if committed.is_none() {
+                return Err(AppError::Cancelled);
             }
+            timings.suspect_commits += 1;
         }
         let batch_suspect_us = suspect_started.elapsed().as_micros();
         timings.suspect_us += batch_suspect_us;
@@ -1154,6 +1205,21 @@ fn run_fast_scan_inner(
     // TOCTOU 复查必须在 writer 锁外完成；结果随后由同一 generation 写闸门保护，
     // 不能让文件系统探测占住 SQLite writer mutex。
     let volume_online = prober.is_online(root);
+    let missing_dirs = if walk_complete && volume_online {
+        // 查询与文件系统检查分段进行；目录检查不得占据 writer 锁。
+        let dirs = {
+            let conn = writer.lock().unwrap_or_else(|e| e.into_inner());
+            let mut stmt = conn
+                .prepare("SELECT id,rel_path FROM directories WHERE root_id=?1 AND is_missing=0")?;
+            let rows = stmt.query_map([root_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        dirs.into_iter().filter_map(|(id,rel)|matches!(std::fs::symlink_metadata(root.join(rel)),Err(e) if e.kind()==std::io::ErrorKind::NotFound).then_some(id)).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let finalize_started = std::time::Instant::now();
     let marked_missing: u64 =
         match with_scan_db_write(writer, write_state, root_id, generation, |conn| {
@@ -1168,6 +1234,9 @@ fn run_fast_scan_inner(
                 &dir_media_counts,
                 inserted as i64,
             )?;
+            for id in &missing_dirs {
+                conn.execute("UPDATE directories SET is_missing=1 WHERE id=?1", [id])?;
+            }
             Ok(marked as u64)
         })? {
             Some(result) => result,

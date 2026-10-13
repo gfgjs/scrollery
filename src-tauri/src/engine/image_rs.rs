@@ -1,5 +1,4 @@
-// src-tauri/src/engine/image_rs.rs
-//! `ImageRsEngine`：使用 `image` crate 解码阶段 1 的格式。
+//! `ImageRsEngine`：使用 `image` crate 解码常见静态图格式。
 //! 支持的格式：jpg, jpeg, png, webp, bmp, gif, tif, tiff
 
 use image::{ImageDecoder, ImageReader};
@@ -7,208 +6,35 @@ use std::fs::File;
 use std::io::{BufReader, Seek};
 use std::path::Path;
 
+use crate::engine::orientation::read_jpeg_orientation_file;
 use crate::engine::traits::{DecodedImage, ImageEngine, ResizeHint};
 use crate::error::AppError;
-use crate::scanner::metadata::read_jpeg_orientation_file;
 
 pub struct ImageRsEngine;
 
-/// 在物化内嵌图片前按真实头信息限制源格式和 RGBA 字节，供共享工作集内的封面派生使用。
-pub(crate) fn decode_image_bytes_bounded(
-    bytes: &[u8],
-    max_pixel_bytes: u64,
-) -> Result<image::DynamicImage, AppError> {
-    let reader = ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(AppError::Io)?;
-    decode_image_reader_bounded(reader, max_pixel_bytes)
+/// 从实际 decoder 取得的尺寸和位深；不包含像素分配，也不信任数据库尺寸。
+// Windows 的预算预估由独立 worker 使用；宿主复用本文件的其他解码入口。
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) struct ImageWorkingSet {
+    pub width: u32,
+    pub height: u32,
+    source_bytes: u64,
+    bytes_per_pixel: u64,
 }
 
-/// 已明确编码格式的产物也复用同一分配前额度检查。
-pub(crate) fn decode_image_reader_bounded<R: std::io::BufRead + Seek>(
-    reader: ImageReader<R>,
-    max_pixel_bytes: u64,
-) -> Result<image::DynamicImage, AppError> {
-    let mut decoder = reader.into_decoder().map_err(AppError::Engine)?;
-    let (width, height) = decoder.dimensions();
-    let rgba_bytes = u64::from(width)
-        .saturating_mul(u64::from(height))
-        .saturating_mul(4);
-    if rgba_bytes > max_pixel_bytes {
-        return Err(AppError::Internal(
-            "embedded RGBA exceeds pixel limit".into(),
-        ));
-    }
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(max_pixel_bytes);
-    limits
-        .reserve(decoder.total_bytes())
-        .map_err(AppError::Engine)?;
-    decoder.set_limits(limits).map_err(AppError::Engine)?;
-    image::DynamicImage::from_decoder(decoder).map_err(AppError::Engine)
-}
-
-impl ImageRsEngine {
-    /// 从已打开 JPEG 提取嵌入图，供受控句柄的子进程快速路径复用。
-    pub fn extract_embedded_thumb_file(file: &mut File) -> Result<Option<Vec<u8>>, AppError> {
-        file.rewind().map_err(AppError::Io)?;
-        let mut reader = std::io::BufReader::new(file);
-        let exif = exif::Reader::new().read_from_container(&mut reader).ok();
-        let Some(exif) = exif else { return Ok(None) };
-        if let Some(field) = exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL) {
-            if let exif::Value::Long(ref offsets) = field.value {
-                if let Some(&offset) = offsets.first() {
-                    if let Some(len_field) =
-                        exif.get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)
-                    {
-                        if let exif::Value::Long(ref lengths) = len_field.value {
-                            if let Some(&length) = lengths.first() {
-                                if length > 0 && length < 1_000_000 {
-                                    // EXIF 偏移以 TIFF 头为基准；必须在解析后的 TIFF 缓冲切片。
-                                    let tiff = exif.buf();
-                                    let start = offset as usize;
-                                    if let Some(end) = start.checked_add(length as usize) {
-                                        if end <= tiff.len() {
-                                            let thumb = &tiff[start..end];
-                                            if thumb.starts_with(&[0xFF, 0xD8]) {
-                                                return Ok(Some(thumb.to_vec()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// 从已经打开且由调用方授权的文件句柄解码；不会按路径重新打开源。
-    pub fn decode_open_file(
-        file: File,
-        format: &str,
-        resize: Option<ResizeHint>,
-    ) -> Result<DecodedImage, AppError> {
-        Self::decode_open_file_bounded(file, format, resize, 512 * 1024 * 1024)
-    }
-
-    /// 在解码像素前检查调用方提供的字节上限；保留 image crate 的内部解码限制。
-    pub fn decode_open_file_bounded(
-        file: File,
-        format: &str,
-        resize: Option<ResizeHint>,
-        max_decoded_bytes: u64,
-    ) -> Result<DecodedImage, AppError> {
-        Self::decode_open_file_bounded_with_source_done(
-            file,
-            format,
-            resize,
-            max_decoded_bytes,
-            || {},
-        )
-    }
-
-    /// 从受控句柄有界解码；源解码器释放后、缩放前通知调用方归还源盘许可。
-    /// 解码失败时不调用回调，由调用方的失败出口归还资源。
-    pub fn decode_open_file_bounded_with_source_done(
-        mut file: File,
-        format: &str,
-        resize: Option<ResizeHint>,
-        max_decoded_bytes: u64,
-        on_source_done: impl FnOnce(),
-    ) -> Result<DecodedImage, AppError> {
-        let orientation =
-            if format.eq_ignore_ascii_case("jpg") || format.eq_ignore_ascii_case("jpeg") {
-                read_jpeg_orientation_file(&mut file)
-            } else {
-                1
-            };
-        file.rewind().map_err(AppError::Io)?;
-        // 便捷路径 `ImageReader::decode()` 会丢弃 ICC(`DynamicImage` 不携带该信息)。
-        // 改走 `into_decoder()` 先取 `icc_profile()` 再 `DynamicImage::from_decoder()`,
-        // 与 `editing/metadata.rs::read_source_metadata` 同款先例,行为对齐。
-        let reader = ImageReader::new(BufReader::new(file))
-            .with_guessed_format()
-            .map_err(AppError::Io)?;
-        let mut decoder = reader.into_decoder().map_err(AppError::Engine)?;
-        // 恢复 ImageReader::decode 内建的 max_alloc 守卫,超大图落稳定错误而非裸分配 abort
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(max_decoded_bytes);
-        limits
-            .reserve(image::ImageDecoder::total_bytes(&decoder))
-            .map_err(AppError::Engine)?;
-        decoder.set_limits(limits).map_err(AppError::Engine)?;
-        let icc = image::ImageDecoder::icc_profile(&mut decoder)
-            .ok()
-            .flatten();
-        let img = image::DynamicImage::from_decoder(decoder).map_err(AppError::Engine)?;
-        // 解码器已消耗并关闭源句柄；内存中的缩放和转向不应继续串行化同盘读取。
-        on_source_done();
-
-        // 如果有缩放请求则进行缩放
-        let img = if let Some(hint) = resize {
-            let (w, h) = (img.width(), img.height());
-            match hint {
-                ResizeHint::LongEdge(target) => {
-                    if w > target || h > target {
-                        let (nw, nh) = if w >= h {
-                            (target, (h as f32 * target as f32 / w as f32).round() as u32)
-                        } else {
-                            ((w as f32 * target as f32 / h as f32).round() as u32, target)
-                        };
-                        img.resize_exact(
-                            nw.max(1),
-                            nh.max(1),
-                            image::imageops::FilterType::CatmullRom,
-                        )
-                    } else {
-                        img
-                    }
-                }
-                ResizeHint::ShortEdge(target) => {
-                    // 只下采样(2026-07-06 审查 R2):与 wic_engine 同规,契约见 ai_cache
-                    // 「分析只下采样…绝不上采样」;short<=target 时原尺寸解码。
-                    let short = w.min(h);
-                    if short > target {
-                        let scale = target as f32 / short as f32;
-                        let nw = (w as f32 * scale).round() as u32;
-                        let nh = (h as f32 * scale).round() as u32;
-                        img.resize_exact(
-                            nw.max(1),
-                            nh.max(1),
-                            image::imageops::FilterType::CatmullRom,
-                        )
-                    } else {
-                        img
-                    }
-                }
-            }
-        } else {
-            img
-        };
-
-        // 灰度/RGB 的解码字节数小于 RGBA；转换前按实际小图尺寸再次检查，不能只限源格式。
-        let rgba_bytes = u64::from(img.width())
-            .checked_mul(u64::from(img.height()))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .unwrap_or(u64::MAX);
-        if rgba_bytes > max_decoded_bytes {
-            return Err(AppError::ThumbnailUnavailable("pixel_limit"));
-        }
-        // 长/短边目标不依赖方向；先缩小再转正，避免为旋转大图再分配一份全尺寸像素。
-        let img = apply_exif_orientation(img, orientation);
-        let rgba = img.into_rgba8();
-        let width = rgba.width();
-        let height = rgba.height();
-
-        Ok(DecodedImage {
-            pixels: rgba.into_raw(),
-            width,
-            height,
-            icc,
-        })
+#[cfg_attr(windows, allow(dead_code))]
+impl ImageWorkingSet {
+    /// 包含源格式、缩放浮点中间图和最坏方向变换的像素峰值。
+    pub(crate) fn bytes_for_resize(&self, resize: Option<ResizeHint>) -> Result<u64, AppError> {
+        let target = resize_dimensions(self.width, self.height, resize)?;
+        Ok(pixel_peak(
+            self.width,
+            self.height,
+            target,
+            self.bytes_per_pixel,
+            self.source_bytes,
+            6,
+        ))
     }
 }
 
@@ -221,99 +47,245 @@ impl ImageEngine for ImageRsEngine {
         &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff"]
     }
 
-    fn decode_bounded(
+    fn decode(
         &self,
         file_path: &Path,
         resize: Option<ResizeHint>,
-        max_pixel_bytes: u64,
     ) -> Result<DecodedImage, AppError> {
-        let file = File::open(file_path).map_err(AppError::Io)?;
+        let mut file = File::open(file_path).map_err(AppError::Io)?;
         let format = file_path
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("");
-        Self::decode_open_file_bounded(file, format, resize, max_pixel_bytes)
-    }
-
-    /// 尝试从 EXIF 中提取嵌入的 JPEG 缩略图（快速路径）。
-    fn extract_embedded_thumb(&self, file_path: &Path) -> Result<Option<Vec<u8>>, AppError> {
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-
-        if !matches!(ext.as_str(), "jpg" | "jpeg") {
-            return Ok(None);
-        }
-
-        let mut file = std::fs::File::open(file_path).map_err(AppError::from)?;
-        Self::extract_embedded_thumb_file(&mut file)
+        // 普通 trait 调用保留 ImageReader 原有 codec 额度，不额外限制缩放/方向的整段峰值。
+        Self::decode_open_file_inner(
+            &mut file,
+            format,
+            resize,
+            u64::MAX,
+            image::Limits::default().max_alloc,
+        )
     }
 }
 
-/// 将 EXIF 方向校正应用于解码后的图像。
+impl ImageRsEngine {
+    /// 探测真实 decoder 元数据。调用方须先预留压缩输入及元数据额度；JPEG 构造器
+    /// 会读入压缩流，`max_probe_bytes` 不能替代调用方的输入文件字节账本。
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn working_set_bytes(
+        file: &mut File,
+        max_probe_bytes: u64,
+    ) -> Result<ImageWorkingSet, AppError> {
+        file.rewind().map_err(AppError::Io)?;
+        let mut reader = ImageReader::new(BufReader::new(file))
+            .with_guessed_format()
+            .map_err(AppError::Io)?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(max_probe_bytes);
+        reader.limits(limits);
+        let decoder = reader.into_decoder().map_err(AppError::Engine)?;
+        let (width, height) = decoder.dimensions();
+        resize_dimensions(width, height, None)?;
+        Ok(ImageWorkingSet {
+            width,
+            height,
+            source_bytes: decoder.total_bytes(),
+            bytes_per_pixel: u64::from(decoder.color_type().bytes_per_pixel()),
+        })
+    }
+
+    /// 从已授权句柄解码，不重新按路径打开；入口自行 rewind，失败后可复用同一句柄。
+    /// `max_decoded_bytes` 限制真实源位深、缩放中间缓冲及输出的已知像素峰值。
+    /// codec 私有分配仍需执行域资源限制；本额度不能由数据库尺寸直接推导。
+    pub fn decode_open_file_bounded(
+        file: &mut File,
+        format: &str,
+        resize: Option<ResizeHint>,
+        max_decoded_bytes: u64,
+    ) -> Result<DecodedImage, AppError> {
+        Self::decode_open_file_inner(
+            file,
+            format,
+            resize,
+            max_decoded_bytes,
+            Some(max_decoded_bytes),
+        )
+    }
+
+    fn decode_open_file_inner(
+        file: &mut File,
+        format: &str,
+        resize: Option<ResizeHint>,
+        max_peak: u64,
+        codec_limit: Option<u64>,
+    ) -> Result<DecodedImage, AppError> {
+        let orientation = if matches!(
+            format.to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "heic" | "heif" | "avif"
+        ) {
+            read_jpeg_orientation_file(file)
+        } else {
+            1
+        };
+        file.rewind().map_err(AppError::Io)?;
+        let mut reader = ImageReader::new(BufReader::new(file))
+            .with_guessed_format()
+            .map_err(AppError::Io)?;
+        let mut limits = image::Limits::default();
+        limits.max_alloc = codec_limit;
+        // PNG 在构建 decoder 时读取元数据，必须在 into_decoder 前传入额度。
+        reader.limits(limits.clone());
+        let mut decoder = reader.into_decoder().map_err(AppError::Engine)?;
+        let (width, height) = decoder.dimensions();
+        let target = resize_dimensions(width, height, resize)?;
+        let source_bytes = decoder.total_bytes();
+        let bytes_per_pixel = u64::from(decoder.color_type().bytes_per_pixel());
+        let peak = pixel_peak(
+            width,
+            height,
+            target,
+            bytes_per_pixel,
+            source_bytes,
+            orientation,
+        );
+        if peak > max_peak {
+            return Err(pixel_limit());
+        }
+        // reserve 恢复 ImageReader::decode 的源缓冲扣额；限制继续交给 codec 自己执行。
+        limits.reserve(source_bytes).map_err(AppError::Engine)?;
+        decoder.set_limits(limits).map_err(AppError::Engine)?;
+        let icc = decoder.icc_profile().map_err(AppError::Engine)?;
+        if icc
+            .as_ref()
+            .is_some_and(|profile| profile.len() > 16 * 1024 * 1024)
+        {
+            return Err(pixel_limit());
+        }
+        let img = image::DynamicImage::from_decoder(decoder).map_err(AppError::Engine)?;
+        // 长/短边与方向无关：先缩小，再旋转，避免完整原图旋转副本。
+        let img = if target != (width, height) {
+            img.resize_exact(target.0, target.1, image::imageops::FilterType::CatmullRom)
+        } else {
+            img
+        };
+        let rgba = apply_exif_orientation(img, orientation).into_rgba8();
+        Ok(DecodedImage {
+            width: rgba.width(),
+            height: rgba.height(),
+            pixels: rgba.into_raw(),
+            icc,
+        })
+    }
+}
+
+/// 根据真实源尺寸计算只下采样的目标；整数比例避免超长边的浮点舍入溢出。
+pub(crate) fn resize_dimensions(
+    width: u32,
+    height: u32,
+    resize: Option<ResizeHint>,
+) -> Result<(u32, u32), AppError> {
+    if width == 0 || height == 0 {
+        return Err(pixel_limit());
+    }
+    let (target, edge) = match resize {
+        Some(ResizeHint::LongEdge(target)) => (target, width.max(height)),
+        Some(ResizeHint::ShortEdge(target)) => (target, width.min(height)),
+        None => return Ok((width, height)),
+    };
+    if target == 0 {
+        return Err(pixel_limit());
+    }
+    if edge <= target {
+        return Ok((width, height));
+    }
+    let scale = |value: u32| {
+        ((u64::from(value) * u64::from(target) + u64::from(edge) / 2) / u64::from(edge)).max(1)
+            as u32
+    };
+    Ok((scale(width), scale(height)))
+}
+
+// CatmullRom 先做纵向 RGBA32F 中间图（源宽 × 目标高），再写目标格式。
+// 以实际位深计算各阶段同时存活的缓冲，不能仅用目标 RGBA 或 DB 宽高作准入。
+fn pixel_peak(
+    width: u32,
+    height: u32,
+    target: (u32, u32),
+    bytes_per_pixel: u64,
+    source_bytes: u64,
+    orientation: u32,
+) -> u64 {
+    let target_pixels = u64::from(target.0) * u64::from(target.1);
+    let native_output = target_pixels.saturating_mul(bytes_per_pixel);
+    let rgba_output = target_pixels.saturating_mul(4);
+    // 解码器可能保留一份源格式缓冲，同时向 DynamicImage 写入另一份。
+    let mut peak = source_bytes.saturating_mul(2);
+    if target != (width, height) {
+        let scratch = u64::from(width)
+            .saturating_mul(u64::from(target.1))
+            .saturating_mul(16);
+        // 采样权重 Vec 按源长边保守计入容量增长；不把 f32 中间图误计成 u8。
+        let weights = u64::from(width.max(height)).saturating_mul(8);
+        peak = peak.max(
+            source_bytes
+                .saturating_add(scratch)
+                .saturating_add(native_output)
+                .saturating_add(weights),
+        );
+    }
+    if (5..=8).contains(&orientation) {
+        peak = peak.max(native_output.saturating_mul(2));
+    }
+    peak.max(native_output.saturating_add(rgba_output))
+}
+
+pub(crate) fn pixel_limit() -> AppError {
+    AppError::Engine(image::ImageError::Limits(
+        image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory),
+    ))
+}
+
+/// 将 EXIF 方向应用于小图；镜像/180° 原地操作，90°/270° 最多保留两份小图。
 pub(crate) fn apply_exif_orientation(
-    img: image::DynamicImage,
+    mut img: image::DynamicImage,
     orientation: u32,
 ) -> image::DynamicImage {
-    match orientation {
-        1 => img,
-        2 => img.fliph(),
-        3 => img.rotate180(),
-        4 => img.flipv(),
-        5 => img.rotate90().fliph(),
-        6 => img.rotate90(),
-        7 => img.rotate270().fliph(),
-        8 => img.rotate270(),
-        _ => img,
+    if let Some(orientation) = image::metadata::Orientation::from_exif(orientation as u8) {
+        img.apply_orientation(orientation);
     }
+    img
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn source_done_releases_file_without_changing_pixels_or_quota() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.png");
-        image::RgbImage::from_pixel(640, 480, image::Rgb([40, 120, 200]))
-            .save(&path)
-            .unwrap();
-        let calls = std::cell::Cell::new(0);
-        let hint = || Some(ResizeHint::LongEdge(32));
-        assert!(ImageRsEngine::decode_open_file_bounded_with_source_done(
-            File::open(&path).unwrap(),
+    fn rejects_real_source_bit_depth_peak_before_small_output_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("16bit.png");
+        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_pixel(
+            64,
+            32,
+            image::Rgba([30000, 500, 600, 65535]),
+        )
+        .save(&path)
+        .unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(ImageRsEngine::decode_open_file_bounded(
+            &mut file,
             "png",
-            hint(),
-            1,
-            || calls.set(calls.get() + 1),
+            Some(ResizeHint::LongEdge(2)),
+            64 * 32 * 8
         )
         .is_err());
-        assert_eq!(calls.get(), 0, "超额失败不能报告读取完成");
-        let expected = ImageRsEngine::decode_open_file_bounded(
-            File::open(&path).unwrap(),
+        let decoded = ImageRsEngine::decode_open_file_bounded(
+            &mut file,
             "png",
-            hint(),
-            4 * 1024 * 1024,
+            Some(ResizeHint::LongEdge(2)),
+            256 * 1024,
         )
         .unwrap();
-        let actual = ImageRsEngine::decode_open_file_bounded_with_source_done(
-            File::open(&path).unwrap(),
-            "png",
-            hint(),
-            4 * 1024 * 1024,
-            || {
-                calls.set(calls.get() + 1);
-                // 回调之后只消费内存像素；清空源文件不影响后续缩放。
-                File::create(&path).unwrap();
-            },
-        )
-        .unwrap();
-        assert_eq!(calls.get(), 1);
-        assert_eq!((actual.width, actual.height), (32, 24));
-        assert_eq!(actual.pixels, expected.pixels);
-        assert_eq!(actual.icc, expected.icc);
+        assert_eq!((decoded.width, decoded.height), (2, 1));
     }
 }

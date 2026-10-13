@@ -45,19 +45,17 @@ describe('renderMarkdown:属性上下文注入(2026-07-16 实证缺口)', () => 
     expect(html).not.toContain('"onmouseover=')
   })
 
-  it('非法协议仍回退 #(既有白名单不回归)', () => {
+  it('非法协议禁用链接且不误跳回文首', () => {
     const html = renderMarkdown('[x](javascript:alert(1))')
-    expect(html).not.toMatch(/href="javascript:/i)
+    expect(html).toBe('<p><a aria-disabled="true">x</a></p>')
   })
 })
 
 describe('renderMarkdown:标记注入(既有转义不回归)', () => {
-
-  it('img onerror 被转义成文本,不成标签', () => {
-    // 产出 &lt;img src=x onerror=alert(1)&gt; —— 文本里带 onerror= 字样无害,关键是它不是标签。
-    const html = renderMarkdown('<img src=x onerror=alert(1)>')
-    expect(hasRawTag(html, 'img')).toBe(false)
-    expect(html).toContain('&lt;img')
+  it('裸 script 标签被转义成文本,不成标签', () => {
+    const html = renderMarkdown('<script>alert(1)</script>')
+    expect(hasRawTag(html, 'script')).toBe(false)
+    expect(html).toContain('&lt;script&gt;')
   })
 })
 
@@ -97,10 +95,9 @@ describe('epubScriptGate:脚本资源被拒', () => {
 
 describe('srtToVtt', () => {
 
-  it('白名单标签含属性时剥除属性', () => {
-    const vtt = srtToVtt('1\n00:00:01,000 --> 00:00:02,000\n<b class="x">text</b>')
-    expect(vtt).toContain('<b>text</b>')
-    expect(vtt).not.toContain('class')
+  it('字幕数字与周围空格不被格式标签占位符替换', () => {
+    const vtt = srtToVtt('1\n00:00:01,000 --> 00:00:02,000\n<b class="x">第 0 次</b>，第 1 次 / 第 27 次')
+    expect(vtt).toContain('<b>第 0 次</b>，第 1 次 / 第 27 次')
   })
 
   it('其余尖括号转义防注入', () => {

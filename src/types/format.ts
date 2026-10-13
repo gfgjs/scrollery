@@ -1,5 +1,5 @@
 // src/types/format.ts
-// 已注册格式的 UI 投影（对应 Rust `formats::FormatDescriptor`，S 线 §6.1 / D-007）。
+// 已注册格式的 UI 投影，对应 Rust `formats::FormatDescriptor`。
 
 import type { MediaType } from './media'
 

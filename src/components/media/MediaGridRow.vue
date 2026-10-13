@@ -15,11 +15,11 @@
     }"
   >
     <!-- 日期/文件夹分隔符(folder 分组时行内 sticky)。
-         重复组头(§6.1/§11.2):separatorKind='duplicateGroup' 走独立分支——真实 h2 语义 +
+         重复组头 separatorKind='duplicateGroup' 走独立分支：真实 h2 语义 +
          CopyCheck 图标(文本/间距/图标三通道表达组边界,不只靠颜色);sticky 跟随现有 folder
-         分隔符机制(仅行内 sticky 定位,标题行不铺底色/不投影——2026-09-12 裁决与画廊底融合)。
+         分隔符机制；仅行内 sticky 定位，标题行不铺底色或投影。
          label 已含完整统计(「重复组 N · M 项 · …」),不再加 separatorCounts 徽标以免信息重复。
-         文件夹头(§7.2/§11.2,P3):separatorKind='duplicateFolder' 走 h3 分支(层级低于组头 h2)
+         文件夹头 separatorKind='duplicateFolder' 走 h3 分支(层级低于组头 h2)
          ——簇首并入簇头行(parentGroupStart,避免两层 sticky)+ 路径行 + 三桶统计行;统计文案由
          宿主经 lensSeparator.formatLensFolderStats 组装,本组件保持 i18n 无关。 -->
     <template v-if="row.rowType === 'separator'">
@@ -45,7 +45,9 @@
           <Folder :size="13" class="separator-icon" />
           <span class="separator-text">{{ row.separatorLabel }}</span>
         </span>
-        <span v-if="lensFolderStatsText" class="dup-folder__stats">{{ lensFolderStatsText(row) }}</span>
+        <span v-if="lensFolderStatsText" class="dup-folder__stats">{{
+          lensFolderStatsText(row)
+        }}</span>
       </h3>
       <div
         v-else
@@ -87,8 +89,12 @@
           'media-card--compact': compactCells,
           'media-card--pending-delete': isPendingDelete(item.id),
         }"
-        :style="{ width: item.w + 'px', height: item.h + 'px' }"
-
+        :style="{
+          width: item.w + 'px',
+          height: item.h + 'px',
+          '--thumb-status-bottom':
+            computeThumbBottomLayout(item.w, !!lensActive, compactCells, true).statusBottom + 'px',
+        }"
         tabindex="0"
         @click="onCardClick(item, $event)"
         @keydown.enter.self.prevent="onCardClick(item, $event)"
@@ -105,10 +111,7 @@
              (组员跨目录无组内序,§16)/尚未确认卡片问号图标(不只靠灰色);独有无徽标。
              徽标选择经宿主注入的 lensCardBadgeText(lensSeparator.resolveLensCardBadge),
              问号以图标渲染、其余为文本;仅镜头态渲染,普通画廊行零开销。 -->
-        <span
-          v-if="lensCardBadgeText && lensCardBadgeText(item)"
-          class="media-card__lens-badge"
-        >
+        <span v-if="lensCardBadgeText && lensCardBadgeText(item)" class="media-card__lens-badge">
           <CircleHelp
             v-if="item.duplicateBucket === 'unconfirmed'"
             :size="12"
@@ -160,6 +163,7 @@
           :is-selected="isSelected(item.id)"
           :is-selection-mode="selectionMode"
           :browse-only="!!lensActive"
+          :pending-delete="isPendingDelete(item.id)"
           :cache-dir="cacheDir"
           @request-thumb="onRequestThumb"
           @cancel-thumb="onCancelThumb"
@@ -184,6 +188,7 @@ import MediaThumbCompact from './MediaThumbCompact.vue'
 import { Folder, Calendar, CopyCheck, CircleHelp, Network } from '@lucide/vue'
 import { isLensClusterStart } from './lensSeparator'
 import type { LayoutRow, LayoutRowItem, LayoutRowSeparator } from '../../types/layout'
+import { computeThumbBottomLayout } from './thumbBottomLayout'
 
 defineProps<{
   row: LayoutRow

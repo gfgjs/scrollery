@@ -1,10 +1,9 @@
 // src-tauri/src/exotic/tools.rs
-//! 视频格式扩展子系统 · FFmpeg 工具包生命周期管理（design.md §3.1/§3.2/§3.3/§8 V2）。
+//! FFmpeg 工具包的下载、校验与安装。
 //!
 //! 与 [`crate::exotic::registry`]/[`crate::exotic::installer`] 的插件安装同姿态，但 FFmpeg
 //! **不是签名插件包**——它是一个第三方（BtbN）预构建的 LGPL-shared 工具包，无 Registry 签名链，
-//! 完整性只靠**钉死的 zip 整包 sha256 + 逐可执行文件 sha256**双重校验（本文件 manifest 常量即真源，
-//! 生产 registry entry 签发归 Part8）。
+//! 完整性由钉定的 zip 整包 sha256 与逐可执行文件 sha256 双重校验。
 //!
 //! 目录布局：`{app_data}/exotic/tools/ffmpeg/{tag}/bin/{ffmpeg.exe,ffprobe.exe,*.dll}`；
 //! `{tag}/.ready` 标记文件存在 = 该 tag 已下载、解压、逐文件 hash 复核全部通过、可安全启动。
@@ -25,11 +24,11 @@ use std::path::{Path, PathBuf};
 use crate::download::{self, DownloadError, TimeoutPolicy};
 use crate::utils::hash::sha256_hex_of_file;
 
-// ── 钉死常量（实测证据：docs/worklogs/2026-07-24-视频格式扩展子系统/scratchpad/v2-ffmpeg-evidence.md）──
+// ── FFmpeg 工具包钉定常量 ────────────────────────────────────────────────
 //
 // BtbN/FFmpeg-Builds 的 dated autobuild release（非浮动 `latest` tag）；win64 LGPL-shared 变体，
 // 已实测确认 configuration 无 `--enable-gpl`、`--disable-libx264`/`--disable-libx265`，且
-// `-encoders` 含 `h264_mf` 与原生 `aac`。生产 registry entry 签发归 Part8，当前 manifest 常量即真源。
+// `-encoders` 含 `h264_mf` 与原生 `aac`；本文件常量是当前校验基准。
 
 /// BtbN release tag（钉死，非浮动 `latest`）。互注(V7 项11):升级须同步改 `PluginStoreView.vue` 源码链 tag。
 pub const BTBN_RELEASE_TAG: &str = "autobuild-2026-07-24-13-32";
@@ -40,7 +39,7 @@ const BTBN_ZIP_SIZE: u64 = 62_417_810;
 /// zip 整包 sha256（实测，`sha256sum`）。
 const BTBN_ZIP_SHA256: &str = "b809e561254cc0634d9fe4ce469c02ac2e194d560e079bb242b96906948ffbeb";
 /// `bin/ffmpeg.exe` sha256（实测）。`pub(crate)`:worker_service session init 下发该 manifest
-/// 常量作 worker 侧防换包比对基准(而非本地现算值),闭合钉定链(§2.4 深审 V4-4)。
+/// 常量作 worker 侧防换包比对基准，不使用运行时现算值替代。
 pub(crate) const FFMPEG_EXE_SHA256: &str =
     "1d53a27637354c9e81317b48ec63940260e1312b57f8f9ba9139639f6ff38f75";
 /// `bin/ffprobe.exe` sha256（实测）。
@@ -405,4 +404,64 @@ pub fn boot_sweep(app_data: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::hash::sha256_hex;
+    use std::io::Write as _;
+
+    fn tmp_dest(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("exotic-tools-dest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// `extract_ffmpeg_zip` 内部使用的 `{dest_dir}.extract.tmp` 中间目录路径（第 4 项引入），
+    /// 测试用以断言成功/失败两路均不留该残留。
+    fn extract_tmp_of(dest_dir: &Path) -> PathBuf {
+        let name = dest_dir.file_name().and_then(|s| s.to_str()).unwrap();
+        dest_dir.with_file_name(format!("{name}.extract.tmp"))
+    }
+
+    #[test]
+    fn zip_slip_backslash_entry_rejected() {
+        // 直接构造含 `..\` 的恶意 entry 名（越过 bin/ 前缀剥离后仍需被路径净化拦下）。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("ffmpeg-evil/bin/..\\..\\evil.exe", opt)
+                .unwrap();
+            zip.write_all(b"EVIL").unwrap();
+            zip.start_file("ffmpeg-evil/bin/ffmpeg.exe", opt).unwrap();
+            zip.write_all(b"REAL").unwrap();
+            zip.start_file("ffmpeg-evil/bin/ffprobe.exe", opt).unwrap();
+            zip.write_all(b"REAL2").unwrap();
+            zip.finish().unwrap();
+        }
+        let zip_path =
+            std::env::temp_dir().join(format!("exotic-tools-evil-{}.zip", std::process::id()));
+        std::fs::write(&zip_path, &buf).unwrap();
+        let dest = tmp_dest("evil");
+        let r = extract_ffmpeg_zip(
+            &zip_path,
+            &dest,
+            &sha256_hex(b"REAL"),
+            &sha256_hex(b"REAL2"),
+        );
+        assert!(matches!(r, Err(ToolsError::UnsafeEntry(_))), "{r:?}");
+        assert!(!dest.exists(), "越界 entry 应整个目录作废，不留半装");
+        assert!(
+            !extract_tmp_of(&dest).exists(),
+            "越界 entry 应连 .extract.tmp 一并作废"
+        );
+        // 确认越界目标本身未被写出（校验入口目录不存在即可，已在上面断言；这里再确认无逃逸文件）。
+        let escaped = std::env::temp_dir().join("evil.exe");
+        assert!(!escaped.exists());
+        let _ = std::fs::remove_file(&zip_path);
+    }
 }

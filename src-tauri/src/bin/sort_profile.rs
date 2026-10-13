@@ -1,4 +1,4 @@
-//! 目录序排序 profile —— 量化方案 B「切列前后」A/B（B-dir 收益证据，设计 §2.4 决策门）。
+//! 目录序排序 profile：对比标量函数与持久目录序键的查询耗时。
 //!
 //! **测什么**：folder 分组的画廊查询,其 ORDER BY 目录序键的两种形态。切列前 =
 //! `TREE_SORT_KEY(d.rel_path)`（每行调 SQLite→Rust 标量函数,列参数不可

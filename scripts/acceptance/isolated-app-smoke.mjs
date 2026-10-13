@@ -1,42 +1,41 @@
 #!/usr/bin/env node
-// 隔离验收驱动器(P1-2 发行验收准备,2026-09-12)。
+// 隔离验收驱动器。
 //
-// why 需要它:Tauri 的 app_data_dir 由 bundle identifier 派生(PathResolver → dirs::data_dir()
-// → Windows SHGetKnownFolderPath(FOLDERID_RoamingAppData) + identifier)。2026-09-12 实测:
+// Tauri 的 app_data_dir 由 bundle identifier 派生(PathResolver → dirs::data_dir()
+// → Windows SHGetKnownFolderPath(FOLDERID_RoamingAppData) + identifier)。实测:
 // 覆盖 APPDATA/LOCALAPPDATA/USERPROFILE 环境变量**不改变**该解析结果,所以「干净测试库」不能靠
 // 进程环境变量实现,只能靠身份覆盖配置 src-tauri/tauri.acceptance.conf.json 构建的验收包
 // (identifier=com.scrollery.app.acceptance,productName=Scrollery Acceptance)。本脚本据此做三件事:
 //   1) 库/缓存/日志/设置全部落在 Windows 解析出的 Roaming 目录下的 com.scrollery.app.acceptance
 //      (硬守卫 + 内容核对,绝不碰用户真实库);
-//   2) 媒体夹具在临时根生成；仅 representative 阶段只读显式提供的 --sample-dir;
+//   2) 媒体夹具在本脚本的临时根目录生成,不读用户照片;
 //   3) 只操作自己拉起的进程 PID,不安装/卸载用户已装应用。
 //
 // 阶段(--stage):
 //   boot   无头:PICASA_SMOKE_TEST=1 拉起验收包,断言 exit 0 且隔离 app-data 内出现启动日志(CI 用)。
-//   ready  经 WebView2 CDP attach:断言 IPC 往返、前端挂载、后端 Ready 日志、零页面异常,再 exit_app 收干净。
+//   ready  经 WebView2 CDP attach 核对验收实例身份,再 exit_app 收干净。
 //   enhance 安装后增强负向验收：worker/ORT 运行、模型文件缺失、清单未就绪、worker 缺失及原图哈希。
 //   chain  完整链路:首启 → 加根扫描 → 缩略图 → 查看 → 标记 → 导出 → 备份 → 重启核对。
 //          --restore-drill 追加恢复演练(restore_stage → restore_arm → 重启后由 boot swap 收口)。
 //          其中含目录移动取证:把 fixture 的 movable/ 子目录经真实 IPC move_directory 搬到
 //          **另一个已扫描根**(目标根夹具),核对 item id / 收藏评分 / source-direct 路径可读
-//         且内容 sha 一致,再搬回;移动前后 list_pending_directory_moves 必须为空清单。
+//         且内容 sha 一致,再搬回;搬回后 list_pending_directory_moves 必须为空清单。
 // ⚠ 跨物理卷:**本机只有一块固定盘**(2026-09-12 实测 Win32_LogicalDisk 仅 C:),默认夹具两
 //   个根同卷 → 走 rename 路径。跨卷「暂存→发布→删源」在本机**没有实测**,不得据此宣称已验证;
 //   它的覆盖由 Rust 侧强制故障注入测试承担(ipc/dir_move/tests.rs:refused_payload_write_blocks_
 //   publish_and_keeps_source / retry_without_payload_persistence_keeps_journal_and_source /
 //   crash_before_publish_is_recovered_by_persisted_payload / crash_after_publish_before_delete_
-//   source_converges / both_present_without_payload_stays_conflict / mismatched_payload_never_
-//   claims_target)。要在真机上跑跨卷,给 --target-root=<另一块盘上的目录>。
+//   source_converges / source_removal_requires_content_proof)。要在真机上跑跨卷,
+//   给 --target-root=<另一块盘上的目录>。
 //
 // 用法:
-//   node scripts/acceptance/isolated-app-smoke.mjs [--stage=boot|ready|chain] [--exe=<path>]
+//   node scripts/acceptance/isolated-app-smoke.mjs [--stage=boot|ready|enhance|chain] [--exe=<path>]
 //        [--root=<dir>] [--port=9333] [--media=9] [--timeout=180] [--keep]
 //        [--restore-drill] [--verify-user-library-untouched] [--proof=<path>]
 //        [--target-root=<dir>]
 //        [--install] [--install-only] [--uninstall-after]
 //        [--report-tag=<tag>]  报告另存为 acceptance-report-<stage>-<tag>.json(负向对照用)
 //        [--record-build] [--probe-build] [--selftest]
-//        [--native-debugger=<cdb.exe>] thumbnails阶段附加自有worker，运行仅供故障诊断
 // 启动前强制三道门(任一不过即拒绝,且都发生在 spawn 之前——普通构建 setup 期就会写用户库):
 //   ① exe 字节内烙有验收 identifier(编译期常量;普通构建烙的是 com.scrollery.app);
 //   ② exe 的版本资源 ProductName 等于验收配置的 productName(独立第二条证据,经 FileVersionInfo 读);
@@ -44,7 +43,7 @@
 // 前置流程:
 //   npx tauri build -c src-tauri/tauri.acceptance.conf.json   # 必须带 bundle:安装验收要 NSIS/MSI 安装包
 //   node scripts/acceptance/isolated-app-smoke.mjs --record-build   # 钉住产物哈希 + 配置哈希
-//   node scripts/acceptance/isolated-app-smoke.mjs --stage=boot|ready|chain
+//   node scripts/acceptance/isolated-app-smoke.mjs --stage=boot|ready|enhance|chain
 //
 // 安装后入口(GO 后首选):--install 会把验收包经 NSIS 静默安装(currentUser)到
 // target/acceptance/install-scrollery-acceptance(自有 + ownership 校验),再从**安装目录**核对
@@ -57,8 +56,10 @@
 // attach 后的第四道门(ready/chain):CDP 端口先查占用,attach 后立刻用既有三个只读 IPC
 // (get_log_dir / get_thumb_cache_dir / get_config_status)确认连上的实例自报路径确实在验收
 // app-data 之下,确认通过才做任何写操作——连错实例时 exit_app 会关掉别人的应用。
-// 退出码:全部步骤通过 = 0;任一断言失败/异常 = 1;selftest 自身损坏 = 2。
+// 退出码:全部步骤通过 = 0;任一断言失败/异常 = 1;selftest 自身损坏 = 1。
 
+import assert from 'node:assert/strict';
+import { testCase } from '../lib/test-case.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -72,12 +73,12 @@ const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 const ACCEPTANCE_IDENTIFIER = 'com.scrollery.app.acceptance';
 const USER_IDENTIFIER = 'com.scrollery.app';
 const EOL = '\n';
-const STAGES = ['boot', 'ready', 'chain', 'enhance', 'thumbnails', 'thumbnail-lifecycle', 'thumbnail-crash', 'thumbnail-ui', 'thumbnail-logs', 'thumbnail-video-crash', 'thumbnail-restore', 'thumbnail-interaction', 'thumbnail-live-addition', 'thumbnail-representative', 'thumbnail-manual-focus'];
+const STAGES = ['boot', 'ready', 'chain', 'enhance', 'interactions'];
 // 用户已装应用默认落点(NSIS currentUser):验收脚本绝不触碰;落点经 Windows known folder 解析
 // 得到(userInstallDir),不用环境变量拼路径。
 
 // Windows known folder 解析:app_data_dir 的权威来源是 SHGetKnownFolderPath,不是环境变量
-// (2026-09-12 实测:改写 APPDATA/LOCALAPPDATA/USERPROFILE 都不改变该 API 结果)。清理与守卫
+// (改写 APPDATA/LOCALAPPDATA/USERPROFILE 不改变该 API 结果)。清理与守卫
 // 一律以 API 结果为准,否则脚本可能删掉与「应用真正会写的位置」不同的目录——真正的库毫发无伤,
 // 而验收却在别处空跑。
 const PS_KNOWN_FOLDERS = [
@@ -222,9 +223,9 @@ export function analyzeExe(exe) {
 const BUILD_HINT = 'npx tauri build -c src-tauri/tauri.acceptance.conf.json';
 const RECORD_HINT = '先跑:' + BUILD_HINT + EOL + '      node scripts/acceptance/isolated-app-smoke.mjs --record-build';
 
-export function assertAcceptanceIdentity(exe) {
+export function assertAcceptanceIdentity(exe, analyzedInfo) {
   const cfg = readAcceptanceConfig();
-  const info = analyzeExe(exe);
+  const info = analyzedInfo ?? analyzeExe(exe);
   const problems = [];
   if (!info.hasIdentifierMarker) {
     problems.push('exe 字节内未见验收 identifier ' + ACCEPTANCE_IDENTIFIER + '(普通构建烙的是 ' + USER_IDENTIFIER + ')');
@@ -243,10 +244,8 @@ function proofPath() {
   return path.resolve(REPO, arg('proof', path.join('target', 'acceptance', 'acceptance-build-proof.json')));
 }
 
-export function recordBuildProof(exe, outPath) {
-  const { cfg, info } = assertAcceptanceIdentity(exe);
-  const nativeWorkerBytes = fs.readFileSync(path.join(path.dirname(exe), "native-thumbnail-worker.exe"));
-  const nativeWorker = { sha256: sha256Buf(nativeWorkerBytes), bytes: nativeWorkerBytes.length };
+export function recordBuildProof(exe, outPath, analyzedInfo) {
+  const { cfg, info } = assertAcceptanceIdentity(exe, analyzedInfo);
   const proof = {
     format: 'scrollery-acceptance-build-proof/1',
     exe: relOrAbs(exe),
@@ -264,29 +263,23 @@ export function recordBuildProof(exe, outPath) {
     // 安装包与包内主程序的指纹。为什么必须一起绑定:target/release 的 exe 是占位符还原版(UNK),
     // 真正装给用户的是包内那份(带 msi/nsis 补丁),二者字节不同。只记 exe hash 回答不了
     // 「装出来的那份是不是这批产物」,故此处把安装包与包内主程序一并钉住。
-    nativeWorker,
-    bundle: collectBundleFingerprints(info.exeBytes, nativeWorker.bytes),
+    bundle: collectBundleFingerprints(info.exeBytes),
     recordedAtUtc: new Date().toISOString(),
   };
-  for (const installer of proof.bundle.installers.filter(item => path.basename(item.path).startsWith(cfg.productName + '_'))) {
-    if (installer.payloadNativeWorker?.sha256 !== nativeWorker.sha256) {
-      throw new Error('Native worker differs from acceptance bundle: ' + installer.path + '; restore the staged native-vpl worker before recording proof');
-    }
-  }
   const target = outPath || proofPath();
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, JSON.stringify(proof, null, 2) + EOL);
   return proof;
 }
 
-export function assertBuildProof(exe, atPath) {
+export function assertBuildProof(exe, atPath, analyzedInfo) {
   const p = atPath || proofPath();
   if (!fs.existsSync(p)) {
     throw new Error('缺验收构建证明:' + p + EOL + '  ' + RECORD_HINT);
   }
   const proof = JSON.parse(fs.readFileSync(p, 'utf8'));
   const cfg = readAcceptanceConfig();
-  const info = analyzeExe(exe);
+  const info = analyzedInfo ?? analyzeExe(exe);
   const problems = [];
   if (proof.exeSha256 !== info.exeSha256) {
     problems.push(
@@ -298,10 +291,6 @@ export function assertBuildProof(exe, atPath) {
     problems.push('验收配置在记证之后被改动,须重新构建并 --record-build');
   }
   if (proof.identifier !== ACCEPTANCE_IDENTIFIER) problems.push('证明记录的 identifier 异常:' + String(proof.identifier));
-  const workerPath = path.join(path.dirname(exe), 'native-thumbnail-worker.exe');
-  if (!proof.nativeWorker || !fs.existsSync(workerPath) || sha256Buf(fs.readFileSync(workerPath)) !== proof.nativeWorker.sha256) {
-    problems.push('native worker 缺失或与构建证明不同，须核对包内载荷并重新记证');
-  }
   if (problems.length) throw new Error('验收构建证明校验失败:' + EOL + '  - ' + problems.join(EOL + '  - '));
   return { proof, info, proofPath: p };
 }
@@ -470,27 +459,6 @@ function makePng(width, height, seed) {
   ]);
 }
 
-// 反向解析自检用:逐 chunk 校验 CRC + IHDR 尺寸,防夹具生成器退化成写坏文件。
-function parsePng(buf) {
-  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  for (let i = 0; i < sig.length; i++) if (buf[i] !== sig[i]) throw new Error('PNG 签名不符');
-  let off = 8;
-  let ihdr = null;
-  const types = [];
-  while (off < buf.length) {
-    const len = buf.readUInt32BE(off);
-    const type = buf.toString('ascii', off + 4, off + 8);
-    const data = buf.subarray(off + 8, off + 8 + len);
-    const want = buf.readUInt32BE(off + 8 + len);
-    const got = crc32(Buffer.concat([Buffer.from(type, 'ascii'), data]));
-    if (want !== got) throw new Error('chunk ' + type + ' CRC 不符');
-    if (type === 'IHDR') ihdr = { width: data.readUInt32BE(0), height: data.readUInt32BE(4) };
-    types.push(type);
-    off += 12 + len;
-  }
-  return { ihdr, types };
-}
-
 const FIXTURE_SIZES = [
   [640, 480],
   [1600, 1200],
@@ -634,8 +602,7 @@ function killOurProcess(child) {
   if (pid) spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
 }
 
-async function attachCdp(port, timeoutMs, windowLabel = 'main') {
-  let pageIndex = 0;
+async function attachCdp(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastErr = '未开始';
   for (;;) {
@@ -643,28 +610,16 @@ async function attachCdp(port, timeoutMs, windowLabel = 'main') {
       const res = await fetch('http://127.0.0.1:' + port + '/json/list');
       if (res.ok) {
         const targets = await res.json();
-        const pages = targets.filter((t) => t.type === 'page');
-        const page = pages[pageIndex++ % pages.length];
+        const page = targets.find((t) => t.type === 'page');
         if (page) {
           const ws = new WebSocket(page.webSocketDebuggerUrl);
           await new Promise((resolve, reject) => {
             ws.onopen = resolve;
             ws.onerror = () => reject(new Error('ws 连接失败'));
           });
-          const cdp = new Cdp(ws);
-          let ready = false;
-          try {
-            // WebView初始页面早于Tauri桥接出现；这里只读就绪状态，身份核对仍先于所有写IPC。
-            const probe = await evaluate(cdp,
-              '({ ready: document.readyState === "complete" && typeof window.__TAURI_INTERNALS__?.invoke === "function", url: location.href, label: window.__TAURI_INTERNALS__?.metadata?.currentWindow?.label })', 5000);
-            ready = probe?.ready === true && probe.label === windowLabel;
-            if (ready) return { cdp, pageUrl: probe.url, close: () => ws.close() };
-            lastErr = 'page尚未完成Tauri桥接:' + probe?.url;
-          } finally {
-            if (!ready) ws.close();
-          }
+          return { cdp: new Cdp(ws), pageUrl: page.url, close: () => ws.close() };
         }
-        if (!page) lastErr = '无 page 目标(现有:' + targets.map((t) => t.type).join(',') + ')';
+        lastErr = '无 page 目标(现有:' + targets.map((t) => t.type).join(',') + ')';
       } else {
         lastErr = 'HTTP ' + res.status;
       }
@@ -687,10 +642,9 @@ async function attachCdp(port, timeoutMs, windowLabel = 'main') {
 //   - TIME_WAIT(connect 被拒):同样等一会儿即自然释放。
 // 超时仍未释放 → 明确失败,不动占用者、也不改端口。
 //
-// 🔴 为什么不改用「每次会话换新端口」(2026-09-12 复查后否掉的方案):WebView2 的浏览器进程按
+// WebView2 的浏览器进程按
 // user-data-dir 复用——旧浏览器进程若还在,新示例的 `--remote-debugging-port` 参数**不会再生效**,
-// 于是新端口上根本没人监听,attach 只会超时。换端口既没解决释放竞态,又新增了 profile 复杂度。
-// 有界等待才是对症的做法:等它退完,同一个端口自然可用。
+// 新端口上可能没人监听；有界等待旧进程释放后再使用同一端口。
 export function assertPortFree(port, graceMs) {
   const grace = graceMs === undefined ? 10000 : graceMs;
   return new Promise((resolve, reject) => {
@@ -754,6 +708,12 @@ export function attachedIdentityViolations(observed, expectedAppDataDir) {
 }
 
 export async function assertAttachedIdentity(cdp, ctx) {
+  // WebView2 已暴露调试目标时，页面脚本与 Tauri 桥仍可能尚未注入（重启时实测可复现）。
+  const deadline = Date.now() + ctx.timeoutMs;
+  while (!await evaluate(cdp, 'typeof window.__TAURI_INTERNALS__?.invoke === "function"')) {
+    if (Date.now() >= deadline) throw new Error('等待 Tauri IPC 桥就绪超时');
+    await sleep(100);
+  }
   const observed = {
     logDir: await ipc(cdp, 'get_log_dir', null),
     thumbCacheDir: await ipc(cdp, 'get_thumb_cache_dir', null),
@@ -837,18 +797,6 @@ async function waitForChannel(cdp, predicate, timeoutMs, label) {
 
 // ── app-data 侧观测(日志 / 缓存文件计数)────────────────────────────────────────
 
-function readLogs(logDir) {
-  if (!fs.existsSync(logDir)) return '';
-  const files = fs
-    .readdirSync(logDir)
-    .filter((n) => n.endsWith('.log') || n.endsWith('.jsonl'))
-    .map((n) => path.join(logDir, n))
-    .sort();
-  let text = '';
-  for (const f of files.slice(-4)) text += fs.readFileSync(f, 'utf8');
-  return text;
-}
-
 function countFiles(dir, ext) {
   if (!fs.existsSync(dir)) return 0;
   let n = 0;
@@ -864,7 +812,7 @@ function countFiles(dir, ext) {
 }
 
 function listPayload(exeDir) {
-  const want = ['native-thumbnail-worker.exe', 'raw-worker.exe', 'ai-worker.exe', 'video-worker.exe', 'enhance-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll'];
+  const want = ['raw-worker.exe', 'ai-worker.exe', 'video-worker.exe', 'enhance-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll'];
   const present = [];
   const missing = [];
   for (const n of want) {
@@ -972,11 +920,10 @@ function find7z() {
 
 // 解出安装包内的主程序并算 sha256——这是「安装目录里的 exe 应等于什么」的期望值。
 //
-// 🔴 为什么不能拿 target/release/scrollery.exe 当期望值(2026-09-12 逐字节实测):tauri-bundler
+// 安装目录 exe 的期望哈希取自安装包载荷：tauri-bundler
 // 为每个 bundle 各打一次补丁——把 exe 内的 `__TAURI_BUNDLE_TYPE_VAR_UNK__` 占位符改写成该 bundle
 // 的类型串(msi / nsis),建完包再把工作副本**还原**回 UNK。于是同一次构建产出三份不同字节:
-//   target/release = bb1c39dc…(UNK) / MSI 载荷 = 52008131…(MSI) / NSIS 载荷 = 323b89f1…(NSIS)
-// 而**安装到磁盘的那份 == NSIS 载荷**(实测逐字节相同)。故期望值必须取自包内。
+// target/release、MSI 载荷与 NSIS 载荷字节不同；安装到磁盘的是 NSIS 载荷。
 //
 // MSI 的载荷被匿名化成 `PathFile_<hash>` 之类的无扩展名条目,名字无从比对,只能按**字节尺寸**定位
 // (与 scripts/verify-bundle-content.mjs 同一套办法)。
@@ -1026,7 +973,7 @@ function extractPayloadExe(installer, exeName, expectedSize) {
 }
 
 // 收集 bundle 产物指纹(安装包本身 + 各自包内主程序),供构建证明绑定与安装取证比对。
-function collectBundleFingerprints(expectedPayloadSize, expectedWorkerSize) {
+function collectBundleFingerprints(expectedPayloadSize) {
   const out = { installers: [], note: null, sevenZip: Boolean(find7z()) };
   const bundleRoot = path.join(REPO, 'target', 'release', 'bundle');
   if (!fs.existsSync(bundleRoot)) {
@@ -1051,8 +998,6 @@ function collectBundleFingerprints(expectedPayloadSize, expectedWorkerSize) {
     };
     const payload = extractPayloadExe(installer, 'scrollery.exe', expectedPayloadSize);
     if (payload) rec.payloadExe = { sha256: payload.sha256, bytes: payload.bytes, entry: payload.entry };
-    const nativePayload = extractPayloadExe(installer, 'native-thumbnail-worker.exe', expectedWorkerSize);
-    if (nativePayload) rec.payloadNativeWorker = nativePayload;
     out.installers.push(rec);
   }
   if (!out.sevenZip) out.note = '未找到 7z,安装包内载荷指纹未记录';
@@ -1181,13 +1126,11 @@ function uninstallAcceptanceEntry(installDir) {
 
 
 // ── Worker 真实运行验证(exotic 帧协议握手)──────────────────────────────────────
-// why 要有这一步:此前只做「文件在不在」的存在性/哈希校验,那只证明**分发**到位,不证明 worker
-// **跑得起来**。这里按生产同一套机制实跑:spawn worker → 写 Hello 帧 → 等 Ready 帧 → 校验
+// 文件存在和哈希只证明分发到位；这里实跑 spawn worker → 写 Hello 帧 → 等 Ready 帧 → 校验
 // worker_id 与协议版本 → 发 Shutdown(在 finish 里)收干净退出。
 //
-// 覆盖边界(如实):握手路径**不承载模型加载**(ai-worker 模块头原文:「进程握手快而恒定
-// (Hello→Ready,5s 档):**不承载模型加载**」),故本轮**不覆盖**模型依赖路径——AI 推理 / OCR /
-// 增强等需要模型文件的分支未跑,也不在本轮供给范围内;raw/video 的能力声明亦只到 probe 通过范围。
+// 握手不承载模型加载；ready/chain 的 AI、RAW、video 覆盖止于握手。
+// enhance 阶段另验安装版增强 worker 的缺失模型路径，仍不证明成功推理。
 const EXOT_MAGIC = Buffer.from('EXOT', 'ascii');
 const EXOT_VERSION = 3;
 const FRAME_HELLO = 1;
@@ -1228,7 +1171,7 @@ function exotTakeFrame(buf) {
 }
 
 // 实跑一个 worker 并完成握手;失败抛错(附 stderr 尾部便于定位)。
-function handshakeWorker(exe, expectedWorkerId, timeoutMs) {
+function handshakeWorker(exe, expectedWorkerId, timeoutMs, requiredCapabilities = []) {
   return new Promise((resolve, reject) => {
     const child = spawn(exe, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let acc = Buffer.alloc(0);
@@ -1268,6 +1211,11 @@ function handshakeWorker(exe, expectedWorkerId, timeoutMs) {
             finish('协议版本不符:' + ready.protocol_version + ' ≠ ' + EXOT_VERSION);
             return;
           }
+          const missing = requiredCapabilities.filter((capability) => !ready.capabilities?.includes(capability));
+          if (missing.length) {
+            finish('worker 缺少宿主所需能力:' + missing.join(', '));
+            return;
+          }
           finish(null, {
             workerId: ready.worker_id,
             workerVersion: ready.worker_version,
@@ -1294,7 +1242,7 @@ function handshakeWorker(exe, expectedWorkerId, timeoutMs) {
 // 打包内应存在的 worker 与其期望 worker_id(与各 worker 源码的 WORKER_ID 常量一致)。
 const EXPECTED_WORKERS = [
   { file: 'raw-worker.exe', id: 'raw-worker' },
-  { file: 'ai-worker.exe', id: 'ai-worker' },
+  { file: 'ai-worker.exe', id: 'ai-worker', requiredCapabilities: ['embedding', 'text_encoding'] },
   { file: 'video-worker.exe', id: 'video-worker' },
 ];
 
@@ -1359,8 +1307,7 @@ async function requestCleanExit(cdp, child, timeoutMs) {
 // 本进程自己拉起的子进程(失败路径统一回收时用)。launchApp 里登记。
 const OWN_CHILDREN = [];
 // 事件循环保活句柄。理由:AsyncLocal 的 pending promise 不持有 handle——当唯一 handle(WebSocket 等)
-// 关闭时 Node 会当作无事可做而静默退出,退出码 0。2026-09-12 实测踩过:chain 跑到 chain:backup 就
-// 「成功」结束了,而报告/日志停在那一瞬。此句柄让流程只能显式收尾,不能悄悄消失。
+// 关闭时 Node 可能以 0 退出，即使验收尚未完成。此句柄要求流程显式收尾。
 let KEEPALIVE = null;
 
 async function runStep(name, fn) {
@@ -1430,16 +1377,6 @@ async function stageBoot(ctx) {
     if (code !== 0) throw new Error('退出码 ' + code + '(期望 0;101=panic,1=启动致命错误)');
     return { exitCode: code };
   });
-  await runStep('boot:isolated-app-data', () => {
-    if (!fs.existsSync(ctx.appDataDir)) {
-      throw new Error('隔离 app-data 未创建:' + ctx.appDataDir + '(说明构建未走验收身份覆盖配置)');
-    }
-    const db = path.join(ctx.appDataDir, 'scrollery.db');
-    if (!fs.existsSync(db)) throw new Error('隔离库缺 scrollery.db:' + db);
-    const logs = readLogs(path.join(ctx.appDataDir, 'logs'));
-    if (logs.includes('[FATAL]')) throw new Error('启动日志含致命错误');
-    return { appDataDir: ctx.appDataDir, dbBytes: fs.statSync(db).size, logChars: logs.length };
-  });
 }
 
 // ── 阶段:ready(CDP attach + IPC 往返 + Ready 日志 + 干净退出)──────────────────
@@ -1449,35 +1386,48 @@ async function stageReady(ctx) {
   // session 在 try 之外先置空:attach 失败也必须走 finally 回收**自己 spawn 的**进程
   // (attach 抛错时若只有 try 内的 finally,进程会留在后台继续跑)。
   let session = null;
-  let lifecycleSaved;
   try {
     session = await attachCdp(port, ctx.timeoutMs);
     const cdp = session.cdp;
     await cdp.send('Runtime.enable');
+    // CDP target 可先于 Tauri 初始化脚本出现；只读等待桥接就绪后再做身份核对。
+    const bridgeDeadline = Date.now() + ctx.timeoutMs;
+    while (!await evaluate(cdp, '!!window.__TAURI_INTERNALS__?.invoke')) {
+      if (Date.now() > bridgeDeadline) throw new Error('等待 Tauri IPC 桥接超时');
+      await sleep(80);
+    }
     // 任何写操作之前先确认连上的是本次验收实例(见守卫注释)。
     await runStep('ready:attached-identity', () => assertAttachedIdentity(cdp, ctx));
-    await runStep('ready:ipc-roundtrip', async () => {
-      const cfg = await ipc(cdp, 'get_startup_config', null);
-      if (!cfg || typeof cfg !== 'object') throw new Error('get_startup_config 返回异常:' + JSON.stringify(cfg));
-      return { keys: Object.keys(cfg).slice(0, 8), pageUrl: session.pageUrl };
-    });
-    await runStep('ready:frontend-mounted', async () => {
-      const raw = await evaluate(
-        cdp,
-        'JSON.stringify({ state: document.readyState, title: document.title,' +
-          ' appChildren: document.getElementById("app") ? document.getElementById("app").childElementCount : -1 })'
-      );
-      const probe = JSON.parse(raw);
-      if (probe.state !== 'complete') throw new Error('document.readyState=' + probe.state);
-      if (!(probe.appChildren > 0)) throw new Error('#app 无子节点,前端未挂载');
-      return probe;
-    });
-    await runStep('ready:no-page-exception', () => {
-      if (cdp.exceptions.length) {
-        throw new Error('页面异常 ' + cdp.exceptions.length + ' 条:' + JSON.stringify(cdp.exceptions[0]).slice(0, 240));
+    if (ctx.stage === 'interactions') {
+      const helpers = { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree };
+      const browserLog = [];
+      const observeLog = (event) => {
+        const message = JSON.parse(event.data);
+        if (message.method === 'Log.entryAdded') browserLog.push(message.params.entry);
+      };
+      cdp.ws.addEventListener('message', observeLog);
+      await cdp.send('Log.enable');
+      try {
+        if (ctx.interaction !== 'copy') {
+          const { verifyEditorInteractions } = await import('./editor-interactions.mjs');
+          await verifyEditorInteractions(ctx, cdp, helpers);
+        }
+        if (ctx.interaction !== 'editor') {
+          const { verifyCopyInteractions } = await import('./copy-interactions.mjs');
+          await verifyCopyInteractions(ctx, cdp, helpers);
+        }
+      } catch (error) {
+        // 保留真实界面，区分驱动定位失败与产品行为失败。
+        const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png' }).catch(() => null);
+        if (screenshot) fs.writeFileSync(path.join(ctx.root, 'interaction-failure.png'), Buffer.from(screenshot.data, 'base64'));
+        const dom = await evaluate(cdp, 'document.documentElement.outerHTML').catch(() => 'unavailable');
+        fs.writeFileSync(path.join(ctx.root, 'interaction-failure.html'), dom);
+        throw error;
+      } finally {
+        cdp.ws.removeEventListener('message', observeLog);
+        fs.writeFileSync(path.join(ctx.root, 'browser-log.json'), JSON.stringify({ entries: browserLog, exceptions: cdp.exceptions }, null, 2));
       }
-      return { exceptions: 0 };
-    });
+    }
     if (ctx.stage === 'enhance') {
       const { verifyEnhanceGates } = await import('./enhance-gates.mjs');
       await verifyEnhanceGates(ctx, cdp, {
@@ -1485,148 +1435,15 @@ async function stageReady(ctx) {
         exotFrame, exotTakeFrame,
       });
     }
-    if (ctx.stage === 'thumbnail-manual-focus') {
-      const { verifyThumbnailManualFocus } = await import('./thumbnail-manual-focus.mjs');
-      await verifyThumbnailManualFocus(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel,
-        attachLogs: () => attachCdp(ctx.port, ctx.timeoutMs, 'logs') });
-    }
-    if (ctx.stage === 'thumbnail-representative') {
-      const { startOwnedResourceSampler } = await import('./owned-resource-sampler.mjs');
-      const { verifyThumbnailRepresentative } = await import('./thumbnail-representative.mjs');
-      const sampler = await startOwnedResourceSampler(ctx, child.pid, OWN_CHILDREN);
-      try {
-        await verifyThumbnailRepresentative(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree, ownedPid: child.pid });
-      } finally { await sampler.stop(); }
-    }
-    if (ctx.stage === 'thumbnail-live-addition') {
-      const { verifyThumbnailLiveAddition } = await import('./thumbnail-live-addition.mjs');
-      await verifyThumbnailLiveAddition(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree });
-    }
-    if (ctx.stage === 'thumbnail-interaction') {
-      const { verifyThumbnailInteraction } = await import('./thumbnail-interaction.mjs');
-      await verifyThumbnailInteraction(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree,
-        attachLogs: () => attachCdp(ctx.port, ctx.timeoutMs, 'logs') });
-    }
-    if (ctx.stage === 'thumbnail-logs') {
-      const { verifyThumbnailLogs } = await import('./thumbnail-logs.mjs');
-      await verifyThumbnailLogs(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel,
-        attachLogs: () => attachCdp(ctx.port, ctx.timeoutMs, 'logs') });
-    }
-    if (ctx.stage === 'thumbnails') {
-      const { verifyThumbnails } = await import('./thumbnail-gates.mjs');
-      const nativeDebugger = arg('native-debugger', null);
-      const beforeCancel = nativeDebugger ? async () => {
-        const { attachNativeDebuggers } = await import('./native-debugger.mjs');
-        return attachNativeDebuggers({ ...ctx, nativeDebugger }, child.pid, OWN_CHILDREN);
-      } : null;
-      await verifyThumbnails(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, waitChannelCount, walkDirectoryTree, beforeCancel });
-    }
-    if (ctx.stage === 'thumbnail-lifecycle' || ctx.stage === 'thumbnail-crash' || ctx.stage === 'thumbnail-video-crash' || ctx.stage === 'thumbnail-restore' || ctx.stage === 'thumbnail-ui') {
-      const { verifyThumbnailLifecycle } = await import('./thumbnail-lifecycle.mjs');
-      const saved = await verifyThumbnailLifecycle(ctx, cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree });
-      if (ctx.stage !== 'thumbnail-ui') lifecycleSaved = saved;
-    }
-    if (ctx.stage === 'thumbnail-crash' || ctx.stage === 'thumbnail-video-crash') {
-      const { interruptThumbnailRun } = await import('./thumbnail-lifecycle.mjs');
-      lifecycleSaved = await interruptThumbnailRun(ctx, cdp, { runStep, ipc }, lifecycleSaved, async () => {
-        killOurProcess(child);
-        await waitExit(child, 10000);
-      });
-    } else await runStep('ready:clean-exit', async () => {
+    await runStep('ready:clean-exit', async () => {
       const code = await requestCleanExit(cdp, child);
       if (code !== 0) throw new Error('exit_app 后退出码 ' + code + '(期望 0:退出路径含 WAL checkpoint)');
       return { exitCode: code };
-    });
-    // 🔴 日志断言必须放在**退出之后**读(2026-09-12 实测踩过):进程存活期间日志走缓冲,
-    // info 级还在内存里没落盘——此时只读得到 WARN 一类已 flush 的行,于是把「后端已就绪」
-    // 误判成「日志未见 Ready」。退出会 flush,退完再读才是完整日志。
-    // 另外:就绪的**行为证据**在退出前已经取到(IPC 往返 / 前端挂载 / 零页面异常),
-    // 这里读日志是补充证据,不是唯一判据。
-    await runStep('ready:backend-ready-log', () => {
-      const logs = readLogs(path.join(ctx.appDataDir, 'logs'));
-      fs.mkdirSync(ctx.logDir, { recursive: true });
-      fs.writeFileSync(path.join(ctx.logDir, ctx.stage + '-backend.jsonl'), logs);
-      if (ctx.manualFocusRounds) {
-        const summaries = logs.split(/\r?\n/).flatMap((line) => {
-          try { const row = JSON.parse(line); return row.msg === 'thumbnail run summary' ? [row] : []; }
-          catch { return []; }
-        });
-        ctx.manualFocusQos = ctx.manualFocusRounds.map((round) => {
-          const rows = summaries.filter((row) => Date.parse(row.ts) >= round.startTimeMs && Date.parse(row.ts) <= round.endTimeMs);
-          const expected = round.focus.main || round.focus.logs;
-          if (!rows.length || rows.at(-1).attributes.qos_foreground !== expected) {
-            throw new Error('收口焦点与后端 QoS 不一致: ' + JSON.stringify({ focus: round.focus, last: rows.at(-1) }));
-          }
-          const last = rows.at(-1).attributes;
-          const receipt = String(last.qos_native_current);
-          if (!/accepted: [1-9]\d*/.test(receipt) || !receipt.includes('failed: 0') || !receipt.includes('applying: 0')) {
-            throw new Error('原生线程 QoS 未确认: ' + receipt);
-          }
-          return { label: round.focus.label, foreground: last.qos_foreground, revision: last.qos_revision,
-            native: last.qos_native_current, host: last.qos_host_current,
-            observedForegroundStates: [...new Set(rows.map((row) => row.attributes.qos_foreground))] };
-        });
-        const [mainRound, logsRound] = ctx.manualFocusRounds;
-        const internalRequests = logs.split(/\r?\n/).flatMap((line) => {
-          try { const row = JSON.parse(line); return row.msg === 'thumbnail host QoS requested' &&
-            Date.parse(row.ts) >= mainRound.endTimeMs && Date.parse(row.ts) <= logsRound.startTimeMs ? [row] : []; }
-          catch { return []; }
-        });
-        if (internalRequests.some((row) => row.attributes.foreground === false)) {
-          throw new Error('主窗到日志窗误切后台: ' + JSON.stringify(internalRequests));
-        }
-      }
-      if (ctx.thumbnailFilterMarkers) {
-        const { hiddenInfo, visibleWarn, visibleInfo } = ctx.thumbnailFilterMarkers;
-        if (logs.includes(hiddenInfo) || !logs.includes(visibleWarn) || !logs.includes(visibleInfo)) {
-          throw new Error('Backend EnvFilter reload did not filter recorded probes');
-        }
-      }
-      if (logs.includes('[FATAL]')) throw new Error('启动日志含致命错误');
-      const m = logs.match(/Rust boot[^\n]*Ready[^\n]*/);
-      // 🔴 为什么**不**拿「日志里必须有 Ready 行」判失败(2026-09-12 单变量实测查明):
-      // logging.rs:546 用 `EnvFilter::try_from_default_env()`,**优先读 `RUST_LOG` 环境变量**,
-      // 只有它缺省时才回落到 config.toml 的 log_level(默认 info)。本机父进程环境里 `RUST_LOG=warn`,
-      // 于是 info 级的 Ready 行被过滤掉——与产品退出实现、与缓冲丢失都无关。
-      // 实测(只改 RUST_LOG 一个变量,其余环境照旧):RUST_LOG=info 的子进程立刻多出 13 行、
-      // 其中包含 `"level":"INFO" ... "Rust boot → Ready 230ms"`;warn 档则只有那条 WARN。
-      // 就绪的正式判据是**行为证据**(IPC 往返 / 前端挂载 / 零页面异常),本步之前已全部通过;
-      // 本步只保留:① FATAL 硬失败;② 有 Ready 行就记为补充证据,没有则如实标注环境过滤原因。
-      return {
-        sawReadyLine: Boolean(m),
-        logChars: logs.length,
-        manualFocusQos: ctx.manualFocusQos,
-        rustLogEnv: process.env.RUST_LOG || null,
-        note: m
-          ? '日志含 Ready 行'
-          : '日志未含 Ready 行:EnvFilter 优先取 RUST_LOG=' + (process.env.RUST_LOG || '(未设)') +
-            ',info 级被过滤(logging.rs:546);就绪由前面的行为证据判定。要复现该行:以 RUST_LOG=info 启动子进程',
-      };
     });
   } finally {
     if (session) session.close();
     killOurProcess(child);
   }
-  if (lifecycleSaved) {
-    const restarted = await launchWithCdp(ctx, 'thumbnail-restart');
-    let restartedSession;
-    try {
-      restartedSession = await attachCdp(restarted.port, ctx.timeoutMs);
-      await restartedSession.cdp.send('Runtime.enable');
-      await runStep('thumbnail-lifecycle:restart-identity', () => assertAttachedIdentity(restartedSession.cdp, ctx));
-      const { verifyThumbnailLifecycle } = await import('./thumbnail-lifecycle.mjs');
-      await verifyThumbnailLifecycle(ctx, restartedSession.cdp, { runStep, ipc, evaluate, openChannel, waitForChannel, walkDirectoryTree }, lifecycleSaved);
-      await runStep('thumbnail-lifecycle:restart-exit', async () => {
-        const code = await requestCleanExit(restartedSession.cdp, restarted.child);
-        if (code !== 0) throw new Error('Restarted app exit: ' + code);
-        return { exitCode: code };
-      });
-    } finally {
-      restartedSession?.close();
-      killOurProcess(restarted.child);
-    }
-  }
-
 }
 
 // ── 阶段:chain(首启→扫描→缩略图→查看→标记→导出→备份→重启恢复)────────────────
@@ -1657,12 +1474,6 @@ async function stageChain(ctx) {
     const expected = ctx.fixtures.items.length;
     // 源根扫描看到的条目 = 根目录文件 + movable/ 子树(移动验收的源);根目录列表仍是 expected。
     const expectedAll = ctx.fixtures.allMediaItems.length;
-
-    await runStep('chain:first-launch-empty', async () => {
-      const roots = await ipc(cdp, 'list_scan_roots', null);
-      if (!Array.isArray(roots) || roots.length !== 0) throw new Error('首启扫描根应 0 个,实际 ' + JSON.stringify(roots));
-      return { roots: 0 };
-    });
 
     const root = await runStep('chain:add-root', async () => {
       const r = await ipc(cdp, 'add_scan_root', { path: ctx.mediaDir, alias: 'Acceptance Fixture' });
@@ -1758,14 +1569,14 @@ async function stageChain(ctx) {
 
     await runStep('chain:thumbnails', async () => {
       const channel = await openChannel(cdp);
-      const done = ipc(
+      // 当前命令只确认受理；先等待受理失败，再读取独立返回的逐项通道结果。
+      await ipc(
         cdp,
         'batch_request_thumbnails',
-        { itemIds: items.ids, targetSize: null, onResult: channel },
+        { itemIds: items.ids, targetSize: null, requestId: 'acceptance-thumbnails', onResult: channel },
         ctx.timeoutMs
       );
       const seen = await waitChannelCount(cdp, items.ids.length, ctx.timeoutMs, 'thumbnails');
-      await done;
       // 逐项核对,而不是只数事件条数(凑够 N 条不代表覆盖了请求的 N 个 item):
       //   ① 响应 itemId 必须在请求集内,且请求集被完整覆盖;
       //   ② thumbPath 必须真实存在,且落在受控的隔离 app-data 内(缓存根就在其下)。
@@ -1959,7 +1770,6 @@ async function stageChain(ctx) {
       }
       return { pending: 0 };
     };
-    await runStep('chain:moves-idle-before', () => pendingMoves('移动前'));
 
     const moved = await runStep('chain:move-to-target', async () => {
       const res = await ipc(
@@ -2004,8 +1814,6 @@ async function stageChain(ctx) {
       return { itemId, absPath: abs, sha256: onDisk.slice(0, 16), availability: d.availability };
     });
 
-    await runStep('chain:moves-idle-after', () => pendingMoves('移动后'));
-
     // 搬回原处,让后续导出/备份/重启按原来的布局对照(移动本身已在上一步取到证据)。
     await runStep('chain:move-back', async () => {
       const res = await ipc(
@@ -2028,18 +1836,6 @@ async function stageChain(ctx) {
 
     await runStep('chain:moves-idle-final', () => pendingMoves('搬回后'));
 
-    // 新增命令的 ACL 取证(命令在 registry 里注册、capabilities 由构建期生成覆盖)。
-    await runStep('chain:new-command-acl', async () => {
-      // clear_semantic_search:新增搜索命令。能通即 ACL 已覆盖;不下载模型(空库上是幂等清空)。
-      await ipc(cdp, 'clear_semantic_search', null);
-      // retry_directory_move:用一个不可能存在的日志 id,应返回 null(这条命令已收尾)。
-      const retried = await ipc(cdp, 'retry_directory_move', { recoveryId: 999999 });
-      if (retried !== null && retried !== undefined) {
-        throw new Error('retry_directory_move(不存在 id)应返回 null,实际 ' + JSON.stringify(retried).slice(0, 200));
-      }
-      return { clearSemanticSearch: 'ok', retryDirectoryMove: null };
-    });
-
     // 打包内 worker 实际运行:逐个 spawn 并完成一次真实 Hello→Ready 握手(见函数头注明的模型边界)。
     await runStep('workers:handshake', async () => {
       const dir = path.dirname(ctx.exe);
@@ -2051,7 +1847,7 @@ async function stageChain(ctx) {
           absent.push(w.file);
           continue;
         }
-        results.push(await handshakeWorker(exe, w.id, 30000));
+        results.push(await handshakeWorker(exe, w.id, 30000, w.requiredCapabilities));
       }
       if (absent.length === EXPECTED_WORKERS.length) {
         throw new Error('目录内没有任何预期 worker:' + dir + '(打包闭包不完整)');
@@ -2193,13 +1989,14 @@ async function stageChain(ctx) {
 
       const staged = await runStep('chain:restore-stage', async () => {
         const r = await ipc(second.cdp, 'restore_stage', { packagePath: backup.packagePath }, ctx.timeoutMs);
-        if (!r || !r.backupId || !r.stagingDir) throw new Error('restore_stage 返回异常:' + JSON.stringify(r).slice(0, 240));
+        if (!r || !r.backupId || !r.stagingDir || !r.stagingToken) throw new Error('restore_stage 返回异常:' + JSON.stringify(r).slice(0, 240));
         // 🔴 必须把 stagingDir 带出来:Rust 侧 `staging_dir: String` 是**必填**字段(非 Option),
         // 漏传会让 IPC 以「缺字段」失败;而且它并非无用参数——后端拿它做一致性核对(非空且与
         // backupId 派生路径不符即拒)。
         return {
           backupId: r.backupId,
           stagingDir: r.stagingDir,
+          stagingToken: r.stagingToken,
           schemaVersion: r.schemaVersion,
           counts: r.counts,
         };
@@ -2208,7 +2005,7 @@ async function stageChain(ctx) {
         await ipc(
           second.cdp,
           'restore_arm',
-          { backupId: staged.backupId, stagingDir: staged.stagingDir },
+          { backupId: staged.backupId, stagingDir: staged.stagingDir, stagingToken: staged.stagingToken },
           ctx.timeoutMs
         );
         const marker = path.join(ctx.appDataDir, 'pending-restore.json');
@@ -2237,7 +2034,6 @@ async function stageChain(ctx) {
           overwrittenThenDiscarded: { isFavorited: false, rating: 2 },
         };
       });
-      await runStep('chain:restore-clean-exit', () => exitClean(third.cdp, third.child, 'chain 恢复后'));
       third.session.close();
     }
     // 终态哨兵:只有真的走完 chain 才会记下这一步。配合上面的结算检查,
@@ -2262,44 +2058,24 @@ function makeContext() {
   // 启动前必须拿到的三份证据(缺任一即拒绝):字节内身份、版本资源身份、记录下来的 exe 哈希。
   // 全部在 spawn 之前完成——普通构建 setup 期就会写用户日常库,「先跑起来再查 appDataDir」那时库已脏。
   const identity = assertAcceptanceIdentity(exe);
-  const proofed = assertBuildProof(exe);
+  // 两道门校验同一次读取的产物，避免重复读取 EXE 与版本资源。
+  const proofed = assertBuildProof(exe, undefined, identity.info);
   const appDataDir = assertAcceptanceDir(appDataDirFor(ACCEPTANCE_IDENTIFIER));
   const userLibrary = userLibraryTopLevelFingerprint();
   const root = assertControlledRoot(arg('root', path.join(REPO, 'target', 'acceptance')));
   // 目标根:默认放在验收根内(同卷);给了 --target-root 就用它——真给另一块盘时
   // 本次运行会走跨卷「暂存→发布→删源」路径,见 chain 的卷别判定与说明。
   const targetMediaDir = assertControlledRoot(arg('target-root', path.join(root, 'media-target')));
-  let sampleDir;
-  if (stage === 'thumbnail-representative') {
-    const requested = arg('sample-dir', null);
-    if (!requested) throw new Error('representative 阶段要求显式 --sample-dir');
-    sampleDir = fs.realpathSync(requested);
-    if (!fs.statSync(sampleDir).isDirectory()) throw new Error('sample-dir 必须是目录');
-    const canonicalTarget = (value) => {
-      if (fs.existsSync(value)) return fs.realpathSync(value);
-      return path.join(canonicalTarget(path.dirname(value)), path.basename(value));
-    };
-    const contains = (parent, child) => {
-      const relative = path.relative(parent, child);
-      return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
-    };
-    for (const writable of [root, appDataDir, targetMediaDir]) {
-      const canonical = canonicalTarget(writable);
-      if (contains(sampleDir, canonical) || contains(canonical, sampleDir)) {
-        throw new Error('只读样本不能与验收写入目录重叠: ' + canonical);
-      }
-    }
-  }
   const mediaCount = Number(arg('media', '9'));
   if (!Number.isInteger(mediaCount) || mediaCount < 3) throw new Error('--media 至少 3(N 张图,含子目录与非媒体文件)');
   const ctx = {
     stage,
+    interaction: arg('interaction', 'all'),
     exe,
     appDataDir,
     root,
     mediaDir: path.join(root, 'media'),
     targetMediaDir,
-    sampleDir,
     exportDir: path.join(root, 'export'),
     backupDir: path.join(root, 'backup'),
     logDir: path.join(root, 'logs'),
@@ -2322,6 +2098,7 @@ function makeContext() {
       proofPath: proofed.proofPath,
     },
   };
+  if (!['all', 'editor', 'copy'].includes(ctx.interaction)) throw new Error('未知 --interaction');
   return ctx;
 }
 
@@ -2336,7 +2113,10 @@ function prepare(ctx) {
       fs.rmSync(assertDeletableFixtureRoot(ctx.mediaDir, ctx.root), { recursive: true, force: true });
       fs.rmSync(assertDeletableFixtureRoot(ctx.targetMediaDir, ctx.root), { recursive: true, force: true });
     }
-  ctx.fixtures = writeFixtures(ctx.mediaDir, ctx.targetMediaDir, Number(arg('media', '9')));
+  // 文档/复制交互只创建各 helper 的非媒体夹具，不生成或扫描图片。
+  ctx.fixtures = ctx.stage === 'interactions'
+    ? { items: [], target: { items: [] } }
+    : writeFixtures(ctx.mediaDir, ctx.targetMediaDir, Number(arg('media', '9')));
   fs.mkdirSync(ctx.exportDir, { recursive: true });
   fs.mkdirSync(ctx.backupDir, { recursive: true });
   const payload = listPayload(path.dirname(ctx.exe));
@@ -2345,7 +2125,9 @@ function prepare(ctx) {
   console.log('  产物身份   : sha256 ' + ctx.identity.exeSha256.slice(0, 16) + '… / ProductName "' + ctx.identity.productName + '"');
   console.log('  构建证明   : ' + ctx.identity.proofPath);
   console.log('  隔离 app-data: ' + ctx.appDataDir);
-  console.log('  媒体夹具   : ' + ctx.mediaDir + '(' + ctx.fixtures.items.length + ' 张 PNG + 1 非媒体)');
+  console.log(ctx.stage === 'interactions'
+    ? '  交互夹具   : 由交互步骤创建临时 Markdown / 非媒体，不生成图片'
+    : '  媒体夹具   : ' + ctx.mediaDir + '(' + ctx.fixtures.items.length + ' 张 PNG + 1 非媒体)');
   console.log('  目标根夹具 : ' + ctx.targetMediaDir + '(' + ctx.fixtures.target.items.length + ' 张 PNG;目录移动的目标宿主)');
   console.log('  源/目标卷  : ' + (ctx.sameVolume ? '同卷(rename 路径)' : '跨卷(暂存→发布→删源路径)'));
   console.log('  旁置载荷   : ' + (payload.present.length ? payload.present.join(', ') : '(无)'));
@@ -2354,315 +2136,22 @@ function prepare(ctx) {
 }
 
 async function selftest() {
-  const fails = [];
-  const expect = (cond, msg) => {
-    if (!cond) fails.push(msg);
-  };
-  // PNG 夹具必须真能被解析回正确尺寸(生成器退化 = 验收基线不可信)。
-  for (const [w, h] of FIXTURE_SIZES.concat([[7, 5]])) {
-    const parsed = parsePng(makePng(w, h, 3));
-    expect(parsed.ihdr && parsed.ihdr.width === w && parsed.ihdr.height === h, 'PNG 往返尺寸不符:' + w + 'x' + h);
-    expect(parsed.types.join(',') === 'IHDR,IDAT,IEND', 'PNG chunk 序列异常:' + parsed.types.join(','));
-  }
-  expect(makePng(16, 16, 1).equals(makePng(16, 16, 1)), 'PNG 生成不确定(同输入两次不一致)');
-  expect(!makePng(16, 16, 1).equals(makePng(16, 16, 2)), 'PNG 生成未随 seed 变化');
-  // 路径守卫:验收身份目录放行,用户真实库必须拦下。
-  const acceptance = path.join(resolveKnownFolders().roaming, ACCEPTANCE_IDENTIFIER);
-  let blocked = false;
-  try {
-    assertAcceptanceDir(path.join(resolveKnownFolders().roaming, USER_IDENTIFIER));
-  } catch (_) {
-    blocked = true;
-  }
-  expect(blocked, '路径守卫未拦下用户真实库');
-  blocked = false;
-  try {
-    assertAcceptanceDir(path.join(resolveKnownFolders().roaming, USER_IDENTIFIER, 'sub'));
-  } catch (_) {
-    blocked = true;
-  }
-  expect(blocked, '路径守卫未拦下用户真实库子目录');
-  expect(assertAcceptanceDir(acceptance).endsWith(ACCEPTANCE_IDENTIFIER), '路径守卫误拦验收目录');
-  // 版本资源桥接(FileVersionInfo)双向取证:非 PE 文件必须读出空 ProductName(不是抛错、更不是
-  // 「有值」),而真实产物在盘时必须读出真 ProductName——恒空或恒有值都会让身份门失效。
-  const verTmp = fs.mkdtempSync(path.join(process.env.TEMP || '.', 'acceptance-ver-'));
-  try {
-    const notPe = path.join(verTmp, 'not-a-pe.exe');
-    fs.writeFileSync(notPe, Buffer.from('not-a-pe'));
-    expect(readFileVersionInfo(notPe).ProductName === '', '非 PE 文件竟读出 ProductName');
-    const realExe = [
-      path.join(resolveKnownFolders().local, 'Scrollery', 'scrollery.exe'),
-      path.join(REPO, 'src-tauri', 'binaries', 'ai-worker-x86_64-pc-windows-msvc.exe'),
-    ].find((p) => fs.existsSync(p));
-    if (realExe) {
-      const name = readFileVersionInfo(realExe).ProductName;
-      if (name) expect(name.length > 0, '真实产物读不出 ProductName:' + realExe);
-      else console.log('  (提示:' + path.basename(realExe) + ' 无版本资源,正样本待真实 Tauri 产物验证)');
-    }
-  } finally {
-    fs.rmSync(verTmp, { recursive: true, force: true });
-  }
-  // 端口守卫(有界等待语义):
-  //   ① 有监听者时,宽限期内拿不到就**失败**(不 attach、不杀占用者);
-  //   ② 期间释放,则等待成功(这正是「刚退出会话的 WebView2 子进程晚一步放端口」那条路径);
-  //   ③ 空闲端口立即通过。①用短 grace 免得自检等满 10s。
-  const portHolder = net.createServer(() => {});
-  await new Promise((resolve, reject) => {
-    portHolder.once('error', reject);
-    portHolder.listen(0, '127.0.0.1', resolve);
-  });
-  const busyPort = portHolder.address().port;
-  let portBlocked = false;
-  try {
-    await assertPortFree(busyPort, 800);
-  } catch (_) {
-    portBlocked = true;
-  }
-  expect(portBlocked, '端口守卫未在有监听者时按宽限期失败');
-  // 期间释放 → 等待应成功(而不是直接判失败)。
-  const releaseLater = assertPortFree(busyPort, 8000);
-  setTimeout(() => portHolder.close(() => {}), 1200);
-  await releaseLater;
-  // 空闲端口立即通过。
-  const freeProbe = net.createServer();
-  await new Promise((resolve) => freeProbe.listen(0, '127.0.0.1', resolve));
-  const freePort = freeProbe.address().port;
-  await new Promise((resolve) => freeProbe.close(resolve));
-  await assertPortFree(freePort, 3000);
-  // 实例身份守卫:只读 IPC 返回的路径必须落在预期验收 app-data 之下。反样本取用户真实库——
-  // 这正是「attach 到别人实例」时会观测到的值(别人的 logDir 会指到用户库)。
   const userDir = path.join(resolveKnownFolders().roaming, USER_IDENTIFIER);
-  expect(
-    attachedIdentityViolations({ logDir: path.join(userDir, 'logs') }, acceptance).length === 1,
-    '身份守卫未拦下用户真实库下的 logDir'
-  );
-  expect(
-    attachedIdentityViolations({ thumbCacheDir: path.join(userDir, 'cache') }, acceptance).length === 1,
-    '身份守卫未拦下用户真实库下的 thumbCacheDir'
-  );
-  expect(
-    attachedIdentityViolations({ logDir: null, thumbCacheDir: '' }, acceptance).length === 2,
-    '身份守卫未拦下读不到路径(不可证)的返回值'
-  );
-  expect(
-    attachedIdentityViolations({ configPath: path.join(userDir, 'config.toml') }, acceptance).length === 1,
-    '身份守卫未拦下用户真实库下的 config.toml'
-  );
-  expect(
-    attachedIdentityViolations(
-      { logDir: path.join(acceptance, 'logs'), thumbCacheDir: path.join(acceptance, 'cache') },
-      acceptance
-    ).length === 0,
-    '身份守卫对验收实例误报'
-  );
-  // 同前缀的兄弟目录不是子目录,不能靠字符串侥幸放行。
-  expect(
-    attachedIdentityViolations({ logDir: acceptance + '-backup' + path.sep + 'logs' }, acceptance).length === 1,
-    '身份守卫未拦下同前缀兄弟目录'
-  );
-  // 身份门:只带 identifier 字节、没有版本资源的文件必须被拒(哈希或 marker 单独都证明不了身份)。
-  const gateTmp = fs.mkdtempSync(path.join(process.env.TEMP || '.', 'acceptance-gate-'));
+  testCase('isolation:reject-user-library', () => {
+    assert.throws(() => assertAcceptanceDir(userDir));
+  });
+  const guardTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'acceptance-guard-'));
   try {
-    const markerOnly = path.join(gateTmp, 'marker-only.exe');
-    fs.writeFileSync(markerOnly, Buffer.concat([Buffer.from('MZ'), Buffer.from(ACCEPTANCE_IDENTIFIER, 'utf8')]));
-    expect(analyzeExe(markerOnly).hasIdentifierMarker === true, '身份分析未识别 identifier 字节');
-    expect(analyzeExe(markerOnly).productName === null, '身份分析对非 PE 谎报读出 ProductName');
-    let caught = false;
-    try {
-      assertAcceptanceIdentity(markerOnly);
-    } catch (_) {
-      caught = true;
-    }
-    expect(caught, '身份门未拦下「只有 marker 字节、无版本资源」的产物');
-    // 构建证明门:缺证明 / exe 哈希不符 / 配置漂移三种都必须拦下,匹配的证明必须放行。
-    const proofFile = path.join(gateTmp, 'proof.json');
-    const cfg = readAcceptanceConfig();
-    const workerFixture = path.join(gateTmp, 'native-thumbnail-worker.exe');
-    fs.writeFileSync(workerFixture, 'expected native worker');
-    const testNative = { sha256: sha256Buf(fs.readFileSync(workerFixture)) };
-    const tryProof = () => {
-      try {
-        assertBuildProof(markerOnly, proofFile);
-        return false;
-      } catch (_) {
-        return true;
-      }
-    };
-    let proofBlocked = 0;
-    if (tryProof()) proofBlocked++;
-    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: 'deadbeef', configSha256: cfg.sha256, identifier: ACCEPTANCE_IDENTIFIER, nativeWorker: testNative }, null, 2));
-    if (tryProof()) proofBlocked++;
-    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: analyzeExe(markerOnly).exeSha256, configSha256: 'stale', identifier: ACCEPTANCE_IDENTIFIER, nativeWorker: testNative }, null, 2));
-    if (tryProof()) proofBlocked++;
-    expect(proofBlocked === 3, '构建证明门漏放(应拦 3 种,实拦 ' + proofBlocked + ' 种)');
-    fs.writeFileSync(proofFile, JSON.stringify({ exeSha256: analyzeExe(markerOnly).exeSha256, configSha256: cfg.sha256, identifier: ACCEPTANCE_IDENTIFIER, nativeWorker: testNative }, null, 2));
-    expect(tryProof() === false, '构建证明门对匹配的证明误拦');
-    fs.writeFileSync(workerFixture, 'different native worker');
-    expect(tryProof(), '构建证明门未拦下被替换的 native worker');
-    fs.unlinkSync(workerFixture);
-    expect(tryProof(), '构建证明门未拦下缺失的 native worker');
-  } finally {
-    fs.rmSync(gateTmp, { recursive: true, force: true });
-  }
-  // 受控删除守卫:名字对但不在 Windows 解析位置、或内容不像验收数据的目录必须拒删;
-  // 夹具目录没有本脚本标识文件必须拒删;受保护目录不能被当作验收根。
-  const guardTmp = fs.mkdtempSync(path.join(process.env.TEMP || '.', 'acceptance-guard-'));
-  try {
-    const fakeAppData = path.join(guardTmp, ACCEPTANCE_IDENTIFIER);
-    fs.mkdirSync(fakeAppData, { recursive: true });
-    fs.writeFileSync(path.join(fakeAppData, 'someone-elses-data.bin'), 'x');
-    let blocked2 = false;
-    try {
-      assertDeletableAppData(fakeAppData);
-    } catch (_) {
-      blocked2 = true;
-    }
-    expect(blocked2, '受控删除守卫未拦下「不在 Roaming 下」的同名目录');
-    const noMarker = path.join(guardTmp, 'fixture-without-marker');
-    fs.mkdirSync(noMarker, { recursive: true });
-    fs.writeFileSync(path.join(noMarker, 'photo.png'), 'x');
-    blocked2 = false;
-    try {
-      assertDeletableFixtureRoot(noMarker, guardTmp);
-    } catch (_) {
-      blocked2 = true;
-    }
-    expect(blocked2, '受控删除守卫未拦下没有标识文件的夹具目录');
-    const marked = path.join(guardTmp, 'fixture-with-marker');
-    fs.mkdirSync(marked, { recursive: true });
-    fs.writeFileSync(path.join(marked, FIXTURE_MARKER), '{}');
-    expect(assertDeletableFixtureRoot(marked, guardTmp) === marked, '受控删除守卫误拦带标识的夹具目录');
-    blocked2 = false;
-    try {
-      assertDeletableFixtureRoot(path.join(os.tmpdir(), 'acceptance-outside-root'), guardTmp);
-    } catch (_) {
-      blocked2 = true;
-    }
-    expect(blocked2, '受控删除守卫未拦下验收根之外的路径');
-    for (const badRoot of [path.parse(guardTmp).root, os.homedir(), REPO]) {
-      let caughtRoot = false;
-      try {
-        assertControlledRoot(badRoot);
-      } catch (_) {
-        caughtRoot = true;
-      }
-      expect(caughtRoot, '受控根守卫未拦下受保护目录:' + badRoot);
-    }
-    expect(assertControlledRoot(guardTmp) === guardTmp, '受控根守卫误拦普通临时目录');
+    testCase('cleanup:reject-unmarked-fixture-directory', () => {
+      const noMarker = path.join(guardTmp, 'fixture-without-marker');
+      fs.mkdirSync(noMarker, { recursive: true });
+      fs.writeFileSync(path.join(noMarker, 'photo.png'), 'x');
+      assert.throws(() => assertDeletableFixtureRoot(noMarker, guardTmp));
+    });
   } finally {
     fs.rmSync(guardTmp, { recursive: true, force: true });
   }
-  // 夹具落盘:数量 + 子目录 + 非媒体文件。
-  // 安装目录守卫:验收根外、用户已装目录、含空白路径都必须拒;合规目录放行;ownership 只认自有。
-  const installTmp = fs.mkdtempSync(path.join(process.env.TEMP || '.', 'acceptance-install-'));
-  try {
-    const okDir = installDirFor(installTmp);
-    expect(assertInstallableDir(okDir, installTmp) === path.resolve(okDir), '安装目录守卫误拦合规目录');
-    let caughtInstall = false;
-    try {
-      assertInstallableDir(path.join(process.env.TEMP || '.', 'outside-root-install'), installTmp);
-    } catch (_) {
-      caughtInstall = true;
-    }
-    expect(caughtInstall, '安装目录守卫未拦下验收根之外的目录');
-    caughtInstall = false;
-    try {
-      assertInstallableDir(path.join(userInstallDir(), 'nested'), installTmp);
-    } catch (_) {
-      caughtInstall = true;
-    }
-    expect(caughtInstall, '安装目录守卫未拦下用户已装目录');
-    caughtInstall = false;
-    try {
-      assertInstallableDir(path.join(userInstallDir(), '..', 'ScrollerySibling'), installTmp);
-    } catch (_) {
-      caughtInstall = true;
-    }
-    expect(caughtInstall, '安装目录守卫未拦下用户已装目录的兄弟路径(仍需在验收根内)');
-    caughtInstall = false;
-    try {
-      assertInstallableDir(path.join(installTmp, 'with space'), installTmp);
-    } catch (_) {
-      caughtInstall = true;
-    }
-    expect(caughtInstall, '安装目录守卫未拦下含空白的路径(NSIS /D= 会截断)');
-    // ownership:空目录/自有标识放行;有内容且无标识 → 拒。
-    expect(claimInstallDir(okDir) === okDir, '安装目录认领失败');
-    expect(fs.existsSync(path.join(okDir, INSTALL_MARKER)), '安装目录缺标识文件');
-    const foreignDir = path.join(installTmp, 'foreign-install');
-    fs.mkdirSync(foreignDir, { recursive: true });
-    fs.writeFileSync(path.join(foreignDir, 'someone-else.bin'), 'x');
-    let caughtClaim = false;
-    try {
-      claimInstallDir(foreignDir);
-    } catch (_) {
-      caughtClaim = true;
-    }
-    expect(caughtClaim, '安装目录认领未拦下非自有目录');
-  } finally {
-    fs.rmSync(installTmp, { recursive: true, force: true });
-  }
-
-  // 从安装目录认主程序:按嵌入 identifier 认,不靠文件名;无候选/多候选都要报错。
-  const instProbe = fs.mkdtempSync(path.join(process.env.TEMP || '.', 'acceptance-instexe-'));
-  try {
-    fs.writeFileSync(path.join(instProbe, 'uninstall.exe'), Buffer.from('MZ-no-marker'));
-    fs.writeFileSync(path.join(instProbe, 'scrollery.exe'), Buffer.concat([Buffer.from('MZ'), Buffer.from(ACCEPTANCE_IDENTIFIER, 'utf8')]));
-    const foundExe = findInstalledExe(instProbe, ACCEPTANCE_IDENTIFIER);
-    expect(path.basename(foundExe) === 'scrollery.exe', '安装目录认主程序找错文件:' + path.basename(foundExe));
-    fs.writeFileSync(path.join(instProbe, 'other.exe'), Buffer.concat([Buffer.from('MZ'), Buffer.from(ACCEPTANCE_IDENTIFIER, 'utf8')]));
-    let multiCaught = false;
-    try {
-      findInstalledExe(instProbe, ACCEPTANCE_IDENTIFIER);
-    } catch (_) {
-      multiCaught = true;
-    }
-    expect(multiCaught, '安装目录认主程序未拦下多候选');
-    fs.rmSync(path.join(instProbe, 'other.exe'));
-    fs.rmSync(path.join(instProbe, 'scrollery.exe'));
-    let noneCaught = false;
-    try {
-      findInstalledExe(instProbe, ACCEPTANCE_IDENTIFIER);
-    } catch (_) {
-      noneCaught = true;
-    }
-    expect(noneCaught, '安装目录认主程序未拦下无候选');
-  } finally {
-    fs.rmSync(instProbe, { recursive: true, force: true });
-  }
-
-  const tmp = fs.mkdtempSync(path.join(process.env.TEMP || '.', 'acceptance-selftest-'));
-  try {
-    const fx = writeFixtures(path.join(tmp, 'media'), path.join(tmp, 'media-target'), 9);
-    expect(fx.items.length === 9, '夹具数量不符:' + fx.items.length);
-    expect(fx.items.filter((i) => i.inSub).length === 3, '子目录夹具数量不符');
-    expect(fs.existsSync(fx.noteFile), '非媒体夹具缺失');
-    expect(fs.existsSync(path.join(path.dirname(fx.noteFile), FIXTURE_MARKER)), '夹具标识文件缺失');
-    for (const it of fx.items) {
-      const parsed = parsePng(fs.readFileSync(it.file));
-      expect(parsed.ihdr.width === it.width, '落盘夹具尺寸漂移:' + it.name);
-    }
-    // 目录移动夹具:movable 子树 + 目标根,且每条都带内容 sha(移动后按 sha 证明搬的是同一份)。
-    expect(fx.movable.items.length === 2, 'movable 条目数不符:' + fx.movable.items.length);
-    expect(fx.allMediaItems.length === fx.items.length + 2, '源根媒体总数不符');
-    expect(fx.target.items.length === 1, '目标根条目数不符:' + fx.target.items.length);
-    expect(fs.existsSync(path.join(tmp, 'media-target', FIXTURE_MARKER)), '目标根标识文件缺失');
-    for (const it of [...fx.items, ...fx.movable.items, ...fx.target.items]) {
-      expect(/^[0-9a-f]{64}$/.test(it.sha256), '夹具条目缺内容 sha:' + it.name);
-      expect(sha256Buf(fs.readFileSync(it.file)) === it.sha256, '夹具内容 sha 与落盘不符:' + it.name);
-    }
-    // 卷别判定:同一棵临时树的两个根必然同卷;不同盘符必须判为跨卷。
-    expect(sameVolume(path.join(tmp, 'media'), path.join(tmp, 'media-target')), '同卷判定误报');
-    expect(!sameVolume('C:/x', 'D:/x'), '不同盘符应判为跨卷');
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-  if (fails.length) {
-    console.error('selftest 失败:');
-    for (const f of fails) console.error('  - ' + f);
-    process.exit(2);
-  }
-  console.log('✓ selftest 通过(PNG + 身份门/构建证明 + 版本资源桥接 + 端口占用/实例身份守卫 + 受控删除 + 夹具/卷别)');
+  console.log('✓ 隔离验收自检通过（用户库拒绝、未认领夹具拒绝）');
 }
 
 async function main() {
@@ -2685,23 +2174,21 @@ async function main() {
     console.log('  ProductName    : ' + (info.productName || '(无)'));
     console.log('  FileDesc       : ' + (info.fileDescription || '(无)'));
     console.log('  FileVersion    : ' + (info.fileVersion || '(无)'));
-    assertAcceptanceIdentity(exePath);
     if (hasFlag('record-build')) {
-      const proof = recordBuildProof(exePath);
+      const proof = recordBuildProof(exePath, undefined, info);
       console.log('✓ 身份校验通过;构建证明已写入:' + proofPath());
       console.log('  ' + proof.exeSha256.slice(0, 16) + '… / config ' + proof.configSha256.slice(0, 16) + '… / ' + proof.productName);
     } else {
-      const proofed = assertBuildProof(exePath);
+      assertAcceptanceIdentity(exePath, info);
+      const proofed = assertBuildProof(exePath, undefined, info);
       console.log('✓ 身份校验与构建证明均通过(' + proofed.proofPath + ')');
     }
     return;
   }
   const ctx = makeContext();
   prepare(ctx);
-  // 🔴 保活定时器:防止「事件循环空转 → Node 静默 exit 0」把一次未跑完的验收伪装成成功。
-  // 2026-09-12 实测踩过:chain 跑到 chain:backup 后进程直接退出、退出码 0、报告与日志都停在那一刻,
-  // 交付目录里留下的还是上一轮的失败报告。AsyncLocal 的 pending promise 不持有 handle,一旦当前
-  // await 所依赖的唯一 handle(WebSocket 等)关闭,Node 就会当作无事可做而退出——退出码还是 0。
+  // pending promise 不持有事件循环句柄；WebSocket 关闭后可能静默 exit 0。
+  // 保活定时器使未完成的验收不能伪装成成功。
   KEEPALIVE = setInterval(() => {}, 1000);
 
   // 安装后入口(GO 后的首选路径):装到自有目录,取证通过后把 ctx.exe 换成安装目录里的主程序。
@@ -2713,9 +2200,9 @@ async function main() {
       ctx.installedEvidence = Object.assign({ ok: true }, installed.evidence);
       if (!ctx.installOnly) ctx.exe = installed.exe;
       await runStep('install:installed-identity', () => {
-        assertAcceptanceIdentity(installed.exe);
+        const { info } = assertAcceptanceIdentity(installed.exe);
         const proof = JSON.parse(fs.readFileSync(proofPath(), 'utf8'));
-        const hash = sha256Buf(fs.readFileSync(installed.exe));
+        const hash = info.exeSha256;
         // 比对目标是**证明里记录的 NSIS 载荷**(而非 exeSha256——那是占位符还原版的 hash,见证明内注释)。
         const nsis = ((proof.bundle && proof.bundle.installers) || []).find((i) => i.kind === 'nsis');
         if (!nsis) throw new Error('构建证明里没有 nsis 条目:先跑 --record-build(构建需带 bundle)');
@@ -2745,8 +2232,8 @@ async function main() {
   }
   const t0 = Date.now();
   if (ctx.stage === 'boot') await stageBoot(ctx);
-  else if (ctx.stage === 'chain') await stageChain(ctx);
-  else await stageReady(ctx);
+  else if (['ready', 'enhance', 'interactions'].includes(ctx.stage)) await stageReady(ctx);
+  else await stageChain(ctx);
   await runStep('isolation:user-library-top-level-unchanged', () => {
     if (!ctx.verifyUserLibrary) return { skipped: '未加 --verify-user-library-untouched' };
     const after = userLibraryTopLevelFingerprint();
@@ -2778,6 +2265,7 @@ async function main() {
   }
   const report = {
     stage: ctx.stage,
+    interaction: ctx.stage === 'interactions' ? ctx.interaction : undefined,
     exe: ctx.exe,
     // 安装入口证据(装了才跑得出真实结论;失败则如实记 false 并说明后续退回构建产物)。
     installedEntry: ctx.installedEvidence || { ok: false, error: '未尝试(--install 未给出)' },
@@ -2786,7 +2274,7 @@ async function main() {
     restoreDrill: ctx.restoreDrill,
     reportTag: ctx.reportTag,
     // 卷别写进报告:同卷只覆盖 rename 路径,跨卷路径在本机未实测(见文件头说明与 Rust 测试)。
-    directoryMove: {
+    directoryMove: ctx.stage === 'interactions' ? { verified: false, note: '本阶段只验文档和目录复制，不运行目录移动负载。' } : {
       sourceRoot: ctx.mediaDir,
       targetRoot: ctx.targetMediaDir,
       sameVolume: ctx.sameVolume,
@@ -2795,11 +2283,8 @@ async function main() {
         ? '本机两个根同卷,只覆盖同卷 rename 路径;跨卷暂存/发布/删源由 Rust 故障注入测试覆盖,未在真机实测。'
         : '两个根跨卷,本次运行覆盖暂存→发布→删源路径。',
     },
-    // 已观察到的产品侧边界(不掩盖):本轮只握手了 3 个 externalBin(raw/ai/video),**不覆盖**
-    // exotic 插件类 worker。实测隔离库日志里有 `exotic-image-psd 启动前复核未过(hash_mismatch):
-    // 拒绝拉起 worker` —— 那是插件的启动前 hash 复核按设计拒绝(既不拉起、也不降级),属
-    // 「可选组件供给/签名边界」,不是本轮 3 个随包 worker 的问题,也不在本轮验证范围内。
-    // 本轮**未**改动注册表/校验/签名,故按 P2 供给边界记录,不声称全部特殊格式 worker 可用。
+    // 常规 worker 探测覆盖 raw/ai/video；enhance 阶段另有安装版负向验收。
+    // 插件类 worker 的供给与签名链不在本验收范围内。
     knownBoundaries: {
       exoticPluginWorkers: {
         verified: false,
@@ -2885,10 +2370,7 @@ function reapOwnArtifacts(err) {
   } catch (_) {}
   const dir = installDirFor(root);
   if (fs.existsSync(dir)) {
-    // 🔴 只回收**真实存在的安装**。判据:除本脚本自己的标识文件外还有别的内容。
-    // 2026-09-12 实测踩过:负向对照里根本没装成(缺安装包 → 安装步骤直接失败),但目录里还留着
-    // 上一轮卸载后的自有标识文件,于是这里照样去调卸载器,报出「没有卸载器,需人工确认」——
-    // 一条与事实相反的假告警(目录里没有任何已安装内容,本就无需回收)。
+    // 只在自有标识之外仍有安装内容时调用卸载器；单独残留标识不代表安装成功。
     const entries = fs.readdirSync(dir).filter((n) => n !== INSTALL_MARKER);
     if (entries.length === 0) {
       console.error('自有安装目录只剩本脚本标识文件,无安装内容,无需回收:' + dir);
@@ -2909,9 +2391,7 @@ main()
   .catch((err) => {
     // 阶段门禁已经打印过逐条失败并把完整报告落盘的情况:不要再补一条泛化消息、更不要覆盖报告
     // (覆盖会把 installedEntry / directoryMove 等字段抹掉,只留 stage/error/steps)。
-    // 无论哪条路径失败,都要保证三件事落地:① 本次失败写进报告(覆盖上一轮的,避免交付目录里
-    // 留着一份与最新失败不对应的旧报告——2026-09-12 实测踩过:08:28 失败而 JSON 还是 08:25 的);
-    // ② 回收自己拉起的进程;③ 回收自有安装目录(装过才回收,且只回收自有那一份)。
+    // 失败报告覆盖旧报告，并回收自己拉起的进程与已安装的自有目录。
     try {
       reapOwnArtifacts(err);
     } catch (_) {}

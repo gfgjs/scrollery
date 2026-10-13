@@ -43,6 +43,8 @@ export function useVideoSubtitles(videoEl: Ref<HTMLVideoElement | null>, itemId:
   let externalTrackEl: HTMLTrackElement | null = null
   let externalBlobUrl: string | null = null
   let loadToken = 0
+  // 加载结果可以补充可选字幕，但不能覆盖读取期间用户新作出的选择。
+  let selectionVersion = 0
 
   function cleanupExternal(): void {
     if (externalBlobUrl) {
@@ -90,12 +92,13 @@ export function useVideoSubtitles(videoEl: Ref<HTMLVideoElement | null>, itemId:
 
   /** 用户在菜单选中某内挂/外挂轨。 */
   function selectTrack(key: string): void {
+    selectionVersion++
     applySelection(key)
   }
 
   /** 关闭字幕(单选「关」项)。 */
   function turnOff(): void {
-    applySelection('off')
+    selectTrack('off')
   }
 
   /** 加载外挂字幕(`path=null`=同目录同名 sidecar 自动探测;`path` 非空=用户对话框选中的路径)。 */
@@ -103,6 +106,7 @@ export function useVideoSubtitles(videoEl: Ref<HTMLVideoElement | null>, itemId:
     const id = itemId.value
     if (id == null) return
     const myToken = ++loadToken
+    const selectionAtStart = selectionVersion
     try {
       const file = await invokeIpc<SubtitleFileResponse>(IPC.LOAD_VIDEO_SUBTITLE, {
         itemId: id,
@@ -123,8 +127,8 @@ export function useVideoSubtitles(videoEl: Ref<HTMLVideoElement | null>, itemId:
       externalBlobUrl = url
       externalLabel.value = file.fileName
       refreshEmbeddedTracks()
-      // 桌面播放器惯例:加载成功即自动启用展示。
-      applySelection('external')
+      // 无后续用户选择才自动启用；关闭字幕或切到内挂轨的意图优先于迟到结果。
+      applySelection(selectionAtStart === selectionVersion ? 'external' : activeKey.value)
     } catch (e) {
       if (myToken !== loadToken) return
       const code = e instanceof IpcError ? e.code : 'Unknown'
@@ -157,9 +161,10 @@ export function useVideoSubtitles(videoEl: Ref<HTMLVideoElement | null>, itemId:
   watch(itemId, () => {
     // 条目切换时立即清理旧条目的外挂轨,不依赖 loadedmetadata 事件
     // (新条目加载可能在 loadedmetadata 前报错,导致旧外挂轨滞留)
+    loadToken++ // 同时作废旧请求，避免迟到字幕在新元数据到达前重新挂回。
     cleanupExternal()
     activeKey.value = 'off'
-  })
+  }, { flush: 'sync' })
 
   onBeforeUnmount(() => {
     loadToken++

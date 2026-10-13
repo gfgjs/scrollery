@@ -1,5 +1,5 @@
 <template>
-  <!-- 外壳迁 UiDialog:恒 Teleport(此前原位渲染无 Teleport)+ 焦点陷阱(此前仅 focus 遮罩、Tab 会逃逸)。
+  <!-- UiDialog 提供 Teleport 与焦点陷阱，避免弹层裁切和 Tab 焦点逸出。
        树列表须满幅(hover 高亮到边)→ body-padding='0';树自身的定高滚动移到插槽内 .tree-scroll。
        本组件由父 v-if 条件挂载,open 恒 true;焦点陷阱经 useFocusTrap immediate 挂载即 engage。 -->
   <UiDialog
@@ -74,7 +74,7 @@
     </template>
   </UiDialog>
 
-  <!-- 嵌套「新建文件夹」对话框:UiDialog 迁移后本组件为多根,它作同级根、各自独立 Teleport 到 body
+  <!-- 嵌套「新建文件夹」对话框与本组件同级，各自独立 Teleport 到 body
        (后挂载者在 DOM 靠后 → 叠于树选择器之上)。 -->
   <FolderCreateDialog
     v-if="folderCreateDialog.isOpen"

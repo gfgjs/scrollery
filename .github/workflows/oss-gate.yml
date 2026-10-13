@@ -1,15 +1,5 @@
-# oss-gate —— 公开镜像发布 gate(Part6 ③c)。
-#
-# 定位:私有投影由 scripts/publish-oss.ps1(git archive + 固定排除表 + gitleaks 双扫)push 到公开仓
-#       `sync-staging` 分支后,本 gate 在该分支跑**前端构建 + 完整开源构建 + 测试 + 密钥扫描**,
-#       全绿方可提升到 main(提升为你侧动作:分支保护 + 手动/自动 ff,见文末说明)。
-#
-# 分工:前端 typecheck/单测/构建 + Rust `--locked` 构建/测试检验投影的**完整性**;gitleaks 检验
-#   **秘密**——私钥与私密签发凭证。两条各管一面,不含任何「某 crate 不得存在」式断言,也不重生 lock。
-#
-# 🔴 本文件**不在 scripts/publish-oss.ps1 的排除表内** → 随投影同步到公开仓,在公开仓生效。私有仓也有它,但:
-#    ①`if: github.repository == 'gfgjs/scrollery'` 守门使它**只在公开仓执行**(私有仓 workflow_dispatch 也不跑);
-#    ②私有仓无 sync-staging 分支,push 触发在私有仓天然不发生。
+# 公开仓 sync-staging 的构建、测试与密钥扫描门禁。
+# 文件随投影进入公开仓；仓库守卫限制执行位置。
 name: oss-gate
 
 on:
@@ -20,9 +10,8 @@ on:
 jobs:
   gate:
     name: OSS 投影构建 gate
-    # 🔴 只在公开仓执行,私有仓一律跳过。
+    # 只在公开仓执行。
     if: github.repository == 'gfgjs/scrollery'
-    # ubuntu runner 更快更省;私有超集树在 ci.yml rust-linux job(check+test)已全绿,公开投影树是其子集。
     runs-on: ubuntu-latest
     # 本 job 只做源码编译与单测，发行资源由 release 打包门验证。
     env:
@@ -48,8 +37,7 @@ jobs:
       - name: Rust 编译缓存
         uses: Swatinem/rust-cache@v2
 
-      # 前端面(2026-09-14 补):公开树须能独立 typecheck/单测/构建。原 gate 只放占位 dist 目录让
-      # tauri::generate_context! 宏(编译期校验 frontendDist 存在)过编译,前端坏掉不会红;现改为真实构建。
+      # 公开树同时验证前端类型、测试和实际构建产物。
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -62,6 +50,9 @@ jobs:
       - name: vue-tsc 类型检查
         run: npm run typecheck
 
+      - name: 全仓测试预算
+        run: npm run check:tests
+
       - name: vitest 单元测试
         run: npm test
 
@@ -72,9 +63,7 @@ jobs:
       - name: cargo check(raw-worker 独立 workspace)
         run: cargo check --manifest-path crates/exotic-workers/raw-worker/Cargo.toml --locked
 
-      # 强制门:公开投影树必须能用**同步来的原锁**解析+编译(Cargo.lock 随投影同步,不重生);
-      # 解析+编译面由下方的 cargo test 覆盖(原单列 cargo check 与 ci.yml 同步去重)。
-      # 附加断言:项目测试多为 rusqlite 内存 DB/逻辑单测,可 headless 跑。
+      # 使用同步来的 Cargo.lock 解析与编译，不重新生成锁文件。
       # 🔴 显式串行(--test-threads=1):不依赖 runner 默认并行度,换取确定性。
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked -- --test-threads=1
@@ -82,8 +71,7 @@ jobs:
 
   # 密钥扫描:防私钥 / 私密签发凭证意外混入公开树或其历史(验签公钥本就可公开,不在此列;
   #    独立 ubuntu job,与 gate 并行)。
-  #    gitleaks 是平台无关的文本扫描,而 gitleaks-action@v2 在 windows 上装不了二进制——它拼的下载名是
-  #    windows_x64.tar.gz,官方 release 的 Windows 资产是 .zip → 404(六跑实证)。ubuntu 是该动作的主流路径。
+  #    gitleaks-action@v2 在 Ubuntu 上运行。
   gitleaks:
     name: gitleaks 密钥扫描
     if: github.repository == 'gfgjs/scrollery'
@@ -91,13 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0     # 扫全部历史(rebaseline 后即单 commit,代价可忽略)
+          fetch-depth: 0     # 扫描全部历史
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-# ── 提升 sync-staging → main(你侧设置,gate 全绿后)──────────────────────────────────────────────
-#  本 gate 只做「验证」,不自动推 main(避免在分支保护上做脆弱假设)。提升二选一:
-#   (a) 手动:公开仓开 sync-staging → main 的 PR,gate 绿即 merge(推荐首发,人工把关 baseline)。
-#   (b) 自动:另加一个 needs: gate 的 job,用 PAT/GITHUB_TOKEN ff main→sync-staging;需分支保护放行该 actor。
-#  公开仓分支保护:main 只接受 sync-bot / 本 gate 通过的提升,拦人类直接 push(防反向漂移被下次 SQUASH 无声覆盖)。

@@ -1,12 +1,13 @@
-// 核心回归：连续远跳有界、布局换代隔离，以及超大库滚动端点可达。
-// node 环境,无 DOM:容器用普通对象伪造;composable 在组件外调用时 onMounted/
-// onBeforeUnmount 为 no-op(仅 [Vue warn],ResizeObserver 永不构造),与方案 A spec 同法。
-// 真机四根因(2026-07-04 诊断)在此的对应锁定:根因 A→「远跳后终点段最先取」;
-// 根因 B→「离窗段在途应答丢弃、无幽灵挂载」;根因 C/D 由架构消除(无观察器/无全量占位)。
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { ref, nextTick } from 'vue'
-import { useBucketVirtualScroll } from './useBucketVirtualScroll'
+// bucket 取数与真实映射状态流：覆盖并发、换代、封顶恢复及输入分类。
+// Node 环境使用伪容器；组件外生命周期钩子不运行，不构造 ResizeObserver。
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
+import { effectScope, nextTick, ref, type EffectScope } from 'vue'
+import { BUCKET_NATIVE_MAX, useBucketVirtualScroll } from './useBucketVirtualScroll'
 import type { LayoutRow } from '../types/layout'
+
+vi.mock('../utils/logger', () => ({ logger: { info: vi.fn(), error: vi.fn() } }))
+
+const scopes: EffectScope[] = []
 
 beforeEach(() => {
   vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -14,6 +15,9 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  scopes.splice(0).forEach((scope) => scope.stop())
+  vi.clearAllTimers()
+  vi.useRealTimers()
   vi.restoreAllMocks()
 })
 
@@ -40,6 +44,8 @@ function flush() {
 }
 
 function makeHarness(init?: {
+  createScroll?: typeof useBucketVirtualScroll
+  spacerCap?: number
   totalHeight?: number
   scrollTop?: number
   deferred?: boolean
@@ -55,8 +61,14 @@ function makeHarness(init?: {
   const version = ref(1)
   const totalHeight = ref(init?.totalHeight ?? 15_000)
   const canvas = ref(init?.canvasMode ?? false)
+  let physicalTop = init?.scrollTop ?? 0
   const container = {
-    scrollTop: init?.scrollTop ?? 0,
+    // 仅模拟浏览器的 scrollTop 范围钳制；映射与输入分类仍由真实 composable 执行。
+    get scrollTop() {
+      physicalTop = Math.max(0, Math.min(physicalTop, Math.min(totalHeight.value, init?.spacerCap ?? Infinity) - this.clientHeight))
+      return physicalTop
+    },
+    set scrollTop(value: number) { physicalTop = value },
     clientHeight: init?.viewportHeight ?? 1000,
     // scrollToLogicalY 的局部/非映射路径经 el.scrollTo 落位(behavior 在 node 无意义)。
     scrollTo(o: { top: number }) {
@@ -68,7 +80,9 @@ function makeHarness(init?: {
   // 注意:非 deferred 模式下构造即取数(immediate watch),初始应答须经 init.rows 注入。
   const state = { useDeferred: init?.deferred ?? false, rowsToReturn: init?.rows ?? [] }
 
-  const bs = useBucketVirtualScroll({
+  const scope = effectScope()
+  scopes.push(scope)
+  const bs = scope.run(() => (init?.createScroll ?? useBucketVirtualScroll)({
     totalHeight: () => totalHeight.value,
     layoutVersion: () => version.value,
     fetchBucketRows: (s, e) => {
@@ -84,12 +98,66 @@ function makeHarness(init?: {
     rowHeight: () => init?.rowHeight ?? 200, // 200 → segPx=4000(既有段边界)
     canvasMode: () => canvas.value,
     resolveLayoutTarget: init?.resolveLayoutTarget,
-  })
+  }))!
 
   return { bs, version, totalHeight, container, fetchCalls, pendingFetches, state, canvas }
 }
 
 describe('useBucketVirtualScroll:有界最新优先/丢弃/换代', () => {
+
+  it.each(['Home', 'End'])('映射态方向键后紧接 %s，小位移也须抵达图库边界', async (key) => {
+    const totalHeight = BUCKET_NATIVE_MAX * 2
+    const viewportHeight = 1000
+    const logicalMax = totalHeight - viewportHeight
+    const physicalMax = BUCKET_NATIVE_MAX - viewportHeight
+    const h = makeHarness({ totalHeight, viewportHeight })
+    await h.bs.scrollToLogicalY(key === 'Home' ? 4000 : logicalMax - 4000)
+    h.bs.onScroll()
+
+    // 方向键产生的局部滚动仍在同一手势链内；到物理边界的位移不足巨跳判定阈值。
+    h.bs.onKeydown({ key: key === 'Home' ? 'ArrowUp' : 'ArrowDown' } as KeyboardEvent)
+    h.container.scrollTop += key === 'Home' ? -100 : 100
+    h.bs.onScroll()
+    h.bs.onKeydown({ key } as KeyboardEvent)
+    h.container.scrollTop = key === 'Home' ? 0 : physicalMax
+    h.bs.onScroll()
+
+    expect(h.bs.logicalScrollTop.value).toBe(key === 'Home' ? 0 : logicalMax)
+    await flush()
+    expect(
+      h.bs.segments.value.some((segment) =>
+        key === 'Home' ? segment.start === 0 : segment.end === totalHeight,
+      ),
+    ).toBe(true)
+  })
+
+  it('远跳(根因 A/B 锁定):飞掠段被丢弃、其应答不落地(无幽灵),终点段最先取', async () => {
+    const h = makeHarness({ deferred: true })
+    expect(h.fetchCalls).toEqual([[0, 4000]]) // 段 0 在途
+
+    // 滚动条拖到 12000:愿望变 [2,3],段 0 离窗被丢弃
+    h.container.scrollTop = 12_000
+    h.bs.onScroll()
+    expect(h.bs.segments.value.map((s) => s.index)).toEqual([2, 3])
+    // 段 0 已离开愿望集，最新视口段立即占旁路第 2 槽，不等陈旧 IPC 返回。
+    expect(h.fetchCalls).toEqual([
+      [0, 4000],
+      [12_000, 15_000],
+    ])
+    expect(h.pendingFetches.length).toBe(2)
+
+    // 陈旧应答落地 → 复核失败被丢弃:段表无 index 0、无行
+    h.pendingFetches[0].resolve([normalRow(0, 100)])
+    await flush()
+    expect(h.bs.segments.value.map((s) => s.index)).toEqual([2, 3])
+    expect(h.bs.mountedRows().length).toBe(0)
+
+    // 泵继续:距视口中心(12500)更近的段 3(中心 13500)先于段 2(中心 10000)
+    expect(h.fetchCalls[1]).toEqual([12_000, 15_000])
+    h.pendingFetches[1].resolve([normalRow(12_000, 100)])
+    await flush()
+    expect(h.fetchCalls[2]).toEqual([8000, 12_000])
+  })
 
   it('连续远跳最多两个 IPC 在途，槽位释放后只追最新视口', async () => {
     const h = makeHarness({ totalHeight: 40_000, deferred: true })
@@ -143,82 +211,190 @@ describe('useBucketVirtualScroll:有界最新优先/丢弃/换代', () => {
   })
 })
 
-// ── 映射态(B3/B3.1):总高 > 16M 的段级坐标映射 ──────────────────────────────
-// B3.1 输入源分类锁定:有 1:1 印记(onWheel/onKeydown/onTouchmove/程序化局部滚动)的
-// 手势局部 1:1;无印记滚动链 = 滚动条拖动 → **逐事件**比例重锚(拖到边 = 逻辑边);
-// 物理钉边由 onWheel 推锚差续滚到逻辑边缘,到边即硬停;偿债仅停稳后,手势中零 scrollTop
-// 写入(真机「到边一跳一跳还能继续滚」回归锁)。手势链沿用起点分类——fake timers 驱动
-// Date.now,用 advanceTimersByTimeAsync(150) 断链(< SETTLE_MS,不误触偿债)。
 
-describe('映射态(B3):段级坐标映射', () => {
-  const PHYS_MAX = 16_000_000 - 1000 // spacer 封顶 − viewH
-  const LOG_MAX = 40_000_000 - 1000
-  const gLogical = (p: number) => (p / PHYS_MAX) * LOG_MAX
-  const wheel = (dy: number) => ({ deltaY: dy, deltaMode: 0 }) as unknown as WheelEvent
+describe('useBucketVirtualScroll:调试封顶下的真实映射状态流', () => {
+  let createScroll: typeof useBucketVirtualScroll
 
-  it('无印记慢速滚动链 = 滚动条拖动:逐事件比例重锚,拖到底即逻辑底(真机回归)', async () => {
-    vi.useFakeTimers()
+  beforeAll(async () => {
+    // SPACER_CAP 在模块初始化时读取；沿用产品调试入口，不替换映射实现。
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => key === 'scrollery.debug.bucketSpacer' ? '10000' : null,
+    })
     try {
-      const h = makeHarness({ totalHeight: 40_000_000 })
-      // 从静止慢拖:每事件 2000px ≪ 巨跳阈值——B3 初版误判 1:1,B3.1 链内沿用「比例」
-      for (let p = 2000; p <= 10_000; p += 2000) {
-        h.container.scrollTop = p
-        h.bs.onScroll()
-        expect(h.bs.logicalScrollTop.value).toBeCloseTo(gLogical(p), 5)
-      }
-      // 慢拖到物理底 → 逻辑恰为库底,不存在「还能继续滚」的钉住态
-      h.container.scrollTop = PHYS_MAX
-      h.bs.onScroll()
-      expect(h.bs.logicalScrollTop.value).toBeCloseTo(LOG_MAX, 5)
-      // 逆向慢拖离底:仍是链内比例,而非 1:1
-      h.container.scrollTop = PHYS_MAX - 3000
-      h.bs.onScroll()
-      expect(h.bs.logicalScrollTop.value).toBeCloseTo(gLogical(PHYS_MAX - 3000), 5)
+      vi.resetModules()
+      const module = await import('./useBucketVirtualScroll')
+      expect(module.resolveBucketSpacerCap()).toBe(10_000)
+      createScroll = module.useBucketVirtualScroll
     } finally {
-      vi.useRealTimers()
+      vi.unstubAllGlobals()
     }
   })
 
-  it('物理钉底后滚轮续滚:直达逻辑底后硬停,不再「还能继续滚」', async () => {
+  beforeEach(() => {
     vi.useFakeTimers()
-    try {
-      const h = makeHarness({ totalHeight: 40_000_000 })
-      h.container.scrollTop = PHYS_MAX - 5000
-      h.bs.onScroll() // 巨跳 → 比例重锚
-      await vi.advanceTimersByTimeAsync(150)
-      h.bs.onWheel(wheel(120)) // 印记
-      h.container.scrollTop = PHYS_MAX // 1:1 下滚 5000 → 钉底
-      h.bs.onScroll()
-      expect(h.bs.logicalScrollTop.value).toBeLessThan(LOG_MAX - 1) // 钉底但逻辑未到底
-      let guard = 0
-      while (h.bs.logicalScrollTop.value < LOG_MAX && ++guard < 10_000) {
-        h.bs.onWheel(wheel(40_000))
-      }
-      expect(h.bs.logicalScrollTop.value).toBe(LOG_MAX)
-      // 到达逻辑底后再滚:钉边条件不再成立 → no-op 硬停
-      const dAtEnd = h.bs.anchorDelta.value
-      h.bs.onWheel(wheel(1000))
-      expect(h.bs.anchorDelta.value).toBe(dAtEnd)
-      expect(h.bs.logicalScrollTop.value).toBe(LOG_MAX)
-      expect(h.container.scrollTop).toBe(PHYS_MAX) // 全程未写 scrollTop
-    } finally {
-      vi.useRealTimers()
-    }
+    vi.setSystemTime(new Date('2026-10-11T00:00:00Z'))
   })
 
-  it('换代总高缩水回非映射态:anchorDelta 归零、spacer 随新几何(不越界)', async () => {
-    const h = makeHarness({ totalHeight: 40_000_000 })
-    await flush()
-    h.container.scrollTop = 8_000_000
-    h.bs.onScroll() // 比例重锚 → 锚差非零
-    expect(h.bs.anchorDelta.value).toBeGreaterThan(0)
+  function mappedHarness(init?: Parameters<typeof makeHarness>[0]) {
+    return makeHarness({ totalHeight: 20_000, ...init, createScroll, spacerCap: 10_000 })
+  }
 
-    // 布局换代:总高缩回非映射区间(< 16M spacer 上限)。
-    h.totalHeight.value = 15_000
-    h.version.value++
+  async function settled(h: ReturnType<typeof makeHarness>) {
     await nextTick()
-    await flush()
+    await h.bs.whenSettled()
+    await nextTick()
+  }
+
+  function wheel(h: ReturnType<typeof makeHarness>, dy: number) {
+    h.bs.onWheel({ deltaY: dy, deltaMode: 0 } as WheelEvent)
+  }
+
+  it('T4-01:布局恢复进入再退出映射态，目标段和后续滚轮位置一致', async () => {
+    let restoreY = 6000
+    const h = mappedHarness({ totalHeight: 9000, resolveLayoutTarget: async () => ({ y: restoreY }) })
+    await settled(h)
+    h.bs.onScroll()
+    expect(h.container.scrollTop).toBe(6000)
     expect(h.bs.anchorDelta.value).toBe(0)
-    expect(h.bs.spacerHeight.value).toBe(15_000)
+
+    h.fetchCalls.length = 0
+    h.totalHeight.value = 20_000
+    h.version.value++
+    await settled(h)
+    expect(h.bs.spacerHeight.value).toBe(10_000)
+    expect(h.bs.logicalScrollTop.value).toBe(6000)
+    expect(h.container.scrollTop).toBe(2842)
+    expect(h.bs.anchorDelta.value).toBe(3158)
+    expect(h.fetchCalls[0]).toEqual([4000, 8000])
+    expect(h.bs.onScroll()).toBe(true)
+    wheel(h, 80)
+    h.container.scrollTop += 80
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(6080)
+
+    restoreY = 6080
+    h.totalHeight.value = 9000
+    h.version.value++
+    await settled(h)
+    expect(h.bs.spacerHeight.value).toBe(9000)
+    expect(h.bs.anchorDelta.value).toBe(0)
+    expect(h.container.scrollTop).toBe(6080)
+    expect(h.bs.logicalScrollTop.value).toBe(6080)
+    expect(h.bs.onScroll()).toBe(true)
+    h.container.scrollTop += 80
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(6160)
   })
+
+  it('T4-02:恢复解析返回空时，退出封顶仍保留原逻辑位置', async () => {
+    const h = mappedHarness({ resolveLayoutTarget: async () => null })
+    await settled(h)
+    await h.bs.scrollToLogicalY(7000)
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(7000)
+
+    h.totalHeight.value = 9000
+    h.version.value++
+    await settled(h)
+    expect(h.bs.logicalScrollTop.value).toBe(7000)
+    expect(h.container.scrollTop).toBe(7000)
+    expect(h.bs.anchorDelta.value).toBe(0)
+    h.bs.onScroll()
+    wheel(h, 50)
+    h.container.scrollTop += 50
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(7050)
+  })
+
+  it('T4-03:连续滚轮在物理钉边后续滚，停稳偿债保持逻辑位置', async () => {
+    const h = mappedHarness()
+    await settled(h)
+    await h.bs.scrollToLogicalY(18_000)
+    h.bs.onScroll()
+    wheel(h, 474)
+    h.container.scrollTop = 9000
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(18_474)
+
+    await vi.advanceTimersByTimeAsync(50)
+    wheel(h, 100)
+    expect(h.container.scrollTop).toBe(9000)
+    expect(h.bs.logicalScrollTop.value).toBe(18_574)
+    await vi.advanceTimersByTimeAsync(199)
+    expect(h.container.scrollTop).toBe(9000)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.container.scrollTop).toBe(8798)
+    expect(h.bs.logicalScrollTop.value).toBe(18_574)
+    expect(h.bs.onScroll()).toBe(true)
+
+    wheel(h, 100)
+    h.container.scrollTop += 100
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(18_674)
+    wheel(h, 102)
+    h.container.scrollTop = 9000
+    h.bs.onScroll()
+    wheel(h, 1000)
+    expect(h.bs.logicalScrollTop.value).toBe(19_000)
+    wheel(h, 100)
+    expect(h.bs.logicalScrollTop.value).toBe(19_000)
+  })
+
+  it('T4-04:连续滚动条拖动按比例重锚并到达两端逻辑边界', async () => {
+    const h = mappedHarness()
+    await settled(h)
+    h.container.scrollTop = 4500
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(9500)
+    await vi.advanceTimersByTimeAsync(16)
+    h.container.scrollTop = 9000
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(19_000)
+    await settled(h)
+    expect(h.bs.segments.value[h.bs.segments.value.length - 1].end).toBe(20_000)
+    h.container.scrollTop = 0
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(0)
+    expect(h.bs.anchorDelta.value).toBe(0)
+    expect(h.bs.segments.value[0].start).toBe(0)
+  })
+
+  it.each([
+    { key: 'Home', physical: 0, logical: 0 },
+    { key: 'End', physical: 9000, logical: 19_000 },
+  ])('T4-05:$key 在滚轮手势之后仍定位逻辑边界', async ({ key, physical, logical }) => {
+    const h = mappedHarness()
+    await settled(h)
+    await h.bs.scrollToLogicalY(9500)
+    h.bs.onScroll()
+    wheel(h, 100)
+    h.container.scrollTop += 100
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(9600)
+
+    h.bs.onKeydown({ key } as KeyboardEvent)
+    h.container.scrollTop = physical
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(logical)
+    expect(h.container.scrollTop + h.bs.anchorDelta.value).toBe(logical)
+  })
+
+  it.each([
+    { key: 'Home', start: 1000, dy: -474, physical: 0, before: 526, logical: 0 },
+    { key: 'End', start: 18_000, dy: 474, physical: 9000, before: 18_474, logical: 19_000 },
+  ])('T4-06:$key 在物理已钉边且没有新 scroll 事件时立即到达逻辑边界', async ({ key, start, dy, physical, before, logical }) => {
+    const h = mappedHarness({ resolveLayoutTarget: async () => ({ y: start }) })
+    await settled(h)
+    h.bs.onScroll()
+    wheel(h, dy)
+    h.container.scrollTop = physical
+    h.bs.onScroll()
+    expect(h.bs.logicalScrollTop.value).toBe(before)
+
+    h.bs.onKeydown({ key } as KeyboardEvent)
+    await settled(h)
+    expect(h.bs.logicalScrollTop.value).toBe(logical)
+    expect(h.container.scrollTop + h.bs.anchorDelta.value).toBe(logical)
+  })
+
 })

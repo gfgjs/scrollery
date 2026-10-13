@@ -1,12 +1,8 @@
-// src/types/view.ts
-// R1-2（S4/T4c）· 后端 ViewDescriptor 的前端镜像。
+// 后端 ViewDescriptor 的前端镜像。
 //
 // wire 形状由后端锁测试钉死（queries.rs::selection_descriptor_wire_format_locks_camel_case）：
 // tag 变体名小驼峰（'directory' / 'selectAll'），struct 变体字段小驼峰（directoryId / excludedIds）。
 // 修改任何一侧都必须同步另一侧 + 锁测试。
-//
-// 2026-09-02 重复镜头方案（docs/designs/2026-09-02-主画廊重复项浏览方案.md §10.2）新增
-// DuplicateLensDescriptorDto：Rust 侧由并行任务同步扩展，wire 形状以本契约为准。
 //
 // 注意：SemanticSearch scope 刻意不镜像 —— 后端 view_to_sql 拒绝解析它（v1 语义搜索非纯 SQL），
 // 语义模式下的批量操作由调用方回退 Explicit（物化 id）。
@@ -23,7 +19,7 @@ export type ViewScopeDto =
 export interface GalleryFilterDto {
   mediaTypes?: string[]
   /**
-   * 细分格式（S 线 D-011）：规范化小写扩展名，与 `mediaTypes` 取 AND、维度内 OR。
+   * 细分格式：规范化小写扩展名，与 `mediaTypes` 取 AND、维度内 OR。
    *
    * 🔴 **必须随描述符走**：SelectAll 经后端 `to_media_filter()` 解析全集，这里漏掉不会报错 ——
    * 批量收藏/评分/删除照跑，只是作用到**比画面更大的集合**上。

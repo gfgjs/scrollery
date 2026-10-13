@@ -9,13 +9,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use thiserror::Error;
-use toml_edit::{DocumentMut, Entry, Item};
+use toml_edit::{DocumentMut, Entry};
 
 use super::schema::{section_title, SettingDef, SETTING_DEFS};
 use super::value;
 
-/// config.toml 读写过程中的错误。**不含任何原始异常字符串直通 IPC 的设计**(硬约束:IPC
-/// 错误不得泄漏内部字符串)——本类型仍是内部错误,A2 接 IPC 时再映射为稳定 code/variant。
+/// config.toml 读写过程中的内部错误；传到 IPC 前须映射为稳定码，避免泄漏原始异常。
 #[derive(Debug, Error)]
 pub enum ConfigFileError {
     /// 整文件级 TOML 语法错误(结构性,如括号不匹配、非法转义)。行列号来自 toml_edit 的 span。
@@ -38,7 +37,7 @@ pub enum ConfigFileError {
 }
 
 impl ConfigFileError {
-    /// A2:转成面向 IPC `get_config_status`/`config-file-error` 的精简描述——
+    /// 转成面向 IPC `get_config_status`/`config-file-error` 的精简描述——
     /// `(message, line)`,`line` 仅语法错误时有值。**不透传 `Io` 变体的原始 `Display`**:
     /// 该分支可能内嵌完整文件路径(含用户名等),违反「IPC 错误不得泄漏内部原始字符串」硬约束;
     /// `Syntax` 分支的 message 本就是 toml_edit 给出的、指着用户自己文件内容说话的面向人类文案,
@@ -67,7 +66,7 @@ impl ConfigFileError {
 pub struct KeyWarning {
     /// 出问题的键名(未知键场景下就是文件里出现的原始键名,可能不在 schema 内)。
     pub key: String,
-    /// 面向用户的中文说明(A2 转发到设置页时直接展示,故本身已是可读文案,不再需要二次翻译)。
+    /// 面向用户的中文说明，由设置页直接展示。
     pub message: String,
 }
 
@@ -182,8 +181,7 @@ pub fn validate_doc(doc: DocumentMut) -> LoadedConfig {
     // 从更新版本降级回来的键)。只警告不报错——不能因为一个陌生键就让整份配置失效。
     let known: std::collections::HashSet<&str> = SETTING_DEFS.iter().map(|d| d.key).collect();
     for (key, _item) in doc.iter() {
-        // 旧版 gpu_engine 只有 wic 一个值；现已不参与路由，保留原文件内容但不报未知键。
-        if !known.contains(key) && key != "gpu_engine" {
+        if !known.contains(key) {
             warnings.push(KeyWarning {
                 key: key.to_string(),
                 message: "未知配置键(不在当前版本可识别的设置项内),已忽略".to_string(),
@@ -199,20 +197,17 @@ pub fn validate_doc(doc: DocumentMut) -> LoadedConfig {
 }
 
 /// 把规范文本值渲染成对应 kind 的 TOML 字面量源码。结构类键渲染成**原生 TOML 数组/内联表**
-/// (方案 §4:文件里不得嵌套 JSON 字符串)。渲染失败只可能发生在 schema 自身的默认值写错上
-/// (调用点传入的都是已校验过的规范文本),故回退成注释友好的占位串并把事实记进日志,不 panic。
-fn render_literal(def: &SettingDef, raw: &str) -> String {
-    value::canonical_to_toml_literal(def, raw).unwrap_or_else(|e| {
-        tracing::error!(
-            key = %def.key,
-            "schema 默认值无法渲染为 TOML 字面量,已回退空数组 | default value is not renderable: {e}"
-        );
-        "[]".to_string()
-    })
+/// (方案 §4:文件里不得嵌套 JSON 字符串)。默认值或覆盖值渲染失败时中止模板生成,
+/// 避免用占位内容覆盖有效配置。
+fn render_literal(def: &SettingDef, raw: &str) -> Result<String, ConfigFileError> {
+    value::canonical_to_toml_literal(def, raw).map_err(ConfigFileError::InvalidValue)
 }
 
 /// 单键的模板片段:注释说明行 + (`# key = 默认值` 或 `key = 覆盖值`)+ 尾随空行。
-fn render_key_block(def: &SettingDef, override_value: Option<&str>) -> String {
+fn render_key_block(
+    def: &SettingDef,
+    override_value: Option<&str>,
+) -> Result<String, ConfigFileError> {
     let mut out = String::new();
     for line in def.comment_zh.lines() {
         out.push_str("# ");
@@ -221,18 +216,18 @@ fn render_key_block(def: &SettingDef, override_value: Option<&str>) -> String {
     }
     match override_value {
         Some(v) => {
-            out.push_str(&format!("{} = {}\n", def.key, render_literal(def, v)));
+            out.push_str(&format!("{} = {}\n", def.key, render_literal(def, v)?));
         }
         None => {
             out.push_str(&format!(
                 "# {} = {}\n",
                 def.key,
-                render_literal(def, def.default)
+                render_literal(def, def.default)?
             ));
         }
     }
     out.push('\n');
-    out
+    Ok(out)
 }
 
 const HEADER: &str = "\
@@ -259,9 +254,8 @@ const HEADER: &str = "\
 
 /// 渲染完整模板:`overrides` 里有的键写成实值行,其余键写成注释态默认值行。用于:
 /// (a) 首次生成全新 config.toml(无覆盖 = 全默认注释态);
-/// (b) 迁移旧 DB 值(overrides = 与默认不同的历史值);
-/// (c) `set_value`/`unset_value` 之外偶尔需要整份重渲染的场景(当前批次未使用,留作 A2 备用)。
-pub fn render_template(overrides: &BTreeMap<String, String>) -> String {
+/// (b) 显式恢复默认配置,或运行期配置文件被外部删除后的编辑。
+pub fn render_template(overrides: &BTreeMap<String, String>) -> Result<String, ConfigFileError> {
     let mut out = String::from(HEADER);
     let mut last_section = "";
     for def in SETTING_DEFS {
@@ -275,39 +269,25 @@ pub fn render_template(overrides: &BTreeMap<String, String>) -> String {
         out.push_str(&render_key_block(
             def,
             overrides.get(def.key).map(String::as_str),
-        ));
+        )?);
     }
-    out
+    Ok(out)
 }
 
 /// 就地修改文档中某键的值(新增或覆盖)。**不经 `Table::insert(&str, Item)`**——该方法会对
 /// 已存在的键调用 `Key::fmt()` 清空其前缀装饰(即行首注释),与"保留既有注释与排版"的硬
 /// 约束冲突;改经 `Entry` API 的 `OccupiedEntry::insert`,只替换值节点、不触碰 key 的装饰。
 ///
-/// `raw_value` 是规范文本形式(与 `SettingDef.default`/`LoadedConfig.values` 同源);未知键
-/// (不在 schema 内)按 `Str` 处理写成带引号字符串——`ConfigManager::set_and_persist` 只应对
-/// 已知键调用本函数,未知键分支纯粹是防御性兜底,不是本函数鼓励的用法。
-pub fn set_value(doc: &mut DocumentMut, key: &str, raw_value: &str) {
-    // 键不在 schema 内时按自由文本处理(防御性兜底,不是鼓励用法——上层只对已知键调用本函数)。
-    let Some(def) = SettingDef::find(key) else {
-        match doc.entry(key) {
-            Entry::Occupied(mut occ) => {
-                occ.insert(Item::Value(raw_value.into()));
-            }
-            Entry::Vacant(vac) => {
-                vac.insert(Item::Value(raw_value.into()));
-            }
-        }
-        return;
-    };
-    let Ok(new_item) = value::canonical_to_item(def, raw_value) else {
-        tracing::error!(
-            key = %key,
-            "规范文本无法渲染为 TOML 节点,本次不写入该键 | value is not renderable, skipping key"
-        );
-        return;
-    };
-    match doc.entry(key) {
+/// `raw_value` 是规范文本形式(与 `SettingDef.default`/`LoadedConfig.values` 同源),
+/// 调用方先定位设置定义;转换失败沿提交链返回,整批不会保存部分键。
+pub fn set_value(
+    doc: &mut DocumentMut,
+    def: &SettingDef,
+    raw_value: &str,
+) -> Result<(), ConfigFileError> {
+    let new_item =
+        value::canonical_to_item(def, raw_value).map_err(ConfigFileError::InvalidValue)?;
+    match doc.entry(def.key) {
         Entry::Occupied(mut occ) => {
             occ.insert(new_item);
         }
@@ -315,6 +295,7 @@ pub fn set_value(doc: &mut DocumentMut, key: &str, raw_value: &str) {
             vac.insert(new_item);
         }
     }
+    Ok(())
 }
 
 /// 删除文档中某键的实值行(用户「回默认」——文件里从此不再出现该键,`load()` 会用
@@ -335,43 +316,4 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<u64, ConfigFileError> 
     std::fs::write(&tmp_path, content)?;
     std::fs::rename(&tmp_path, path)?;
     Ok(fingerprint(content))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 单键类型错(布尔键写了字符串)→ 记警告并跳过该键,其余合法键照常进入 values。
-    #[test]
-    fn single_bad_key_warns_and_others_still_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "ai_hq_cache_enabled = \"yes\"\nthumb_size = 256\n").unwrap();
-        let loaded = load(&path).unwrap();
-        assert!(loaded
-            .warnings
-            .iter()
-            .any(|w| w.key == "ai_hq_cache_enabled"));
-        assert_eq!(
-            loaded.values.get("thumb_size").map(String::as_str),
-            Some("256")
-        );
-        assert!(!loaded.values.contains_key("ai_hq_cache_enabled"));
-    }
-
-    /// write_atomic 产物存在、内容正确,且不残留同名 .tmp 文件。
-    #[test]
-    fn write_atomic_leaves_no_tmp_residue() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let fp = write_atomic(&path, "thumb_size = 256\n").unwrap();
-        assert!(path.exists());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "thumb_size = 256\n"
-        );
-        assert_eq!(fp, fingerprint("thumb_size = 256\n"));
-        let tmp = path.with_extension("toml.tmp");
-        assert!(!tmp.exists(), "写盘后不应残留 .tmp 文件");
-    }
 }

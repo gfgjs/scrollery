@@ -1,9 +1,8 @@
-// src-tauri/src/video/playable_cache.rs
-//! 视频可播产物独立缓存池(视频格式扩展子系统 design.md §5.4)。
+//! 视频可播产物的独立缓存池。
 //!
 //! **不共用缩略图 10GB 池**:转码/改封产物是 GB 级,共池会把全库几十 KB 级缩略图驱逐殆尽。
 //! 独立池落 `{cache_dir}/video/`,LRU 按**最近播放时间**驱逐(触摸 = resolve 命中,`touch_played`)。
-//! 默认 20GB([`DEFAULT_VIDEO_CACHE_MAX_MB`],D-444 ②),用户可经设置键 `video_cache_max_mb` 调整。
+//! 默认 20GB([`DEFAULT_VIDEO_CACHE_MAX_MB`])，用户可经设置键 `video_cache_max_mb` 调整。
 //!
 //! 纯 IO 工具(无 async、无 DB、无 worker);调用方在 `spawn_blocking`/专用阻塞线程内跑
 //! (遍历/删文件是阻塞 IO)。产物写入走 `*.tmp` + 同卷 rename(源自 worker 侧 work_dir 白名单)。
@@ -14,8 +13,8 @@ use std::path::{Path, PathBuf};
 /// `video_cache_max_mb` 未配置时的 LRU 预算默认值(MB)= 20 GB(D-444 ②)。
 pub const DEFAULT_VIDEO_CACHE_MAX_MB: u64 = 20 * 1024;
 
-/// 单文件护栏比例(§5.4):产物预估 > 池预算 × 本比例 → host 回报 `needs_confirm`,由前端确认
-/// (临时放行/调大池/放弃归 V7)。
+/// 单文件护栏比例：产物预估 > 池预算 × 本比例时，host 回报 `needs_confirm`；
+/// 用户可选择临时放行、调大池或放弃。
 const POOL_HALF: u64 = 2; // 50%
 
 /// 视频池根目录 `{cache_dir}/video/`。也是 worker 侧 `VideoSessionInit.work_dir` 白名单前缀(同卷)。
@@ -40,8 +39,7 @@ pub fn estimate_output_bytes(source_bytes: u64) -> u64 {
 }
 
 /// 预估是否超过池预算的 50%(§5.4 单文件护栏)。`max_mb` 由消费侧 [`read_video_cache_max_mb`]
-/// 保证 > 0(config 侧 `filter(|&v| v>0)` 禁 0 回退默认,§V6-5),故此处不再设「0=无护栏」旁路——
-/// 曾经的 0 旁路会让配错的 0 静默放行任意大产物,与「禁 0」语义统一后一并删除。
+/// 保证 > 0；0 在配置层回退默认值，不能绕过单文件护栏。
 pub fn exceeds_half_pool(estimate_bytes: u64, max_mb: u64) -> bool {
     let budget_bytes = max_mb.saturating_mul(1024 * 1024);
     estimate_bytes > budget_bytes / POOL_HALF
@@ -80,7 +78,7 @@ pub fn sweep_tmp(cache_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 视频池占用统计(字节 + 文件数)。设置页缓存卡消费归 V7(CacheStats 扩容先例)。纯只读。
+/// 视频池占用统计（字节与文件数），只读。
 pub fn pool_stat(cache_dir: &Path) -> (u64, u64) {
     let dir = pool_dir(cache_dir);
     if !dir.exists() {

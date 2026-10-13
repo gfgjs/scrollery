@@ -1,12 +1,12 @@
 // src/utils/ipc.ts
-// Part5 T8/T9 · 统一 IPC 封装 + 结构化错误解析。
+// 统一 IPC 封装与结构化错误解析。
 //
 // 目的:
 // 1. **常量强制**——invokeIpc 只接受 `IpcCommand`(IPC 常量的值类型),类型层禁止裸字符串命令名,
 //    消除「改后端命令名而前端漏改」的隐患(裸字符串改名零保障)。
 // 2. **结构化错误**——后端 AppError 经 IPC 序列化为 `{ code, message }`(error.rs)。invokeIpc 捕获
 //    invoke 的 reject,统一解析为 IpcError(带稳定 code),调用方据 code **按类型分流**(而非匹配文案)。
-//    仍返回裸字符串的旧命令(如 ai_commands 尚未迁移)被宽容降级为 code='Unknown',不致解析崩溃。
+//    返回裸字符串的命令降级为 code='Unknown'，避免解析失败。
 
 import { invoke } from '@tauri-apps/api/core'
 import { IPC } from '../constants/ipc'
@@ -35,8 +35,8 @@ export type AppErrorCode =
   | 'AiModelNotLoaded'
   | 'System'
   | 'Internal'
-  | 'VolumeOffline' // 前向声明:T13 离线 UX 落地后由后端打开原图/视频命令返回(见 §3.7)
-  | 'move_db_pending' // 目录移动半完成:物理已落盘、索引未更新,可重试收尾(P0-1)
+  | 'VolumeOffline' // 后端打开原图或视频时可能返回
+  | 'move_db_pending' // 目录移动半完成：物理已落盘、索引未更新，可重试收尾
   | 'Unknown' // 前端兜底:无法解析为结构化 AppError 时(如旧命令裸字符串)
   | (string & {}) // 开放:保留任意后端/exotic 自定义 code,同时不丢上面字面量的补全
 

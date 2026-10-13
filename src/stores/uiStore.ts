@@ -1,5 +1,4 @@
-// src/stores/uiStore.ts
-// 全局 UI 状态 — 在有说明的地方持久化到 app_config。
+// 全局 UI 状态；需持久化的偏好通过共享设置服务写入 config.toml。
 
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
@@ -9,10 +8,10 @@ import { invokeIpc } from '../utils/ipc'
 import { logger, setLoggerEnabled } from '../utils/logger'
 import i18n from '../i18n'
 import { useToastStore } from './toastStore'
+import { useViewerStore } from './viewerStore'
 import {
   initializeSettings,
   readSetting,
-  refreshSettingsFromBackend,
   settingsGeneration,
   settingsValues,
   writeSettings,
@@ -30,8 +29,7 @@ export type MinimapRenderMode = 'colors' | 'thumbnails'
 
 /**
  * 「用户主动选择的画廊组内排序模式」使用计数(仅开发构建、仅内存,不落盘、不进配置文件)。
- * 服务「先测 filename 使用频率」决策门(见 docs/planning/2026-07-14-统一文件树与画廊目录排序/
- * 方案B §15)。**仅统计真实用户动作**:唯一来源是排序下拉的 change → `setSortWithinGroup` 的
+ * 仅统计真实用户动作：来源是排序下拉的 change → `setSortWithinGroup` 的
  * `persist===true` 路径;AI 切 similarity、URL/pref 恢复均走 `persist=false`,不计(否则每次启动/
  * 导航都虚增,污染频率)。开发期在 devtools 里读 `__scrollerySortModeUsage` 查看分布。
  */
@@ -114,7 +112,7 @@ function syncLocalFromSetting<T>(
   watch(settingsGeneration, sync)
 }
 
-// get_startup_config 的载荷(R2-4:14 键单次往返;与后端 config_commands.rs StartupConfig 同步)。
+// get_startup_config 的载荷，与后端 config_commands.rs StartupConfig 同步。
 export interface StartupConfig {
   language: string | null
   timelineScrollWidth: string | null
@@ -135,20 +133,18 @@ export interface StartupConfig {
   // 详细首次使用引导手册(设计文档):独立于首启向导 first_launch,首次关闭手册后写 true 不再自动弹,
   // 设置入口仍可随时强开(35 键,与后端同步)。
   guideSeen: string | null
-  // 文件树显示范围 S 线(2026-07-16)→ 20 键,与后端同步。
+  // 文件树显示范围。
   treeDisplayMode: string | null
-  // 选择态缩略图拖拽手柄显隐(2026-07-17 #5)→ 21 键,与后端同步。
+  // 选择态缩略图拖拽手柄显隐。
   showDragHandle: string | null
-  // 无缝分组(2026-07-17 #1)→ 22 键,与后端同步。
+  // 无缝分组。
   seamlessGroups: string | null
-  // 无缝 minimap 轴显隐(2026-07-17)+ 渲染模式(2026-07-19)→ 24 键,与后端同步。
+  // 无缝 minimap 轴显隐与渲染模式。
   seamlessMinimap: string | null
   minimapRenderMode: string | null
-  // 日志能力重构 S3(2026-07-20):logger.ts 的 off 档联动须在启动早期就位(不能等设置页才读)
-  // → 25 键,与后端同步。
+  // logger.ts 的 off 档联动须在启动早期就位，不能等设置页加载。
   logLevel: string | null
-  // 配置重构批次C(2026-07-22):5 个前端阈值键(advanced,新增字段,不改旧字段位置/类型)
-  // → 30 键,与后端同步。均为 hot——config-file-changed 后 refreshFromBackend 重拉即生效,
+  // 前端阈值键均可热更新：config-file-changed 更新中央快照后即生效，
   // 消费点(useHoverPreview.ts / useJustifiedLayout.ts / AppToolbar.vue / HGalleryLabView.vue)
   // 一律响应式读取(函数体内取值,非组合式函数初始化时快照),无需重启应用。
   heavyVideoMaxPixels: string | null
@@ -156,15 +152,13 @@ export interface StartupConfig {
   hoverDelayMs: string | null
   searchDebounceMs: string | null
   resizeDebounceMs: string | null
-  // 小批 C2(2026-07-22):雪碧图切帧列数,须与后端提取帧数(video_keyframe_count)同源,
-  // 否则用户改键后前端仍按旧硬编码列数切新雪碧图 → 画面错位 → 31 键,与后端同步。
+  // 雪碧图切帧列数须与后端提取帧数(video_keyframe_count)同源，否则画面错位。
   videoKeyframeCount: string | null
-  // 窗口化沉浸模式(2026-07-23):非全屏时自动隐藏顶栏/底栏,鼠标移边缘唤出 → 32 键,与后端同步。
+  // 窗口化沉浸模式：非全屏时自动隐藏顶栏/底栏，鼠标移边缘唤出。
   autoHideChromeWindowed: string | null
-  // 轴视窗不透明度缩放(2026-07-24):时间轴/minimap 拖动视窗,百分比 → 33 键,与后端同步。
+  // 时间轴/minimap 拖动视窗的不透明度百分比。
   axisViewportOpacity: string | null
-  // 轴形态偏好(2026-07-24 画廊轴/minimap 重构):timeline|minimap,两分组模式通用,
-  // 持久化替代原会话态 preferredAxis → 34 键,与后端同步。
+  // 轴形态偏好：timeline|minimap，两分组模式通用。
   axisMode: string | null
 }
 
@@ -220,8 +214,6 @@ export const useUiStore = defineStore('ui', () => {
   function hydrateGuideSeen(val: string | null) {
     guideSeen.value = val === 'true'
   }
-
-  // 缩略图策略由 configStore 持有；uiStore 不再保留同步副本。
 
   // ── 侧边栏 ────────────────────────────────────────────────────────────
   // 侧栏宽度:拖拽期是高频预览(每帧改),故用本地 ref 跟手,松手才经中央服务提交;
@@ -279,8 +271,6 @@ export const useUiStore = defineStore('ui', () => {
     // 拖拽结束提交一次(拖动期只走 setSidebarWidth 的本地预览)。
     writeSettings({ [KEY_SIDEBAR_WIDTH]: String(sidebarWidth.value) }).catch(() => {})
   }
-
-  // ── Active view:已拆出至 stores/viewStore.ts(P1-21 渐进拆分第二刀)。消费方改用 useViewStore()。 ──
 
   // ── 排序 ───────────────────────────────────────────────────────────────
   const sortOrder = ref<'asc' | 'desc'>('desc')
@@ -391,8 +381,6 @@ export const useUiStore = defineStore('ui', () => {
     writeSettings({ [KEY_MINIMAP_RENDER_MODE]: val }).catch(() => {})
   }
 
-  // ── Toasts:已拆出至 stores/toastStore.ts(P1-21 渐进拆分)。消费方改用 useToastStore()。 ──
-
   // ── 搜索 ─────────────────────────────────────────────────────────────
   const searchQuery = ref('')
   const searchScope = ref<string>('filename')
@@ -438,17 +426,18 @@ export const useUiStore = defineStore('ui', () => {
     }
   }
 
-  /**
-   * 退出应用,并处理「退出前落盘失败」这一真实结果。
-   *
-   * 后端 EXIT_APP 会先等前端在途设置落盘;写盘失败时它不退出,而是返回稳定 code
-   * settings_flush_failed。此时若什么都不做,用户点了 ✕ 会**看似毫无反应**——故给出
-   * 「重试」与「放弃未保存修改并退出」两个明确出口:既不静默丢失改动,也不把失败当成已保存。
-   * 放弃走 force 分支(后端跳过 flush 直接退),是用户显式承担丢改动的选择。
-   */
+  /** 退出入口共用文档保存屏障；force 仅跳过后端设置落盘，不丢弃文档草稿。 */
+  async function exitAppAfterSaving(force = false): Promise<boolean> {
+    const prepareClose = useViewerStore().activeViewer?.api?.prepareClose
+    if (prepareClose && !(await prepareClose())) return false
+    await invokeIpc(IPC.EXIT_APP, force ? { force: true } : undefined)
+    return true
+  }
+
+  /** 设置落盘失败时保留窗口，并提供重试或明确放弃设置修改的出口。 */
   async function exitAppWithFlushGuard(): Promise<void> {
     try {
-      await invokeIpc(IPC.EXIT_APP)
+      await exitAppAfterSaving()
     } catch (e) {
       const code = (e as { code?: string }).code
       if (code !== SETTINGS_FLUSH_FAILED_CODE) throw e
@@ -461,7 +450,7 @@ export const useUiStore = defineStore('ui', () => {
         {
           label: i18n.global.t('closeConfirm.exitAnyway'),
           onClick: () => {
-            void invokeIpc(IPC.EXIT_APP, { force: true }).catch((err) =>
+            void exitAppAfterSaving(true).catch((err) =>
               logger.error('forced exit failed', { error: err }),
             )
           },
@@ -475,16 +464,21 @@ export const useUiStore = defineStore('ui', () => {
   // 两个常驻工具项由默认值保证存在(schema 默认已含),无需再补种写盘。
   const pinnedSettings = computed<string[]>(() =>
     parseSettingJson<string[]>(readSetting(KEY_PINNED_SETTINGS), []).filter(
-      (k): k is string => typeof k === 'string',
+      (k): k is string => typeof k === 'string' && k !== 'gpuEngine',
     ),
   )
 
+  /** 批量固定或取消指定设置；保留其余工具的顺序，并一次提交完整清单。 */
+  function setPinnedSettings(keys: readonly string[], pinned: boolean) {
+    const selected = new Set(keys)
+    const next = pinned
+      ? [...new Set([...pinnedSettings.value, ...keys])]
+      : pinnedSettings.value.filter((key) => !selected.has(key))
+    return writeSettings({ [KEY_PINNED_SETTINGS]: JSON.stringify(next) })
+  }
+
   function togglePinnedSetting(key: string) {
-    const idx = pinnedSettings.value.indexOf(key)
-    const next = [...pinnedSettings.value]
-    if (idx >= 0) next.splice(idx, 1)
-    else next.push(key)
-    writeSettings({ [KEY_PINNED_SETTINGS]: JSON.stringify(next) }).catch(() => {})
+    setPinnedSettings([key], !pinnedSettings.value.includes(key)).catch(() => {})
   }
 
   // 将置顶工具从一个位置移动到另一个位置（拖拽排序）并持久化。
@@ -531,9 +525,9 @@ export const useUiStore = defineStore('ui', () => {
     writeSettings({ [KEY_HOVER_AUTOPLAY]: String(val) }).catch(() => {})
   }
 
-  // ── 配置重构批次C:5 个前端阈值键(advanced,只读——无设置页 UI,无 setter) ──────────
+  // 前端阈值键（advanced，只读；无设置页 UI 和 setter）。
   // 悬停预览「重」视频判据(与既有 useHoverPreview.ts::HEAVY_VIDEO_PIXELS/HEAVY_VIDEO_BYTES
-  // 同默认值,批次C起改由此处响应式下发,消费点不再自持模块级常量)。
+  // 同默认值，由此处响应式下发。
   const heavyVideoMaxPixels = computed(() =>
     readSettingNumber(KEY_HEAVY_VIDEO_MAX_PIXELS, 3840 * 2160),
   )
@@ -610,14 +604,6 @@ export const useUiStore = defineStore('ui', () => {
   )
 
   /**
-   * 兼容既有调用点(useConfigFile 的 config-file-changed):中央服务已统一应用快照,
-   * 此处保留为显式刷新入口,供需要主动重取的场景使用。
-   */
-  async function refreshFromBackend() {
-    await refreshSettingsFromBackend()
-  }
-
-  /**
    * 共享的启动 Promise(既有消费方:App.vue 的首启/引导判定、useGalleryQuerySync 的水合门)。
    * 实际实现经中央服务的 initializeSettings——全应用只发一次请求,失败时 resolve 为 null 而不是
    * 抛出,使排在它后面的水合门/首屏逻辑仍能继续(读取失败的可重试提示由 App 层给出)。
@@ -640,8 +626,6 @@ export const useUiStore = defineStore('ui', () => {
     hydrateGuideSeen,
     // R2-4:共享给 App.vue 的启动配置批(单次 IPC)。
     startupConfigPromise,
-    // 外置配置文件（config.toml，批次B）热更新到达时刷新（composables/useConfigFile.ts 消费）。
-    refreshFromBackend,
     // 侧边栏
     sidebarWidth,
     gallerySidebarVisible,
@@ -692,9 +676,13 @@ export const useUiStore = defineStore('ui', () => {
     closeBehavior,
     showCloseConfirmDialog,
     requestAppClose,
+    // 托盘等显式退出入口不读取关闭到托盘偏好，仍复用文档保存与设置失败处理。
+    requestAppExit: exitAppWithFlushGuard,
+    exitAppAfterSaving,
     setCloseBehavior,
     // 置顶设置
     pinnedSettings,
+    setPinnedSettings,
     togglePinnedSetting,
     reorderPinnedSetting,
     // 缩略图信息
@@ -709,7 +697,7 @@ export const useUiStore = defineStore('ui', () => {
     setShowDragHandle,
     autoHideChromeWindowed,
     setAutoHideChromeWindowed,
-    // 配置重构批次C:5 个前端阈值键(只读,无 setter——见其声明处注释)
+    // 前端阈值键（只读）。
     heavyVideoMaxPixels,
     heavyVideoMaxBytes,
     hoverDelayMs,

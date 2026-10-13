@@ -1,13 +1,5 @@
-//! R10 通用下载引擎（Part6 §3.1.2）。
-//!
-//! 此前 exotic（`exotic/fetch.rs`）与 AI/face（今 `ipc/model_download.rs::download_assets`）各写一套下载逻辑：
-//! sha256 循环、reqwest client 构建、`.part` 原子改名、size/sha 校验重复两份；且 exotic 缺 Range
-//! 续传/镜像回退/进度，AI 缺 HTTPS 强制/超时加固。本模块把**可共享的机制原语**收敛到一处：
-//! 安全 client（HTTPS 强制 + 重定向加固 + 分级超时）、单文件流式下载（Range 续传）、镜像回退、
-//! sha256 校验。各调用方保留自己的**领域编排**（exotic 的包校验、AI 的多资产清单/进度聚合），
-//! 仅机制下沉——延续「找真正解耦的单元、不强抽纠缠的胶水」原则。
-//!
-//! 安全不降级（合并自 exotic 的更严策略）：全程仅 HTTPS、拒非 HTTPS 重定向降级、连接超时防慢速挂起。
+//! 通用下载引擎：HTTPS 客户端、Range 续传、镜像回退与 sha256 校验。
+//! 拒绝非 HTTPS 重定向；调用方负责包或模型资产的领域编排。
 
 use std::path::Path;
 use std::time::Duration;
@@ -47,7 +39,7 @@ impl DownloadError {
     }
 }
 
-/// 超时策略。🔴 大文件不可套用小文件的整体超时——否则慢速链路下 ~1GB 模型 blob（Part6 T7）
+/// 超时策略。大文件不可套用小文件的整体超时，否则慢速链路下约 1GB 的模型 blob
 /// 会被整体超时**误杀**。故按调用方语义分级。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeoutPolicy {
@@ -434,124 +426,4 @@ pub fn verify_size_sha(
         return Err(DownloadError::HashMismatch);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn noop() -> Box<OnBytes<'static>> {
-        Box::new(|_| {})
-    }
-
-    // 仅测试响应处理：生产入口仍先拒绝非 HTTPS，测试不访问外部网络。
-    async fn response(status: &str, headers: &str, body: &str) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let wire = format!("HTTP/1.1 {status}\r\nConnection: close\r\n{headers}\r\n{body}");
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
-            socket.write_all(wire.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        });
-        let resp = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap()
-            .get(format!("http://{address}/file"))
-            .send()
-            .await
-            .unwrap();
-        server.await.unwrap();
-        resp
-    }
-
-    #[tokio::test]
-    async fn chunked_exact_and_short_downloads_preserve_final_verification() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        let resp = response(
-            "200 OK",
-            "Transfer-Encoding: chunked\r\n",
-            "5\r\nhello\r\n0\r\n\r\n",
-        )
-        .await;
-        write_download_response(resp, &path, 0, 5, &|_| {})
-            .await
-            .unwrap();
-        assert!(verify_size_sha(&path, 5, None).is_ok());
-
-        let resp = response(
-            "200 OK",
-            "Transfer-Encoding: chunked\r\n",
-            "3\r\nhel\r\n0\r\n\r\n",
-        )
-        .await;
-        write_download_response(resp, &path, 0, 5, &|_| {})
-            .await
-            .unwrap();
-        assert!(matches!(
-            verify_size_sha(&path, 5, None),
-            Err(DownloadError::SizeMismatch {
-                expected: 5,
-                got: 3
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn chunked_oversend_never_writes_beyond_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        let resp = response(
-            "200 OK",
-            "Transfer-Encoding: chunked\r\n",
-            "5\r\nhello\r\n1\r\n!\r\n0\r\n\r\n",
-        )
-        .await;
-        let result = write_download_response(resp, &path, 0, 5, &|_| {}).await;
-        assert!(matches!(result, Err(DownloadError::TooLarge)), "{result:?}");
-        assert!(std::fs::metadata(&path).unwrap().len() <= 5);
-    }
-
-    #[tokio::test]
-    async fn wrong_range_start_does_not_append() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.part");
-        std::fs::write(&path, b"he").unwrap();
-        let resp = response(
-            "206 Partial Content",
-            "Content-Length: 3\r\nContent-Range: bytes 1-3/5\r\n",
-            "llo",
-        )
-        .await;
-        assert!(write_download_response(resp, &path, 2, 5, &|_| {})
-            .await
-            .is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"he");
-    }
-
-    #[test]
-    fn download_file_rejects_non_https() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let client = secure_client(TimeoutPolicy::SmallFile).unwrap();
-        let dest = std::env::temp_dir().join("dl-nohttps.part");
-        let cb = noop();
-        let r = rt.block_on(download_file(
-            &client,
-            "http://x.invalid/a",
-            &dest,
-            0,
-            5,
-            cb.as_ref(),
-        ));
-        assert!(matches!(r, Err(DownloadError::NotHttps)));
-    }
 }

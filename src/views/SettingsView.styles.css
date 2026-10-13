@@ -8,7 +8,7 @@
   overflow: hidden;
 }
 
-/* ── 外置配置文件解析错误横幅(批次B)：置顶、恒可见,不占 settings-header 的 grid 布局。 ── */
+/* 外置配置文件解析错误横幅置顶显示，不占 settings-header 的 grid 布局。 */
 .settings-config-banner {
   display: flex;
   align-items: flex-start;
@@ -25,7 +25,7 @@
   flex-shrink: 0;
   margin-top: 2px;
 }
-/* 信息级变体(批次B深审 #7:「需重启生效」提示条)：同结构，改走 info 色阶 + 可关闭按钮。 */
+/* 「需重启生效」提示使用信息色阶，并提供关闭按钮。 */
 .settings-config-banner--info {
   background: var(--color-info-subtle);
   border-bottom-color: color-mix(in srgb, var(--color-info) 45%, var(--color-border));
@@ -61,7 +61,7 @@
 .settings-header {
   background: var(--color-bg-primary);
   display: grid;
-  grid-template-columns: minmax(150px, 1fr) minmax(220px, 480px) minmax(100px, 1fr);
+  grid-template-columns: minmax(120px, 1fr) minmax(180px, 480px) auto;
   align-items: center;
   gap: var(--spacing-xl);
   min-height: 56px;
@@ -192,9 +192,14 @@
 
 .settings-header__actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--spacing-md);
   justify-content: flex-end;
+}
+.settings-pin-all {
+  gap: var(--spacing-xs);
+  white-space: nowrap;
 }
 
 /* 详细引导手册入口:视觉对齐同一套次要操作样式。 */
@@ -338,7 +343,6 @@
 
 /* ── Card overrides (extend global .settings-card) ─────────────────────── */
 /* The base .settings-card styles are in index.css. */
-/* 行外壳(__item 内边距/pin 钮)样式已随 §8 注册式重构移入 SettingRow.vue。 */
 
 .clickable-path {
   cursor: pointer;
@@ -354,7 +358,7 @@
   text-decoration-color: var(--color-accent);
 }
 
-/* ── 外置配置文件路径(批次B):非目录,不可点(与 clickable-path 系区分),等宽字体便于辨认路径。 ── */
+/* 外置配置文件路径不可点，等宽字体便于辨认。 */
 .configfile-path {
   font-family: var(--font-mono);
   word-break: break-all;
@@ -428,7 +432,7 @@
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
 }
-/* 生成阶段小徽章(原内联 style 收进 class,S6) */
+/* 生成阶段徽章。 */
 .thumb-gen-phase {
   font-weight: 500;
   color: var(--color-warning);
@@ -462,7 +466,7 @@
   white-space: nowrap;
 }
 
-/* ── 自定义 ICC 列表(方案 B §0④/⑤)──────────────────────────────────── */
+/* 自定义 ICC 列表。 */
 .icc-profile-list {
   margin-top: var(--spacing-sm);
   display: flex;
@@ -502,7 +506,7 @@
   color: var(--color-error);
 }
 
-/* ── 悬停信息元素多选面板(原内联 style 收进 class,S6)─────────────────── */
+/* 悬停信息元素多选面板。 */
 .thumb-info-options {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -522,7 +526,7 @@
   accent-color: var(--color-accent);
 }
 
-/* ── AI 引擎状态描述(原内联 style 收进 class,S6)──────────────────────── */
+/* AI 引擎状态描述。 */
 .ai-status-warn {
   color: var(--color-warning);
 }

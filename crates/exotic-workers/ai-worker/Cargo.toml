@@ -1,7 +1,6 @@
 # crates/exotic-workers/ai-worker/Cargo.toml
-# AI 推理 Worker(Part4-T15,合并单 worker:CLIP 嵌入 + 人脸检测/嵌入,T9.5 VRAM 实测支持合并、
-# 正式拍板随 T20)。长驻子进程:stdin 收协议帧、stdout 回协议帧、stderr 写日志。
-# 推理核不在本 crate——共享 scrollery-ai-core(src-tauri 进程内路径在 T16 前同源消费)。
+# AI 推理 Worker 承接 CLIP、人脸与 OCR；stdin/stdout 传协议帧，stderr 写日志。
+# 推理核来自共享的 scrollery-ai-core。
 
 [package]
 name = "ai-worker"
@@ -35,6 +34,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1"
 # WorkerLogLine 序列化 + 自定义 FormatEvent 的字段收集(D-313/D-314)。
 serde_json = "1"
+
+# 与宿主授权打开共用同版本平台 API；只读已打开且通过边界检查的缓存句柄。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 # 合规隔离(Part4-T1):转发至 ai-core,研究/自用构建才含 SCRFD/ArcFace 轨。

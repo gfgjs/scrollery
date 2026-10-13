@@ -10,15 +10,7 @@ use crate::db::models::{AppStats, ImageMeta, MediaDetail, MediaItem, MediaMeta, 
 use crate::error::{AppError, Result};
 use crate::utils::path::resolve_media_path;
 
-pub(in crate::db::queries) const MEDIA_ITEM_COLUMNS: &str =
-    "id, directory_id, file_name, file_size, file_mtime, file_format,
-     media_type, width, height, duration_ms, sort_datetime, cache_key,
-     thumb_status, thumb_path, thumbhash, is_favorited, is_deleted,
-     deleted_at, rating, is_live_photo, has_embedded_video, companion_of,
-     content_hash, created_at, updated_at, color_label, view_rotation,
-     playback_position_ms, source_revision";
-
-pub(in crate::db::queries) fn map_media_item(row: &Row<'_>) -> rusqlite::Result<MediaItem> {
+fn map_media_item(row: &Row<'_>) -> rusqlite::Result<MediaItem> {
     Ok(MediaItem {
         id: row.get(0)?,
         directory_id: row.get(1)?,
@@ -57,35 +49,83 @@ pub(in crate::db::queries) fn map_media_item(row: &Row<'_>) -> rusqlite::Result<
     })
 }
 
-/// 将一条 media_items 行复制到 `target_dir_id`（新自增 id），复用源的 cache_key / 缩略图 /
-/// 尺寸，使副本即时显示。返回新 id。用于拖拽复制；精确的新 id 使复制可干净撤销（问题2）。
+/// 物理复制完成后从目标文件读取的大小与修改时间，用于建立副本的缓存身份。
+pub struct MediaCopyFileStat {
+    /// 目标文件的字节数。
+    pub file_size: i64,
+    /// 修改时间的 Unix 秒值。
+    pub file_mtime: i64,
+    /// 修改时间的绝对 Unix 纳秒值；0 表示调用方无法取得精度。
+    pub file_mtime_ns: i64,
+}
+
+/// 将媒体项的用户和内容属性复制到 `target_dir_id`，以目标文件信息建立独立缓存身份。
+/// 返回新 id，供调用方精确撤销复制；副本的缩略图由其独立生成流程建立。
+/// 源行在复制期间消失时返回 `MediaNotFound`，不生成可撤销的副本记录。
+/// 调用方须持有本事务至副本文件发布成功后再提交；本函数不创建嵌套事务或自行提交。
 pub fn duplicate_media_item_into_dir(
-    conn: &Connection,
+    tx: &rusqlite::Transaction<'_>,
     src_id: i64,
     target_dir_id: i64,
+    stat: &MediaCopyFileStat,
 ) -> Result<i64> {
+    // 计算身份与复制属性共用事务，避免另一连接改名/移动目录后落入不匹配的缓存键。
+    let file_name: String = tx
+        .query_row(
+            "SELECT file_name FROM media_items WHERE id=?1",
+            [src_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(AppError::MediaNotFound(src_id))?;
+    let rel_path: String = tx.query_row(
+        "SELECT rel_path FROM directories WHERE id=?1",
+        [target_dir_id],
+        |row| row.get(0),
+    )?;
+    let cache_key = crate::utils::hash::compute_cache_key_with_mtime_ns(
+        target_dir_id,
+        &rel_path,
+        &file_name,
+        stat.file_mtime,
+        stat.file_mtime_ns,
+    );
     // 列清单取舍(2026-07-10 审查 A3):内容/用户属性(color_label 用户资产、content_identifier
     // Live Photo 配对键——字节级复制保留内容内在标识)必须随行复制;而 volume_id /
     // volume_relative_path / availability 是**位置属性**——副本物理落在目标目录,照抄源值会指向
     // 源位置(缺失检测误报/重链接错键),故有意不复制,留 NULL/DEFAULT 由下次扫描 COALESCE 治愈。
     // 2026-07-23 裁决 J11 补齐:view_rotation(V20 看图台展示旋转)与 playback_position_ms
     // (V23 播放进度记忆)同为用户属性,按 A3 原则随行——先前遗漏致副本「转回去」,与本注释矛盾。
-    conn.execute(
-        "INSERT INTO media_items
-            (directory_id, file_name, file_size, file_mtime, file_format, media_type,
+    // RETURNING 只返回本次真正插入的行；零行时 last_insert_rowid 仍会指向之前的无关资产。
+    // 副本即使与源字节相同也须拥有独立缓存；源路径以后可能被同时间的新文件重新占用。
+    let new_id = tx
+        .query_row(
+            "INSERT INTO media_items
+            (directory_id, file_name, file_size, file_mtime, file_mtime_ns, file_format, media_type,
              width, height, duration_ms, sort_datetime, cache_key, thumb_status, thumb_path,
              thumbhash, is_favorited, is_deleted, deleted_at, rating, is_live_photo,
              has_embedded_video, companion_of, content_hash, color_label, content_identifier,
              view_rotation, playback_position_ms, created_at, updated_at)
-         SELECT ?1, file_name, file_size, file_mtime, file_format, media_type,
-             width, height, duration_ms, sort_datetime, cache_key, thumb_status, thumb_path,
-             thumbhash, is_favorited, is_deleted, deleted_at, rating, is_live_photo,
+         SELECT ?1, file_name, ?3, ?4, ?5, file_format, media_type,
+             width, height, duration_ms, sort_datetime, ?6, 0, NULL,
+             NULL, is_favorited, is_deleted, deleted_at, rating, is_live_photo,
              has_embedded_video, companion_of, content_hash, color_label, content_identifier,
              view_rotation, playback_position_ms, strftime('%s','now'), strftime('%s','now')
-         FROM media_items WHERE id = ?2",
-        params![target_dir_id, src_id],
-    )?;
-    Ok(conn.last_insert_rowid())
+         FROM media_items WHERE id = ?2
+         RETURNING id",
+            params![
+                target_dir_id,
+                src_id,
+                stat.file_size,
+                stat.file_mtime,
+                stat.file_mtime_ns,
+                cache_key
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(AppError::MediaNotFound(src_id))?;
+    Ok(new_id)
 }
 
 #[cfg(test)]
@@ -93,11 +133,62 @@ mod duplicate_media_item_tests {
     //! 2026-07-10 审查 A3 回归钉:复制须带走用户/内容属性,且**不得**带走位置属性。
     use super::*;
 
+    /// 源行在物理复制后消失，INSERT SELECT 不插入任何行；不得返回无关资产的旧 rowid。
+    #[test]
+    fn missing_copy_source_never_returns_unrelated_item_id() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, rel_path, name) VALUES
+                 (10, 1, 'src', 's'), (11, 1, 'dst', 'd');
+             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime,
+                 file_format, sort_datetime, cache_key) VALUES
+                 (1, 10, 'source.jpg', 5, 1, 'jpg', 1, 11),
+                 (2, 10, 'untouched.jpg', 9, 2, 'jpg', 2, 22);
+             DELETE FROM media_items WHERE id=1;",
+        )
+        .unwrap();
+        assert_eq!(c.last_insert_rowid(), 2, "连接还保存着无关资产的旧 rowid");
+
+        let tx = c.transaction().unwrap();
+        let result = duplicate_media_item_into_dir(
+            &tx,
+            1,
+            11,
+            &MediaCopyFileStat {
+                file_size: 5,
+                file_mtime: 1,
+                file_mtime_ns: 1_000_000_000,
+            },
+        );
+        assert!(
+            matches!(result, Err(AppError::MediaNotFound(1))),
+            "缺失源必须报错，不能把旧 rowid 作为副本交给撤销逻辑: {result:?}"
+        );
+        tx.rollback().unwrap();
+        let survivor: (i64, String, i64) = c
+            .query_row(
+                "SELECT directory_id, file_name, cache_key FROM media_items WHERE id=?1",
+                params![2],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(survivor, (10, "untouched.jpg".to_string(), 22));
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM media_items", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "没有创建任何副本，也不改变无关资产"
+        );
+    }
+
     #[test]
     // 8 元组仅为一次性读回断言,拆结构体反增噪——测试内豁免 type_complexity。
     #[allow(clippy::type_complexity)]
     fn copies_user_and_content_fields_but_resets_location_fields() {
-        let c = Connection::open_in_memory().unwrap();
+        let mut c = Connection::open_in_memory().unwrap();
         crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
@@ -107,13 +198,22 @@ mod duplicate_media_item_tests {
              INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime,
                  file_format, media_type, width, height, sort_datetime, cache_key,
                  color_label, content_identifier, volume_id, volume_relative_path, availability,
-                 view_rotation, playback_position_ms)
+                 view_rotation, playback_position_ms, thumb_status, thumb_path, thumbhash,
+                 file_mtime_ns, source_revision)
              VALUES (1, 10, 'a.heic', 1, 1, 'heic', 'image', 10, 10, 100, 11,
-                 'red', 'live-pair-1', 7, 'src/a.heic', 'offline', 90, 4321);",
+                 'red', 'live-pair-1', 7, 'src/a.heic', 'offline', 90, 4321,
+                 3, '/r/src/a.heic', X'0102', 1000000000, 8);",
         )
         .unwrap();
 
-        let new_id = duplicate_media_item_into_dir(&c, 1, 11).unwrap();
+        let stat = MediaCopyFileStat {
+            file_size: 246,
+            file_mtime: 1_700_000_000,
+            file_mtime_ns: 1_700_000_000_123_456_700,
+        };
+        let tx = c.transaction().unwrap();
+        let new_id = duplicate_media_item_into_dir(&tx, 1, 11, &stat).unwrap();
+        tx.commit().unwrap();
 
         let (dir, label, cid, vol, vrp, avail, rot, pos): (
             i64,
@@ -157,12 +257,98 @@ mod duplicate_media_item_tests {
         assert_eq!(vol, None);
         assert_eq!(vrp, None);
         assert_eq!(avail, "online");
+
+        let expected_key = crate::utils::hash::compute_cache_key_with_mtime_ns(
+            11,
+            "dst",
+            "a.heic",
+            stat.file_mtime,
+            stat.file_mtime_ns,
+        );
+        let (key, size, mtime, ns, revision, thumb_status, thumb_path, thumbhash): (
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            i64,
+            i64,
+            Option<String>,
+            Option<Vec<u8>>,
+        ) = c
+            .query_row(
+                "SELECT cache_key,file_size,file_mtime,file_mtime_ns,source_revision,
+                thumb_status,thumb_path,thumbhash FROM media_items WHERE id=?1",
+                [new_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(key, expected_key);
+        assert_ne!(key, 11, "副本不能沿用源目录的缓存身份");
+        assert_eq!(
+            (size, mtime, ns),
+            (stat.file_size, stat.file_mtime, Some(stat.file_mtime_ns))
+        );
+        assert_eq!(revision, 1);
+        assert_eq!(
+            (thumb_status, thumb_path, thumbhash),
+            (0, None, None),
+            "不得继承指向源文件的直显路径"
+        );
+        let scanned = super::super::FastScanItem {
+            directory_id: 11,
+            file_name: "a.heic".into(),
+            file_size: stat.file_size,
+            file_mtime: stat.file_mtime,
+            file_mtime_ns: stat.file_mtime_ns,
+            file_format: "heic".into(),
+            media_type: "image".into(),
+            width: 10,
+            height: 10,
+            sort_datetime: stat.file_mtime,
+            cache_key: expected_key,
+        };
+        assert_eq!(
+            super::super::upsert_fast_scan_item(&c, &scanned, None).unwrap(),
+            super::super::UpsertOutcome::Unchanged(new_id),
+            "刚复制的文件重扫不应因遗漏纳秒时间进入可疑变更流程",
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT cache_key,source_revision,thumb_path FROM media_items WHERE id=1",
+                [],
+                |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+            (11, 8, "/r/src/a.heic".into()),
+            "副本落库和重扫不能修改源项",
+        );
     }
 }
 
 pub fn get_media_item(conn: &Connection, id: i64) -> Result<MediaItem> {
     conn.query_row(
-        &format!("SELECT {MEDIA_ITEM_COLUMNS} FROM media_items WHERE id=?1"),
+        "SELECT id, directory_id, file_name, file_size, file_mtime, file_format,
+                media_type, width, height, duration_ms, sort_datetime, cache_key,
+                thumb_status, thumb_path, thumbhash, is_favorited, is_deleted,
+                deleted_at, rating, is_live_photo, has_embedded_video, companion_of,
+                content_hash, created_at, updated_at, color_label, view_rotation,
+                playback_position_ms, source_revision
+         FROM media_items WHERE id=?1",
         params![id],
         map_media_item,
     )
@@ -473,6 +659,15 @@ pub fn expand_companions(conn: &Connection, ids: &[i64]) -> Result<Vec<i64>> {
     Ok(out)
 }
 
+// 删除/恢复只撤销普通图片的展示引用；插件产物仍由独立任务持有。
+const ORDINARY_IMAGE_THUMBNAIL: &str = "media_type='image'
+    AND NOT EXISTS (
+        SELECT 1 FROM exotic_catalog_formats ec, json_each(ec.capabilities_json) capability
+        WHERE ec.format=media_items.file_format AND capability.value='thumbnail')
+    AND NOT EXISTS (
+        SELECT 1 FROM exotic_tasks et
+        WHERE et.item_id=media_items.id AND et.capability='thumbnail')";
+
 pub fn soft_delete_items(conn: &Connection, item_ids: &[i64]) -> Result<()> {
     if item_ids.is_empty() {
         return Ok(());
@@ -480,14 +675,17 @@ pub fn soft_delete_items(conn: &Connection, item_ids: &[i64]) -> Result<()> {
     // D5：连带其 Live Photo companion，避免删静图留下孤儿伴随视频。
     let ids = expand_companions(conn, item_ids)?;
     let tx = conn.unchecked_transaction()?;
+    let sql = format!(
+        "UPDATE media_items SET is_deleted=1, source_revision=source_revision+1,
+                 thumb_status=CASE WHEN {ORDINARY_IMAGE_THUMBNAIL} THEN 0 ELSE thumb_status END,
+                 thumb_path=CASE WHEN {ORDINARY_IMAGE_THUMBNAIL} THEN NULL ELSE thumb_path END,
+                 thumbhash=CASE WHEN {ORDINARY_IMAGE_THUMBNAIL} THEN NULL ELSE thumbhash END,
+                 deleted_at=strftime('%s','now'),
+                 updated_at=strftime('%s','now')
+         WHERE id=?1"
+    );
     for &id in &ids {
-        tx.execute(
-            "UPDATE media_items SET is_deleted=1, source_revision=source_revision+1,
-                     deleted_at=strftime('%s','now'),
-                     updated_at=strftime('%s','now')
-             WHERE id=?1",
-            params![id],
-        )?;
+        tx.execute(&sql, params![id])?;
         // 删除/恢复会改变去重候选的可见性；清掉旧 sidecar，避免恢复后在尚未重新
         // 分析时复用一份可能已过期的精确证据。
         tx.execute("DELETE FROM dedup_index WHERE item_id=?1", params![id])?;
@@ -503,14 +701,17 @@ pub fn restore_items(conn: &Connection, item_ids: &[i64]) -> Result<()> {
     // D5：恢复静图时对称地连带恢复其 companion。
     let ids = expand_companions(conn, item_ids)?;
     let tx = conn.unchecked_transaction()?;
+    let sql = format!(
+        "UPDATE media_items SET is_deleted=0, source_revision=source_revision+1,
+                 thumb_status=CASE WHEN {ORDINARY_IMAGE_THUMBNAIL} THEN 0 ELSE thumb_status END,
+                 thumb_path=CASE WHEN {ORDINARY_IMAGE_THUMBNAIL} THEN NULL ELSE thumb_path END,
+                 thumbhash=CASE WHEN {ORDINARY_IMAGE_THUMBNAIL} THEN NULL ELSE thumbhash END,
+                 deleted_at=NULL,
+                 updated_at=strftime('%s','now')
+         WHERE id=?1"
+    );
     for &id in &ids {
-        tx.execute(
-            "UPDATE media_items SET is_deleted=0, source_revision=source_revision+1,
-                     deleted_at=NULL,
-                     updated_at=strftime('%s','now')
-             WHERE id=?1",
-            params![id],
-        )?;
+        tx.execute(&sql, params![id])?;
         tx.execute("DELETE FROM dedup_index WHERE item_id=?1", params![id])?;
     }
     tx.commit()?;
@@ -530,14 +731,14 @@ pub fn get_app_stats(conn: &Connection) -> Result<AppStats> {
     let hidden = super::scan::hidden_root_ids(conn)?;
     let mut sql = String::from(
         "SELECT
-            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL),
-            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND media_type='image'),
-            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND media_type='video'),
-            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND media_type='audio'),
-            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND media_type='document'),
-            COUNT(*) FILTER (WHERE is_favorited=1 AND is_deleted=0),
+            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND availability != 'missing'),
+            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND availability != 'missing' AND media_type='image'),
+            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND availability != 'missing' AND media_type='video'),
+            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND availability != 'missing' AND media_type='audio'),
+            COUNT(*) FILTER (WHERE is_deleted=0 AND companion_of IS NULL AND availability != 'missing' AND media_type='document'),
+            COUNT(*) FILTER (WHERE is_favorited=1 AND is_deleted=0 AND availability != 'missing'),
             COUNT(*) FILTER (WHERE is_deleted=1),
-            COUNT(*) FILTER (WHERE is_live_photo=1 AND is_deleted=0 AND companion_of IS NULL)
+            COUNT(*) FILTER (WHERE is_live_photo=1 AND is_deleted=0 AND companion_of IS NULL AND availability != 'missing')
          FROM media_items",
     );
     if !hidden.is_empty() {
@@ -678,4 +879,58 @@ mod companion_expand_tests {
             "恢复再次推进 source_revision"
         );
     }
+}
+
+/// 普通图片批量源读取与固定候选页共用的最大项数。
+pub const IMAGE_SOURCE_PAGE_SIZE: usize = 256;
+
+/// 普通图片的源授权数据；文件名位于 `item.file_name`，调用方仍须打开授权句柄。
+#[derive(Debug, Clone)]
+pub struct ImageSource {
+    pub item: MediaItem,
+    pub root_path: String,
+    pub relative_dir: String,
+}
+
+// catalog 接管早于任务播种也必须让路；已完成的 exotic 任务同样不进入普通图片管线。
+pub(super) const IMAGE_SOURCE_ELIGIBILITY: &str = "m.media_type='image' AND m.is_deleted=0
+    AND r.is_hidden=0
+    AND NOT EXISTS (
+        SELECT 1 FROM exotic_catalog_formats ec, json_each(ec.capabilities_json) capability
+        WHERE ec.format=m.file_format AND capability.value='thumbnail')
+    AND NOT EXISTS (
+        SELECT 1 FROM exotic_tasks et WHERE et.item_id=m.id AND et.capability='thumbnail')";
+
+/// 批量读取普通图片和源路径组成部分，供视口与后台页共用（最多 256 项）。
+///
+/// 返回按 ID 排序的存在且可处理的项；已删除、隐藏、非图片、exotic 或缺失 ID 不返回。
+/// 不执行磁盘授权；调用方用根路径、相对目录与文件名打开授权句柄。
+pub fn get_image_sources_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<ImageSource>> {
+    if ids.len() > IMAGE_SOURCE_PAGE_SIZE {
+        return Err(AppError::Internal("image source batch exceeds 256".into()));
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT m.id, m.directory_id, m.file_name, m.file_size, m.file_mtime, m.file_format,
+                m.media_type, m.width, m.height, m.duration_ms, m.sort_datetime, m.cache_key,
+                m.thumb_status, m.thumb_path, m.thumbhash, m.is_favorited, m.is_deleted,
+                m.deleted_at, m.rating, m.is_live_photo, m.has_embedded_video, m.companion_of,
+                m.content_hash, m.created_at, m.updated_at, m.color_label, m.view_rotation,
+                m.playback_position_ms, m.source_revision, r.path, d.rel_path
+         FROM media_items m JOIN directories d ON d.id=m.directory_id
+         JOIN scan_roots r ON r.id=d.root_id
+         WHERE m.id IN ({placeholders}) AND {IMAGE_SOURCE_ELIGIBILITY} ORDER BY m.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        Ok(ImageSource {
+            item: map_media_item(row)?,
+            root_path: row.get(29)?,
+            relative_dir: row.get(30)?,
+        })
+    })?;
+    rows.map(|row| row.map_err(AppError::from)).collect()
 }

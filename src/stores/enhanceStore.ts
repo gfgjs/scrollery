@@ -1,14 +1,14 @@
-// src/stores/enhanceStore.ts
-// 影像增强 store（降噪/超分子系统 P0 批 5）——照 aiStore 形态（defineStore + 常规 ref，无大数组）。
+// 影像增强 store：门控、模型、队列与增强任务状态。
 //
 // 职责：门控/模型态查询、模型下载（Channel 进度）+ 删除、队列拉取 + `enhance:queue-changed`
-// 事件订阅刷新、enhance_start/enhance_cancel、参数记忆（本批内存态）、错误码→用户可读消息映射。
+// 事件订阅刷新、enhance_start/enhance_cancel、参数记忆（内存态）、错误码→用户可读消息映射。
 // 授权真相全在后端（enhance_start 有后端真门）；本 store 只做薄封装 + 门控 UX 引导所需的状态镜像。
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { Channel } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { UnlistenFn } from '@tauri-apps/api/event'
+import { listenAppEvent } from '../utils/appEvents'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import { IPC, EVENTS } from '../constants/ipc'
@@ -42,7 +42,7 @@ export function enhanceErrorMessageKey(code: string | null | undefined): string 
   switch (code) {
     case 'enhance_input_too_large':
       return 'enhance.errInputTooLarge'
-    case 'enhance_unlicensed':
+    case 'enhance_inactive':
       return 'enhance.errUnlicensed'
     case 'enhance_input_unsupported':
       return 'enhance.errInputUnsupported'
@@ -77,7 +77,7 @@ export const useEnhanceStore = defineStore('enhance', () => {
   const lastParams = ref<EnhanceParams | null>(null)
 
   // ── Computed ──────────────────────────────────────────────────────────────
-  const isAuthorized = computed(() => status.value?.availability === 'authorized')
+  const isAvailable = computed(() => status.value?.availability === 'ready')
   /** 存在运行中/排队中的 job（入口按钮/面板据此提示）。 */
   const hasActiveJob = computed(() =>
     queue.value.some((j) => j.status === 'queued' || j.status === 'running'),
@@ -152,10 +152,14 @@ export const useEnhanceStore = defineStore('enhance', () => {
     }
   }
 
+  let queueGeneration = 0
   /** 队列全量快照拉取（事件触发或进面板时调）。 */
   async function fetchQueue(): Promise<void> {
+    const current = ++queueGeneration
     try {
       const next = await invokeIpc<EnhanceJob[]>(IPC.GET_ENHANCE_QUEUE)
+      // 事件、取消和多面板会并发刷新；旧响应不能回退队列或终态通知记录。
+      if (current !== queueGeneration) return
       notifyTerminalTransitions(next)
       queue.value = next
     } catch (e) {
@@ -198,7 +202,7 @@ export const useEnhanceStore = defineStore('enhance', () => {
     }
     subscribing = true
     try {
-      unlisten = await listen(EVENTS.ENHANCE_QUEUE_CHANGED, () => void fetchQueue())
+      unlisten = await listenAppEvent(EVENTS.ENHANCE_QUEUE_CHANGED, () => void fetchQueue())
     } finally {
       subscribing = false
     }
@@ -222,7 +226,7 @@ export const useEnhanceStore = defineStore('enhance', () => {
     queue,
     lastParams,
     // computed
-    isAuthorized,
+    isAvailable,
     hasActiveJob,
     // helpers
     modelsForTask,

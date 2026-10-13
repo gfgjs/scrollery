@@ -1,8 +1,6 @@
 <script setup lang="ts">
-// VideoSeekBar — 进度条:played(已播)+ buffered(已缓冲)双层,点击/拖拽 seek(拖拽中只动预览、
-// 松手才提交,边界 4),hover 显时间 tooltip。sprite 缩略帧预览接口以具名 slot `preview` 预留
-// (props/位置已备),实现归 GE 批;GC 仅落时间 tooltip。duration 非有限(NaN/Infinity 直播流)时
-// 禁 seek(边界 2)。
+// 已播放与已缓冲双层进度条。拖动时只更新预览，松手后提交 seek；具名 preview 插槽显示帧预览。
+// 时长非有限值或不大于零时禁用 seek。
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import { formatPlayerTime } from '../../../utils/format'
 
@@ -17,7 +15,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** 松手提交:跳到该秒。 */
   (e: 'seek', seconds: number): void
-  /** 拖拽/hover 预览位置(秒);null=离开,供上层(GE sprite)消费。 */
+  /** 拖拽或悬停的预览位置，单位秒；null 表示离开。 */
   (e: 'preview', seconds: number | null): void
 }>()
 
@@ -63,8 +61,7 @@ watch(
     if (Math.abs(actualRatio - pendingRatio.value) < 0.005) clearPending()
   },
 )
-// 切源（duration 变化）立即清 pendingRatio，不等 1000ms 兜底——避免残留旧源的待确认比例
-// 短暂错误映射到新源的进度条上。
+// 切源后立即清除待确认比例，避免旧源进度短暂映射到新源。
 watch(() => props.duration, clearPending)
 const bufferedRatio = computed(() => {
   if (!seekable.value) return 0
@@ -85,7 +82,8 @@ function ratioFromEvent(clientX: number): number {
 }
 
 function onPointerDown(e: PointerEvent): void {
-  if (!seekable.value) return
+  // 右键用于查看器资源菜单，中键也不能顺带移动播放头；触摸/笔尖按下同属主按钮。
+  if (e.button !== 0 || !seekable.value) return
   clearPending()
   dragging.value = true
   dragRatio.value = ratioFromEvent(e.clientX)

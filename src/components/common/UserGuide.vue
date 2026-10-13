@@ -1,5 +1,5 @@
 <template>
-  <!-- 详细首次使用引导手册(设计文档):分章图文,可随时从设置头部重开,故不像 OnboardingWizard
+  <!-- 引导手册可随时从设置页重开，故不像 OnboardingWizard
        那样强门控——允许点遮罩/Escape 关闭,关闭键常开。关闭统一走 ui.dismissUserGuide()
        (只在首次写 guide_seen 标记,重开不受影响)。 -->
   <UiDialog

@@ -178,7 +178,7 @@ pub fn update_version_path(conn: &Connection, id: i64, abs_path: &str) -> Result
     Ok(())
 }
 
-/// 将某版本标为当前（或全清 → 以源文件为当前）。当前版本至多一个。
+/// 将某版本标为当前（或全清 → 以源文件为当前）。版本须属于该文档，否则保留原选择。
 pub fn set_current_version(conn: &Connection, item_id: i64, version_id: Option<i64>) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -186,10 +186,16 @@ pub fn set_current_version(conn: &Connection, item_id: i64, version_id: Option<i
         params![item_id],
     )?;
     if let Some(vid) = version_id {
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE document_versions SET is_current = 1 WHERE id = ?1 AND item_id = ?2",
             params![vid, item_id],
         )?;
+        // 切换期间版本可能已删除，或调用方传入其他文档的版本；失败必须回滚前面的清除。
+        if changed == 0 {
+            return Err(AppError::DocumentRender(
+                "文档版本不存在或不属于当前文档 | Document version not found for this item".into(),
+            ));
+        }
     }
     tx.commit()?;
     Ok(())
@@ -337,10 +343,8 @@ pub fn delete_reader_bookmark(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-// ── 文档元数据 DAO（document_meta，Phase 2「死表」激活）────────────────────────
-//
-// 该表 SCHEMA_V1 即建但此前无 DAO（死表）。文档 enrichment（Part3）算出页数/子类型后写入，
-// 供阅读器进度条 / 封面派生消费。
+// ── 文档元数据 DAO（document_meta）────────────────────────
+// enrichment 写入页数/子类型，供阅读器进度条和封面派生消费。
 
 /// upsert 文档元数据（页数 / 子类型）。`item_id` 冲突则覆盖（重新 enrich 即更新）。
 pub fn upsert_document_meta(
@@ -385,4 +389,32 @@ pub fn get_document_meta(conn: &Connection, item_id: i64) -> Result<Option<Docum
     )
     .optional()
     .map_err(AppError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version_fixture() -> (Connection, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
+        // 仅验证版本切换事务，无需构造不参与查询的媒体与扫描根。
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        let version =
+            insert_version(&conn, 42, None, None, "appdata", "draft.txt", "user", None).unwrap();
+        set_current_version(&conn, 42, Some(version)).unwrap();
+        (conn, version)
+    }
+
+    #[test]
+    fn foreign_version_rejected_without_clearing_current_document() {
+        let (conn, current) = version_fixture();
+        let foreign =
+            insert_version(&conn, 43, None, None, "appdata", "other.txt", "user", None).unwrap();
+        set_current_version(&conn, 43, Some(foreign)).unwrap();
+
+        assert!(set_current_version(&conn, 42, Some(foreign)).is_err());
+        assert_eq!(get_current_version(&conn, 42).unwrap().unwrap().id, current);
+        assert_eq!(get_current_version(&conn, 43).unwrap().unwrap().id, foreign);
+    }
 }

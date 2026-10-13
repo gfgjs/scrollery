@@ -1,12 +1,9 @@
 // crates/scrollery-ai-core/src/enhance_profile.rs
 //! 影像增强模型契约（`EnhanceProfile`）+ 内置注册表（纯数据，零 ort）。
 //!
-//! 仿 [`crate::ocr_profile`] 之法：把「换降噪/超分模型档位」变成 DATA 而非 CODE——
-//! 文件名、任务归属、tile 几何全部来自 profile。
+//! 文件名、任务归属与 tile 几何均由 profile 定义。
 //!
-//! # 单源约定
-//! 5 模型短名单出自 `docs/planning/2026-07-24-降噪超分子系统/design.md` §D/§H
-//! 定案；模型资产托管/sha256 钉定由 host 侧资产清单负责，本文件只管纯数据契约。
+//! 模型资产托管与 sha256 校验由 host 侧资产清单负责。
 //!
 //! # tile 静态 shape 联动契约（D-439）
 //! `tile`/`tile_pad` 与导出 ONNX 时锁定的静态输入 shape（1×3×512×512，见 design.md

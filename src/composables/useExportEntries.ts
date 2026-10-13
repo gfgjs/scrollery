@@ -1,6 +1,4 @@
-// src/composables/useExportEntries.ts
-// U-2(方案 A):相册卡片右键「导出相册」+ 当前视图工具栏「导出当前视图」共用的 descriptor 组装
-// 逻辑,从组件里抽出以保持组件单一职责——CollectionsView/GalleryViewControls 只管 UI 触发,不关心
+// 相册与当前视图导出共用的 descriptor 组装逻辑；调用组件只负责触发，不关心
 // SelectionDescriptor/ExportSource 的具体形状。
 //
 // 两个入口都产出 SelectAll{view, excludedIds:[]}(整相册 / 整视图,不受调用组件自身选区态影响)+

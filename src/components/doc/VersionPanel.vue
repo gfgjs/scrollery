@@ -61,12 +61,12 @@
     </div>
 
     <!-- diff 视图 -->
-    <div v-if="diff" class="ver-diff">
+    <div v-if="diffVid !== null" class="ver-diff">
       <div class="ver-diff__head">
         <span>{{ t('doc.verDiffTitle', { id: diffVid }) }}</span>
         <button
           class="ver-panel__x"
-          @click="diff = null"
+          @click="closeDiff"
           :title="t('common.close')"
 
         >
@@ -74,6 +74,7 @@
         </button>
       </div>
       <div class="ver-diff__body">
+        <div v-if="diff === null" role="status">{{ t('common.loading') }}</div>
         <div v-for="(op, i) in diff" :key="i" class="ver-diff__line" :class="'op-' + op.tag">
           <span class="ver-diff__sign">{{
             op.tag === 'insert' ? '+' : op.tag === 'delete' ? '−' : ' '
@@ -86,8 +87,8 @@
 </template>
 
 <script setup lang="ts">
-// 文档版本时间线 + 差异（§5.3）。列出原始文件基线 + 各版本快照；设为当前 / 删除 / 与原始比较。
-import { ref, computed, watch } from 'vue'
+// 文档版本时间线列出原始文件与各版本快照，支持设为当前、删除和与原始版本比较。
+import { ref, computed, watch, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { X, Trash2, GitCompare } from '@lucide/vue'
 import { IPC } from '../../constants/ipc'
@@ -120,6 +121,9 @@ const toast = useToastStore()
 const versions = ref<DocVersion[]>([])
 const diff = ref<DiffOp[] | null>(null)
 const diffVid = ref<number | null>(null)
+let diffRequest = 0
+let listRequest = 0
+let disposed = false
 
 const versionsDesc = computed(() => [...versions.value].reverse())
 const currentId = computed(() => versions.value.find((v) => v.isCurrent)?.id ?? null)
@@ -136,17 +140,32 @@ function fmtTime(t: number) {
 }
 
 async function reload() {
-  versions.value = await invokeIpc<DocVersion[]>(IPC.LIST_VERSIONS, { itemId: props.itemId }).catch(
-    () => [],
-  )
+  if (disposed) return false
+  const request = ++listRequest
+  try {
+    const result = await invokeIpc<DocVersion[]>(IPC.LIST_VERSIONS, { itemId: props.itemId })
+    // 切换版本会并发刷新，旧列表回执不能把「当前」标记退回已离开的版本。
+    if (disposed || request !== listRequest) return false
+    versions.value = result
+    return true
+  } catch (e) {
+    // 列表读取失败不代表版本已清空，保留已知状态并提示当前请求的错误。
+    if (!disposed && request === listRequest) {
+      toast.addToast('error', t('doc.versionOpFailed', { error: ipcErrorMessage(e) }))
+    }
+    return false
+  }
 }
 
 async function setCurrent(versionId: number | null) {
-  // P1-16:切换当前版本失败静默 → 列表高亮与实际生效版本分叉。
+  // 切换当前版本失败时须提示，避免列表高亮与实际版本分叉。
   try {
     await invokeIpc(IPC.SET_CURRENT_VERSION, { itemId: props.itemId, versionId })
-    await reload()
+    if (disposed) return
+    versions.value = versions.value.map(version => ({ ...version, isCurrent: version.id === versionId }))
+    // 写入已确认，正文刷新不应依赖随后列表读取是否成功。
     emit('changed')
+    await reload()
   } catch (e) {
     toast.addToast('error', t('doc.versionOpFailed', { error: ipcErrorMessage(e) }))
   }
@@ -155,25 +174,45 @@ async function setCurrent(versionId: number | null) {
 async function remove(versionId: number) {
   try {
     await invokeIpc(IPC.DELETE_VERSION, { versionId })
-    if (diffVid.value === versionId) diff.value = null
-    await reload()
+    if (disposed) return
+    versions.value = versions.value.filter(version => version.id !== versionId)
+    if (diffVid.value === versionId) closeDiff()
     emit('changed')
+    await reload()
   } catch (e) {
     toast.addToast('error', t('doc.versionOpFailed', { error: ipcErrorMessage(e) }))
   }
 }
 
 async function showDiff(versionId: number) {
+  const request = ++diffRequest
   diffVid.value = versionId
+  diff.value = null
   // a = null（原始基线），b = 该版本
-  diff.value = await invokeIpc<DiffOp[]>(IPC.DIFF_VERSIONS, {
+  const result = await invokeIpc<DiffOp[]>(IPC.DIFF_VERSIONS, {
     itemId: props.itemId,
     a: null,
     b: versionId,
   }).catch(() => [])
+  if (request === diffRequest) diff.value = result
 }
 
-watch(() => props.itemId, reload, { immediate: true })
+function closeDiff() {
+  // 请求不可撤回，但关闭、切换目标或离开后旧比较结果不能再显示。
+  diffRequest++
+  diffVid.value = null
+  diff.value = null
+}
+
+watch(() => props.itemId, () => {
+  closeDiff()
+  versions.value = []
+  void reload()
+}, { immediate: true, flush: 'sync' })
+onBeforeUnmount(() => {
+  disposed = true
+  closeDiff()
+})
 defineExpose({ reload })
 </script>
 

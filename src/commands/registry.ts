@@ -1,5 +1,4 @@
-// CommandRegistry(顶栏重构 L3):一套注册表被多处消费——上下文工具栏(L4)、右键菜单、
-// 未来命令面板、统一 keymap。本文件是注册/查询/求值/执行的**纯机制**;具体命令在 builtins/*。
+// 命令注册、查询、求值与执行；具体命令定义在 builtins/*。
 
 import type { Command, CommandContext, CommandGroup } from './types'
 import { logger } from '../utils/logger'

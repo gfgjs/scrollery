@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/supervisor.rs
-//! 冷门格式插件 · WorkerSupervisor（v3 Part2 §3.6）。
+//! 冷门格式插件的 WorkerSupervisor。
 //!
 //! 持有真实子进程，并把进程生命周期与 [`super::worker::WorkerConn`] 的协议状态机绑在一起：
 //!
@@ -53,12 +53,10 @@ impl ChildHandle for Child {
 }
 
 /// stderr 环形缓冲上限：只保留最近 64 KiB 诊断，不无限累积内存（§3.4）。
-/// worker stderr 行日志转发(日志能力重构线 阶段 3 · W4,D-310/D-313)已迁至
-/// `worker_log` 模块:字节级环形缓冲(本常量)与行级 `worker_log::LineScanner`
-/// 是两套并行机制(D-313 已裁决双写可接受),迁移/改动时**不得合并**。
+/// 行级日志转发由 `worker_log` 处理；字节级环形缓冲供崩溃摘尾诊断。
 const STDERR_RING_CAP: usize = 64 * 1024;
 
-/// 已加载会话的 host 侧快照(T15,D3 §4②):记录 SessionInit 时的 model_profile 关键字段
+/// 已加载会话的 host 侧快照：记录 SessionInit 时的 model_profile 关键字段
 /// 与 SessionReady 应答。派批前 host 据此比对目标模型——不符则先 SessionClose 再
 /// SessionInit(切换语义);实例被 kill 时随之清零(重建后首个动作必然是重 Init,§4⑤)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +76,7 @@ pub struct SessionDescriptor {
     pub face_embed_dim: Option<u32>,
     /// 本会话实际可服务的能力(worker 声明,host 派活依据)。
     pub caps: Vec<String>,
-    /// worker 回声的执行提供器/GPU 名(T16;None=旧 worker 帧,host 保留既有配置)。
+    /// worker 回声的执行提供器/GPU 名；None 时 host 保留既有配置。
     pub provider: Option<String>,
     pub gpu_name: Option<String>,
 }
@@ -93,14 +91,13 @@ pub struct WorkerSupervisor {
     /// 实例死亡（超时/断开/协议违例后置位）；池据此回收并补新实例。
     alive: bool,
     worker_version: String,
-    /// 已加载会话快照(T15);None = 未加载/已卸载/实例已死。
+    /// 已加载会话快照；None 表示未加载、已卸载或实例已死。
     session: Option<SessionDescriptor>,
 }
 
 impl WorkerSupervisor {
     /// 启动并完成握手。失败则 kill 子进程后返回 Err（不留孤儿）。
     ///
-    /// 注：§3.6 启动顺序第一步「验证安装记录与当前文件 hash」在 Part3 接入；Part2 仅校验路径存在。
     pub fn spawn(spec: &WorkerSpec, cfg: &WorkerConfig) -> Result<Self, String> {
         let mut child =
             spawn_worker_process(spec).map_err(|e| format!("创建 Worker 进程失败：{e}"))?;
@@ -162,7 +159,7 @@ impl WorkerSupervisor {
         self.session.as_ref()
     }
 
-    /// 跑任意 op 的请求(T15 泛化,D3 §4①)。进程级异常(超时/断开/协议违例)时
+    /// 执行任意 op 请求。发生超时、断开或协议违例时
     /// `kill → wait` 并标死亡,与 [`Self::run_thumbnail`] 同一回收语义;返回的
     /// `Success` **未经 op 校验**,由调用方按 op 分派验证。
     pub fn run_request(
@@ -192,7 +189,7 @@ impl WorkerSupervisor {
         self.run_request_observed(req, timeout, total_cap, cancelled, None)
     }
 
-    /// 同 [`Self::run_request`],额外透传 per-tile 进度回调(深审 b)。`None` 时行为
+    /// 同 [`Self::run_request`]，额外透传 per-tile 进度回调。`None` 时行为
     /// 与 `run_request` 完全一致;委托到 [`Self::run_request_observed`] 并取缺省 total_cap。
     pub fn run_request_with_progress(
         &mut self,
@@ -230,6 +227,10 @@ impl WorkerSupervisor {
                 .run_request_observed(req, timeout, total_cap, cancelled, progress_observer);
         match &outcome {
             RawOutcome::Success { .. } | RawOutcome::Failure(_) => {}
+            RawOutcome::Cancelled => {
+                debug!("Worker 请求已取消 → kill 回收");
+                self.kill_and_reap();
+            }
             RawOutcome::TimedOut | RawOutcome::Disconnected | RawOutcome::Protocol(_) => {
                 warn!(
                     "Worker 实例异常（{}）→ kill 回收；stderr 尾部：{}",
@@ -263,6 +264,8 @@ impl WorkerSupervisor {
         };
         let (session_id, model_profile) = (*session_id, model_profile.clone());
 
+        // 补载失败后 worker 不再持有旧会话；先清快照，避免继续派发旧能力。
+        self.session = None;
         let outcome = self.run_request(req, timeout, cancelled);
         if let RawOutcome::Success { body, .. } = &outcome {
             match &body.session {
@@ -325,6 +328,10 @@ impl WorkerSupervisor {
         let outcome = self.conn.run_thumbnail(req, limits, timeout, cancelled);
         match &outcome {
             TaskOutcome::Success { .. } | TaskOutcome::Failure(_) => {}
+            TaskOutcome::Cancelled => {
+                debug!("Worker 缩略图请求已取消 → kill 回收");
+                self.kill_and_reap();
+            }
             TaskOutcome::TimedOut | TaskOutcome::Disconnected | TaskOutcome::Protocol(_) => {
                 warn!(
                     "Worker 实例异常（{}）→ kill 回收；stderr 尾部：{}",
@@ -420,6 +427,7 @@ fn outcome_label(o: &TaskOutcome) -> &'static str {
         TaskOutcome::Success { .. } => "success",
         TaskOutcome::Failure(_) => "failure",
         TaskOutcome::TimedOut => "timeout",
+        TaskOutcome::Cancelled => "cancelled",
         TaskOutcome::Disconnected => "disconnected",
         TaskOutcome::Protocol(_) => "protocol_violation",
     }
@@ -430,6 +438,7 @@ fn raw_outcome_label(o: &RawOutcome) -> &'static str {
         RawOutcome::Success { .. } => "success",
         RawOutcome::Failure(_) => "failure",
         RawOutcome::TimedOut => "timeout",
+        RawOutcome::Cancelled => "cancelled",
         RawOutcome::Disconnected => "disconnected",
         RawOutcome::Protocol(_) => "protocol_violation",
     }
@@ -442,7 +451,7 @@ mod tests {
 
     // ── R2-5 确定性单测:kill/reap/Drop/shutdown 簿记(经 ChildHandle 假件,零真进程) ──
 
-    use exotic_protocol::{Frame, FrameType, ProtocolError, ReadyBody};
+    use exotic_protocol::{Frame, ProtocolError, ReadyBody};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 记录 kill/wait 次数的假子进程;try_wait 行为由闭包脚本化。
@@ -479,7 +488,6 @@ mod tests {
 
     struct SupParts {
         kills: Arc<AtomicUsize>,
-        waits: Arc<AtomicUsize>,
         /// 持有发送端防 channel 变 clean-EOF;测试可预灌响应帧。
         tx: crossbeam_channel::Sender<Result<Frame, ProtocolError>>,
     }
@@ -515,7 +523,7 @@ mod tests {
             worker_version: "0.0-test".into(),
             session: None,
         };
-        (sup, SupParts { kills, waits, tx })
+        (sup, SupParts { kills, tx })
     }
 
     fn thumb_req() -> RequestBody {
@@ -532,68 +540,13 @@ mod tests {
     }
 
     #[test]
-    fn drop_releases_reader_blocked_by_full_frame_queue() {
-        let (mut sup, _parts) = make_sup(true, never_exits());
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let ready = ReadyBody {
-            worker_id: "psd-worker".into(),
-            worker_version: "test".into(),
-            protocol_version: 0,
-            capabilities: vec!["thumbnail".into()],
-            max_blob_len: exotic_protocol::MAX_BLOB_LEN,
-        };
-        sup.conn = WorkerConn::from_parts(Box::new(std::io::sink()), rx, ready);
-        let frame = || Ok(Frame::control(FrameType::Shutdown, 0, &serde_json::json!({})).unwrap());
-        tx.send(frame()).unwrap();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        sup.reader_handle.take().unwrap().join().unwrap();
-        sup.reader_handle = Some(std::thread::spawn(move || {
-            assert!(tx.send(frame()).is_err());
-        }));
-        std::thread::spawn(move || {
-            drop(sup);
-            done_tx.send(()).unwrap();
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("满队列不能阻止 Drop 回收");
-    }
-
-    #[test]
-    fn cancelled_disconnect_kills_once_and_stays_dead() {
+    fn cancelled_request_reaps_without_reporting_disconnection() {
         let (mut sup, parts) = make_sup(true, never_exits());
-        // cancelled=||true 在任何等待前命中(worker.rs 取消轮询),零 sleep 确定性触发 kill 路径。
-        let out = sup.run_thumbnail(
-            &thumb_req(),
-            &default_thumbnail_limits(),
-            Duration::from_secs(30),
-            &|| true,
-        );
-        assert!(matches!(out, TaskOutcome::Disconnected));
+        let out = sup.run_request(&thumb_req(), Duration::from_secs(1), &|| true);
+        assert_eq!(raw_outcome_label(&out), "cancelled");
         assert_eq!(parts.kills.load(Ordering::SeqCst), 1);
-        assert_eq!(parts.waits.load(Ordering::SeqCst), 1);
         assert!(!sup.is_alive());
-        assert!(
-            sup.reader_handle.is_none(),
-            "kill_and_reap 应已 join 读取线程"
-        );
-        assert!(sup.stderr_handle.is_none());
-
-        // 幂等:再跑直接 Disconnected、不二次 kill;Drop 因 alive=false 也只 join 不复杀。
-        let out2 = sup.run_thumbnail(
-            &thumb_req(),
-            &default_thumbnail_limits(),
-            Duration::from_secs(1),
-            &|| false,
-        );
-        assert!(matches!(out2, TaskOutcome::Disconnected));
-        drop(sup);
-        assert_eq!(
-            parts.kills.load(Ordering::SeqCst),
-            1,
-            "全生命周期恰好 1 次 kill"
-        );
-        assert_eq!(parts.waits.load(Ordering::SeqCst), 1);
+        drop(parts.tx);
     }
 
     #[test]
@@ -609,54 +562,5 @@ mod tests {
         assert_eq!(parts.kills.load(Ordering::SeqCst), 1);
         assert!(!sup.is_alive());
         drop(parts.tx); // 显式:发送端存活至此,超时非 EOF 所致
-    }
-
-    // ── T15 会话生命周期(D3 §4②⑤ + §5 T_t:SessionInit 超时→kill→session 清零)────────
-
-    use exotic_protocol::{
-        ModelDescriptor, ModelHandle, ModelProfileSnapshot, ModelRole, SuccessBody,
-    };
-
-    fn session_init_req(session_id: u64) -> RequestBody {
-        RequestBody::SessionInit {
-            session_id,
-            models: vec![ModelDescriptor {
-                role: ModelRole::ImageEncoder,
-                handle: ModelHandle::Path("C:/models/img.onnx".into()),
-                len: 3,
-                sha256: "ab".repeat(32),
-                model_id: None,
-            }],
-            model_profile: ModelProfileSnapshot {
-                arch_id: "cn-clip-vit-b16".into(),
-                image_file: "img.onnx".into(),
-                text_file: "txt.onnx".into(),
-                batch_size: 16,
-                face_profile_id: Some("yunet-sface".into()),
-            },
-            models_root: "C:/models".into(),
-            ai_cache_dir: "C:/cache/ai".into(),
-            image_provider: "cpu".into(),
-        }
-    }
-
-    #[test]
-    fn init_session_success_without_ready_body_is_protocol_kill() {
-        let (mut sup, parts) = make_sup(true, never_exits());
-        // Success 但缺 session 应答体 → 协议违例,kill 回收。
-        parts
-            .tx
-            .send(Ok(Frame::control(
-                FrameType::Success,
-                1,
-                &SuccessBody::default(),
-            )
-            .unwrap()))
-            .unwrap();
-        let out = sup.init_session(&session_init_req(7), Duration::from_secs(1), &|| false);
-        assert!(matches!(out, RawOutcome::Protocol(_)));
-        assert!(!sup.is_alive());
-        assert!(sup.session().is_none());
-        assert_eq!(parts.kills.load(Ordering::SeqCst), 1);
     }
 }

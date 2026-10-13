@@ -1,16 +1,9 @@
-//! 编辑保存的元数据策略(方案 C §4,P0 spike)。
+//! 编辑保存的元数据策略。
 //!
-//! **spike 结论**(详见 `docs/worklogs/2026-07-19-图片简单编辑施工/findings.md`):
-//! - JPEG/PNG 的 ICC/EXIF 读写完全由 `image 0.25.10` 原生覆盖(`ImageDecoder::{icc_profile,
-//!   exif_metadata,orientation}` + `ImageEncoder::{set_icc_profile,set_exif_metadata}`),两侧都不需要
-//!   `img-parts`/`little_exif`。
-//! - 有损 WebP(`webp` 0.3.1,libwebp 绑定)encoder 无任何 ICC/EXIF 钩子;image crate 自带的 WebP
-//!   encoder 又只支持无损。方案 C-6 因此判定:v1 **不 admit WebP 输出**(不是用无损冒充有损,是老实
-//!   不给这个选项),留 P2 用 RIFF 容器手工注入或新依赖重新评估。
-//! - 输出侧**不转发原始 EXIF blob**:一是几何操作(orientation 之外还有本次 rotate/flip/crop)会让
-//!   原始内嵌 EXIF 缩略图(IFD1)与新像素不一致,二是不想连带保留未验证的字段。改为构造一个全新的
-//!   最小 EXIF:Orientation 固定写 1(旋转已烤入像素),DateTimeOriginal 若源文件存在且格式合法则透传。
-//!   ICC 走独立通道,原样透传原始 profile 字节(不解析语义,只做不透明搬运)。
+//! JPEG/PNG 通过 `image` 读写 ICC 与 EXIF。有损 WebP 编码器无 ICC/EXIF 写入接口，
+//! 因此编辑输出仅支持 JPEG/PNG。
+//! 几何操作会使原 EXIF 缩略图与新像素不一致，输出重建最小 EXIF：Orientation 为 1，
+//! 格式合法时保留 DateTimeOriginal；ICC 原字节单独透传。
 
 use image::metadata::Orientation;
 use image::ImageDecoder;
@@ -39,11 +32,10 @@ pub fn read_source_metadata(decoder: &mut impl ImageDecoder) -> SourceMetadata {
     }
 }
 
-/// D-009(2026-07-19 裁决):编辑链「文件 EXIF orientation 只应用一次」**仅对 JPEG 生效**,
+/// 编辑链只对 JPEG 应用文件 EXIF orientation，
 /// 与查看器实际行为对齐——`engine::image_rs::ImageRsEngine` 只在 jpg/jpeg 分支应用 orientation,
 /// PNG/WebP/BMP/TIFF 一律显示原始像素。若编辑链单方面对非 JPEG 应用 orientation,用户已用
 /// `view_rotation` 手动扶正过的 PNG 会被双重旋转,输出与所见不符。非 JPEG 带 orientation 的
-/// 显示错位属 viewer 全格式 orientation 治理(P2),届时两侧同步放开并删除本函数。
 ///
 /// `ext` 为源文件扩展名(不含点),大小写不敏感;调用方传 DB item 的 canonical 扩展名。
 pub fn effective_source_orientation(ext: &str, decoded: Orientation) -> Orientation {

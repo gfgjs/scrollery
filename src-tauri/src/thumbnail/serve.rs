@@ -1,36 +1,16 @@
-//! 多档缩略图源的服务选档(2026-08-16 缩略图性能线阶段 2;2026-09-12 P1-5 滚动热路径收口)。
+//! 多档缩略图源的服务选档。
 //!
-//! 背景:档位文件路径 `{tier}/{xx}/{hex}.webp`(hex = cache_key)完全确定,同项可存在多份
-//! 不同档位产物;但 `media_items.thumb_path` 只记一份(生成时的档位),旧库普遍只有 512 档。
-//! 生成侧视口批量对**未生成项**已按行高档位生成;缺口在**已生成项**——服务时永远回 DB
-//! 旧档路径,极密视图也吃 512 源(冷区 bitmapLoad 中位 54-101ms 的输入,阶段 1 真机基线)。
+//! 同一项可存多档产物，但 `media_items.thumb_path` 只记录一档；服务时可选用更贴近视口需求的现有档。
 //!
-//! 本模块在出口拼装(hydrate_item,仅可视区 10^2 级)按需重写:need = ceil(max(格宽,格高)
-//! × DPR) 设备像素,取**最小满足且磁盘存在**的档;缺档回退 DB 路径(todo 契约「缺档回退」)。
-//! 只有 512 档的旧库照旧由 512 档服务小格——**不**为密集视图强制补 64 档(既有回退策略)。
+//! 所需尺寸为 ceil(max(格宽,格高) × DPR) 设备像素；按升序选取最小满足且磁盘存在的档。
+//! 没有可用候选时沿用 DB 路径，不因密集视图强制生成小档。
 //!
-//! **S4(2026-09-12)稀疏多档升序探测**:档目录非空只说明「有别的图写过这一档」,不等于本项
-//! 在这一档有文件。旧实现只验全局最小满足档这**一个**候选,本项缺该档就整项回退 DB
-//! (need 96、全局有 128 目录、本项缺 128 而存 256、DB 记 512 时照旧吃 512 源)。现在按 ≥need
-//! 的非空档**升序逐档探测、命中即停**,落到该项实际存在的最小满足档;探到 DB 档自身即止
-//! ——DB 档路径免重写,更大档不会减小源字节。候选 ≤5 档、同批同一相对路径只 stat 一次,
-//! 候选全缺仍回退 DB 路径。
+//! 档目录非空不代表本项有该档文件，须逐项探测；探到 DB 档即止，更大档不会减少源字节。
 //!
-//! **P1-5 三段式(三滚动出口同一主流程)**:旧实现每批取行都在 async 命令线程上 probe 5 档
-//! 目录,再在 ItemsCache 载荷读锁内逐项 exists()(慢盘上两者都直接顶在滚动热路径上):
-//! ① 载荷读锁内(**零 IO**)只收集选档请求(见 layout::items_cache::collect_serve_requests);
-//! ② [`prepare_offloaded`] 在阻塞线程内做全部磁盘 IO——probe(≤5 次 read_dir,结果按 cache_dir +
-//!    TTL 进 [`ThumbProbeCache`] 复用)与候选档存在性 stat,既不在 async 执行器上,也不在
-//!    载荷锁内(生成/批量 patch 的写锁不再被慢盘拖住);
-//! ③ 载荷读锁内(**零 IO**)应用:只查 ② 已确认存在的目标档,命中才重写。
-//! 应用阶段不触盘 ⇒ 判据漂移最坏只是某次重写不发生(回退 DB 路径)。**存在性确认只覆盖 prepare
-//! 时刻**:确认之后文件仍可能被 LRU 驱逐/清缓存/换盘删掉,那一刻的 404 由前端自愈命令
-//! (regenerate_missing_thumb)复位待重生成——本模块不承诺「呈现时刻文件仍在磁盘」。
+//! 载荷读锁内只收集和应用选档请求；[`prepare_offloaded`] 在阻塞线程探测目录与文件。
+//! 存在性只在准备时确认；之后若文件被驱逐，前端通过 `regenerate_missing_thumb` 自愈。
 //!
-//! **失效模型**:存在性 stat 每批重判(唯一事实源——LRU 驱逐/清缓存/换盘即刻生效,404 自愈
-//! 链路不变);probe 结果只是「省一次目录枚举」的提示,陈旧最坏退化为少一次重写或多一次 stat。
-//! TTL 兜底档位目录增删;cache_dir 不符(换盘)即自动重探。命中即重写、未命中零改动,故不触碰
-//! 布局缓存失效逻辑(DPR 更新走 compute_layout 的原子写,几何不依赖 DPR、无需重排)。
+//! 文件存在性每批重判；目录探测结果按 cache_dir 与 TTL 复用，过期或换盘时重探。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -40,7 +20,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::cache::thumb_db_path;
 use super::generator::THUMB_TIERS;
-use super::scheduler::OutputFingerprint;
 
 /// 目录探测结果的复用窗口:滚动热路径每批取行都重探 5 档目录纯属重复;窗口内复用同一份结果,
 /// 档位目录的增删最多晚一个窗口被看见——存在性 stat 仍逐批真值,故只是提示层的延迟。
@@ -78,7 +57,7 @@ struct ProbeEntry {
 }
 
 /// 非空档集合的可失效缓存(见 [`THUMB_PROBE_TTL`]):TTL 未过且 cache_dir 相同则零 IO 复用;
-/// cache_dir 不符(换盘)自动重探;[`invalidate`](Self::invalidate) 供显式失效(测试/后续接线)。
+/// cache_dir 不符时自动重探；[`invalidate`](Self::invalidate) 可显式失效。
 pub struct ThumbProbeCache {
     ttl: Duration,
     slot: Mutex<Option<ProbeEntry>>,
@@ -147,6 +126,21 @@ pub fn serve_need_px(cell_w: f64, cell_h: f64, dpr: f64) -> u32 {
     ((cell_w.max(cell_h) * dpr.clamp(0.25, 4.0)).ceil() as u32).max(1)
 }
 
+/// 选档与提交校验共用版本路径识别，保留媒体 ID、源代次和策略，只替换尺寸。
+fn versioned_suffix(path: &str) -> Option<&str> {
+    let (_, suffix) = path.split_once('/')?;
+    let mut parts = suffix.split('/');
+    parts.next()?; // 缓存键前缀。
+    let identity = parts.next()?;
+    // 新产物含媒体 ID；既有不含媒体 ID 的版本化产物仍须验证数据库提交。
+    let revision = if identity.starts_with('i') {
+        parts.next()?
+    } else {
+        identity
+    };
+    (revision.starts_with('r') && revision.contains('-')).then_some(suffix)
+}
+
 /// 纯函数:本项**可重写的升序目标档候选**(相对路径,惰性 yield)。
 ///
 /// 按全局档位常量升序枚举,滤出 ≥ need 的非空档;遇 DB 档自身即止——那一刻的路径无需重写,
@@ -159,38 +153,18 @@ fn candidate_rels<'a>(
     cache_key: i64,
     nonempty_tiers: &'a [u32],
 ) -> impl Iterator<Item = String> + 'a {
-    // 新产物只继承尺寸无关的家族；旧三段路径照旧探旧档。旧尺寸摘要不能反推其他档，
-    // 避免给同源但不同质量的缩略图错误选档。
-    let mut parts = db_path.split('/');
-    let style = match (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-    ) {
-        (Some(_), Some(_), Some(_), None, None) => Some(None),
-        (Some(_), Some(fingerprint), Some(_), Some(_), None) => fingerprint
-            .strip_prefix("family-")
-            .filter(|hex| hex.len() == 32 && OutputFingerprint::from_hex(hex).is_some())
-            .map(|_| Some(fingerprint)),
-        _ => None,
-    };
     THUMB_TIERS
         .iter()
         .copied()
-        .filter(move |&tier| style.is_some() && tier >= need_px && nonempty_tiers.contains(&tier))
+        .filter(move |&tier| tier >= need_px && nonempty_tiers.contains(&tier))
         .scan(false, move |stopped, tier| {
             if *stopped {
                 return None;
             }
-            let rel = match style.expect("invalid paths were filtered") {
-                Some(family) => {
-                    let legacy = thumb_db_path(tier, cache_key);
-                    let (_, suffix) = legacy.split_once('/').expect("tier path");
-                    format!("{tier}/{family}/{suffix}")
-                }
-                None => thumb_db_path(tier, cache_key),
+            let rel = if let Some(suffix) = versioned_suffix(db_path) {
+                format!("{tier}/{suffix}")
+            } else {
+                thumb_db_path(tier, cache_key)
             };
             if rel == db_path {
                 *stopped = true;
@@ -275,16 +249,75 @@ impl ThumbServe {
     }
 }
 
+struct CommittedIo<'a> {
+    root: &'a Path,
+    committed: FxHashSet<String>,
+}
+impl ServeIo for CommittedIo<'_> {
+    fn dir_has_entry(&self, directory: &Path) -> bool {
+        RealServeIo.dir_has_entry(directory)
+    }
+    fn file_exists(&self, file: &Path) -> bool {
+        let relative = file
+            .strip_prefix(self.root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"));
+        let allowed = relative
+            .as_deref()
+            .is_some_and(|path| versioned_suffix(path).is_none() || self.committed.contains(path));
+        allowed && RealServeIo.file_exists(file)
+    }
+}
+
 /// 异步薄封装(生产入口,三滚动出口共用):probe + 逐项 stat 全部交给阻塞线程——
 /// async 执行器只等结果,等待期间载荷读锁完全空置。
 pub async fn prepare_offloaded(
     cache_dir: PathBuf,
     dpr: f64,
     requests: Vec<ServeRequest>,
+    pool: crate::db::DbPool,
 ) -> Result<ThumbServe, tokio::task::JoinError> {
     tokio::task::spawn_blocking(move || {
+        // 版本化产物必须已有当前源的提交记录，不能仅凭并行写线程留下的文件选档。
+        let mut committed = FxHashSet::default();
+        let paths: Vec<_> = requests
+            .iter()
+            .flat_map(|request| {
+                candidate_rels(
+                    &request.db_path,
+                    request.need_px,
+                    request.cache_key,
+                    &THUMB_TIERS,
+                )
+            })
+            .filter(|path| versioned_suffix(path).is_some())
+            .collect();
+        if let Ok(conn) = pool.get() {
+            for chunk in paths.chunks(128) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT a.path FROM image_artifacts a JOIN media_items m ON m.id=a.item_id \
+                     WHERE a.kind='display' AND a.status=1 AND m.is_deleted=0 \
+                     AND m.source_revision=a.source_revision AND m.cache_key=a.cache_key \
+                     AND a.path IN ({placeholders})"
+                );
+                if let Ok(mut statement) = conn.prepare(&sql) {
+                    if let Ok(rows) = statement
+                        .query_map(rusqlite::params_from_iter(chunk), |row| {
+                            row.get::<_, String>(0)
+                        })
+                    {
+                        committed.extend(rows.filter_map(std::result::Result::ok));
+                    }
+                }
+            }
+        }
+        let thumb_root = cache_dir.join("thumbnails");
         ThumbServe::prepare_with(
-            &RealServeIo,
+            &CommittedIo {
+                root: &thumb_root,
+                committed,
+            },
             &SHARED_PROBES,
             &cache_dir,
             dpr,
@@ -318,6 +351,139 @@ pub async fn prepare_offloaded_with(
     .await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thumbnail::generator::ThumbConfig;
+
+    fn config(cache_dir: &Path, size: u32) -> ThumbConfig {
+        ThumbConfig {
+            cache_dir: cache_dir.to_path_buf(),
+            size,
+            skip_max_bytes: 0,
+            strategy: "auto".into(),
+            gpu_engine: "wic".into(),
+            ai_hq_cache: false,
+            webp_quality: 80,
+            ai_cache_short_edge: 336,
+        }
+    }
+
+    fn write_variant(cache_dir: &Path, relative: &str) {
+        let path = cache_dir.join("thumbnails").join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"thumbnail").unwrap();
+    }
+
+    fn request(db_path: &str) -> ServeRequest {
+        ServeRequest {
+            cache_key: 91,
+            need_px: 96,
+            db_path: db_path.into(),
+        }
+    }
+
+    #[test]
+    fn item_variants_select_smallest_tier_without_legacy_fallback() {
+        let cache = tempfile::tempdir().unwrap();
+        // 路径直接来自生产生成器，避免测试也沿用漏掉媒体 ID 的旧格式。
+        let large = config(cache.path(), 512).display_path(7, 2, 91);
+        let small = config(cache.path(), 128).display_path(7, 2, 91);
+        let medium = config(cache.path(), 256).display_path(7, 2, 91);
+        write_variant(cache.path(), &large);
+        write_variant(cache.path(), &small);
+        write_variant(cache.path(), &medium);
+        write_variant(cache.path(), &thumb_db_path(128, 91));
+        let probes = ThumbProbeCache::new(THUMB_PROBE_TTL);
+        let prepare = || {
+            ThumbServe::prepare_with(
+                &RealServeIo,
+                &probes,
+                cache.path(),
+                1.0,
+                &[request(&large)],
+                Instant::now(),
+            )
+        };
+        assert_eq!(
+            prepare().rewrite_path(&large, 96.0, 96.0, 91),
+            Some(small.clone())
+        );
+        std::fs::remove_file(cache.path().join("thumbnails").join(&small)).unwrap();
+        assert_eq!(
+            prepare().rewrite_path(&large, 96.0, 96.0, 91),
+            Some(medium.clone())
+        );
+        std::fs::remove_file(cache.path().join("thumbnails").join(&medium)).unwrap();
+        assert_eq!(prepare().rewrite_path(&large, 96.0, 96.0, 91), None);
+    }
+
+    #[tokio::test]
+    async fn item_variants_require_current_committed_artifacts() {
+        let cache = tempfile::tempdir().unwrap();
+        let db_path = cache.path().join("library.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::db::connection::apply_pragmas(&conn).unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO scan_roots(id,path) VALUES(1,'C:/photos');
+             INSERT INTO directories(id,root_id,rel_path,name) VALUES(1,1,'','photos');
+             INSERT INTO media_items(id,directory_id,file_name,file_size,file_mtime,
+                 file_format,sort_datetime,cache_key,source_revision)
+                 VALUES(7,1,'image.jpg',10,11,'jpg',12,91,2);",
+        )
+        .unwrap();
+        let pool = crate::db::create_read_pool(&db_path, 1).unwrap();
+        let large = config(cache.path(), 512).display_path(7, 2, 91);
+        let small_config = config(cache.path(), 128);
+        let small = small_config.display_path(7, 2, 91);
+        write_variant(cache.path(), &large);
+        write_variant(cache.path(), &small);
+        let prepare = || {
+            prepare_offloaded(
+                cache.path().to_path_buf(),
+                1.0,
+                vec![request(&large)],
+                pool.clone(),
+            )
+        };
+        // 文件已落盘但尚未提交，不能抢先展示。
+        assert_eq!(
+            prepare()
+                .await
+                .unwrap()
+                .rewrite_path(&large, 96.0, 96.0, 91),
+            None
+        );
+        conn.execute(
+            "INSERT INTO image_artifacts(item_id,source_revision,cache_key,kind,fingerprint,status,path)
+             VALUES(?1,?2,?3,'display',?4,1,?5)",
+            rusqlite::params![7, 2, 91, small_config.display_fingerprint(), small],
+        )
+        .unwrap();
+        assert_eq!(
+            prepare()
+                .await
+                .unwrap()
+                .rewrite_path(&large, 96.0, 96.0, 91),
+            Some(small)
+        );
+        // 选档请求仍持有旧路径时，也必须拒绝源换代后的旧提交。
+        conn.execute(
+            "UPDATE media_items SET source_revision=?1 WHERE id=?2",
+            [3, 7],
+        )
+        .unwrap();
+        assert_eq!(
+            prepare()
+                .await
+                .unwrap()
+                .rewrite_path(&large, 96.0, 96.0, 91),
+            None
+        );
+    }
+}
+
 /// 测试用可控 IO 探针(仅 test 构建):计数 + 可注入延迟 + 门闸 + 载荷锁探测。
 #[cfg(test)]
 pub(crate) mod test_io {
@@ -344,6 +510,22 @@ pub(crate) mod test_io {
                 s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
             }
         }
+
+        /// 测试侧:等到有 IO 进入(超时返回 false,防夹具失效时挂死测试)。
+        pub fn wait_entered_timeout(&self, timeout: std::time::Duration) -> bool {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let (s, _) = self
+                .cv
+                .wait_timeout_while(s, timeout, |s| !s.0)
+                .unwrap_or_else(|e| e.into_inner());
+            s.0
+        }
+
+        pub fn release(&self) {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.1 = true;
+            self.cv.notify_all();
+        }
     }
 
     /// 计数/延迟/门闸/锁探测四合一假 IO。延迟参数是**显式模型值**(如 2ms/read_dir 代表慢盘),
@@ -369,22 +551,15 @@ pub(crate) mod test_io {
     }
 
     impl CountingIo {
+        pub fn set_gate(&self, gate: Arc<Gate>) {
+            *self.gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+        }
+
         pub fn set_results(&self, dir_nonempty: bool, file_exists: bool) {
             self.dir_has_entry_result
                 .store(dir_nonempty, Ordering::Relaxed);
             self.file_exists_result
                 .store(file_exists, Ordering::Relaxed);
-        }
-
-        pub fn set_lock_probe(&self, probe: impl Fn() -> bool + Send + 'static) {
-            *self.lock_free.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(probe));
-        }
-
-        pub fn counts(&self) -> (u64, u64) {
-            (
-                self.dir_calls.load(Ordering::Relaxed),
-                self.file_calls.load(Ordering::Relaxed),
-            )
         }
 
         pub fn under_lock(&self) -> u64 {

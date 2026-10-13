@@ -7,7 +7,10 @@
       class="semantic-panel"
       :class="{
         'semantic-panel--has-results':
-          ai.semanticQuery && !ai.isSearching && (media.layoutSummary?.totalItems || 0) > 0,
+          ai.semanticQuery &&
+          !ai.isSearching &&
+          !ai.searchError &&
+          (media.layoutSummary?.totalItems || 0) > 0,
       }"
     >
       <!-- Header -->

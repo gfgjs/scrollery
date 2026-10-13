@@ -10,17 +10,19 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::error::{AppError, Result};
-use crate::exotic::{ExoticTaskStatus, FormatResolution, InstalledExoticPlugin, PluginEntitlement};
+use crate::exotic::{
+    ExoticTaskStatus, FormatResolution, InstalledExoticPlugin, PluginAvailability,
+};
 use crate::state::AppState;
 
 /// 列出 Catalog 中**全部**格式的解析结果。未安装 PSD 也会得到 `availableUninstalled`
-/// （首次离线也显示购买占位）。
+/// （首次离线也显示安装占位）。
 #[tauri::command]
 pub async fn list_exotic_format_resolutions(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<FormatResolution>> {
-    // 运行期 Host：含真实安装/授权真相（已安装并激活的 PSD 显示 Authorized 而非 AvailableUninstalled）。
-    // R1-3：host 解析内部是 rusqlite 读 + keyring 系统调用，离开 tokio worker。
+    // 运行期 Host：含真实安装/激活真相（已安装并激活的 PSD 显示 Ready 而非 AvailableUninstalled）。
+    // 数据库读取在线程池执行。
     let state_arc = state.inner().clone();
     tokio::task::spawn_blocking(move || Ok(state_arc.exotic_host().list_resolutions()))
         .await
@@ -66,12 +68,11 @@ pub async fn get_exotic_item_state(
         let resolution = if snap.resolve_format(&item.file_format).is_some() {
             let host = state_arc.exotic_host();
             let resolved = host.resolve_format(&item.file_format);
-            if resolved
-                .plugin_id
-                .as_deref()
-                .is_some_and(crate::official::includes)
-            {
-                crate::official::entitlement(state_arc.entitlement_provider().as_ref())?;
+
+            if resolved.activation_required {
+                if let Some(plugin_id) = &resolved.plugin_id {
+                    crate::feature_activation::status(&conn, plugin_id)?;
+                }
             }
             Some(resolved)
         } else {
@@ -101,22 +102,22 @@ pub async fn list_installed_exotic_plugins(
     super::blocking::read_blocking(&state, crate::db::queries::list_installed_exotic_plugins).await
 }
 
-/// 某插件的授权判定（前端 gate / 购买引导用，Part6 §3.8）。判定全在后端 EntitlementProvider；
-/// 前端据此 gate / 购买引导，**不持任何验签逻辑**。catalog 无此插件 → `no_offering`（前端可按 code 分流）。
+/// 查询插件激活与资源状态；Catalog 无此插件返回 no_offering。
 #[tauri::command]
-pub async fn get_plugin_entitlement(
+pub async fn get_plugin_availability(
     plugin_id: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<PluginEntitlement> {
-    // R1-3：entitlement_of 内含 DB 读 + keyring 验签（同步系统调用），离开 tokio worker。
+) -> Result<PluginAvailability> {
+    // 数据库读取在线程池执行。
     let state_arc = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        if crate::official::includes(&plugin_id) {
-            crate::official::entitlement(state_arc.entitlement_provider().as_ref())?;
+        if crate::feature_activation::requires_activation(&plugin_id) {
+            let conn = state_arc.db_read_pool.get().map_err(AppError::from)?;
+            crate::feature_activation::status(&conn, &plugin_id)?;
         }
         state_arc
             .exotic_host()
-            .entitlement_of(&plugin_id)
+            .availability_of_plugin(&plugin_id)
             .ok_or_else(|| AppError::Exotic {
                 code: "no_offering",
                 message: format!("Catalog 无此插件：{plugin_id}"),
@@ -151,7 +152,7 @@ const CAPABILITY_STR: &str = "thumbnail";
 /// 安装/卸载前静默 exotic 子系统的等待上限（kill→wait Worker、释放句柄）。
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// 当前 unix 秒（License 时间窗判定）。
+/// 当前 unix 秒（发行签名时间窗判定）。
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -187,7 +188,7 @@ pub async fn stop_exotic_processing(state: State<'_, Arc<AppState>>) -> Result<(
     Ok(())
 }
 
-/// 处理状态摘要（对齐前端 camelCase）。`blockedByAvailability` 单列「未购买/平台不支持」而卡住的项，
+/// 处理状态摘要（对齐前端 camelCase）。`blockedByAvailability` 单列「未激活/平台不支持」而卡住的项，
 /// 避免进度条永久停 0%（Part2 §4.5）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -197,7 +198,7 @@ pub struct ExoticProcessingStatus {
     pub processing: i64,
     pub done: i64,
     pub error: i64,
-    /// 因不可领取（未授权/平台不支持/未安装）而卡住的待处理数。
+    /// 因不可领取（未激活/平台不支持/未安装）而卡住的待处理数。
     pub blocked_by_availability: i64,
     pub running: bool,
     pub paused: bool,

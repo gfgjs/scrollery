@@ -12,14 +12,15 @@
       'media-thumb--compact': compact,
       'media-thumb--missing': availability === 'missing',
       'media-thumb--offline': availability === 'offline',
+      'media-thumb--canvas-interactions': canvasInteractions,
     }"
-    @mouseenter="isHovering = true; onHoverEnter()"
-    @mouseleave="isHovering = false; onHoverLeave()"
+    @mouseenter="onCellEnter"
+    @mouseleave="onCellLeave"
     @mousemove="onCellMove"
   >
     <!-- 可用态角标（缺失检测 Part2 §3.2）：missing/offline 始终可见（含 compact），一眼可辨。 -->
     <div
-      v-if="availability !== 'online'"
+      v-if="!canvasInteractions && availability !== 'online'"
       class="media-thumb__avail"
       :class="'avail--' + availability"
       :title="
@@ -30,7 +31,11 @@
     </div>
     <!-- 颜色标签色条（T16）：缩略图顶缘细条（Lightroom 式）。直接挂 .media-thumb（非 overlays），
          故 compact 下也显（零 SVG、仅一个 div，利于快速 culling）。 -->
-    <div v-if="colorStrip" class="media-thumb__color-strip" :style="{ background: colorStrip }"></div>
+    <div
+      v-if="!canvasInteractions && colorStrip"
+      class="media-thumb__color-strip"
+      :style="{ background: colorStrip }"
+    ></div>
     <!-- 拖拽手柄(需求3):已选中格左上角的抓取点,按住它拖到文件夹树 = 移动(Shift = 复制)。
          刻意置于 overlays(v-if !compact) 块之外、仅由 isSelected 门控 —— 使 Canvas 悬停卡在
          compact+选择态(MediaThumb 内部 compact=true)下也显手柄;DOM 网格 compact 走 MediaThumbCompact
@@ -41,13 +46,12 @@
       v-if="isSelected && ui.showDragHandle && !browseOnly"
       class="media-thumb__drag-handle"
       :title="$t('common.move')"
-
     >
       <GripVertical :size="14" />
     </div>
     <!-- Text-document card (txt/md/office) — CSS「文本卡」，零解码，比灰底占位更清晰（§3.4） -->
     <div
-      v-if="!isLoaded && isTextCard"
+      v-if="!canvasInteractions && !isLoaded && isTextCard"
       class="media-thumb__textcard"
       :class="'fmt-' + (fileFormat || '').toLowerCase()"
     >
@@ -62,7 +66,7 @@
     <!-- RAW 专属占位符(已注册未解码,thumb_status=2):区别于损坏文件的通用空白——
          RAW 图标 + 扩展名,告知用户「非损坏,预览即将支持」而非「软件坏了」。 -->
     <div
-      v-else-if="!isLoaded && isRawNoThumbCell"
+      v-else-if="!canvasInteractions && !isLoaded && isRawNoThumbCell"
       class="media-thumb__placeholder media-thumb__placeholder--raw"
       :style="{ backgroundColor: placeholderBgColor }"
     >
@@ -71,7 +75,7 @@
     </div>
     <!-- 纯色占位符 + 文件格式文本 -->
     <div
-      v-else-if="!isLoaded"
+      v-else-if="!canvasInteractions && !isLoaded"
       class="media-thumb__placeholder"
       :class="{ 'is-fallback': !placeholderColor }"
       :style="{ backgroundColor: placeholderBgColor }"
@@ -80,7 +84,7 @@
     </div>
     <!-- 实际图片 -->
     <img
-      v-if="displaySrc"
+      v-if="!canvasInteractions && displaySrc"
       class="media-thumb__img thumb-loaded"
       :src="displaySrc"
       :width="w"
@@ -88,6 +92,8 @@
       loading="lazy"
       @error="onError"
     />
+
+    <slot name="canvas-surface" />
 
     <!-- Hover auto-play preview (video / live photo) — 共享池，同时仅一个在播放（需求1） -->
     <!-- is-painted：首帧真正合成呈现(rVFC)后才渐显，之前 opacity:0 让封面图透出，避免「移入闪黑/灰白」 -->
@@ -111,39 +117,11 @@
     <div v-if="isScrubbing" class="media-thumb__sprite" :style="scrubStyle" />
 
     <!-- 覆盖层 -->
-    <!-- T0(极密网格 §5):compact(60px 类)整个覆盖层不渲染——含选择态。此前 `|| isSelectionMode`
-         会在进入选择态时给全窗口每格瞬间新建 overlays+checkbox 节点(数千格一次 flush 内建节点+
-         布局+全文档 style recalc = 用户报告的「进选择态卡顿」)。现 compact 选中态由
-         .media-thumb--selected 的内描边表达,选择经卡片点击切换(handleCardClick §5.4)。 -->
+    <!-- compact 卡片不渲染覆盖层；选择态由内描边表达，避免进入选择态时为数千格创建节点。 -->
     <div v-if="!compact" class="media-thumb__overlays">
       <!-- Advanced Info Overlay & Badges -->
-      <div
-        v-if="
-          !compact &&
-          (thumbInfoLines.length > 0 ||
-            (similarity == null &&
-              isLoaded &&
-              thumbStatus === 3 &&
-              ui.showThumbInfo &&
-              ui.thumbInfoElements.includes('status')) ||
-            (similarity == null &&
-              isLoaded &&
-              thumbStatus === 1 &&
-              ui.showThumbInfo &&
-              ui.thumbInfoElements.includes('status')) ||
-            (similarity == null &&
-              fileSize &&
-              ui.showThumbInfo &&
-              ui.thumbInfoElements.includes('size')) ||
-            similarity != null ||
-            isLivePhoto ||
-            showTypeBadge)
-        "
-        class="media-thumb__info-overlay"
-      >
-        <div
-          class="media-thumb__badges"
-        >
+      <div v-if="!canvasInteractions && infoVisible" class="media-thumb__info-overlay">
+        <div v-if="visibleInfoBadges" class="media-thumb__badges">
           <span
             v-if="
               similarity == null &&
@@ -190,18 +168,26 @@
             >{{ typeBadgeLabel }}</span
           >
         </div>
-        <div v-for="(line, idx) in thumbInfoLines" :key="idx" class="info-line">{{ line }}</div>
+        <div v-for="(line, idx) in visibleThumbInfoLines" :key="idx" class="info-line">
+          {{ line }}
+        </div>
       </div>
 
       <!-- 视频播放角标:撑到预览首帧真正呈现(previewPainted)才隐藏。此前挂载即隐——
            角标在视频还不可见的加载空窗先消失,多一次状态闪(用户报告闪烁链一环)。 -->
       <span
-        v-if="mediaType === 'video' && !compact && !previewPainted && !isScrubbing"
+        v-if="
+          !canvasInteractions &&
+          mediaType === 'video' &&
+          !compact &&
+          !previewPainted &&
+          !isScrubbing
+        "
         class="badge badge-video"
         ><Play :size="20" fill="#fff"
       /></span>
       <!-- 时长 -->
-      <span v-if="durationMs && !compact" class="badge badge-duration">{{
+      <span v-if="!canvasInteractions && durationMs && !compact" class="badge badge-duration">{{
         formatDuration(durationMs)
       }}</span>
       <!-- 收藏（极小尺寸下隐藏 —— 点不动且是常驻的高成本 SVG）。
@@ -216,8 +202,8 @@
         }"
         @pointerdown.stop
         @click.stop="toggleFav"
+        :disabled="!interactionActive"
         :title="$t('selection.favorite')"
-
       >
         <Heart
           :size="14"
@@ -232,22 +218,23 @@
            只呈现组位次/路径/可用态,不含评分)。 -->
       <div v-if="!compact && !browseOnly" class="media-thumb__rating-slot">
         <StarRating
-          v-if="isHovering"
+          v-if="isHovering || canvasInteractions"
           class="media-thumb__rating media-thumb__rating--edit"
           tone="rating"
           :model-value="rating"
-          :size="13"
+          :size="ratingSize"
+          :readonly="!interactionActive"
           @change="onRate"
           @pointerdown.stop
           @click.stop
         />
         <StarRating
-          v-else-if="rating > 0"
+          v-else-if="!canvasInteractions && rating > 0"
           class="media-thumb__rating"
           tone="rating"
           :model-value="rating"
           :max="rating"
-          :size="12"
+          :size="Math.min(12, ratingSize)"
           readonly
           @pointerdown.stop
         />
@@ -268,7 +255,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { Play, Heart, Check, GripVertical } from '@lucide/vue'
 import { formatDuration, formatFileSize } from '../../utils/format'
 import StarRating from '../common/StarRating.vue'
@@ -285,6 +272,7 @@ import {
   isRawNoThumb,
   typeBadgeOf,
 } from './mediaGrid.helpers'
+import { computeThumbBottomLayout, thumbInfoLineLimit, thumbActionsFit } from './thumbBottomLayout'
 import type { LayoutRowItem } from '../../types/layout'
 
 interface Props {
@@ -316,6 +304,12 @@ interface Props {
   /** 强制全功能渲染(跳过 compact 门控)。Canvas 悬停卡专用:单例实例无「×数百格」的
    *  成本乘法,倍率封顶后卡可小于 100px,仍需完整控件(星级/红心/checkbox)。网格内勿用。 */
   forceFull?: boolean
+  /** 宿主暂存删除态也占用独立状态行。 */
+  pendingDelete?: boolean
+  /** Canvas 宿主只复用操作和动态预览，静态内容由宿主唯一绘制；挂载期间此值不变。 */
+  canvasInteractions?: boolean
+  /** 退场立即撤销交互与预览资格。 */
+  interactionActive?: boolean
   cacheDir: string
   item?: LayoutRowItem
 }
@@ -333,6 +327,8 @@ const props = withDefaults(defineProps<Props>(), {
   isDragHover: false,
   browseOnly: false,
   forceFull: false,
+  canvasInteractions: false,
+  interactionActive: true,
 })
 
 const emit = defineEmits<{
@@ -343,6 +339,7 @@ const emit = defineEmits<{
   (e: 'request-thumb', id: number): void
   (e: 'cancel-thumb', id: number): void
   (e: 'regenerate-thumb', id: number): void
+  (e: 'preview-state', id: number, active: boolean): void
 }>()
 
 const ui = useUiStore()
@@ -354,27 +351,40 @@ const meta = computed(() => (props.id != null ? media.viewportMeta.get(props.id)
 const favAnimating = ref(false)
 // hover 态：驱动评分星条「只读角标 ↔ 交互 5 星」切换 —— 仅当前 hover 的那一格渲染交互条，
 // 全屏同时只存在一组交互 SVG（同收藏红心的成本纪律）。未 hover 且 rating>0 时仅显填充星角标。
-const isHovering = ref(false)
+const isHovering = ref(props.canvasInteractions)
 
-// 缩略图加载(status 1/3/0 解码 + 懒自愈)抽到 useThumbLoader 单源(T1 §6.3)，与 MediaThumbCompact /
-// MediaGridCanvas 共享同一逻辑，杜绝多份 loadThumb 漂移。displaySrc/isLoaded 供模板；onError 兜底自愈。
-const { isLoaded, displaySrc, onError } = useThumbLoader(
-  {
-    id: () => props.id,
-    thumbStatus: () => props.thumbStatus,
-    thumbPath: () => props.thumbPath,
-    cacheDir: () => props.cacheDir,
-  },
-  {
-    requestThumb: (id) => emit('request-thumb', id),
-    cancelThumb: (id) => emit('cancel-thumb', id),
-    regenerateThumb: (id) => emit('regenerate-thumb', id),
-  },
-)
+// DOM 卡片与 MediaThumbCompact 共用加载器；Canvas 交互入口不启动第二条静态加载路径。
+const thumbLoader = props.canvasInteractions
+  ? null
+  : useThumbLoader(
+      {
+        id: () => props.id,
+        thumbStatus: () => props.thumbStatus,
+        thumbPath: () => props.thumbPath,
+        cacheDir: () => props.cacheDir,
+      },
+      {
+        requestThumb: (id) => emit('request-thumb', id),
+        cancelThumb: (id) => emit('cancel-thumb', id),
+        regenerateThumb: (id) => emit('regenerate-thumb', id),
+      },
+    )
+
+const isLoaded = computed(() => thumbLoader?.isLoaded.value ?? false)
+const displaySrc = computed(() => thumbLoader?.displaySrc.value ?? '')
+function onError() {
+  thumbLoader?.onError()
+}
 
 const thumbStyle = computed(() => ({
   width: `${props.w}px`,
   height: `${props.h}px`,
+  '--thumb-info-bottom': `${bottomLayout.value.infoBottom}px`,
+  '--thumb-status-bottom': `${bottomLayout.value.statusBottom}px`,
+  '--thumb-duration-bottom': `${bottomLayout.value.durationBottom}px`,
+  '--thumb-rating-bottom': `${bottomLayout.value.ratingBottom}px`,
+  '--thumb-favorite-bottom': `${bottomLayout.value.favoriteBottom}px`,
+  '--thumb-doc-pad-y': `${Math.max(31, props.h * 0.14)}px`,
 }))
 
 // 低于此单元尺寸时，砍掉非必要的覆盖层/徽章 —— 关键是其 `backdrop-filter` 模糊与常驻
@@ -390,6 +400,7 @@ const {
   isPreviewing: isHoverPreview,
   previewSrc: hoverSrc,
   isScrubbing,
+  spriteSrc,
   scrubStyle,
   onMove: onHoverMove,
   onEnter: onHoverEnter,
@@ -416,21 +427,52 @@ const {
 // 合成后才渐显（封面图在此之前一直垫底）；无 rVFC 的环境回退 loadeddata 即显。
 // 预览结束（isHoverPreview→false）即复位，保证下一次进入的新 video 仍从 opacity:0 开始。
 const previewPainted = ref(false)
+const spritePainted = ref(false)
+// CSS 背景尚未解码时仍保留 Canvas 封面，避免切关键帧时出现透明空窗。
+watch([isScrubbing, spriteSrc], ([scrubbing, src], _previous, onCleanup) => {
+  spritePainted.value = false
+  if (!props.canvasInteractions || !scrubbing || !src) return
+  let current = true
+  onCleanup(() => {
+    current = false
+  })
+  const image = new Image()
+  image.src = src
+  image
+    .decode()
+    .then(() => {
+      if (current && props.interactionActive && isScrubbing.value) spritePainted.value = true
+    })
+    .catch(() => {})
+})
+watch(
+  () => props.interactionActive,
+  (active) => {
+    isHovering.value = active
+    if (!active) onHoverLeave()
+    else if (props.canvasInteractions) onHoverEnter()
+  },
+)
+watch(
+  () =>
+    previewPainted.value || (props.canvasInteractions ? spritePainted.value : isScrubbing.value),
+  (active) => emit('preview-state', props.id, active),
+)
 watch(isHoverPreview, (v) => {
   if (!v) previewPainted.value = false
 })
 function onPreviewFirstFrame(e: Event) {
   const v = e.target as HTMLVideoElement
-  const rvfc = (
-    v as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number }
-  ).requestVideoFrameCallback
+  const rvfc = (v as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number })
+    .requestVideoFrameCallback
   // 护栏:划走后 video 已卸载而回调滞后到达时不得置位——否则 previewPainted 悬空为 true,
   // 会把下一次静态态的播放角标误隐掉。
   if (rvfc) {
     rvfc.call(v, () => {
-      if (isHoverPreview.value) previewPainted.value = true
+      if (isHoverPreview.value && props.interactionActive && v.isConnected)
+        previewPainted.value = true
     })
-  } else {
+  } else if (isHoverPreview.value && props.interactionActive && v.isConnected) {
     previewPainted.value = true
   }
 }
@@ -446,6 +488,17 @@ function onCellMove(e: MouseEvent) {
   const rect = el.getBoundingClientRect()
   onHoverMove(e.clientX - rect.left, rect.width)
 }
+function onCellEnter() {
+  if (!props.interactionActive) return
+  isHovering.value = true
+  onHoverEnter()
+}
+function onCellLeave() {
+  isHovering.value = false
+  onHoverLeave()
+}
+// 单例是在指针下挂载的，不能依赖浏览器再次派发 mouseenter 才启动延迟预览。
+if (props.canvasInteractions) onMounted(onCellEnter)
 
 // 元数据加载后置静音并播放 —— 用属性方式设 muted 规避 Vue 对 `muted` 特性绑定的已知问题，
 // 同时满足浏览器自动播放策略。
@@ -459,26 +512,64 @@ function onPreviewReady(e: Event) {
 
 const thumbInfoLines = computed(() => {
   // compact 模式下直接跳过，避免 800+ 组件追踪 6+ 响应式依赖
-  if (compact.value || !ui.showThumbInfo || !props.item) return []
+  if (props.canvasInteractions || compact.value || !ui.showThumbInfo || !props.item) return []
   // 组装逻辑与 Canvas 网格共享单源(mediaGrid.helpers.buildThumbInfoLines)。
   return buildThumbInfoLines(props.item, meta.value, ui.thumbInfoElements)
 })
 
-// 系统可用态（缺失检测 Part2 §3.2）：从布局行项读取，旧缓存项缺该字段时默认 'online'。
+// 系统可用态从布局行项读取；缺字段的旧缓存项默认 'online'。
 const availability = computed<string>(() => props.item?.availability ?? 'online')
+const bottomLayout = computed(() => {
+  const hasAvailability = availability.value !== 'online' || !!props.pendingDelete
+  const hasStatus = hasAvailability || !!props.durationMs
+  const splitStatus = props.w < 112 && !!props.durationMs && hasAvailability
+  const omitActions = props.canvasInteractions
+    ? !thumbActionsFit(props.w, props.h, hasStatus, splitStatus)
+    : compact.value
+  return computeThumbBottomLayout(
+    props.w,
+    props.browseOnly,
+    omitActions,
+    hasStatus,
+    undefined,
+    splitStatus,
+  )
+})
+const ratingSize = computed(() => Math.min(13, Math.max(1, (props.w - 20) / 5)))
+const hasInfoBadges = computed(
+  () =>
+    props.similarity != null ||
+    props.isLivePhoto ||
+    showTypeBadge.value ||
+    (ui.showThumbInfo &&
+      ((!!props.fileSize && ui.thumbInfoElements.includes('size')) ||
+        (isLoaded.value &&
+          (props.thumbStatus === 1 || props.thumbStatus === 3) &&
+          ui.thumbInfoElements.includes('status')))),
+)
+const visibleInfoBadges = computed(
+  () => hasInfoBadges.value && props.h >= bottomLayout.value.infoBottom + 40,
+)
+const visibleThumbInfoLines = computed(() =>
+  thumbInfoLines.value.slice(
+    0,
+    thumbInfoLineLimit(props.h, bottomLayout.value.infoBottom, visibleInfoBadges.value),
+  ),
+)
+const infoVisible = computed(
+  () => visibleThumbInfoLines.value.length > 0 || visibleInfoBadges.value,
+)
 
-// 颜色标签色条颜色（T16）：0/未标 → null（不渲染色条）。色档→hex 映射在前端 colorLabels。
+// 颜色标签 0/未标时不渲染色条，色档到 hex 的映射在 colorLabels 中。
 const colorStrip = computed<string | null>(() => colorLabelHex(props.colorLabel))
 
-// 回退 bg-elevated:与 app chrome(侧栏等)同画风,网格常态不吃画格暗灰(真机反馈:
-// 整片暗灰占位显脏)。canvas 悬停卡内的回退占位另由 MediaGridCanvas 侧按 .is-fallback
-// 覆盖为画格同源色,避免弹卡瞬间从画格色跳 elevated(「中间插一次主题色」)。
+// DOM 回退占位沿用主题格面色；Canvas 的静态占位由宿主绘制。
 const placeholderBgColor = computed(() => props.placeholderColor ?? 'var(--color-bg-elevated)')
 
 // 不栅格化的文本文档格式（pdf/svg/epub 有真实缩略图）。用 CSS「文本卡」（仿文本行 + 扩展名角标）
-// 呈现，替代灰底占位（§3.4）。compact 尺寸下退回居中扩展名占位即可。
+// 呈现。compact 尺寸下退回居中扩展名占位。
 // 格式表与 Canvas 网格共享单源(mediaGrid.helpers.TEXT_CARD_FORMATS)。
-// epub 补充降级(⑤):封面提取盖棺失败(status=2)也出文本卡,替代灰底占位。
+// epub 封面提取确定失败(status=2)时也显示文本卡。
 const isTextCard = computed(
   () =>
     !compact.value &&
@@ -487,9 +578,7 @@ const isTextCard = computed(
 )
 
 // 类型角标(AUDIO/DOC/RAW):判定走 helpers 单源与 canvas 网格共享,防两路条件漂移。
-const typeBadge = computed(() =>
-  typeBadgeOf(props.mediaType, props.fileFormat, props.thumbStatus),
-)
+const typeBadge = computed(() => typeBadgeOf(props.mediaType, props.fileFormat, props.thumbStatus))
 const showTypeBadge = computed(
   () => typeBadge.value != null && ui.showThumbInfo && ui.thumbInfoElements.includes('type'),
 )
@@ -510,6 +599,7 @@ const isRawNoThumbCell = computed(() =>
 )
 
 async function toggleFav() {
+  if (!props.interactionActive) return
   favAnimating.value = true
   setTimeout(() => {
     favAnimating.value = false
@@ -520,6 +610,7 @@ async function toggleFav() {
 // 缩略图内 hover 快捷评分：把用户点选值上抛父层（MediaGrid 落 setRating + 乐观更新布局行）。
 // 与收藏一致走 emit 而非直接调 store，保持「视图组件不内嵌 IPC」的一致性。
 function onRate(value: number) {
+  if (!props.interactionActive) return
   emit('rate', props.id, value)
 }
 </script>
@@ -535,6 +626,29 @@ function onRate(value: number) {
   transition:
     border-radius 0.2s ease,
     box-shadow 0.2s ease;
+}
+.media-thumb.media-thumb--canvas-interactions {
+  background: transparent;
+  filter: none;
+  opacity: 1;
+  box-shadow: none;
+}
+.media-thumb--canvas-interactions .media-thumb__video {
+  transition: none;
+}
+.media-thumb--canvas-interactions::before,
+.media-thumb--canvas-interactions::after {
+  display: none;
+}
+.media-thumb--canvas-interactions.media-thumb--missing .media-thumb__video.is-painted,
+.media-thumb--canvas-interactions.media-thumb--missing .media-thumb__sprite {
+  filter: grayscale(1) brightness(0.85);
+  opacity: 0.5;
+}
+.media-thumb--canvas-interactions.media-thumb--offline .media-thumb__video.is-painted,
+.media-thumb--canvas-interactions.media-thumb--offline .media-thumb__sprite {
+  filter: grayscale(0.7);
+  opacity: 0.72;
 }
 .media-thumb:hover .media-thumb__fav,
 .media-thumb:hover .media-thumb__checkbox,
@@ -603,7 +717,7 @@ function onRate(value: number) {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 14% 12%;
+  padding: var(--thumb-doc-pad-y) 12%;
   /* 顶端细装订线，强化「文档」观感 */
   border-top: 3px solid rgba(0, 0, 0, 0.06);
 }
@@ -631,7 +745,9 @@ function onRate(value: number) {
   width: 55%;
 }
 .media-thumb__textcard-ext {
-  align-self: flex-start;
+  position: absolute;
+  top: 3px;
+  left: 12%;
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 700;
@@ -716,9 +832,16 @@ function onRate(value: number) {
 }
 .media-thumb__badges {
   display: flex;
-  gap: var(--spacing-xs);
-  margin-bottom: 2px;
-  flex-wrap: wrap;
+  gap: 4px;
+  height: 16px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.media-thumb__badges .badge {
+  flex: 0 0 auto;
+  height: 16px;
+  line-height: 12px;
+  padding: 2px 5px;
 }
 .badge-source {
   position: static;
@@ -790,7 +913,7 @@ function onRate(value: number) {
   pointer-events: none;
 }
 .badge-duration {
-  bottom: 6px;
+  bottom: var(--thumb-duration-bottom, 4px);
   right: 6px;
   background: var(--color-badge-scrim);
   color: #fff;
@@ -800,7 +923,7 @@ function onRate(value: number) {
 
 .media-thumb__fav {
   position: absolute;
-  bottom: 4px;
+  bottom: var(--thumb-favorite-bottom, 4px);
   right: 4px;
   background: transparent;
   color: #fff;
@@ -826,7 +949,7 @@ function onRate(value: number) {
 /* ── 评分星级（左下，经典桌面相册式）─────────────────────────────────────── */
 .media-thumb__rating-slot {
   position: absolute;
-  bottom: 4px;
+  bottom: var(--thumb-rating-bottom, 8px);
   left: 6px;
   /* 容器不挡事件；仅交互星条（--edit）显式开启 pointer-events，避免只读角标拦截下层 hover 预览。 */
   pointer-events: none;
@@ -836,13 +959,6 @@ function onRate(value: number) {
 }
 .media-thumb__rating--edit {
   pointer-events: auto;
-}
-
-/* 左下角有可用态角标(missing/offline)时,评分星条上抬一档避让(角标占据左下角)。
-   待删态的抬升由宿主 .media-card--pending-delete 规则负责(pending 是卡级状态,本组件不感知)。 */
-.media-thumb--missing .media-thumb__rating-slot,
-.media-thumb--offline .media-thumb__rating-slot {
-  bottom: 24px;
 }
 
 /* 颜色标签色条（T16）：顶缘 4px 细条，盖过角标层但不挡交互。 */
@@ -962,12 +1078,13 @@ function onRate(value: number) {
     transparent 100%
   );
   color: #fff;
-  padding: 24px 6px 6px 6px;
+  padding: 24px 6px var(--thumb-info-bottom, 6px);
   font-size: 10px;
   font-family: var(--font-mono);
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0;
+  line-height: 12px;
   pointer-events: none;
   opacity: 1;
   transition: opacity var(--transition-fast);
@@ -993,7 +1110,7 @@ function onRate(value: number) {
 
 .media-thumb__avail {
   position: absolute;
-  bottom: var(--spacing-2xs); /* 左下角:让出左上给拖拽手柄(需求3) */
+  bottom: var(--thumb-status-bottom, 4px);
   left: var(--spacing-2xs);
   z-index: 11; /* 盖过 overlays，保证可见 */
   font-size: var(--font-size-2xs);

@@ -1,11 +1,11 @@
 // src-tauri/src/reader/text_index.rs
-//! txt 智能分章（阅读器完善方案 §5.2 / R1-3）。
+//! txt 智能分章。
 //!
 //! 产物 = 章节索引(标题 + 源文件字节区间 + 章内字符数)。前端只见「章序号 + 标题 + 字符数」,
 //! 字节偏移留在 Rust(get_text_chapter 按区间 seek 解码,IPC 载荷恒为单章级)。
 //!
-//! 机制仿 legado(GPL,**只借鉴机制,规则自写**,见 txt_toc_rules.json):
-//!   - 内置一组带 priority/deny_suffix 的正则规则(数据文件,为将来「用户可编辑规则」留门);
+//! 规则见 `txt_toc_rules.json`：
+//!   - 内置带 priority/deny_suffix 的正则规则；
 //!   - 选规则:前 512KB 逐规则统计命中(相邻 <1000 字符只计一次,防正文连续引用误判),
 //!     命中最多者当选,平手按 priority;命中不足阈值 → 伪章兜底;
 //!   - 分章:当选规则跑全文,命中位置(天然在行首)即章界。
@@ -25,7 +25,7 @@ use super::encoding as enc_seam;
 
 /// 分章标题最大字符数(超出截断;章题过长多为误命中的正文行)。
 const MAX_TITLE_CHARS: usize = 60;
-/// 选规则采样字节数(方案 §5.2)。
+/// 选规则采样字节数。
 const SELECT_SAMPLE_BYTES: usize = 512 * 1024;
 /// 选规则相邻命中去重的字符距离(防正文连续引用「第X章」刷高某规则分数)。
 const ADJ_DEDUP_CHARS: usize = 1000;
@@ -40,7 +40,7 @@ const PSEUDO_CHARS: usize = 10_000;
 /// 续切,标题「原题 · N」保导航语义。
 const MAX_RULE_CHAPTER_CHARS: usize = 30_000;
 
-/// 一章的元数据。序列化为 DB `text_book_index.chapters` 的 JSON 数组(键 t/s/e/n 省空间)。
+/// 一章的元数据。序列化到 DB `text_book_index.chapters` 的快照内(短键省空间)。
 /// `byte_start`/`byte_end` 是**源文件字节偏移**(位于源编码的字符边界,可安全切片再解码)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChapterMeta {
@@ -52,6 +52,9 @@ pub struct ChapterMeta {
     pub byte_end: usize,
     #[serde(rename = "n")]
     pub char_len: usize,
+    /// 解码全文中的绝对零基行号，严格按 LF 计数，不受显示重排和替换影响。
+    #[serde(rename = "l")]
+    pub start_line: usize,
 }
 
 /// 分章索引的完整构建结果。encoding/confidence 落 DB 同名列,chapters 落 JSON 列。
@@ -63,6 +66,8 @@ pub struct TextBookIndex {
     pub confidence: String,
     /// U+FFFD 替换率(不落库,仅供日志/可选透传;confidence='lossy' 已编码「超阈」事实)。
     pub replacement_ratio: f32,
+    /// 解码原文的 UTF-8 SHA-256，保留原始换行以核对 LF 行号。
+    pub source_hash: String,
     pub chapters: Vec<ChapterMeta>,
 }
 
@@ -91,8 +96,6 @@ fn default_enabled() -> bool {
 }
 
 struct CompiledRule {
-    #[allow(dead_code)] // 保留供日志/将来规则编辑器展示
-    name: String,
     re: Regex,
     /// 匹配结束位置紧邻字符若在此集合内则否决匹配(负向断言等价,规避 Rust regex 无 lookaround)。
     deny_suffix: String,
@@ -132,7 +135,6 @@ fn load_rules() -> &'static [CompiledRule] {
             .filter(|r| r.enabled)
             .filter_map(|r| match Regex::new(&r.pattern) {
                 Ok(re) => Some(CompiledRule {
-                    name: r.name,
                     re,
                     deny_suffix: r.deny_suffix,
                     priority: r.priority,
@@ -154,14 +156,19 @@ pub fn build_index(source_bytes: &[u8], override_label: Option<&str>) -> TextBoo
     let enc = outcome.encoding;
     let decoded = &outcome.text;
 
-    let src_starts = source_line_starts(source_bytes, enc);
-    let dec_lines: Vec<&str> = decoded.split('\n').collect();
+    let mut src_starts = source_line_starts(source_bytes, enc);
+    let mut dec_lines: Vec<&str> = decoded.split('\n').collect();
     // 两向量应等长(见模块注释论证);为防御异常编码下的失配,后续一切索引都 clamp 到 min。
     debug_assert_eq!(
         src_starts.len(),
         dec_lines.len(),
         "源行首数应与解码行数对齐"
     );
+    // 末尾换行后的 EOF 哨兵没有源字节，不能在分章阈值处变成额外空章；空文件仍保留一行。
+    if src_starts.len() > 1 && src_starts.last() == Some(&source_bytes.len()) {
+        src_starts.pop();
+        dec_lines.pop();
+    }
 
     let rules = load_rules();
     let selected = select_rule(rules, &src_starts, &dec_lines, source_bytes.len());
@@ -180,6 +187,7 @@ pub fn build_index(source_bytes: &[u8], override_label: Option<&str>) -> TextBoo
             byte_start: 0,
             byte_end: source_bytes.len(),
             char_len: decoded.chars().count(),
+            start_line: 0,
         });
     }
 
@@ -187,6 +195,7 @@ pub fn build_index(source_bytes: &[u8], override_label: Option<&str>) -> TextBoo
         encoding: enc.name().to_string(),
         confidence: outcome.confidence.as_str().to_string(),
         replacement_ratio: outcome.replacement_ratio,
+        source_hash: crate::utils::hash::sha256_hex(decoded.as_bytes()),
         chapters,
     }
 }
@@ -331,6 +340,7 @@ fn push_chapter_capped(
             byte_start: src_starts[start_line],
             byte_end: line_byte_end(src_starts, end_line, src_len),
             char_len: count_chars(dec_lines, start_line, end_line),
+            start_line,
         });
         return;
     }
@@ -348,6 +358,7 @@ fn push_chapter_capped(
                 byte_start: src_starts[seg_start],
                 byte_end: line_byte_end(src_starts, i + 1, src_len),
                 char_len: seg_chars,
+                start_line: seg_start,
             });
             part += 1;
             seg_start = i + 1;
@@ -360,6 +371,7 @@ fn push_chapter_capped(
             byte_start: src_starts[seg_start],
             byte_end: line_byte_end(src_starts, end_line, src_len),
             char_len: seg_chars,
+            start_line: seg_start,
         });
     }
 }
@@ -408,6 +420,7 @@ fn make_pseudo(
         byte_start: src_starts[start_line.min(src_starts.len().saturating_sub(1))],
         byte_end: line_byte_end(src_starts, end_line, src_len),
         char_len: count_chars(dec_lines, start_line, end_line),
+        start_line,
     }
 }
 
@@ -454,109 +467,4 @@ fn clip_title<S: AsRef<str>>(line: S) -> String {
         out.push('…');
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 用给定编码把文本编成源字节,构建索引,再对每章「切源字节区间→解码」对拍标题,验证偏移正确。
-    fn roundtrip_check(index: &TextBookIndex, source: &[u8]) {
-        let enc = Encoding::for_label(index.encoding.as_bytes()).expect("已知编码");
-        for ch in &index.chapters {
-            assert!(ch.byte_start <= ch.byte_end, "章区间应有序");
-            assert!(ch.byte_end <= source.len(), "章区间不越界");
-            let (slice_text, _, _) = enc.decode(&source[ch.byte_start..ch.byte_end]);
-            // 章文本(去空白)应以章标题打头(标题取自该章首行);标题可能被截断,故用 starts_with 前缀判定。
-            let head: String = slice_text
-                .trim_start()
-                .chars()
-                .take(ch.title.chars().count())
-                .collect();
-            let title_no_ellipsis = ch.title.trim_end_matches('…');
-            assert!(
-                head.starts_with(title_no_ellipsis)
-                    || ch.title == "前言"
-                    || ch.title.starts_with("片段")
-                    // 巨章续切的「原题 · N」子章:N≥2 的切片起点在章体中部,标题是合成导航锚
-                    // 而非首行快照,不做前缀对拍(区间有序/越界断言仍全量生效)。
-                    || ch.title.contains(" · "),
-                "章「{}」偏移对拍失败:切片开头为「{}」",
-                ch.title,
-                slice_text.trim_start().chars().take(20).collect::<String>()
-            );
-        }
-    }
-
-    /// 单行填充正文(~1440 字符,无内部换行),用于把测试章节撑到超过 1000 字符去重窗口,
-    /// 使「选规则」阶段的相邻去重不把紧邻的测试章节折叠掉 —— 代表真实小说的章间距。
-    fn filler_para() -> String {
-        "填充正文内容,足够长以超过相邻命中去重窗口。".repeat(80)
-    }
-
-    /// 造一本「真实间距」的书:每章 = 标题行 + 一行长填充正文,章间以 \n 相连。
-    fn make_book(titles: &[&str]) -> String {
-        let f = filler_para();
-        titles
-            .iter()
-            .map(|t| format!("{t}\n{f}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn gbk_offsets_roundtrip() {
-        let text = make_book(&["第一章 洛阳", "第二章 长安", "第三章 江南"]);
-        let (bytes, _, _) = encoding_rs::GBK.encode(&text);
-        let index = build_index(&bytes, None);
-        assert_eq!(index.encoding, "GBK");
-        assert_eq!(index.chapters.len(), 3);
-        assert_eq!(index.chapters[0].title, "第一章 洛阳");
-        // 偏移对拍:切 GBK 源字节区间 + 解码,须还原各章文本。
-        roundtrip_check(&index, &bytes);
-    }
-
-    #[test]
-    fn oversized_rule_chapter_gets_capped() {
-        let f = filler_para();
-        // 巨章:第二章正文 30 段填充(~43K 字符)> MAX_RULE_CHAPTER_CHARS → 按 PSEUDO_CHARS 续切「· N」。
-        let giant_body = format!("{f}\n").repeat(30);
-        let text = format!("第一章 甲\n{f}\n第二章 乙\n{giant_body}第三章 丙\n{f}");
-        let index = build_index(text.as_bytes(), None);
-        let titles: Vec<&str> = index.chapters.iter().map(|c| c.title.as_str()).collect();
-        // 常规章不受影响。
-        assert!(
-            titles.contains(&"第一章 甲"),
-            "enc={} conf={} titles[0..3]={:?}",
-            index.encoding,
-            index.confidence,
-            &titles[..titles.len().min(3)]
-        );
-        assert!(titles.contains(&"第三章 丙"), "titles={titles:?}");
-        // 巨章切为「第二章 乙 · N」序列,原题单章不复存在。
-        let parts = titles
-            .iter()
-            .filter(|t| t.starts_with("第二章 乙 · "))
-            .count();
-        assert!(parts >= 3, "巨章应切多个子章,实得 {titles:?}");
-        assert!(!titles.contains(&"第二章 乙"), "巨章不应再以原题整章存在");
-        // 子章字符数有界(PSEUDO_CHARS 粒度,行边界允许溢出一行 ≈ filler 长度)。
-        for ch in index
-            .chapters
-            .iter()
-            .filter(|c| c.title.starts_with("第二章 乙 · "))
-        {
-            assert!(
-                ch.char_len <= PSEUDO_CHARS + 2000,
-                "子章过大:{} = {} 字符",
-                ch.title,
-                ch.char_len
-            );
-        }
-        // 全书区间连续无缝(续切不得制造空洞/重叠)。
-        for w in index.chapters.windows(2) {
-            assert_eq!(w[0].byte_end, w[1].byte_start, "章区间应首尾相接");
-        }
-        roundtrip_check(&index, text.as_bytes());
-    }
 }

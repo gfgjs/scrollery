@@ -84,15 +84,14 @@ const GROUP_LABEL: Record<MediaType, string> = {
 }
 
 /**
- * 可用态 → badge。只对**需要用户动作**的态出 badge：未装 / 未授权 / 过期。
+ * 可用态 → badge。只对**需要用户动作**的态出 badge：未装 / 未激活 / 过期。
  *
  * `authorized` 不出 badge（能用就是常态，没必要标）；平台不支持 / 安装损坏等也不出 —— 那些
  * 与「能不能筛」无关，而弹层的语境是筛选，塞进去只会让用户以为筛不出来。
  */
 const BADGE: Partial<Record<Availability, { short: string; title: string }>> = {
   availableUninstalled: { short: 'toolbar.fmtBadgeNotInstalled', title: 'toolbar.fmtBadgeNotInstalledHint' },
-  installedUnlicensed: { short: 'toolbar.fmtBadgeUnlicensed', title: 'toolbar.fmtBadgeUnlicensedHint' },
-  licenseExpired: { short: 'toolbar.fmtBadgeExpired', title: 'toolbar.fmtBadgeExpiredHint' },
+  inactive: { short: 'toolbar.fmtBadgeUnlicensed', title: 'toolbar.fmtBadgeUnlicensedHint' },
 }
 
 function badgeOf(o: FormatOption): { short: string; title: string } | null {

@@ -1,17 +1,12 @@
-// src-tauri/src/video/worker_service.rs
-//! 视频格式扩展 · host 侧 `VideoWorkerService`(视频格式扩展子系统 design.md §2.1/§2.4/§4.1/§6)。
+//! host 侧 `VideoWorkerService`：管理视频 worker 的任务、进度与生命周期。
 //!
-//! **Service 型 worker**(OCR/Enhance 先例):常见容器的 remux/转码/缩略图增强**不进** exotic
-//! 任务化调度,由 host 侧本 Service 直持一个 [`WorkerSupervisor`] + video-worker client。
-//! 总闸是 `availability_of(VIDEO_PLUGIN_ID)`(builtin+free 直放行既有语义,§2.1);FFmpeg 组件
-//! 未就绪即回 [`VideoServiceError::NeedsComponent`]。
+//! remux、转码和取帧由本服务通过 [`WorkerSupervisor`] 调度；FFmpeg 未就绪时返回
+//! [`VideoServiceError::NeedsComponent`]。
 //!
-//! ## 并发形态(硬约束:不跨 `.await` 持 std Mutex)
-//! supervisor 句柄由**专用阻塞 OS 线程**(driver)独占同步驱动;async 侧只经 std `Mutex`+`Condvar`
-//! 的任务队列 + tokio `oneshot` 交互——**driver 线程内无任何 `.await`**,async 侧持 std 锁的窗口
-//! 只在同步入队块内、绝不跨 await(Enhance 先例同型)。
+//! supervisor 由专用阻塞线程独占；async 侧通过任务队列与 `oneshot` 交互，
+//! 不跨 `.await` 持有 std `Mutex`。
 //!
-//! ## 双优先队列 + 抢占(§2.4 / §9.12)
+//! ## 双优先队列与抢占
 //! 交互(播放:probe/remux/transcode)> 背景(封面/雪碧图:frames)。交互任务到达且在途为背景任务时,
 //! 背景 op 的取消轮询命中「有交互在队」→ 返回 Disconnected → supervisor kill → 背景任务**重回队列头**
 //! → driver 先跑交互 → 再重建 worker 续跑背景。同 `(item, kind)` 在途/在队去重挂载同一任务。
@@ -32,17 +27,15 @@ use crate::state::AppState;
 
 /// 握手超时(模型/ffmpeg 装载不在握手期,恒 5s 快失败;同 exotic coordinator 惯例)。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// 单 op 重试预算(genuine Disconnected/worker 通路失败:respawn 后重派一次;§2.3
-/// `InternalError` retryable 预算 1 次)。
+/// worker 通路失败时最多尝试两次，第二次会重建 worker。
 const MAX_ATTEMPTS: u32 = 2;
 
 mod runner;
-/// 视频格式扩展 host 侧 Service 启动期装配(design.md §2.1/§8 V4/V5)。
+/// setup 期装配视频服务。
 ///
 /// 惰性起 worker(首次实际派活才 spawn),此处只装配 Service 本体 + 绑定
 /// `video::backend_for` 桥用的 AppState 句柄(晚绑定,同 exotic coordinator 姿态)。
 ///
-/// 自 `lib.rs::run()` 的 setup 段 q 迁出(D-450 纯结构移动,行为不变)。
 /// 顺序不变量:必须在 `app.manage(app_state)` 之后调用。
 pub fn bootstrap(state: Arc<AppState>) {
     let video_svc = Arc::new(VideoWorkerService::new(state.clone()));
@@ -101,9 +94,7 @@ struct Job {
     priority: VideoPriority,
     /// 去重:同 `(item, kind)` 的全部请求共挂本 job,完成时逐一 fan-out。
     waiters: Vec<oneshot::Sender<JobResult>>,
-    /// per-job 硬取消标志(§5.4):`cancel()` 置位;在途 job 由 `run_job` 的 cancelled 闭包
-    /// 下一轮询命中,在队未起跑 job 由 `cancel()` 直接出队,二者互斥(标志位对后者是死代码
-    /// 但保留以防未来 cancel 时序变化)。
+    /// per-job 硬取消标志：在途任务由 `run_job` 的轮询检测，在队任务由 `cancel()` 直接出队。
     cancelled: Arc<AtomicBool>,
     /// per-job 进度广播(§5.3):remux/transcode 调用方可选注册,driver 收到 Progress 帧即更新;
     /// probe/frames 恒 `None`(不需要细粒度进度)。

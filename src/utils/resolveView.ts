@@ -1,11 +1,4 @@
-// src/utils/resolveView.ts
-// 当前画廊视图维度的**单一决策源**（S2-c1）。纯函数,无 store 依赖。
-//
-// 背景（🔴 R1-2）：useJustifiedLayout.compute() 与 useViewDescriptor.buildCurrentViewDescriptor()
-// 此前各自内联同一套「视图维度 → backend」的 precedence 与映射（person > collection > smart-album
-// > directory；system 夹 ≈ mediaTypes+favorited 等），两处必须锁步,否则「全选目标集」与「画廊显示集」
-// 漂移。本函数把**决策**（哪个维度胜出 + 其身份/类型）收敛为单源;两处投影只保留各自机械的
-// 「ResolvedView → 自身形态」映射（扁平 filters+directoryId param / scope+filter DTO）。
+// 画廊布局与后端视图描述符共用此视图维度决策，避免全选目标集与显示集漂移。
 //
 // 注意:viewStore 保证四维度互斥（setActiveX 清其余三 + activeSmartAlbum 缺省 'all'）,故 precedence
 // 在可达状态下等价于「取唯一被设定的维度」;这里显式保留优先级顺序以对齐两处投影的原控制流。
@@ -38,7 +31,7 @@ export type ResolvedView =
 
 /**
  * 按 person > collection > smart-album(favorites/live/recent/trash) > directory > all 的优先级,
- * 归一当前视图维度。与 useJustifiedLayout / useViewDescriptor 原内联控制流一一对应。
+ * 归一当前视图维度，供 useJustifiedLayout 与 useViewDescriptor 各自投影。
  */
 export function resolveView(v: ViewState): ResolvedView {
   if (v.activePersonId != null) {

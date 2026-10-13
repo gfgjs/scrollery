@@ -1,18 +1,14 @@
 // src-tauri/src/state/run_token.rs
-//! 通用取消令牌槽(自 state.rs 结构性拆分,tierB-1;语义详见 [`RunTokenSlot`] 文档)。
+//! 带运行代次的通用取消令牌槽；语义详见 [`RunTokenSlot`]。
 
 use std::sync::Mutex;
 
 use tokio_util::sync::CancellationToken;
 
-/// A cancellation-token slot tagged with a run generation (2026-07-18 审查 F-01/F-02)。
-///
 /// 后台流水线的通用「令牌槽」:`begin` 安装新一轮 (代次, token);`cancel` 显式取消当前轮;
 /// `finish(代次)` 是完成回调专用的 compare-and-clear——仅当槽内仍是本轮才清空。没有代次时,
-/// 旧轮迟到的收尾会 take+cancel 新一轮刚安装的 token(「停止→立即重启」竞态),这正是
-/// `finish_ai_analysis` 已修过的同款问题(2026-07-10 审查 F10);本类型把该纪律沉淀为可复用件。
-/// 现为全仓唯一范式:thumb/derive/ai/face 四槽均已迁入(F-025 收编 ai/face,各槽代次独立计数
-/// ——finish 只与本槽存的代次比较,从无跨槽比较,共享计数器无必要)。
+/// 旧轮迟到的收尾可能清掉新轮刚安装的 token（「停止→立即重启」竞态）。
+/// 各槽独立计数，`finish` 只与本槽代次比较。
 pub struct RunTokenSlot {
     generation: std::sync::atomic::AtomicU64,
     slot: Mutex<Option<(u64, CancellationToken)>>,
@@ -40,6 +36,14 @@ impl RunTokenSlot {
     /// 显式取消当前轮(用户停止/新一轮启动前):take + cancel 槽内任意轮次。
     pub fn cancel(&self) {
         if let Some((_, token)) = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            token.cancel();
+        }
+    }
+
+    /// 在同一锁内匹配并取消指定代次，保留槽直到任务真正收尾；迟到取消不影响新任务。
+    pub fn cancel_generation(&self, generation: u64) {
+        let slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, token)) = slot.as_ref().filter(|(current, _)| *current == generation) {
             token.cancel();
         }
     }
@@ -79,7 +83,7 @@ impl RunTokenSlot {
     }
 
     /// 「本轮是否仍持终态发布权」的**只读**判定(不清槽,语义同 [`Self::finish`] 的返回值)。
-    /// 用于「先落终态快照、再清 token」的收尾姿态(审查 #13):清 token 前先据此决定是否发布,
+    /// 用于「先落终态快照、再清 token」：清 token 前先据此决定是否发布，
     /// 使发布期间 token 仍在(is_running 仍 true),关闭「token 已清、快照仍 running」的误报窗口。
     pub fn is_current(&self, generation: u64) -> bool {
         let slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -114,5 +118,46 @@ impl RunTokenSlot {
 impl Default for RunTokenSlot {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunTokenSlot;
+
+    #[test]
+    fn stale_cancel_does_not_cancel_new_run() {
+        let slot = RunTokenSlot::new();
+        let (old_generation, old_token) = slot.begin();
+        slot.cancel_generation(old_generation);
+        assert!(old_token.is_cancelled());
+        assert!(slot.is_running(), "取消请求后保留槽，等待真实收尾");
+        let (generation, token) = slot.begin();
+        slot.cancel_generation(old_generation);
+        assert!(!token.is_cancelled());
+        assert!(slot.is_generation_current(generation));
+        slot.cancel_generation(generation);
+        assert!(token.is_cancelled());
+        assert!(slot.finish(generation));
+        slot.cancel_generation(old_generation);
+        assert!(!slot.is_running());
+    }
+
+    /// 旧轮 finish 晚于新轮 start 时，不得清掉新轮 token。
+    #[test]
+    fn stale_finish_does_not_steal_new_run() {
+        let slot = RunTokenSlot::new();
+        let (g1, _t1) = slot.begin();
+        // 重启:显式取消旧轮,再安装新轮(与 start_derivation / run_thumbnail_generation 姿态一致)。
+        slot.cancel();
+        let (g2, t2) = slot.begin();
+        assert!(g2 > g1);
+        // 旧轮迟到的收尾:代次不匹配 → 不清槽、无终态发布权。
+        assert!(!slot.finish(g1));
+        assert!(slot.is_running());
+        assert!(!t2.is_cancelled());
+        // 新轮自己的收尾正常清槽。
+        assert!(slot.finish(g2));
+        assert!(!slot.is_running());
     }
 }

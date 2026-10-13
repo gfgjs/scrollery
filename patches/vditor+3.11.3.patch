@@ -1,0 +1,231 @@
+diff --git a/node_modules/vditor/dist/index.js b/node_modules/vditor/dist/index.js
+index a792fe54..9eebb299 100644
+--- a/node_modules/vditor/dist/index.js
++++ b/node_modules/vditor/dist/index.js
+@@ -5999,1 +5999,48 @@ var expandMarker = function (range, vditor) {
++// IR 的格式标记也是 DOM 文本；跨边界替换时只让选区覆盖待删除的标记，保留侧先闭合格式。
++var normalizeInlineSelection = function (range) {
++    var _a, _b;
++    var block = (0,hasClosest/* hasClosestByMatchTag */.lG)(range.startContainer, "LI") || (0,hasClosest/* hasClosestBlock */.F9)(range.startContainer);
++    if (!block || block !== ((0,hasClosest/* hasClosestByMatchTag */.lG)(range.endContainer, "LI") || (0,hasClosest/* hasClosestBlock */.F9)(range.endContainer))) {
++        return;
++    }
++    var first = (0,hasClosest/* hasClosestByAttribute */.a1)(range.startContainer, "data-newline", "1");
++    var last = (0,hasClosest/* hasClosestByAttribute */.a1)(range.endContainer, "data-newline", "1");
++    if (first === last) {
++        return;
++    }
++    // 嵌套格式的标记必须逐层配对；此处只修正已验证的单层边界，避免只保住最内层。
++    if ((first && (0,hasClosest/* hasClosestByAttribute */.a1)(first.parentElement.parentElement, "data-newline", "1")) ||
++        (last && (0,hasClosest/* hasClosestByAttribute */.a1)(last.parentElement.parentElement, "data-newline", "1"))) {
++        return;
++    }
++    if (last && !last.contains(range.startContainer) && ((_a = last.previousElementSibling) === null || _a === void 0 ? void 0 : _a.classList.contains("vditor-ir__marker"))) {
++        var remainder = range.cloneRange();
++        remainder.selectNodeContents(last);
++        remainder.setStart(range.endContainer, range.endOffset);
++        if (remainder.toString() === "") {
++            range.setEndAfter(last.parentElement);
++        }
++        else {
++            var marker = document.createTextNode(last.previousElementSibling.textContent);
++            var point = range.cloneRange();
++            point.collapse(false);
++            point.insertNode(marker);
++            range.setEndBefore(marker);
++        }
++    }
++    if (first && !first.contains(range.endContainer) && ((_b = first.nextElementSibling) === null || _b === void 0 ? void 0 : _b.classList.contains("vditor-ir__marker"))) {
++        var prefix = range.cloneRange();
++        prefix.selectNodeContents(first);
++        prefix.setEnd(range.startContainer, range.startOffset);
++        if (prefix.toString() === "") {
++            range.setStartBefore(first.parentElement);
++        }
++        else {
++            var marker = document.createTextNode(first.nextElementSibling.textContent);
++            range.insertNode(marker);
++            range.setStartAfter(marker);
++        }
++    }
++};
++
+ var processKeydown = function (vditor, event) {
+@@ -6009,2 +6056,6 @@ var processKeydown = function (vditor, event) {
+     var range = (0,selection/* getEditorRange */.zh)(vditor);
++    if (!range.collapsed && !(0,compatibility/* isCtrl */.yl)(event) && !event.altKey && !event.metaKey &&
++        (event.key === "Backspace" || event.key === "Delete" || event.key === "Enter" || event.key.length === 1)) {
++        normalizeInlineSelection(range);
++    }
+     var startContainer = range.startContainer;
+@@ -6022,3 +6073,3 @@ var processKeydown = function (vditor, event) {
+     var newlineElement = (0,hasClosest/* hasClosestByAttribute */.a1)(startContainer, "data-newline", "1");
+-    if (!(0,compatibility/* isCtrl */.yl)(event) && !event.altKey && !event.shiftKey && event.key === "Enter" && newlineElement
++    if (!(0,compatibility/* isCtrl */.yl)(event) && !event.altKey && !event.shiftKey && event.key === "Enter" && range.collapsed && newlineElement
+         && range.startOffset < newlineElement.textContent.length) {
+@@ -10528,3 +10579,3 @@ var listOutdent = function (vditor, liElement, range, topListElement) {
+         var afterHTML_1 = "";
+-        liParentElement.querySelectorAll("li").forEach(function (item) {
++        liParentElement.querySelectorAll(":scope > li").forEach(function (item) {
+             if (isMatch_1) {
+@@ -11358,2 +11409,6 @@ var fixTask = function (vditor, range, event) {
+         if (event.key === "Enter" && !(0,compatibility/* isCtrl */.yl)(event) && !event.shiftKey && !event.altKey) {
++            // 同一任务项先替换选中文字，再沿用原有拆分及撤销流程；跨项选区不在此处理。
++            if (!range.collapsed && (0,hasClosest/* hasClosestByMatchTag */.lG)(range.endContainer, "LI") === taskItemElement) {
++                range.deleteContents();
++            }
+             if (taskItemElement.textContent.trim() === "") {
+@@ -12032,3 +12087,3 @@ var process_processToolbar = function (vditor, actionBtn, prefix, suffix) {
+             else {
+-                html = "".concat(prefix).concat(range.toString()).concat(suffix.replace(")", "<wbr>)"));
++                html = "".concat(prefix).concat(Lute.EscapeHTMLStr(range.toString())).concat(suffix.replace(")", "<wbr>)"));
+             }
+@@ -12047,9 +12102,9 @@ var process_processToolbar = function (vditor, actionBtn, prefix, suffix) {
+                 if (commandName === "code") {
+-                    html = "".concat(prefix, "\n").concat(range.toString(), "<wbr>").concat(suffix);
++                    html = "".concat(prefix, "\n").concat(Lute.EscapeHTMLStr(range.toString()), "<wbr>").concat(suffix);
+                 }
+                 else if (commandName === "table") {
+-                    html = "".concat(prefix).concat(range.toString(), "<wbr>").concat(suffix);
++                    html = "".concat(prefix).concat(Lute.EscapeHTMLStr(range.toString()), "<wbr>").concat(suffix);
+                 }
+                 else {
+-                    html = "".concat(prefix, "<wbr>").concat(range.toString(), "<wbr>").concat(suffix);
++                    html = "".concat(prefix, "<wbr>").concat(Lute.EscapeHTMLStr(range.toString()), "<wbr>").concat(suffix);
+                     keepSelection = true;
+@@ -12476,2 +12531,12 @@ var IR = /** @class */ (function () {
+         this.element.addEventListener("paste", function (event) {
++            var data = event.clipboardData;
++            if (_this.element.getAttribute("contenteditable") === "true" && data && data.files.length === 0 &&
++                (data.getData("text/plain").trim() !== "" || data.getData("text/html").trim() !== "")) {
++                var range = (0,selection/* getEditorRange */.zh)(vditor);
++                // 粘贴不经过普通字符的 keydown；沿用同一选区规则，代码仍由原有专用分支处理。
++                if (!range.collapsed && !(0,hasClosest/* hasClosestByMatchTag */.lG)(range.startContainer, "CODE") &&
++                    !(0,hasClosest/* hasClosestByMatchTag */.lG)(range.endContainer, "CODE")) {
++                    normalizeInlineSelection(range);
++                }
++            }
+             paste(vditor, event, {
+diff --git a/node_modules/vditor/src/ts/ir/processKeydown.ts b/node_modules/vditor/src/ts/ir/processKeydown.ts
+index 47e44528..d5b22aae 100644
+--- a/node_modules/vditor/src/ts/ir/processKeydown.ts
++++ b/node_modules/vditor/src/ts/ir/processKeydown.ts
+@@ -28,1 +28,45 @@ import {processAfterRender, processHeading} from "./process";
++// IR 的格式标记也是 DOM 文本；跨边界替换时只让选区覆盖待删除的标记，保留侧先闭合格式。
++export const normalizeInlineSelection = (range: Range) => {
++    const block = hasClosestByMatchTag(range.startContainer, "LI") || hasClosestBlock(range.startContainer);
++    if (!block || block !== (hasClosestByMatchTag(range.endContainer, "LI") || hasClosestBlock(range.endContainer))) {
++        return;
++    }
++    const first = hasClosestByAttribute(range.startContainer, "data-newline", "1");
++    const last = hasClosestByAttribute(range.endContainer, "data-newline", "1");
++    if (first === last) {
++        return;
++    }
++    // 嵌套格式的标记必须逐层配对；此处只修正已验证的单层边界，避免只保住最内层。
++    if ((first && hasClosestByAttribute(first.parentElement.parentElement, "data-newline", "1")) ||
++        (last && hasClosestByAttribute(last.parentElement.parentElement, "data-newline", "1"))) {
++        return;
++    }
++    if (last && !last.contains(range.startContainer) && last.previousElementSibling?.classList.contains("vditor-ir__marker")) {
++        const remainder = range.cloneRange();
++        remainder.selectNodeContents(last);
++        remainder.setStart(range.endContainer, range.endOffset);
++        if (remainder.toString() === "") {
++            range.setEndAfter(last.parentElement);
++        } else {
++            const marker = document.createTextNode(last.previousElementSibling.textContent);
++            const point = range.cloneRange();
++            point.collapse(false);
++            point.insertNode(marker);
++            range.setEndBefore(marker);
++        }
++    }
++    if (first && !first.contains(range.endContainer) && first.nextElementSibling?.classList.contains("vditor-ir__marker")) {
++        const prefix = range.cloneRange();
++        prefix.selectNodeContents(first);
++        prefix.setEnd(range.startContainer, range.startOffset);
++        if (prefix.toString() === "") {
++            range.setStartBefore(first.parentElement);
++        } else {
++            const marker = document.createTextNode(first.nextElementSibling.textContent);
++            range.insertNode(marker);
++            range.setStartAfter(marker);
++        }
++    }
++};
++
+ export const processKeydown = (vditor: IVditor, event: KeyboardEvent) => {
+@@ -40,2 +84,6 @@ export const processKeydown = (vditor: IVditor, event: KeyboardEvent) => {
+     const range = getEditorRange(vditor);
++    if (!range.collapsed && !isCtrl(event) && !event.altKey && !event.metaKey &&
++        (event.key === "Backspace" || event.key === "Delete" || event.key === "Enter" || event.key.length === 1)) {
++        normalizeInlineSelection(range);
++    }
+     const startContainer = range.startContainer;
+@@ -58,3 +106,3 @@ export const processKeydown = (vditor: IVditor, event: KeyboardEvent) => {
+     const newlineElement = hasClosestByAttribute(startContainer, "data-newline", "1");
+-    if (!isCtrl(event) && !event.altKey && !event.shiftKey && event.key === "Enter" && newlineElement
++    if (!isCtrl(event) && !event.altKey && !event.shiftKey && event.key === "Enter" && range.collapsed && newlineElement
+         && range.startOffset < newlineElement.textContent.length) {
+diff --git a/node_modules/vditor/src/ts/ir/index.ts b/node_modules/vditor/src/ts/ir/index.ts
+index 2d6eec50..33b48d30 100644
+--- a/node_modules/vditor/src/ts/ir/index.ts
++++ b/node_modules/vditor/src/ts/ir/index.ts
+@@ -12,3 +12,3 @@ import {
+ import {paste} from "../util/fixBrowserBehavior";
+-import {hasClosestByAttribute, hasClosestByClassName} from "../util/hasClosest";
++import {hasClosestByAttribute, hasClosestByClassName, hasClosestByMatchTag} from "../util/hasClosest";
+ import {hasClosestByHeadings} from "../util/hasClosestByHeadings";
+@@ -24,1 +24,2 @@ import {processAfterRender, processHint} from "./process";
+ import {hidePanel} from "../toolbar/setToolbar";
++import {normalizeInlineSelection} from "./processKeydown";
+@@ -96,2 +97,12 @@ class IR {
+         this.element.addEventListener("paste", (event: ClipboardEvent & { target: HTMLElement }) => {
++            const data = event.clipboardData;
++            if (this.element.getAttribute("contenteditable") === "true" && data && data.files.length === 0 &&
++                (data.getData("text/plain").trim() !== "" || data.getData("text/html").trim() !== "")) {
++                const range = getEditorRange(vditor);
++                // 粘贴不经过普通字符的 keydown；沿用同一选区规则，代码仍由原有专用分支处理。
++                if (!range.collapsed && !hasClosestByMatchTag(range.startContainer, "CODE") &&
++                    !hasClosestByMatchTag(range.endContainer, "CODE")) {
++                    normalizeInlineSelection(range);
++                }
++            }
+             paste(vditor, event, {
+diff --git a/node_modules/vditor/src/ts/ir/process.ts b/node_modules/vditor/src/ts/ir/process.ts
+index bc6b8eb3..02040d50 100644
+--- a/node_modules/vditor/src/ts/ir/process.ts
++++ b/node_modules/vditor/src/ts/ir/process.ts
+@@ -191,3 +191,3 @@ export const processToolbar = (vditor: IVditor, actionBtn: Element, prefix: stri
+             } else {
+-                html = `${prefix}${range.toString()}${suffix.replace(")", "<wbr>)")}`;
++                html = `${prefix}${Lute.EscapeHTMLStr(range.toString())}${suffix.replace(")", "<wbr>)")}`;
+             }
+@@ -204,7 +204,7 @@ export const processToolbar = (vditor: IVditor, actionBtn: Element, prefix: stri
+                 if (commandName === "code") {
+-                    html = `${prefix}\n${range.toString()}<wbr>${suffix}`;
++                    html = `${prefix}\n${Lute.EscapeHTMLStr(range.toString())}<wbr>${suffix}`;
+                 } else if (commandName === "table") {
+-                    html = `${prefix}${range.toString()}<wbr>${suffix}`;
++                    html = `${prefix}${Lute.EscapeHTMLStr(range.toString())}<wbr>${suffix}`;
+                 } else {
+-                    html = `${prefix}<wbr>${range.toString()}<wbr>${suffix}`;
++                    html = `${prefix}<wbr>${Lute.EscapeHTMLStr(range.toString())}<wbr>${suffix}`;
+                     keepSelection = true;
+diff --git a/node_modules/vditor/src/ts/util/fixBrowserBehavior.ts b/node_modules/vditor/src/ts/util/fixBrowserBehavior.ts
+index fa4c874e..888d7b52 100644
+--- a/node_modules/vditor/src/ts/util/fixBrowserBehavior.ts
++++ b/node_modules/vditor/src/ts/util/fixBrowserBehavior.ts
+@@ -328,3 +328,3 @@ export const listOutdent = (vditor: IVditor, liElement: HTMLElement, range: Rang
+         let afterHTML = "";
+-        liParentElement.querySelectorAll("li").forEach((item) => {
++        liParentElement.querySelectorAll(":scope > li").forEach((item) => {
+             if (isMatch) {
+@@ -1195,2 +1195,6 @@ export const fixTask = (vditor: IVditor, range: Range, event: KeyboardEvent) =>
+         if (event.key === "Enter" && !isCtrl(event) && !event.shiftKey && !event.altKey) {
++            // 同一任务项先替换选中文字，再沿用原有拆分及撤销流程；跨项选区不在此处理。
++            if (!range.collapsed && hasClosestByMatchTag(range.endContainer, "LI") === taskItemElement) {
++                range.deleteContents();
++            }
+             if (taskItemElement.textContent.trim() === "") {

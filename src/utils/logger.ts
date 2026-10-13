@@ -1,6 +1,4 @@
-// src/utils/logger.ts
-// 前端日志桥(日志能力重构方案 §4/§9.3-E,S3):替换 84 处裸 console.*,把前端日志汇入后端
-// tracing——同一套 JSONL 文件/UI 环形缓冲/重复压缩治理,agent 与用户不用再分两处找日志。
+// 前端日志桥将事件汇入后端 tracing，共用 JSONL 文件与 UI 环形缓冲。
 
 import { invokeIpc } from './ipc'
 import { IPC } from '../constants/ipc'

@@ -1,7 +1,5 @@
-//! AI(CLIP embedding)域 DAO:向量写读、ai_status 状态机计数/复位/同步、pending 队列
-//! (T 线拆分自 queries.rs,SQL 与行为不变;与 face 状态机同构但有意不抽泛型,设计 §4.1)。
-//! `reset_error_items_batched` 为 ai/faces 共用 helper,归本域并以
-//! `pub(in crate::db::queries)` 供 faces 定向引用(设计 §4.3)。
+//! AI(CLIP embedding)域 DAO：向量读写、ai_status 状态机与 pending 队列。
+//! `reset_error_items_batched` 由 ai/faces 共用，在本域定义并供 faces 引用。
 
 use rusqlite::{params, Connection};
 
@@ -33,26 +31,26 @@ pub fn upsert_ai_embedding(
     Ok(())
 }
 
+/// 批量完成写入的数据：(item_id, model_name, embedding, version, cache_key, source_revision)。
+pub type AiEmbeddingWrite = (i64, String, Vec<u8>, i64, i64, i64);
+
 /// AI 条件完成写(2026-07-10 审查 X1,对齐 `update_thumb_result` 的条件写范式):
-/// 仅当 `media_items.cache_key` 仍等于任务**领取时的快照**才落 Done+向量。不符即该项已被
+/// 仅当源代次与 `media_items.cache_key` 仍等于任务领取快照且未删除时才落 Done+向量。不符即该项已被
 /// SourceChanged 失效(status→0、换 cache_key、删旧向量)——迟到的 Writer flush 整项落空,
 /// 下轮重分析。worker 回声的 fingerprint 只防「worker 读错文件」,防不了 host 落库陈旧,
 /// 这一步才是闭环(缩略图线 P1-4 同款病灶的既定修法,此前未复制到 AI/face)。
 /// 返回实际完成数(len - 返回值 = 被失效跳过数)。
-pub fn batch_finish_ai_items(
-    conn: &Connection,
-    rows: &[(i64, String, Vec<u8>, i64, i64)], // (item_id, model_name, embedding, version, cache_key 快照)
-) -> Result<usize> {
+pub fn batch_finish_ai_items(conn: &Connection, rows: &[AiEmbeddingWrite]) -> Result<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
     let tx = conn.unchecked_transaction()?;
     let mut done = 0usize;
-    for (item_id, model_name, embedding, version, cache_key) in rows {
+    for (item_id, model_name, embedding, version, cache_key, source_revision) in rows {
         let fresh = tx.execute(
             "UPDATE media_items SET ai_status=2, updated_at=strftime('%s','now')
-              WHERE id=?1 AND cache_key=?2",
-            params![item_id, cache_key],
+              WHERE id=?1 AND cache_key=?2 AND source_revision=?3 AND is_deleted=0",
+            params![item_id, cache_key, source_revision],
         )?;
         if fresh == 0 {
             // 已失效(或行已删):该向量由旧内容的缓存算出,必须丢弃。
@@ -73,11 +71,11 @@ pub fn batch_finish_ai_items(
     Ok(done)
 }
 
-/// X1 条件状态写(Error 等失败路径):仅 `cache_key` 未变的行生效——失效项不得被迟到的
+/// 条件状态写(Error 等失败路径):仅源代次与缓存键未变且未删除的行生效——失效项不得被迟到的
 /// Error 覆盖(它已回 Pending 等待按新内容重分析)。返回生效行数。
 pub fn batch_update_ai_status_guarded(
     conn: &Connection,
-    items: &[(i64, i64)], // (item_id, cache_key 快照)
+    items: &[(i64, i64, i64)], // (item_id, cache_key, source_revision 快照)
     status: i64,
 ) -> Result<usize> {
     if items.is_empty() {
@@ -85,11 +83,11 @@ pub fn batch_update_ai_status_guarded(
     }
     let tx = conn.unchecked_transaction()?;
     let mut n = 0usize;
-    for (id, cache_key) in items {
+    for (id, cache_key, source_revision) in items {
         n += tx.execute(
             "UPDATE media_items SET ai_status=?1, updated_at=strftime('%s','now')
-              WHERE id=?2 AND cache_key=?3",
-            params![status, id, cache_key],
+              WHERE id=?2 AND cache_key=?3 AND source_revision=?4 AND is_deleted=0",
+            params![status, id, cache_key, source_revision],
         )?;
     }
     tx.commit()?;
@@ -151,10 +149,9 @@ pub struct PendingAiItem {
     /// 源文件绝对路径(缺 ai_cache 时现场派生的解码源,T18)。
     pub abs_path: String,
     pub file_format: String,
-    /// `cache_key` 定位磁盘上的 AI 分析缓存文件(`ai_cache_path(cache_dir, cache_key)`)。
-    /// worker 端解码的唯一源;按**文件存在性**发现(而非 `media_derivations` 行),
-    /// 故缩略图生成时顺带产出的缓存(一次解码两份产物)同样能被发现。
+    /// 领取时的缓存键；与 source_revision 共同限定已提交 AI 产物及结果回写。
     pub cache_key: i64,
+    pub source_revision: i64,
 }
 
 /// 取一批待 CLIP 分析的图像(T16:worker 端按 cache_key 读 ai_cache 解码,缩略图/尺寸
@@ -165,7 +162,7 @@ pub fn get_pending_ai_items(conn: &Connection, limit: i64) -> Result<Vec<Pending
                 CASE WHEN d.rel_path = '' THEN r.path || '/' || m.file_name
                      ELSE r.path || '/' || d.rel_path || '/' || m.file_name
                 END,
-                m.file_format, m.cache_key
+                m.file_format, m.cache_key, m.source_revision
          FROM media_items m
          JOIN directories d ON m.directory_id = d.id
          JOIN scan_roots r ON d.root_id = r.id
@@ -180,9 +177,47 @@ pub fn get_pending_ai_items(conn: &Connection, limit: i64) -> Result<Vec<Pending
             abs_path: row.get(1)?,
             file_format: row.get(2)?,
             cache_key: row.get(3)?,
+            source_revision: row.get(4)?,
         })
     })?;
     rows.map(|r| r.map_err(AppError::from)).collect()
+}
+
+/// 批量查找任务当前源与所需 short 对应的已提交 AI 产物；返回相对缓存根的 canonical 路径。
+/// 输入为 (item_id, cache_key, source_revision)，每条 SQL 最多 256 项；没有命中时由调用方
+/// 沿用独立 AI 的旧缓存/现场派生流程，不把仅存在于磁盘的新路径视为已提交。
+pub fn find_ai_cache_artifacts(
+    conn: &Connection,
+    items: &[(i64, i64, i64)],
+    short_edge: u32,
+) -> Result<std::collections::HashMap<i64, String>> {
+    let mut paths = std::collections::HashMap::new();
+    for chunk in items.chunks(256) {
+        let slots = vec!["(?,?,?)"; chunk.len()].join(",");
+        let sql = format!(
+            "WITH requested(item_id,cache_key,source_revision) AS (VALUES {slots})
+             SELECT a.item_id,a.path FROM requested q
+             JOIN media_items m ON m.id=q.item_id AND m.cache_key=q.cache_key
+                 AND m.source_revision=q.source_revision AND m.is_deleted=0
+             JOIN image_artifacts a ON a.item_id=m.id AND a.cache_key=m.cache_key
+                 AND a.source_revision=m.source_revision
+             WHERE a.kind='ai' AND a.status=1 AND a.fingerprint=? AND a.path IS NOT NULL"
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() * 3 + 1);
+        for &(id, key, revision) in chunk {
+            values.extend([id.into(), key.into(), revision.into()]);
+        }
+        values.push(format!("image-ai-v3:{short_edge}").into());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        for row in rows {
+            let (id, path) = row?;
+            paths.insert(id, path);
+        }
+    }
+    Ok(paths)
 }
 
 /// 统计待处理的 AI 项数量。

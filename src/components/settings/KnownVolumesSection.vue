@@ -1,4 +1,4 @@
-<!-- 已知卷面板（Part5 T13 §3.7 离线 UX）：列出应用登记的物理卷（在线态 + 媒体数）+ 重命名 / 忘记。 -->
+<!-- 已知卷面板列出物理卷的在线状态与媒体数，并提供重命名和忘记操作。 -->
 <template>
   <CollapsibleCard id="knownVolumes" :title="$t('settings.volTitle')">
     <div class="kv-intro">{{ $t('settings.volIntro') }}</div>

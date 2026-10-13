@@ -1,14 +1,14 @@
 // crates/exotic-workers/raw-probe/src/main.rs
-//! RAW 技术去险探针（阶段 B 前置 spike）。
+//! RAW 解码技术探针。
 //!
-//! 目标：在裁定 RAW 支持范围之前，用**可执行的实测**回答：
+//! 通过可执行检查确认：
 //!   1. `rsraw =0.1.1`（vendored LibRaw C++，经 x86_64-pc-windows-gnu 工具链）能否真编出来；
 //!   2. `RawImage::open` / `extract_thumbs` API 面是否可调用（证 API 形状可编）；
 //!   3. 畸形输入（空 / 随机字节 / 截断 / 错 magic）是否 **不 panic、稳定失败**。
 //!
 //! 仓内无真实 RAW 样张（无法像 PSD 那样手写合成一张最小合法 RAW——RAW 格式无统一
 //! 简单容器）。故本探针的「合法输入」部分只证 API 面能编译调用；健壮性验证落在
-//! 畸形输入的 catch_unwind 上。真样张后续走 `RAW_PROBE_SAMPLES` 环境目录。
+//! 畸形输入的 catch_unwind 上。真实样张可由 `RAW_PROBE_SAMPLES` 环境目录提供。
 //!
 //! `RawImage::open` 返回 `Result`（非裸 panic 型 API），但底层是 vendored C++，
 //! 无法排除 FFI 边界内部真实 crash/panic，故仍需 catch_unwind 兜底。

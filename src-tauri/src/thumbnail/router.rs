@@ -1,14 +1,7 @@
-//! 主缩略图路由（v3 §6.2 / Part1 §2.2 / 勘误 R3）。
+//! 主缩略图路由。
 //!
 //! 纯判定函数：决定一个缩略图请求走「现有缓存 / 主 generator / 冷门让路」哪条路。
-//! **不持 `AppState`、不查 DB、不调 Coordinator**——与 generator 一样是纯函数（附录 A 已核验
-//! generator 不持 AppState）。数据访问层负责批量预取 `FormatResolution` 与 task 状态后传入，
-//! 避免 Router 内 N+1 查询（R7）。
-//!
-//! 真实入口（R3）：`thumbnail_commands.rs` 只有 `batch_request_thumbnails` 与
-//! `start_full_thumbnail_generation` 两个命令，各自「查缓存 → needs_gen → 生成」。Router 接在
-//! **这两处的 needs_gen 过滤点**：命中未完成 `Exotic` 即不入 needs_gen——既不调
-//! `decode_media_step`/`process_deferred_cpu`，也不写 `thumb_status=2`。
+//! 数据访问层批量预取格式解析与任务状态，避免逐项查库；未完成的 exotic 任务不进入主生成队列。
 
 use crate::exotic::{Capability, ExoticTaskStatus, FormatResolution};
 
@@ -20,7 +13,7 @@ pub enum ThumbnailRoute {
     /// 常见格式 → 交主 generator。
     Common,
     /// 冷门格式且未完成 → 不调 generator；前端按 `resolution.availability` 显示
-    /// 处理中 / 购买占位 / 平台不支持等；数据层合并发一次 Coordinator wake。
+    /// 处理中 / 安装占位 / 平台不支持等；数据层合并发一次 Coordinator wake。
     Exotic(FormatResolution),
 }
 
@@ -38,12 +31,12 @@ pub struct ThumbnailRouteInput<'a> {
     pub fingerprint_valid: bool,
 }
 
-/// 纯判定（规则顺序对齐 Part1 §2.2）：
+/// 纯判定，按以下顺序处理：
 ///   1. 已有有效缩略图（status 1/3）→ Existing；
 ///   2. 非 exotic（无 offering 或不认领 thumbnail）→ Common；
 ///   3. exotic 且 task done 且指纹有效 → Existing（优先用产物，不再尝试解原图）；
 ///   4. exotic 未完成 → Exotic(resolution)，不调 generator；
-///   5. 无插件/未授权/平台不支持 → 仍 Exotic（availability 在 resolution 内，供前端准确占位）。
+///   5. 无插件/未激活/平台不支持 → 仍 Exotic（availability 在 resolution 内，供前端准确占位）。
 pub fn route_thumbnail(input: &ThumbnailRouteInput<'_>) -> ThumbnailRoute {
     // 1. 已有有效缩略图（1=已生成 / 3=小文件直显）。
     if input.thumb_status == 1 || input.thumb_status == 3 {
@@ -61,6 +54,6 @@ pub fn route_thumbnail(input: &ThumbnailRouteInput<'_>) -> ThumbnailRoute {
         return ThumbnailRoute::Existing;
     }
 
-    // 4./5. exotic 未完成（含未安装/未授权/平台不支持）→ 让路，不调 generator。
+    // 4./5. exotic 未完成（含未安装/未激活/平台不支持）→ 让路，不调 generator。
     ThumbnailRoute::Exotic(res.clone())
 }

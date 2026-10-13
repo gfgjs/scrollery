@@ -11,40 +11,23 @@ import themeDefaultCssPlugin from './scripts/vite-plugin-theme-default-css'
 const host = process.env.TAURI_DEV_HOST
 
 // https://vite.dev/config/
-// https://vite.dev/config/
 export default defineConfig(async () => ({
-  // themeDefaultCss:注入默认主题 CSS 并交付首帧脚本(与运行时同源,见插件头注)。
+  // 默认主题 CSS 与首帧脚本共用运行时主题生成逻辑。
   plugins: [themeDefaultCssPlugin(), vue(), bundleBudget(), devCsp()],
 
   build: {
-    // 关掉 Rollup 的无差别体积告警,由 bundleBudget 插件的两条**可行动**不变量取代
-    // (入口块预算 + 重依赖不得进入口)。不是「调高阈值让它闭嘴」而是**换掉机制**:
-    // Rollup 那条是告警不是门(实测把 pdfjs 静态 import 进首屏它照喊照过 exit=0),
-    // 且喊的两个块全是误报(cpp 是懒加载语法、index 是路由全懒加载后的外壳)。
-    // 完整实测与取舍见 scripts/vite-plugin-bundle-budget.mjs 顶部注释。
+    // 由 bundleBudget 校验入口体积及重依赖；懒加载块只报告体积。
     chunkSizeWarningLimit: Number.MAX_SAFE_INTEGER,
   },
 
-  // vue-i18n JIT 编译开关（P1-23,CSP 加固前置)。
-  // vue-i18n v9 默认把 locale 消息(含 {name} 等插值)在运行时用 `new Function` 编译成可执行
-  // 函数——本质等于 eval,故此前 CSP 必须放行 `'unsafe-eval'`。开启 JIT 后,消息改为编译成 AST
-  // 并在运行时**解释执行**,不再走 `new Function`,从而允许 CSP 删除 `'unsafe-eval'`(仍保留
-  // `'wasm-unsafe-eval'` 供 wasm 解码器)。v9 默认 false,须显式置 true;仅翻转编译策略,不改
-  // legacy/install 等其余行为(那些 flag 保持 vue-i18n 内建默认)。
-  // define: JIT compilation for vue-i18n so message compiling no longer needs `new Function` (eval),
-  // which lets the production CSP drop `'unsafe-eval'`.
+  // i18n 消息以 AST 解释执行，避免 new Function，使生产 CSP 无需 unsafe-eval。
   define: {
     __INTLIFY_JIT_COMPILATION__: true,
   },
 
-  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
-  // 专为 Tauri 开发量身定制的 Vite 选项，仅在 `tauri dev` 或 `tauri build` 中应用
-  //
-  // 1. prevent Vite from obscuring rust errors
-  // 1. 防止 Vite 掩盖 rust 错误
+  // 保留终端中的 Rust 错误。
   clearScreen: false,
-  // 2. tauri expects a fixed port, fail if that port is not available
-  // 2. Tauri 期望一个固定端口，如果该端口不可用则失败
+  // Tauri devUrl 使用固定端口，占用时直接报错。
   server: {
     port: 1420,
     strictPort: true,
@@ -59,10 +42,7 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri` and the Rust build output.
-      //    workspace 迁移后 target 到了**仓库根**（非 src-tauri/target），故必须显式忽略 `**/target/**`；
-      //    否则 cargo 编译时 Vite 试图 watch 被占用的 `target/debug/deps/*.dll` → Windows EBUSY 崩溃。
-      // 3. 告诉 Vite 忽略监视 `src-tauri` 及 Rust 编译产物目录。
+      // 忽略 Rust 源码与构建产物，避免监视 Windows 上被占用的 DLL 引发 EBUSY。
       ignored: ['**/src-tauri/**', '**/target/**'],
     },
   },

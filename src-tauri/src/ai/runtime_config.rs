@@ -1,11 +1,5 @@
 // src-tauri/src/ai/runtime_config.rs
-//! AI 运行时配置真相(U-P2-a,2026-07-16 从 IPC 层 AI 命令文件下沉;
-//! 本文件注释避写旧路径名——U 设计 §4.2 依赖方向门按裸词扫描本目录)。
-//!
-//! 「当前激活模型/人脸模型/模型目录/provider 回声」这些跨层共享的解析函数此前寄居
-//! IPC 命令文件,导致 `ai/worker_client`、`ai/face_pipeline`、`ai/worker_pipeline`、
-//! `ai/pipeline` 四个核心模块反向 import IPC 层(层次倒挂)。下沉后依赖方向恢复:
-//! ipc → ai,核心层内部横向引用。函数体逐行原样搬迁,签名与行为不变。
+//! AI 运行时配置：解析激活模型、人脸模型、模型目录及 worker 的 provider 回声。
 
 use std::path::PathBuf;
 
@@ -20,8 +14,7 @@ pub(crate) fn models_dir(state: &AppState) -> PathBuf {
     state.app_data_dir.join("models")
 }
 
-/// worker 会话的 provider/gpu_name 回声落库(T16):EP 探测只发生在 worker 侧,host 写回
-/// 既有 `ai_provider`/`ai_gpu_name` 键——status 命令读法零改动;无会话/旧帧保留旧值。
+/// 将 worker 会话的 provider/gpu_name 回声写入配置；无有效回声时保留现值。
 pub(crate) fn persist_provider_echo(state: &AppState) {
     let echo = {
         let client = state.ai_worker.lock().unwrap_or_else(|p| p.into_inner());
@@ -38,20 +31,13 @@ pub(crate) fn persist_provider_echo(state: &AppState) {
     }
 }
 
-/// Resolve the currently-active model profile from config (`ai_active_model`), falling back
-/// to the default. The id is also the `ai_embeddings.model_name` key for this model's vectors.
 /// 从配置（`ai_active_model`）解析当前激活的模型 profile，缺省回退默认。该 id 同时是本模型
 /// 向量在 `ai_embeddings.model_name` 的键。
-///
-/// A2:`ai_active_model`/`ai_active_image_file` 是 schema 设置类键,唯一真源已切到
-/// `ConfigManager`——不再需要读池连接,`active_profile_with` 的 `conn` 参数随之改为
-/// `&ConfigManager`。
 pub(crate) fn active_profile(state: &AppState) -> ModelProfile {
     active_profile_with(&state.config)
 }
 
-/// A2 前称「连接已在手的变体」——`ai_active_model`/`ai_active_image_file` 迁往 config.toml 后
-/// 不再需要 DB 连接,改收 `&ConfigManager`。
+/// 从指定配置快照解析当前模型 profile。
 pub(crate) fn active_profile_with(config: &crate::config::ConfigManager) -> ModelProfile {
     // 现在「激活模型」由两段配置组成：`ai_active_model`=架构 id（= 向量空间主键），
     // `ai_active_image_file`=选中的图像 onnx 变体文件名（决定加载哪份图像塔，不改向量身份）。
@@ -65,25 +51,16 @@ pub(crate) fn active_profile_with(config: &crate::config::ConfigManager) -> Mode
         .unwrap_or_else(profile::default_profile)
 }
 
-/// Resolve the active face model profile from config (`face_model_active`), default fallback.
-/// Returns `None` when face feature is disabled (`face_enabled=0`) → engine skips loading face
-/// sessions entirely (saves load time/VRAM). The id is also the `faces.model_name` vector-space key.
 /// 从配置（`face_model_active`）解析当前激活的人脸模型 profile，缺省回退默认。人脸功能关闭
-/// （`face_enabled=0`）时返回 `None`，引擎完全跳过加载人脸 session（省加载时间/显存）。
+/// （`face_enabled=false`）时返回 `None`，worker 无需加载人脸 session。
 /// 该 id 同时是人脸向量在 `faces.model_name` 的键。
-///
-/// A2:`face_enabled`/`face_model_active` 是 schema 设置类键,唯一真源已切到 `ConfigManager`。
 pub(crate) fn active_face_profile(
     state: &AppState,
 ) -> Option<crate::ai::face_profile::FaceProfile> {
     active_face_profile_with(&state.config)
 }
 
-/// A2 前称「连接已在手的变体」——两键均已迁往 config.toml,改收 `&ConfigManager`。
-///
-/// **布尔编码变更**:config.toml 的 `Bool` 类型恒渲染为 `"true"`/`"false"`(见
-/// `config::schema::SettingKind::Bool`),不再是历史 DB 的 `"0"`/`"1"`(`migrate.rs` 一次性
-/// 迁移已把旧值归一化)——判定条件相应改为 `== Some("false")`。
+/// 从指定配置快照解析人脸模型；`face_enabled` 以 `"false"` 表示禁用。
 pub(crate) fn active_face_profile_with(
     config: &crate::config::ConfigManager,
 ) -> Option<crate::ai::face_profile::FaceProfile> {
@@ -98,9 +75,6 @@ pub(crate) fn active_face_profile_with(
     Some(face_profile::find_face_profile(&id).unwrap_or_else(face_profile::default_face_profile))
 }
 
-/// Whether a specific image-encoder variant is fully usable on disk: image onnx header + its
-/// external-data weights, the shared text encoder + its weights, and the vocab. Existence-only — a
-/// present-but-wrong-size file still counts (download re-fetches/repairs via size + sha256 checks).
 /// 某个图像编码器变体是否已就位可用：图像 onnx 头 + 其外部权重、共享文本塔 + 其权重、词表。
 /// 仅按存在判定 —— 存在但大小不符仍算已装（下载命令会按 大小+sha256 校验并按需重拉/修复）。
 pub(crate) fn variant_installed(
@@ -116,4 +90,10 @@ pub(crate) fn variant_installed(
         "vocab.txt".to_string(),
     ];
     needed.iter().all(|f| models_dir.join(f).exists())
+}
+
+/// 图片分析只依赖图像塔及其外部权重；文本查询另按文本角色加载。
+pub(crate) fn image_variant_installed(models_dir: &std::path::Path, image_file: &str) -> bool {
+    models_dir.join(image_file).exists()
+        && models_dir.join(format!("{image_file}.extra_file")).exists()
 }

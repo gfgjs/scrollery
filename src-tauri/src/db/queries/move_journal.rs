@@ -192,3 +192,36 @@ fn map_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MoveJournalEntry> {
         affected_media: row.get(14)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c
+    }
+
+    /// 根定位三态：存在 → Some；行确实不在 → None（可作废日志）；查询失败 → Err（必须保留线索）。
+    #[test]
+    fn find_scan_root_ref_distinguishes_absent_from_error() {
+        let c = mem_db();
+        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        c.execute(
+            "INSERT INTO scan_roots (id, path, alias, volume_id, volume_subpath) VALUES (1, '/r', 'R', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        let found = find_scan_root_ref(&c, 1).unwrap().expect("root exists");
+        assert_eq!(found.path, "/r");
+        assert_eq!(found.volume_id, None);
+        assert_eq!(find_scan_root_ref(&c, 999).unwrap(), None, "行不在 → None");
+
+        c.execute_batch("DROP TABLE scan_roots;").unwrap();
+        assert!(
+            find_scan_root_ref(&c, 1).is_err(),
+            "查询失败不能伪装成「根不存在」，否则会丢掉恢复线索"
+        );
+    }
+}

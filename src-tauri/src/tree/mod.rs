@@ -1,10 +1,10 @@
 // src-tauri/src/tree/mod.rs
-//! 文件树的**文件系统数据源**（S 线 §4）。
+//! 文件树的文件系统数据源。
 //!
-//! 文件树有两条数据源（§4）：`已注册格式` 模式走现有 DB 目录树（零回归的快路径）；两种
+//! 文件树有两条数据源：`已注册格式` 模式走 DB 目录树；两种
 //! `所有文件` 模式走本模块的惰性 FS 枚举。本模块只回答**文件系统事实**（有什么、是不是目录、
 //! 隐不隐藏），不碰媒体库实体 —— `registered`/`mediaId`/`directoryId` 的填充在 IPC 层，
-//! 因为那需要 Catalog 与 DB（S 线 D-013：树节点身份 ≠ 媒体库实体身份）。
+//! 因为那需要 Catalog 与 DB，且树节点身份不同于媒体库实体身份。
 //!
 //! 路径安全边界见 [`crate::utils::path::resolve_within_root`]：本模块的入参 `dir` 必须**已经**
 //! 过那道校验，这里不再重复判边界。
@@ -161,7 +161,7 @@ fn platform_hidden_flag(meta: &std::fs::Metadata) -> bool {
     meta.st_flags() & UF_HIDDEN != 0
 }
 
-/// Linux / Android：点前缀是唯一约定，无属性位。
+/// Linux：点前缀是唯一约定，无属性位。
 #[cfg(not(any(windows, target_os = "macos")))]
 fn platform_hidden_flag(_meta: &std::fs::Metadata) -> bool {
     false

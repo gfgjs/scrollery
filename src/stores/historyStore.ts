@@ -14,9 +14,10 @@
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { invokeIpc, ipcErrorMessage, moveRecoveryOf } from '../utils/ipc'
+import { Channel } from '@tauri-apps/api/core'
+import { invokeIpc, ipcErrorMessage, moveRecoveryOf, parseAppError } from '../utils/ipc'
 import { IPC } from '../constants/ipc'
-import type { CopyDirResult, MoveDirResult } from '../types/ipc'
+import type { CopyDirResult, DirectoryCopyProgress, MediaCopyBatchResult, MediaRelocationBatchResult, MoveDirResult } from '../types/ipc'
 import i18n from '../i18n'
 import { logger } from '../utils/logger'
 import { useToastStore } from './toastStore'
@@ -58,19 +59,6 @@ interface CopyMediaRecord {
   label: string
 }
 
-/** relocate_media_items 的后端结果 */
-interface MediaRelocationResult {
-  id: number
-  fromDirId: number
-  targetDirId: number
-}
-
-/** copy_media_items_db 的后端结果 */
-interface MediaCopyResult {
-  srcId: number
-  newId: number
-}
-
 /**
  * 通用可撤销记录：调用方自己执行动作，只把「怎么撤 / 怎么重做」登记进来。
  *
@@ -107,11 +95,18 @@ export const useHistoryStore = defineStore('history', () => {
   const undoStack = ref<OpRecord[]>([])
   const redoStack = ref<OpRecord[]>([])
   const busy = ref(false)
+  const copyProgress = ref<(Omit<DirectoryCopyProgress, 'generation'> & {
+    generation: number | null
+    name: string
+    cancelling: boolean
+  }) | null>(null)
+  let activeCopy: symbol | null = null
   // CallbackRecord 的自增标识（不能用对象身份比对：undoStack 是 deep ref，入栈的对象会被代理包裹）。
   let callbackSeq = 0
 
-  const canUndo = computed(() => undoStack.value.length > 0 && !busy.value)
-  const canRedo = computed(() => redoStack.value.length > 0 && !busy.value)
+  // 其他并发操作收尾会清 busy；复制仍在运行时不能重新开放历史操作并覆盖其 Channel。
+  const canUndo = computed(() => undoStack.value.length > 0 && !busy.value && !copyProgress.value)
+  const canRedo = computed(() => redoStack.value.length > 0 && !busy.value && !copyProgress.value)
 
   // 通知界面其余部分刷新。侧边栏监听 `folder-stats-changed`（重载文件夹树、保留展开态，
   // 并在给出 `detail.selectDirId` 时选中它）；媒体网格重新计算布局。一个事件 → 一次重载。
@@ -160,12 +155,45 @@ export const useHistoryStore = defineStore('history', () => {
     }
   }
 
-  async function execCopy(sourceDirId: number, targetDirId: number): Promise<CopyDirResult> {
-    const res = await invokeIpc<CopyDirResult>(IPC.COPY_DIRECTORY, { sourceDirId, targetDirId })
+  async function execCopy(sourceDirId: number, targetDirId: number, name: string): Promise<CopyDirResult> {
+    const run = Symbol('directory-copy')
+    activeCopy = run
+    copyProgress.value = { generation: null, name, copiedFiles: 0, copiedBytes: 0, publishing: false, cancelling: false }
+    let res: CopyDirResult
+    try {
+      const onProgress = new Channel<DirectoryCopyProgress>()
+      onProgress.onmessage = (progress) => {
+        // 旧 Channel 的迟到消息不能覆盖新一轮或已经结束的复制。
+        if (activeCopy !== run || !copyProgress.value) return
+        copyProgress.value = {
+          ...progress,
+          name,
+          cancelling: !progress.publishing && copyProgress.value.cancelling,
+        }
+      }
+      res = await invokeIpc<CopyDirResult>(IPC.COPY_DIRECTORY, { sourceDirId, targetDirId, onProgress })
+    } finally {
+      activeCopy = null
+      copyProgress.value = null
+    }
     // 通过目标根的后台重扫把复制出的文件作为全新资产引入；失败只提示「已复制、待入库」。
     await ingestCopiedDir(res)
     refresh()
     return res
+  }
+
+  /** 取消当前复制代次；实际终态仍由 copy_directory 返回，发布成功不会被迟到的取消改写。 */
+  async function cancelDirectoryCopy(): Promise<void> {
+    const progress = copyProgress.value
+    if (!progress || progress.generation === null || progress.publishing || progress.cancelling) return
+    progress.cancelling = true
+    try {
+      await invokeIpc(IPC.CANCEL_DIRECTORY_COPY, { generation: progress.generation })
+    } catch (e) {
+      if (copyProgress.value?.generation !== progress.generation) return
+      copyProgress.value.cancelling = false
+      useToastStore().addToast('error', i18n.global.t('history.copyCancelFailed', { error: ipcErrorMessage(e) }))
+    }
   }
 
   async function execDeleteCopy(rec: CopyRecord): Promise<void> {
@@ -245,9 +273,10 @@ export const useHistoryStore = defineStore('history', () => {
   }
 
   async function copy(sourceDirId: number, name: string, targetDirId: number): Promise<void> {
+    if (copyProgress.value) throw parseAppError({ code: 'FileJobBusy', message: i18n.global.t('history.copyBusy') })
     busy.value = true
     try {
-      const res = await execCopy(sourceDirId, targetDirId)
+      const res = await execCopy(sourceDirId, targetDirId, name)
       undoStack.value.push({
         type: 'copy',
         sourceDirId,
@@ -265,28 +294,32 @@ export const useHistoryStore = defineStore('history', () => {
 
   // ── 对外：把媒体项移动到文件夹（拖到文件夹，可撤销） ────────────────────────────
   /** 重定位一组项（撤销+重做共用）。 */
-  async function relocateMedia(moves: { id: number; targetDirId: number }[]): Promise<void> {
-    await invokeIpc(IPC.RELOCATE_MEDIA_ITEMS, { moves })
-    refresh() // 重载树（实时计数）+ 重算网格
+  async function relocateMedia(moves: { id: number; targetDirId: number }[]): Promise<MediaRelocationBatchResult> {
+    try {
+      return await invokeIpc<MediaRelocationBatchResult>(IPC.RELOCATE_MEDIA_ITEMS, { moves })
+    } finally {
+      // 失败也可能已有部分移动落盘，目录树与图库必须重载事实。
+      refresh()
+    }
   }
 
   async function moveMedia(itemIds: number[], targetDirId: number, label: string): Promise<number> {
     if (itemIds.length === 0) return 0
     busy.value = true
     try {
-      const results = await invokeIpc<MediaRelocationResult[]>(IPC.RELOCATE_MEDIA_ITEMS, {
-        moves: itemIds.map((id) => ({ id, targetDirId })),
-      })
-      if (results.length === 0) return 0 // 无实际移动（已在目标目录）
-      undoStack.value.push({
-        type: 'moveMedia',
-        items: results.map((r) => ({ id: r.id, fromDirId: r.fromDirId })),
-        targetDirId,
-        label,
-      })
-      redoStack.value = []
-      refresh()
-      return results.length
+      const result = await relocateMedia(itemIds.map((id) => ({ id, targetDirId })))
+      if (result.completed.length) {
+        undoStack.value.push({
+          type: 'moveMedia',
+          items: result.completed.map((r) => ({ id: r.id, fromDirId: r.fromDirId })),
+          targetDirId,
+          label,
+        })
+        redoStack.value = []
+      }
+      // 先登记真实成功项，随后仍向发起方报告未完成，不能把部分成功伪装为全部成功。
+      if (result.failure) throw parseAppError(result.failure.error)
+      return result.completed.length
     } finally {
       busy.value = false
     }
@@ -296,21 +329,24 @@ export const useHistoryStore = defineStore('history', () => {
     if (itemIds.length === 0) return 0
     busy.value = true
     try {
-      const results = await invokeIpc<MediaCopyResult[]>(IPC.COPY_MEDIA_ITEMS_DB, {
+      const result = await invokeIpc<MediaCopyBatchResult>(IPC.COPY_MEDIA_ITEMS_DB, {
         moves: itemIds.map((id) => ({ id, targetDirId })),
       })
-      if (results.length === 0) return 0 // 无实际复制（冲突或同目录）
-      undoStack.value.push({
-        type: 'copyMedia',
-        srcIds: itemIds,
-        targetDirId,
-        createdIds: results.map((r) => r.newId),
-        label,
-      })
-      redoStack.value = []
-      refresh()
-      return results.length
+      if (result.completed.length) {
+        undoStack.value.push({
+          type: 'copyMedia',
+          srcIds: result.completed.map((item) => item.srcId),
+          targetDirId,
+          createdIds: result.completed.map((item) => item.newId),
+          label,
+        })
+        redoStack.value = []
+      }
+      // 后续项失败也不能丢掉已落库副本；仅实际复制项产生撤销和重做记录。
+      if (result.failure) throw parseAppError(result.failure.error)
+      return result.completed.length
     } finally {
+      refresh()
       busy.value = false
     }
   }
@@ -347,13 +383,40 @@ export const useHistoryStore = defineStore('history', () => {
 
   // ── Undo / Redo ────────────────────────────────────────────────────────────
   /**
-   * 只弹仍然在栈顶的那条记录。
+   * 按身份移除已经处理的记录，保留异步等待期间追加的新记录。
    *
    * 撤销/重做期间有 await，用户此时新起一次拖拽就会往栈里压新记录——无条件 pop() 会把**别人**
-   * 挤掉。身份比对安全：同一对象的响应式代理由 Vue 按目标对象缓存，两次读出是同一个代理。
+   * 挤掉，只检查栈顶又会留下已撤销记录。Vue 缓存同一对象的代理，可按身份定位原记录。
    */
-  function dropTop(stack: typeof undoStack, rec: OpRecord): void {
-    if (stack.value[stack.value.length - 1] === rec) stack.value.pop()
+  function dropRecord(stack: typeof undoStack, rec: OpRecord): void {
+    const index = stack.value.indexOf(rec)
+    if (index >= 0) stack.value.splice(index, 1)
+  }
+
+  /** 媒体移动按后端实际完成结果拆分两侧历史，保留首个失败项及未执行项供重试。 */
+  async function replayMedia(from: 'undo' | 'redo', rec: MoveMediaRecord): Promise<void> {
+    const source = from === 'undo' ? undoStack : redoStack
+    const destination = from === 'undo' ? redoStack : undoStack
+    const targetBranch = destination.value
+    const result = await relocateMedia(rec.items.map((item) => ({
+      id: item.id, targetDirId: from === 'undo' ? item.fromDirId : rec.targetDirId,
+    })))
+    const completedIds = new Set(result.completed.map((item) => item.id))
+    const completed = rec.items.filter((item) => completedIds.has(item.id))
+    // 请求来自唯一媒体 ID 集合。失败前已在目标的无操作项也已处理，但不产生逆操作。
+    const failedId = result.failure?.id
+    const failedIndex = failedId === undefined ? rec.items.length : rec.items.findIndex((item) => item.id === failedId)
+    const remaining = rec.items.slice(failedIndex)
+    if (remaining.length) rec.items = remaining
+    else dropRecord(source, rec)
+    // 新编辑会替换重做栈；旧撤销的成功子集不能重新填回已作废的分支。
+    if (completed.length && destination.value === targetBranch) {
+      destination.value.push({ ...rec, items: completed })
+    }
+    if (result.failure) throw parseAppError(result.failure.error)
+    useToastStore().addToast('success', i18n.global.t(
+      from === 'undo' ? 'history.undoMoveItems' : 'history.redoMoveItems', { count: completed.length },
+    ))
   }
 
   /**
@@ -368,16 +431,18 @@ export const useHistoryStore = defineStore('history', () => {
     rec: OpRecord,
     reversedMovePending: boolean,
     msg: string,
+    targetBranch: OpRecord[],
   ): void {
     const toast = useToastStore()
     if (from === 'undo') {
-      dropTop(undoStack, rec)
+      dropRecord(undoStack, rec)
       if (!reversedMovePending) {
-        redoStack.value.push(rec)
+        // 只向开始撤销时的分支登记重做，尊重新编辑已经执行的重做清空。
+        if (redoStack.value === targetBranch) redoStack.value.push(rec)
         toast.addToast('success', msg)
       }
     } else {
-      dropTop(redoStack, rec)
+      dropRecord(redoStack, rec)
       if (!reversedMovePending) {
         undoStack.value.push(rec)
         toast.addToast('success', msg)
@@ -389,6 +454,7 @@ export const useHistoryStore = defineStore('history', () => {
     if (!canUndo.value) return
     const toast = useToastStore()
     const rec = undoStack.value[undoStack.value.length - 1]
+    const targetBranch = redoStack.value
     busy.value = true
     try {
       let msg: string
@@ -401,9 +467,8 @@ export const useHistoryStore = defineStore('history', () => {
         await execDeleteCopy(rec)
         msg = i18n.global.t('history.undoCopyFolder', { name: rec.name })
       } else if (rec.type === 'moveMedia') {
-        // 媒体移动：把每项移回原目录。
-        await relocateMedia(rec.items.map((i) => ({ id: i.id, targetDirId: i.fromDirId })))
-        msg = i18n.global.t('history.undoMoveItems', { count: rec.items.length })
+        await replayMedia('undo', rec)
+        return
       } else if (rec.type === 'callback') {
         await rec.undo()
         msg = rec.undoMessage
@@ -413,11 +478,15 @@ export const useHistoryStore = defineStore('history', () => {
         refresh()
         msg = i18n.global.t('history.undoCopyItems', { count: rec.createdIds.length })
       }
-      settleHistory('undo', rec, reversedMovePending, msg)
+      settleHistory('undo', rec, reversedMovePending, msg, targetBranch)
     } catch (e) {
-      // 文件操作可能已失效（目标被外部改动等），照旧丢弃；幂等回调保留供重试。
+      // 复制撤销的路径解析失败发生在回收之前，恢复磁盘访问后仍可重试同一目标。
+      // 媒体移动已拆分成功子集；失败剩余及幂等回调保留供重试。
+      // 媒体副本回收允许部分完成；后端容忍已不存在的副本，保留原 ID 集合即可继续撤销。
       // 注：半完成移动不走这里——它由 runMove 返回 'pending' 并已登记恢复任务。
-      if (rec.type !== 'callback') dropTop(undoStack, rec)
+      if (rec.type === 'copyMedia') refresh()
+      const copyPathUnavailable = rec.type === 'copy' && parseAppError(e).code === 'PathResolution'
+      if (rec.type !== 'callback' && rec.type !== 'moveMedia' && rec.type !== 'copyMedia' && !copyPathUnavailable) dropRecord(undoStack, rec)
       toast.addToast('error', i18n.global.t('common.undoFailed', { error: e }))
     } finally {
       busy.value = false
@@ -428,6 +497,7 @@ export const useHistoryStore = defineStore('history', () => {
     if (!canRedo.value) return
     const toast = useToastStore()
     const rec = redoStack.value[redoStack.value.length - 1]
+    const targetBranch = undoStack.value
     busy.value = true
     try {
       let msg: string
@@ -436,34 +506,49 @@ export const useHistoryStore = defineStore('history', () => {
         reversedMovePending = (await runMove(rec.dirId, rec.name, rec.toParentId)) === 'pending'
         msg = i18n.global.t('history.redoMoveFolder', { name: rec.name })
       } else if (rec.type === 'copy') {
-        const res = await execCopy(rec.sourceDirId, rec.targetDirId)
+        const res = await execCopy(rec.sourceDirId, rec.targetDirId, rec.name)
         rec.createdRootId = res.createdRootId
         rec.createdRelPath = res.createdRelPath
         rec.createdAbsPath = res.createdAbsPath
         msg = i18n.global.t('history.redoCopyFolder', { name: rec.name })
       } else if (rec.type === 'moveMedia') {
-        // 媒体移动：把每项重新移动到目标目录。
-        await relocateMedia(rec.items.map((i) => ({ id: i.id, targetDirId: rec.targetDirId })))
-        msg = i18n.global.t('history.redoMoveItems', { count: rec.items.length })
+        await replayMedia('redo', rec)
+        return
       } else if (rec.type === 'callback') {
         await rec.redo()
         msg = rec.redoMessage
       } else {
-        // copyMedia: re-copy from the original sources; capture the fresh new ids so a
-        // subsequent undo still deletes the right rows.
-        // 媒体复制：从原始源重新复制；记录新的 id，使随后的撤销仍能删除正确的行。
-        const results = await invokeIpc<MediaCopyResult[]>(IPC.COPY_MEDIA_ITEMS_DB, {
+        const result = await invokeIpc<MediaCopyBatchResult>(IPC.COPY_MEDIA_ITEMS_DB, {
           moves: rec.srcIds.map((id) => ({ id, targetDirId: rec.targetDirId })),
         })
-        rec.createdIds = results.map((r) => r.newId)
-        refresh()
-        msg = i18n.global.t('history.redoCopyItems', { count: rec.createdIds.length })
+        // 首个失败之前的同目录无操作已处理；重试只保留失败项及尚未执行的源。
+        const failedIndex = result.failure ? rec.srcIds.indexOf(result.failure.id) : rec.srcIds.length
+        const remaining = rec.srcIds.slice(failedIndex)
+        if (result.completed.length) {
+          undoStack.value.push({
+            ...rec,
+            srcIds: result.completed.map((item) => item.srcId),
+            createdIds: result.completed.map((item) => item.newId),
+          })
+        }
+        if (remaining.length) {
+          rec.srcIds = remaining
+          rec.createdIds = []
+        } else dropRecord(redoStack, rec)
+        if (result.failure) throw parseAppError(result.failure.error)
+        toast.addToast('success', i18n.global.t('history.redoCopyItems', { count: result.completed.length }))
+        return
       }
-      settleHistory('redo', rec, reversedMovePending, msg)
+      settleHistory('redo', rec, reversedMovePending, msg, targetBranch)
     } catch (e) {
-      if (rec.type !== 'callback') dropTop(redoStack, rec)
+      if (rec.type === 'copy' && parseAppError(e).code === 'Cancelled') {
+        toast.addToast('info', i18n.global.t('history.copyCancelled'))
+        return
+      }
+      if (rec.type !== 'callback' && rec.type !== 'moveMedia' && rec.type !== 'copyMedia') dropRecord(redoStack, rec)
       toast.addToast('error', i18n.global.t('history.redoFailed', { error: e }))
     } finally {
+      if (rec.type === 'copyMedia') refresh()
       busy.value = false
     }
   }
@@ -476,6 +561,8 @@ export const useHistoryStore = defineStore('history', () => {
     canRedo,
     move,
     copy,
+    copyProgress,
+    cancelDirectoryCopy,
     moveMedia,
     copyMedia,
     pushUndoable,

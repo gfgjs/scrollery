@@ -1,16 +1,6 @@
-# drift-alarm —— 反向漂移告警(Part6 ③c §8)。
-#
-# 定位:公开仓是私有 canonical 的 SQUASH 投影,不是并行分叉——任何人类在公开仓直接 push 的改动,
-#       会被下一次同步**无声覆盖**(草稿 §8)。本 workflow 在公开仓 sync-staging / main 的每次 push
-#       断言 HEAD 作者 = sync-bot(copy.bara.sky authoring.overwrite 的固定身份);非 bot 提交即红叉告警,
-#       提示改动须回私有仓走同步管线。
-#
-# 与 main ruleset 的 required checks 联动:本 check 列入 main 的必需状态检查后,人类直接落在
-# sync-staging 上的 commit(本 check 红)**无法被提升到 main**——告警之外多一层硬拦截。
-#
-# 🔴 本文件**不被 copy.bara.sky 排除** → 随投影同步到公开仓,在公开仓生效。它也存在于私有仓,但
-#    `if: github.repository` 守门使它只在公开仓执行(同 oss-gate.yml 的模式);私有仓无 sync-staging,
-#    私有 main 的 push 在守门处直接 Skipped,不产生噪声红叉。
+# 公开仓由私有仓投影；直接提交会被下次同步覆盖。
+# 在公开仓 sync-staging/main 的 push 上检查 HEAD 作者是否为 sync-bot。
+# 仓库守卫使本工作流只在公开仓执行。
 name: drift-alarm
 
 on:
@@ -20,7 +10,7 @@ on:
 jobs:
   author-check:
     name: 反向漂移告警
-    # 🔴 只在公开仓执行,私有仓一律跳过。
+    # 只在公开仓执行。
     if: github.repository == 'gfgjs/scrollery'
     runs-on: ubuntu-latest
     steps:

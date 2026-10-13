@@ -1,4 +1,4 @@
-//! 视频格式扩展 · 播放链路 IPC(视频格式扩展子系统 design.md §5)。
+//! 视频播放链路 IPC。
 //!
 //! `resolve_video_playback` 是前端播放入口的唯一后端契约:据判定表([`playback_policy`])返回
 //! 六态(direct / derived / preparing / needs_component / needs_hevc_ext / needs_confirm)。
@@ -6,9 +6,7 @@
 //! (交互优先级)→ 产物 `*.tmp` 同卷 rename 落独立视频池 → finish 回 derived。进度经事件广播
 //! (Channel→事件+快照的缩略图进度先例)。
 //!
-//! 命令壳(本文件,契约面)+ 编排内核([`crate::video::playback_orchestrator`],resolve/派生/
-//! 进度私有调用链)两层结构(超长文件拆分方案 tierB-2):`#[tauri::command]` 属性、函数名、
-//! `Result<T, AppError>` 错误契约原样在本文件不动,内部改为调用编排内核的函数。
+//! 本文件提供命令入口；[`crate::video::playback_orchestrator`] 负责解析、派生和进度编排。
 //!
 //! ## 硬约束落实
 //! - rusqlite 全走 `spawn_blocking`(`db_read_pool` / `db_writer`);不跨 `.await` 持 std Mutex。

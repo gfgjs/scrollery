@@ -1,5 +1,4 @@
-// src/composables/useViewDescriptor.ts
-// R1-2（S4/T4c）· 当前画廊视图 → 后端 ViewDescriptor 的装配点。
+// 当前画廊视图到后端 ViewDescriptor 的装配点。
 //
 // 🔴 与 useJustifiedLayout.compute() 的扁平 filters 装配**一一对应**（同一 UI 状态、两种投影：
 // compute 喂扁平 MediaFilter 给 compute_layout；本函数拆成 scope + GalleryFilter 给 SelectAll
@@ -33,9 +32,7 @@ export function buildCurrentViewDescriptor(): ViewDescriptorDto | null {
   const f: GalleryFilterDto = { ...filter.toApiFilter() }
   let scope: ViewScopeDto = { kind: 'all' }
 
-  // 视图维度 → scope + filter overlay 的映射。precedence 决策由 resolveView 单源提供（S2-c1，
-  // 与 useJustifiedLayout.compute() 共用同一决策，消除此前两处各自内联 precedence 的 🔴 R1-2
-  // 双维护）；本 switch 只做 VD 侧机械映射（scope 判别联合 / filter overlay）。
+  // resolveView 与布局计算共用维度优先级；此处只投影到 scope 与 filter。
   const resolved = resolveView({
     activePersonId: viewStore.activePersonId,
     activeCollection: viewStore.activeCollection,
@@ -74,9 +71,7 @@ export function buildCurrentViewDescriptor(): ViewDescriptorDto | null {
   // 重复镜头态：本描述符**有意**不带 duplicateLens。镜头激活时全部消费入口已被 browse-only
   // gate 阻断（§8.1）——选区被清空且无任何再选中入口（Ctrl+A/框选/右键/卡片勾选全阻断），
   // 「导出当前视图」按钮在镜头态不渲染（GalleryViewControls），故本函数在镜头下不可达。
-  // 未来若给镜头加批量/导出能力，必须先让描述符携带 duplicateLens（scope=all、filter 为空、
-  // orderingVersion；仅 groups 有 SQL lowering，folders 会被 view_to_sql 拒绝），保证
-  // SelectAll/导出与镜头布局同一边界（方案 §10.2）。
+  // 镜头态的批量/导出入口受 gate 阻断，故此描述符不携带 duplicateLens。
   return {
     scope,
     filter: f,

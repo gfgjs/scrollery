@@ -1,4 +1,4 @@
-//! 收藏夹 / 媒体过滤器 / 视图描述符与选择契约域模型(T18 / T14.5)。
+//! 收藏夹、媒体过滤器、视图描述符与选择契约域模型。
 
 use serde::{Deserialize, Serialize};
 
@@ -114,10 +114,9 @@ impl Default for SortSpec {
 }
 
 /// 视图集合来源（决定 FROM/JOIN 与基础谓词）。与 `GalleryFilter` 分工：scope 定**来源**，
-/// filter 在来源上**再筛**。这些字段从 `MediaFilter` 剥离至此（D1），避免「同一语义两处可填、互相打架」。
-/// ⚠️ serde 细节（R1-2 契约定形）：enum 级 `rename_all` 只改**变体名**，不改 struct 变体内的
+/// filter 在来源上**再筛**，避免同一语义两处可填。
+/// serde 的 enum 级 `rename_all` 只改变体名，不改 struct 变体内的
 /// 字段名——各携带字段的变体须自带 `rename_all`，前端才能以 camelCase（directoryId 等）构造。
-/// 此前该路径无前端消费者，形状错配从未暴露；wire 格式已由 queries.rs 的 S1 锁测试钉死。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum ViewScope {

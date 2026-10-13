@@ -8,7 +8,7 @@
 //! - `C == N + 1` → 无空格字符(`use_space = false`);
 //! - `C == N + 2` → `use_space = true`,此时 idx `N+1` = `" "`(PaddleOCR `use_space_char`)。
 //!
-//! 否则报 [`AiError::Ocr`]——这是坑8(词表错配 → 输出乱码)的 OCR 同型防线:
+//! 否则报 [`AiError::Ocr`]，避免字典与识别模型错配后输出乱码：
 //! 拒绝带病服务而非静默算错。
 
 use std::path::Path;

@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// UiField — 表单字段原语（S1 UI primitive）：label + 单个控件（input/select/textarea/range）的统一外壳。
+// 表单字段外壳：label + 单个 input/select/textarea/range 控件。
 //
 // 目的：收敛全库 6 种碎裂的字段包裹范式（清点见 findings 会话续 8），从类型层保证 label 与控件的
 // label 关联——修 A/D/E/F 四类「label 未关联（兄弟 label / span 伪 label）」与「无 label（仅 placeholder）」缺陷。
-// 样式为本原语自持的轻量基座（各消费方原有 scoped 字段类迁移后删除）。
+// 字段基座样式由本组件提供。
 //
 // 两种关联模式（用户裁决：双模并存）：
 //   · nest（默认）：<label> 物理包裹「caption + 控件」→ 隐式关联，无需 id。适合控件可被 label 包裹的多数场景。

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cancel-directory-copy"
+description = "Enables the cancel_directory_copy command without any pre-configured scope."
+commands.allow = ["cancel_directory_copy"]
+
+[[permission]]
+identifier = "deny-cancel-directory-copy"
+description = "Denies the cancel_directory_copy command without any pre-configured scope."
+commands.deny = ["cancel_directory_copy"]

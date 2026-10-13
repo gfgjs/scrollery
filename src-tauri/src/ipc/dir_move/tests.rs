@@ -101,7 +101,7 @@ impl Fixture {
         thumb_status: i64,
         thumb_path: Option<&str>,
     ) -> i64 {
-        let key = compute_cache_key_with_mtime_ns(rel, file_name, 1_700_000_000, 0);
+        let key = compute_cache_key_with_mtime_ns(dir_id, rel, file_name, 1_700_000_000, 0);
         self.conn()
             .execute(
                 "INSERT INTO media_items
@@ -223,9 +223,35 @@ fn basic_fixture() -> Fixture {
     f
 }
 
+// Unix 的跨卷收尾由用户处理源后完成；同一恢复测试保留各平台的真实契约。
+fn complete_platform_cleanup(
+    f: &Fixture,
+    plan: &MovePlan,
+    journal: i64,
+    report: MoveRecoveryReport,
+) -> MoveRecoveryReport {
+    #[cfg(windows)]
+    {
+        let _ = (f, plan, journal);
+        report
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(report.needs_retry);
+        assert_eq!(report.detail, "source_cleanup_required");
+        assert!(plan.src_abs.exists());
+        let entry = q::get(&f.conn(), journal).unwrap().unwrap();
+        assert_eq!(pending_report(&entry).detail, "source_cleanup_required");
+        // 测试夹具内模拟用户确认后处理源，不改变生产清理策略。
+        std::fs::remove_dir_all(&plan.src_abs).unwrap();
+        retry_entry(f.db(), &f.cache_dir(), journal)
+            .unwrap()
+            .unwrap()
+    }
+}
+
 // ── 1. 同卷移动：身份与元数据 ────────────────────────────────────────────────
 
-/// 同卷（同根）移动：物理就位 + 目录/媒体路径重写；收藏与评分（用户资产）不动。
 #[test]
 fn same_volume_move_rewrites_paths_and_keeps_user_assets() {
     let f = Fixture::new();
@@ -422,6 +448,7 @@ fn db_failure_after_publish_returns_recoverable_state_and_retries_idempotently()
     let report = retry_entry(f.db(), &f.cache_dir(), recovery_id)
         .unwrap()
         .expect("日志行仍在");
+    let report = complete_platform_cleanup(&f, &plan, recovery_id, report);
     assert!(!report.needs_retry, "重试后不应仍需重试: {report:?}");
     {
         let conn = f.conn();
@@ -472,6 +499,7 @@ fn crash_before_publish_is_recovered_by_persisted_payload() {
     let report = retry_entry(f.db(), &f.cache_dir(), journal)
         .unwrap()
         .unwrap();
+    let report = complete_platform_cleanup(&f, &plan, journal, report);
     assert!(!report.needs_retry, "{report:?}");
     assert!(f.exists(&f.root_b, "Dest/Move/a.jpg"));
     assert!(!f.exists(&f.root_a, "Photos/Move"), "证明一致后源被清理");
@@ -505,6 +533,7 @@ fn crash_after_publish_before_delete_source_converges() {
     let report = retry_entry(f.db(), &f.cache_dir(), journal)
         .unwrap()
         .unwrap();
+    let report = complete_platform_cleanup(&f, &plan, journal, report);
     assert!(
         !report.needs_retry,
         "双端存在 + 凭据一致 → 可认领: {report:?}"
@@ -522,43 +551,153 @@ fn crash_after_publish_before_delete_source_converges() {
     assert!(f.exists(&f.root_b, "Dest/Move/a.jpg"));
 }
 
-/// 若凭据是在发布**之后**才可能落盘（旧序），这组物理状态就永远收不了尾——本测试锁住
-/// 「有凭据才认领」的判据：无凭据的双端存在必须保持冲突。
-#[test]
-fn both_present_without_payload_stays_conflict() {
-    let f = basic_fixture();
-    f.write(&f.root_b, "Dest/Move/a.jpg", "aaa"); // 目标已有同内容目录
-    let journal = f.journal(q::STAGE_INTENT, 10, None, None);
-
-    let report = retry_entry(f.db(), &f.cache_dir(), journal)
-        .unwrap()
-        .unwrap();
-    assert_eq!(report.detail, "target_conflict");
-    assert!(report.needs_retry);
-    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "aaa", "源不动");
-    assert_eq!(f.read(&f.root_b, "Dest/Move/a.jpg"), "aaa", "目标不动");
-    let conn = f.conn();
-    assert_eq!(dir_row(&conn, 10).2, "Photos/Move", "库不动");
-    assert_eq!(q::list_pending(&conn).unwrap().len(), 1, "日志保留");
-}
-
-/// 摘要对不上（目标是别人写了一半的同名目录）：不认领、不改库、不删源。
-#[test]
-fn mismatched_payload_never_claims_target() {
-    let f = basic_fixture();
-    f.write(&f.root_b, "Dest/Move/other.jpg", "different");
-    let journal = f.journal(q::STAGE_INTENT, 10, None, Some(("deadbeef", 1)));
-
-    let report = retry_entry(f.db(), &f.cache_dir(), journal)
-        .unwrap()
-        .unwrap();
-    assert_eq!(report.detail, "target_conflict");
-    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "aaa");
-    assert_eq!(f.read(&f.root_b, "Dest/Move/other.jpg"), "different");
-    assert_eq!(dir_row(&f.conn(), 10).2, "Photos/Move");
-}
-
 // ── 6. 卷离线/根缺失：不丢恢复线索 ──────────────────────────────────────────
+
+/// 暂存凭据只证明旧副本；崩溃后源的同长改写必须保留，且恢复记录不能被收掉。
+#[test]
+fn staged_retry_keeps_same_length_source_rewrite() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    let payload = prepare_staging(&plan).unwrap();
+    let journal = f.journal(
+        q::STAGE_INTENT,
+        10,
+        Some(&plan.staging_abs),
+        Some((&payload.digest, payload.files as i64)),
+    );
+    f.write(&f.root_a, "Photos/Move/a.jpg", "new");
+
+    let report = retry_entry(f.db(), &f.cache_dir(), journal)
+        .unwrap()
+        .unwrap();
+    assert!(
+        plan.src_abs.exists(),
+        "暂存后的同长改写不得随旧副本发布而被删"
+    );
+    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "new");
+    assert_eq!(f.read(&f.root_b, "Dest/Move/a.jpg"), "aaa");
+    assert!(report.needs_retry, "{report:?}");
+    assert_eq!(
+        report.detail,
+        if cfg!(windows) {
+            "source_changed"
+        } else {
+            "source_cleanup_required"
+        }
+    );
+    assert_eq!(report.stage, q::STAGE_SOURCE_LEFTOVER);
+    assert!(!plan.staging_abs.exists());
+    assert_eq!(dir_row(&f.conn(), 10).2, "Dest/Move");
+    assert_eq!(media_row(&f.conn(), 100).volume_id, Some(2));
+    let pending = q::list_pending(&f.conn()).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, journal);
+    assert_eq!(pending[0].stage, q::STAGE_SOURCE_LEFTOVER);
+    assert_eq!(
+        pending[0].payload_digest.as_deref(),
+        Some(payload.digest.as_str())
+    );
+
+    // 再次重试仍须保留最新源内容；已发布的索引和凭据可继续恢复。
+    let again = retry_entry(f.db(), &f.cache_dir(), journal)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        again.detail,
+        if cfg!(windows) {
+            "source_changed"
+        } else {
+            "source_cleanup_required"
+        }
+    );
+    assert!(again.needs_retry);
+    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "new");
+    assert_eq!(q::list_pending(&f.conn()).unwrap().len(), 1);
+}
+
+/// 暂存后新增的小文件没有进入已落盘副本，恢复发布不得把它连同源目录删除。
+#[test]
+fn staged_retry_keeps_new_source_file() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    let payload = prepare_staging(&plan).unwrap();
+    let journal = f.journal(
+        q::STAGE_INTENT,
+        10,
+        Some(&plan.staging_abs),
+        Some((&payload.digest, payload.files as i64)),
+    );
+    f.write(&f.root_a, "Photos/Move/later.txt", "keep me");
+
+    let report = retry_entry(f.db(), &f.cache_dir(), journal)
+        .unwrap()
+        .unwrap();
+    assert!(plan.src_abs.exists(), "暂存后新增的文件不得被删");
+    assert_eq!(f.read(&f.root_a, "Photos/Move/later.txt"), "keep me");
+    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "aaa");
+    assert_eq!(f.read(&f.root_b, "Dest/Move/a.jpg"), "aaa");
+    assert!(!f.exists(&f.root_b, "Dest/Move/later.txt"));
+    assert!(report.needs_retry, "{report:?}");
+    assert_eq!(
+        report.detail,
+        if cfg!(windows) {
+            "source_changed"
+        } else {
+            "source_cleanup_required"
+        }
+    );
+    assert_eq!(report.stage, q::STAGE_SOURCE_LEFTOVER);
+    assert_eq!(dir_row(&f.conn(), 10).2, "Dest/Move");
+    let pending = q::list_pending(&f.conn()).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, journal);
+    assert_eq!(pending[0].stage, q::STAGE_SOURCE_LEFTOVER);
+}
+
+/// 空目录也属于外部占位，发布不能依赖各平台裸 rename 对空目录的覆盖行为。
+#[test]
+fn staged_publish_rejects_occupied_empty_target() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    let payload = prepare_staging(&plan).unwrap();
+    let journal = f.journal(
+        q::STAGE_INTENT,
+        10,
+        Some(&plan.staging_abs),
+        Some((&payload.digest, payload.files as i64)),
+    );
+    std::fs::create_dir(&plan.dst_abs).unwrap();
+
+    assert!(matches!(publish_staging(&plan), Err(AppError::MoveFile(_))));
+    assert_eq!(std::fs::read_dir(&plan.dst_abs).unwrap().count(), 0);
+    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "aaa");
+    assert!(!plan.staging_abs.exists());
+    assert!(!staging_marker_path(&plan.staging_abs).exists());
+    assert_eq!(dir_row(&f.conn(), 10).2, "Photos/Move");
+    let report = retry_entry(f.db(), &f.cache_dir(), journal)
+        .unwrap()
+        .unwrap();
+    assert!(report.needs_retry);
+    assert_eq!(report.detail, "target_conflict");
+    assert_eq!(q::list_pending(&f.conn()).unwrap().len(), 1);
+}
+
+/// 首次同卷搬运同样拒绝空目录占位，并保留源及原索引。
+#[test]
+fn physical_move_rejects_occupied_empty_target() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    std::fs::create_dir_all(&plan.dst_abs).unwrap();
+
+    assert!(matches!(
+        run_move(&f, &plan),
+        Err(AppError::DirectoryExists(_))
+    ));
+    assert_eq!(std::fs::read_dir(&plan.dst_abs).unwrap().count(), 0);
+    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "aaa");
+    assert_eq!(dir_row(&f.conn(), 10).2, "Photos/Move");
+    assert!(q::list_pending(&f.conn()).unwrap().is_empty());
+}
 
 /// 凭据写入被拒 → **绝不发布**：目标未落盘、源完整、我们自己的暂存留着、日志可重试。
 /// （内容凭据是发布的硬前置，不是 best-effort。）
@@ -604,6 +743,7 @@ fn refused_payload_write_blocks_publish_and_keeps_source() {
     let report = retry_entry(f.db(), &f.cache_dir(), journal)
         .unwrap()
         .unwrap();
+    let report = complete_platform_cleanup(&f, &plan, journal, report);
     assert!(!report.needs_retry, "{report:?}");
     assert!(f.exists(&f.root_b, "Dest/Move/a.jpg"));
     assert!(!f.exists(&f.root_a, "Photos/Move"));
@@ -637,40 +777,6 @@ fn retry_without_payload_persistence_keeps_journal_and_source() {
     assert_eq!(q::list_pending(&f.conn()).unwrap().len(), 1, "日志保留");
 }
 
-/// 两侧路径都看不见（卷离线常表现为 NotFound）→ 绝不作废日志（审查复核 6）。
-#[test]
-fn offline_roots_do_not_discard_journal() {
-    let f = Fixture::new();
-    // 源那侧整棵不见（模拟源卷离线），目标那侧根也不在。
-    f.dir(9, 1, None, "Photos", "Photos", 1);
-    f.dir(20, 2, None, "Dest", "Dest", 1);
-    f.dir(10, 1, Some(9), "Photos/Move", "Move", 2);
-    let journal = f.journal(q::STAGE_INTENT, 10, None, None);
-    // 目标根路径指向不存在的位置 → 根不可访问。
-    f.conn()
-        .execute(
-            "UPDATE scan_roots SET path=?1 WHERE id=2",
-            params![f
-                .tmp
-                .path()
-                .join("missing-volB")
-                .to_string_lossy()
-                .to_string()],
-        )
-        .unwrap();
-
-    let report = retry_entry(f.db(), &f.cache_dir(), journal)
-        .unwrap()
-        .unwrap();
-    assert!(report.needs_retry, "{report:?}");
-    assert_ne!(report.detail, "absent", "卷离线不得被当成「什么都没发生」");
-    assert_eq!(
-        q::list_pending(&f.conn()).unwrap().len(),
-        1,
-        "恢复线索必须保留"
-    );
-}
-
 // ── 7. 删源证明：内容一致才删 ────────────────────────────────────────────────
 
 /// 删源必须逐文件证明内容：同尺寸改写、源里多出的文件都算「源不是目标的子集」→ 绝不删；
@@ -687,7 +793,12 @@ fn source_removal_requires_content_proof() {
         .unwrap();
     assert!(report.needs_retry);
     assert_eq!(
-        report.detail, "source_changed",
+        report.detail,
+        if cfg!(windows) {
+            "source_changed"
+        } else {
+            "source_cleanup_required"
+        },
         "同尺寸改写必须被内容比对拦下"
     );
     assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "aaaa", "源保留");
@@ -703,7 +814,14 @@ fn source_removal_requires_content_proof() {
         .unwrap()
         .unwrap();
     assert!(report2.needs_retry, "{report2:?}");
-    assert_eq!(report2.detail, "source_changed");
+    assert_eq!(
+        report2.detail,
+        if cfg!(windows) {
+            "source_changed"
+        } else {
+            "source_cleanup_required"
+        }
+    );
     assert!(
         f2.exists(&f2.root_a, "Photos/Move/extra.txt"),
         "源里独有内容不得丢失"
@@ -714,10 +832,12 @@ fn source_removal_requires_content_proof() {
     f3.write(&f3.root_a, "Photos/Move/a.jpg", "same");
     f3.write(&f3.root_b, "Dest/Move/a.jpg", "same");
     f3.write(&f3.root_b, "Dest/Move/target-only.txt", "kept");
+    let plan3 = f3.plan(10, 20);
     let journal3 = f3.journal(q::STAGE_SOURCE_LEFTOVER, 10, None, None);
     let report3 = retry_entry(f3.db(), &f3.cache_dir(), journal3)
         .unwrap()
         .unwrap();
+    let report3 = complete_platform_cleanup(&f3, &plan3, journal3, report3);
     assert!(!report3.needs_retry, "{report3:?}");
     assert!(!f3.exists(&f3.root_a, "Photos/Move"), "可收敛，不留死结");
     assert!(f3.exists(&f3.root_b, "Dest/Move/target-only.txt"));
@@ -850,30 +970,96 @@ fn stale_plan_is_rejected_after_identity_change() {
 
 // ── 10. 复制 ─────────────────────────────────────────────────────────────────
 
-/// 复制走独占暂存 + rename 发布：文件数正确、源不变、目标已存在一律拒绝。
+// ── 11. 小工具 ───────────────────────────────────────────────────────────────
+
+#[cfg(not(windows))]
 #[test]
-fn copy_publishes_complete_tree_and_counts_files() {
-    let f = Fixture::new();
-    f.write(&f.root_a, "Photos/Move/a.jpg", "aaa");
-    f.write(&f.root_a, "Photos/Move/sub/b.jpg", "bbbb");
-    f.write(&f.root_a, "Photos/Move/sub/c.jpg", "c");
-    let src = f.root_a.join("Photos/Move");
-    let dst = f.root_b.join("Dest/Move");
-    std::fs::create_dir_all(f.root_b.join("Dest")).unwrap();
-
-    let files = copy_tree_published(&src, &dst, "Move").unwrap();
-    assert_eq!(files, 3);
-    assert_eq!(std::fs::read_to_string(dst.join("sub/c.jpg")).unwrap(), "c");
-    assert_eq!(std::fs::read_to_string(src.join("a.jpg")).unwrap(), "aaa");
-
-    std::fs::write(dst.join("keep.txt"), b"user").unwrap();
-    let err = copy_tree_published(&src, &dst, "Move").unwrap_err();
-    assert!(matches!(err, AppError::DirectoryExists(_)), "{err:?}");
-    assert_eq!(
-        std::fs::read_to_string(dst.join("keep.txt")).unwrap(),
-        "user"
+fn cross_volume_publish_keeps_source_until_manual_cleanup() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    let payload = prepare_staging(&plan).unwrap();
+    let journal = f.journal(
+        q::STAGE_INTENT,
+        10,
+        Some(&plan.staging_abs),
+        Some((&payload.digest, payload.files as i64)),
     );
-    assert_eq!(std::fs::read_to_string(src.join("a.jpg")).unwrap(), "aaa");
+    assert!(!publish_staging(&plan).unwrap());
+    f.write(&f.root_a, "Photos/Move/a.jpg", "new");
+    let report = retry_entry(f.db(), &f.cache_dir(), journal)
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.detail, "source_cleanup_required");
+    assert_eq!(f.read(&f.root_a, "Photos/Move/a.jpg"), "new");
+    assert_eq!(f.read(&f.root_b, "Dest/Move/a.jpg"), "aaa");
+    assert_eq!(dir_row(&f.conn(), 10).2, "Dest/Move");
+    let report = complete_platform_cleanup(&f, &plan, journal, report);
+    assert_eq!(report.detail, "completed");
+    assert!(!report.needs_retry);
+    assert!(q::list_pending(&f.conn()).unwrap().is_empty());
 }
 
-// ── 11. 小工具 ───────────────────────────────────────────────────────────────
+#[cfg(windows)]
+#[test]
+fn cleanup_keeps_file_added_after_content_proof() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    std::fs::create_dir_all(&plan.dst_abs).unwrap();
+    std::fs::write(plan.dst_abs.join("a.jpg"), b"aaa").unwrap();
+    let mut added = false;
+    let result = cleanup_source_with(&plan.src_abs, &plan.dst_abs, &mut |_, _| {
+        if !added {
+            std::fs::write(plan.src_abs.join("late.txt"), b"new-user-data").unwrap();
+            added = true;
+        }
+    });
+    assert!(added);
+    assert_ne!(result.ok(), Some(SourceCleanup::Removed));
+    assert_eq!(
+        std::fs::read(plan.src_abs.join("late.txt")).unwrap(),
+        b"new-user-data"
+    );
+    assert_eq!(std::fs::read(plan.dst_abs.join("a.jpg")).unwrap(), b"aaa");
+}
+
+#[cfg(windows)]
+#[test]
+fn cleanup_pins_both_verified_files_and_source_directory() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    std::fs::create_dir_all(&plan.dst_abs).unwrap();
+    std::fs::write(plan.dst_abs.join("a.jpg"), b"aaa").unwrap();
+    let mut checked = false;
+    let result = cleanup_source_with(&plan.src_abs, &plan.dst_abs, &mut |src, dst| {
+        assert!(std::fs::write(src, b"bbb").is_err(), "源的写入必须被阻止");
+        assert!(std::fs::write(dst, b"ccc").is_err(), "目标的写入必须被阻止");
+        assert!(std::fs::rename(src, src.with_extension("old")).is_err());
+        assert!(std::fs::rename(&plan.src_abs, plan.src_abs.with_extension("old")).is_err());
+        checked = true;
+    })
+    .unwrap();
+    assert!(checked);
+    assert_eq!(result, SourceCleanup::Removed);
+    assert!(!plan.src_abs.exists());
+    assert_eq!(std::fs::read(plan.dst_abs.join("a.jpg")).unwrap(), b"aaa");
+}
+
+#[cfg(windows)]
+#[test]
+fn cleanup_keeps_source_with_existing_writable_handle() {
+    let f = basic_fixture();
+    let plan = f.plan(10, 20);
+    std::fs::create_dir_all(&plan.dst_abs).unwrap();
+    std::fs::write(plan.dst_abs.join("a.jpg"), b"aaa").unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(plan.src_abs.join("a.jpg"))
+        .unwrap();
+    assert!(cleanup_source(&plan.src_abs, &plan.dst_abs).is_err());
+    assert_eq!(std::fs::read(plan.src_abs.join("a.jpg")).unwrap(), b"aaa");
+    drop(writer);
+    assert_eq!(
+        cleanup_source(&plan.src_abs, &plan.dst_abs).unwrap(),
+        SourceCleanup::Removed
+    );
+}

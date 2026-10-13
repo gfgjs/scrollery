@@ -425,7 +425,7 @@ function onBlur() {
   bottom: 0;
   /* 整轨可点/可拖（旧 mini-timeline 是 pointer-events:none，仅圆点可点；scrubber 需整轨拖拽）。 */
   cursor: pointer;
-  touch-action: none; /* 防止移动端拖拽被浏览器手势抢走 */
+  touch-action: none; /* 防止指针拖拽被浏览器手势抢走 */
 }
 /* 键盘聚焦轮廓：仅键盘导航时显示，指针点击不打扰视觉。 */
 .tl-scrubber:focus-visible {

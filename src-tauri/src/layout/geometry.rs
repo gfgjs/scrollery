@@ -75,13 +75,10 @@ pub struct SlimRowItem {
     pub h: f64,
 }
 
-/// 线上（IPC）布局行：serde 形状与 S3 前的 LayoutRow 完全一致（rowType 标签、camelCase），
-/// **前端零改动**。由出口拼装产生（[`crate::layout::items_cache::hydrate_rows`]），不常驻。
+/// 线上（IPC）布局行，由 [`crate::layout::items_cache::hydrate_rows`] 按需拼装，不常驻。
 ///
-/// 重复镜头增量（2026-09-02 主画廊重复项浏览方案 §11.2）：Separator 变体的镜头字段全部
-/// 可选 + `skip_serializing_if`——普通画廊（P0 起的既有路径）序列化时这些键**不存在**，
-/// wire 形状与方案前逐字节一致；P1 镜头布局实现时才由镜头出口填值。`default` 使旧 JSON
-/// （无新键）仍可反序列化（双向兼容）。
+/// 重复镜头的 Separator 字段可选且跳过空值，普通画廊的 wire 不包含这些键；
+/// `default` 允许反序列化缺少镜头字段的旧 JSON。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "rowType")]
 pub enum HydratedRow {
@@ -264,9 +261,8 @@ pub struct LayoutRowItem {
     pub original_width: i64,
     pub original_height: i64,
     pub sort_datetime: i64,
-    /// 重复镜头逐项增量（方案 §11.1，P1 起才有生产者）：分类桶 + 组内/组间序号 + 组成员数。
-    /// 全部可选 + skip：普通画廊线上 JSON 不含这些键（wire 不膨胀）；常驻 `LayoutRowItem`
-    /// 不加字段——P1 镜头布局在出口拼装层按需填值。
+    /// 重复镜头逐项字段：分类桶、组内/组间序号和组成员数。
+    /// 普通画廊线上 JSON 不含空字段；镜头布局在出口拼装时填值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duplicate_bucket: Option<DuplicateBucket>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,7 +273,6 @@ pub struct LayoutRowItem {
     pub duplicate_member_count: Option<u32>,
 }
 
-// ── Layout parameters ─────────────────────────────────────────────────────────
 // ── 布局参数 ─────────────────────────────────────────────────────────
 
 pub struct LayoutParams {
@@ -295,7 +290,6 @@ pub struct LayoutParams {
 /// 分隔符固定高度(justified / grid 共用)。
 pub(super) const SEPARATOR_HEIGHT: f64 = 36.0;
 
-// ── Shared helpers (justified + grid) ──────────────────────────────────────────
 // ── 共享辅助（justified + grid 两种布局共用）────────────────────────────────────
 
 /// 出口拼装（S3 几何/载荷分离）：瘦行项几何 + `LayoutItem` 载荷 → 线上行项。字段集与
@@ -337,7 +331,7 @@ pub fn hydrate_item(
         original_width: item.width,
         original_height: item.height,
         sort_datetime: item.sort_datetime,
-        // P0 契约冻结：镜头字段无生产者，恒 None（P1 镜头出口才填值）。
+        // 普通布局不生成镜头字段；镜头出口按 id 填值。
         duplicate_bucket: None,
         duplicate_group_ordinal: None,
         duplicate_member_ordinal: None,

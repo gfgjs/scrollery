@@ -1,10 +1,7 @@
 <script setup lang="ts">
-// UiDialog（S1 原语）：全库模态对话框的唯一实现。
-// 此前 7 个对话框各自逐字重复 ~120 行骨架,且 CloseConfirmDialog 漏用 Teleport(原位渲染,
-// z-index 可被祖先层叠上下文裁剪)。本原语收敛「模态外壳 + Teleport + 焦点陷阱接线 +
-// Escape/点遮罩关闭」为单一可测源:外壳走全局 .dialog-overlay/.dialog-content 基座
-// + 本地 scoped 补齐 header/body/footer(全局基座见 index.css A2 层);焦点陷阱复用既有 useFocusTrap
-// (初始焦点目标 data-autofocus 落在消费方插槽,querySelector 跨插槽命中——见 useFocusTrap:70)。
+// 全库模态对话框共用 Teleport、焦点陷阱、Escape 和遮罩关闭行为。
+// 外壳使用全局 .dialog-overlay/.dialog-content，头部、正文和页脚样式由本组件补齐。
+// 消费方可在插槽内用 data-autofocus 指定初始焦点。
 import { ref } from 'vue'
 import { X } from '@lucide/vue'
 import { useFocusTrap } from '../../composables/useFocusTrap'

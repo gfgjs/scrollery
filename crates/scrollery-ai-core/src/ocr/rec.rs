@@ -16,7 +16,7 @@ use crate::error::{AiError, Result};
 use crate::ocr_profile::OcrProfile;
 
 /// CTC 贪心解码:`logits` 为 `[T, C]` 行主序(T 个时间步各 C 类)。
-/// 返回 `(text, conf)`;`class_check` 内含 rec/dict 契约自检(坑8 同型防线)。
+/// 返回 `(text, conf)`；`class_check` 校验识别模型与字典的类别数契约。
 pub(crate) fn ctc_greedy_decode(
     logits: &[f32],
     t: usize,

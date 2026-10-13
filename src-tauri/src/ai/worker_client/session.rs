@@ -1,11 +1,11 @@
 // src-tauri/src/ai/worker_client/session.rs
-//! B 组:会话协议组装(CLIP 会话 + OCR 会话,D-OCR-1 双槽独立)。
+//! CLIP 与 OCR 会话的协议组装；两类会话使用独立槽。
 
 use super::*;
 
 impl AiWorkerClient {
     /// 确保 worker 会话与 `spec` 一致,返回会话快照(embed_dim 等校验参数来源)。
-    /// 快照匹配时零帧直接返回;不符先 close 再 init(切换语义)。
+    /// 快照匹配时零帧返回；同模型补载角色，切模型先 close 再 init。
     ///
     /// 失败按 [`EnsureError`] 二分:进程级(死管道/超时/协议违例)由 `run_validated`
     /// 的 attempt 圈重建重试;数据级(模型加载失败等 worker 明确拒绝)重试同死,直接冒泡。
@@ -14,31 +14,54 @@ impl AiWorkerClient {
         spec: &SessionSpec,
         cancelled: &dyn Fn() -> bool,
     ) -> std::result::Result<SessionDescriptor, EnsureError> {
+        if cancelled() {
+            return Err(EnsureError::Terminal(AppError::Cancelled));
+        }
         // spawn 失败(exe 缺失等)是确定性环境问题,重试无意义 → 数据级。
         self.ensure_worker().map_err(EnsureError::Terminal)?;
         // 借用分离:先只读比对,需要切换时再取 &mut。
+        let mut requested = spec.clone();
         let need_switch = {
             let w = self.worker.as_ref().expect("ensure_worker 后必有实例");
             match w.session() {
                 Some(desc) if spec.matches(desc) => return Ok(desc.clone()),
+                Some(desc) if spec.can_extend(desc) => {
+                    requested.roles.image |= desc.caps.iter().any(|c| c == capability::EMBEDDING);
+                    requested.roles.text |=
+                        desc.caps.iter().any(|c| c == capability::TEXT_ENCODING);
+                    if requested.face_profile.is_none() {
+                        requested.face_profile = desc
+                            .face_profile_id
+                            .as_deref()
+                            .and_then(crate::ai::face_profile::find_face_profile);
+                    }
+                    requested.batch_size = requested.batch_size.max(desc.batch_size);
+                    false
+                }
                 Some(_) => true,
                 None => false,
             }
         };
         if need_switch {
             let w = self.worker.as_mut().expect("上方已确保实例");
-            let _ = w.close_session(op_timeouts::SESSION_CLOSE, cancelled);
+            if matches!(
+                w.close_session(op_timeouts::SESSION_CLOSE, cancelled),
+                RawOutcome::Cancelled
+            ) {
+                return Err(EnsureError::Terminal(AppError::Cancelled));
+            }
             // close 的进程级失败已由 Supervisor kill;重建后继续走 init。
             self.ensure_worker().map_err(EnsureError::Terminal)?;
         }
 
         let session_id = self.next_session_id;
         self.next_session_id += 1;
-        let req = build_session_init(session_id, spec, &mut self.sha_cache)
+        let req = build_session_init(session_id, &requested, &mut self.sha_cache)
             .map_err(EnsureError::Terminal)?;
 
         let w = self.worker.as_mut().expect("上方已确保实例");
         match w.init_session(&req, op_timeouts::SESSION_INIT, cancelled) {
+            RawOutcome::Cancelled => Err(EnsureError::Terminal(AppError::Cancelled)),
             RawOutcome::Success { .. } => w.session().cloned().ok_or_else(|| {
                 EnsureError::Terminal(AppError::Internal("init_session 成功但无会话快照".into()))
             }),
@@ -73,6 +96,9 @@ impl AiWorkerClient {
         spec: &OcrSessionSpec,
         cancelled: &dyn Fn() -> bool,
     ) -> std::result::Result<(), EnsureError> {
+        if cancelled() {
+            return Err(EnsureError::Terminal(AppError::Cancelled));
+        }
         self.ensure_worker().map_err(EnsureError::Terminal)?;
         // 换代/自杀后 ocr_loaded 已在 drop_worker/ensure_worker 复位;此处只比对在载 id。
         if self.ocr_loaded.as_deref() == Some(spec.profile.id.as_str()) {
@@ -85,6 +111,7 @@ impl AiWorkerClient {
 
         let w = self.worker.as_mut().expect("ensure_worker 后必有实例");
         match w.run_batch(&req, op_timeouts::OCR_SESSION_INIT, cancelled) {
+            RawOutcome::Cancelled => Err(EnsureError::Terminal(AppError::Cancelled)),
             RawOutcome::Success { body, .. } if body.ocr_session.is_some() => {
                 self.ocr_loaded = Some(spec.profile.id.clone());
                 Ok(())
@@ -124,25 +151,28 @@ impl AiWorkerClient {
     }
 }
 
-/// 组装 SessionInit 请求:按 profile 契约列模型角色(CLIP 成对必备;face 按 spec 成对),
+/// 组装 SessionInit 请求:按所需角色列模型文件，face 按 spec 成对，
 /// 逐模型带 len+sha256(D1 §3;sha 经 mtime+len 备忘,GB 级文件不重算)。
 pub(super) fn build_session_init(
     session_id: u64,
     spec: &SessionSpec,
     sha_cache: &mut HashMap<PathBuf, ShaEntry>,
 ) -> Result<RequestBody> {
-    let mut models = vec![
-        model_descriptor(
+    let mut models = Vec::new();
+    if spec.roles.image {
+        models.push(model_descriptor(
             ModelRole::ImageEncoder,
             &spec.models_dir.join(&spec.profile.image_file),
             sha_cache,
-        )?,
-        model_descriptor(
+        )?);
+    }
+    if spec.roles.text {
+        models.push(model_descriptor(
             ModelRole::TextEncoder,
             &spec.models_dir.join(&spec.profile.text_file),
             sha_cache,
-        )?,
-    ];
+        )?);
+    }
     if let Some(fp) = &spec.face_profile {
         models.push(model_descriptor(
             ModelRole::FaceDetect,
@@ -256,7 +286,7 @@ fn model_descriptor(
 pub fn build_session_spec(
     state: &crate::state::AppState,
     profile: ModelProfile,
-    face_profile: Option<FaceProfile>,
+    purpose: SessionPurpose<'_>,
 ) -> SessionSpec {
     let models_dir = crate::ai::runtime_config::models_dir(state);
     let ai_cache_dir = state
@@ -270,8 +300,26 @@ pub fn build_session_spec(
         .get("ai_provider_override")
         .unwrap_or_else(|| "auto".to_string());
     let batch_size = crate::ai::pipeline::resolve_batch_size(state, &profile) as u32;
+    let (roles, face_profile) = match purpose {
+        SessionPurpose::Image => (
+            ClipRoles {
+                image: true,
+                text: false,
+            },
+            None,
+        ),
+        SessionPurpose::Text => (
+            ClipRoles {
+                image: false,
+                text: true,
+            },
+            None,
+        ),
+        SessionPurpose::Face(fp) => (ClipRoles::default(), Some(fp.clone())),
+    };
     SessionSpec {
         profile,
+        roles,
         face_profile,
         models_dir,
         ai_cache_dir,

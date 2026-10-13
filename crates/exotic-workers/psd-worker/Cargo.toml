@@ -1,13 +1,11 @@
 # crates/exotic-workers/psd-worker/Cargo.toml
-# PSD 缩略图 Worker（v3 Part2 §3.5）。长驻子进程：stdin 收协议帧、stdout 回协议帧、stderr 写日志。
+# PSD 缩略图 Worker：stdin/stdout 传协议帧，stderr 写日志。
 # 只声明 probe 实测通过范围（RGB 8-bit + merged image，raw）；CMYK/16-bit/PSB/无 merged → 稳定错误码。
 #
 # 锁定 `psd =0.3.5`（探针结论只对该版本成立，见 exotic-psd-probe-report.md）。
 
 [package]
 name = "psd-worker"
-# 0.1.1(2026-07-05):功能零变化的版本 bump——制造 worker_version 变化的 registry v3,
-# 真机验证「升级 → 版本对账 → done 任务失效重做」链路(病历 #4 修复的观察面)。
 version = "0.1.1"
 edition = "2021"
 license.workspace = true # 第一方许可:AGPL-3.0-only(2026-09-14 决议,根 [workspace.package] 单一事实源)

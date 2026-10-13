@@ -1,9 +1,4 @@
-// 全局/通用命令(顶栏重构 P2-2)。本册目前聚焦「右键菜单收敛(P2-3)」所需的上下文命令:
-// 复制图像 / 在资源管理器显示 / 设为壁纸。三者均上下文无关(目标由 ctx.contextTarget.id 给),
-// run 自足(invokeIpc)。move/copy 因需各宿主的本地对话框实例,由宿主组件以本地 Command 提供
-// (见 contextMenu.ts / MediaGrid / ContentViewer),不入本册。
-//
-// 网格 navigation 命令(undo/redo/全屏)在 grid.ts(P3 交付);密集值选择器类控件不入注册表。
+// 通用右键命令从 contextTarget 取得目标；移动和复制文件的对话框由各宿主提供。
 
 import { markRaw } from 'vue'
 import { Copy, FolderOpen, Monitor } from '@lucide/vue'
@@ -12,7 +7,6 @@ import { invokeIpc } from '../../utils/ipc'
 import { logger } from '../../utils/logger'
 import { IPC } from '../../constants/ipc'
 import { useToastStore } from '../../stores/toastStore'
-import { isMobilePlatform } from '../../utils/platform'
 import i18n from '../../i18n'
 
 const t = (key: string) => i18n.global.t(key)
@@ -38,9 +32,7 @@ export const globalCommands: Command[] = [
     icon: markRaw(FolderOpen),
     group: 'overflow',
     order: 20,
-    // 移动端 opener 不支持 reveal(D-001):动作整个不出,后端 unsupported_platform 只是
-    // 被直调时的兜底(R-09)。
-    when: (ctx) => ctx.contextTarget != null && !isMobilePlatform,
+    when: (ctx) => ctx.contextTarget != null,
     run: async (ctx) => {
       if (!ctx.contextTarget) return
       // 此前是 `.catch(() => {})` 静默吞——那时后端是 `Command::spawn` 发射后不管、几乎不会失败,

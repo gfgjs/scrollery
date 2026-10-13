@@ -79,36 +79,12 @@ export interface ComputeLayoutParams {
   gap: number
 }
 
-export interface ThumbResultCounts {
-  available: number
-  direct: number
-  failed: number
-  newlyGenerated: number
-  cacheHit: number
-  temporarilyUnavailable: number
-}
-
-/** 本轮新发布产物的实际后端；null 表示宿主尚未提供阶段事实。 */
-export interface ThumbExecutionCount {
-  native: {
-    backend: 'embeddedJpeg' | 'imageD2d' | 'imageWic' | 'imageRs' | 'videoMf' | 'videoMfHardwareMft' | 'imageVpl'
-    vendorId: number
-    deviceId: number
-    luidHigh: number
-    luidLow: number
-    adapterKind: 'unknown' | 'integrated' | 'discrete'
-  } | null
-  count: number
-}
-
 export interface FullThumbProgressPayload {
   generated: number
   total: number
-  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error'
+  status: 'running' | 'completed' | 'cancelled' | 'error'
   currentItem?: string
   phase?: string
-  results: ThumbResultCounts
-  executions: ThumbExecutionCount[]
 }
 
 // ── 精确内容去重 ─────────────────────────────────────────────────────────
@@ -139,11 +115,7 @@ export interface DedupStatusSnapshot {
   errors: DedupErrorSummary[]
   waitingOn: string[]
 }
-// 组浏览响应（DuplicateGroup/DuplicateMember/KeysetPage）与文件夹复核/清理草案类型
-// （DuplicateFolder*/DedupFolderCleanup*）已随旧 /duplicates 前端在 P4 退场删除；
-// 后端对应 IPC 暂保留，待清理体验设计定案后再统一收口。
-
-// ── 目录移动（P0-1：半完成恢复）─────────────────────────────────────────────
+// ── 目录移动的半完成恢复 ────────────────────────────────────────────────
 
 /** move_directory 的结果（file_ops_commands.rs 的 MoveDirResult）。 */
 export interface MoveDirResult {
@@ -160,6 +132,14 @@ export interface MoveDirResult {
   recoveryId: number | null
 }
 
+/** 目录复制的累计进度；publishing 后以命令返回值判定最终结果。 */
+export interface DirectoryCopyProgress {
+  generation: number
+  copiedFiles: number
+  copiedBytes: number
+  publishing: boolean
+}
+
 /** copy_directory 的结果（file_ops_commands.rs 的 CopyDirResult）。 */
 export interface CopyDirResult {
   createdRootId: number
@@ -169,6 +149,26 @@ export interface CopyDirResult {
   copiedFiles: number
   /** 需要调用方触发目标根重扫把新文件入库（入库失败不代表复制失败）。 */
   needsRescan: boolean
+}
+
+/** 单项实际完成的媒体移动，保留原目录以构造逆操作。 */
+export interface MediaRelocationResult {
+  id: number
+  fromDirId: number
+  targetDirId: number
+}
+
+/** 批量移动遇首个失败即停止；同目录无操作不计入 completed。 */
+export interface MediaRelocationBatchResult {
+  completed: MediaRelocationResult[]
+  /** 失败项及稳定 IPC 错误；它之后的请求尚未执行。 */
+  failure: { id: number; error: { code: string; message: string } } | null
+}
+
+/** 批量复制的实际成功项与首个失败项；失败后的请求尚未执行。 */
+export interface MediaCopyBatchResult {
+  completed: { srcId: number; newId: number }[]
+  failure: { id: number; error: { code: string; message: string } } | null
 }
 
 /** 未完成目录移动的报告（dir_move.rs 的 MoveRecoveryReport）。 */
@@ -186,4 +186,20 @@ export interface DirectoryMoveRecovery {
   needsRetry: boolean
   /** 稳定短标签（dir_move.rs 的白名单）；标签→文案映射见 directoryMoveRecoveryStore。 */
   detail: string
+}
+
+/** 已提交图片结果；available 为新生成与缓存复用之和。 */
+export interface ThumbResultCounts {
+  available: number
+  newlyGenerated: number
+  cacheHit: number
+  direct: number
+  failed: number
+  temporarilyUnavailable: number
+}
+
+/** 已发布新图片使用的实际解码后端；空值表示未提供执行信息。 */
+export interface ThumbExecutionCount {
+  backend: string | null
+  count: number
 }

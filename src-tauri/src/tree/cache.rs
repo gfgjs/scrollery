@@ -1,5 +1,5 @@
 // src-tauri/src/tree/cache.rs
-//! 目录快照缓存 —— 支撑「所有文件」模式的**稳定分页**（S 线 §4.2）。
+//! 目录快照缓存，支撑「所有文件」模式的稳定分页。
 //!
 //! ## 为什么需要
 //!
@@ -18,6 +18,7 @@
 //! **同时按两个维度封顶**：快照条数与总条目数。只封条数是不够的 —— 8 个 10 万项目录
 //! ≈ 50MB 常驻，对一个侧栏面板而言不可接受。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::FsEntry;
@@ -55,6 +56,7 @@ pub struct Page {
 pub struct DirSnapshotCache {
     /// 尾部 = 最近使用。容量个位数，`Vec` 线性扫描足够。
     inner: Mutex<Vec<(SnapshotKey, Arc<Vec<FsEntry>>)>>,
+    revision: AtomicU64,
 }
 
 impl Default for DirSnapshotCache {
@@ -67,6 +69,7 @@ impl DirSnapshotCache {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Vec::new()),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -80,9 +83,17 @@ impl DirSnapshotCache {
         Some(snap)
     }
 
-    /// 存快照（同键覆盖），随后按两个维度逐出最久未用者。
-    pub fn put(&self, key: SnapshotKey, snap: Arc<Vec<FsEntry>>) {
+    /// 枚举前捕获的缓存代次；只用于拒绝失效后迟到的快照回填。
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// 目录变化或显式刷新后，旧枚举不能再次填回已失效缓存。
+    pub fn put_if_current(&self, key: SnapshotKey, snap: Arc<Vec<FsEntry>>, revision: u64) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if self.revision.load(Ordering::Acquire) != revision {
+            return false;
+        }
         if let Some(pos) = g.iter().position(|(k, _)| *k == key) {
             g.remove(pos);
         }
@@ -97,17 +108,21 @@ impl DirSnapshotCache {
         while g.len() > 1 && g.iter().map(|(_, v)| v.len()).sum::<usize>() > MAX_TOTAL_ENTRIES {
             g.remove(0);
         }
+        true
     }
 
     /// 失效某扫描根下的全部快照（该根重扫完成/卷状态变化时调用）。
     pub fn invalidate_root(&self, root_id: i64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.revision.fetch_add(1, Ordering::AcqRel);
         g.retain(|(k, _)| k.root_id != root_id);
     }
 
     /// 清空（显式刷新）。
     pub fn clear(&self) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        g.clear();
     }
 }
 
@@ -123,5 +138,30 @@ pub fn slice_page(snap: &[FsEntry], cursor: usize, page_size: usize) -> Page {
         entries: snap[start..end].to_vec(),
         next_cursor: if end < total { Some(end) } else { None },
         total,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalidation_prevents_late_enumeration_from_restoring_stale_cache() {
+        let cache = DirSnapshotCache::new();
+        let key = SnapshotKey {
+            root_id: 1,
+            rel_path: "folder".into(),
+            include_hidden: false,
+        };
+        let revision = cache.revision();
+        cache.invalidate_root(1);
+        assert!(!cache.put_if_current(key.clone(), Arc::new(vec![]), revision));
+        assert!(cache.get(&key).is_none());
+        assert!(cache.put_if_current(key.clone(), Arc::new(vec![]), cache.revision()));
+        assert!(cache.get(&key).is_some());
+        let revision = cache.revision();
+        cache.clear();
+        assert!(!cache.put_if_current(key.clone(), Arc::new(vec![]), revision));
+        assert!(cache.get(&key).is_none());
     }
 }

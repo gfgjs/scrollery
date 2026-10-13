@@ -1,10 +1,10 @@
-//! Document IPC commands (P4, §3.4/§3.5). 文档相关 IPC 命令（P4）。
+//! 文档相关 IPC 命令。
 //!
-//! 首批：文档缩略图的前端离屏渲染回环（§3.4 Lite 路径）。
+//! 文档缩略图由前端离屏渲染并回传：
 //!  - `list_pending_doc_thumbs`：前端领取待渲染的 pdf/svg 文档。
 //!  - `store_doc_thumbnail`：前端回传渲染好的 PNG 字节 → 落盘缩略图缓存 + 回填 media_items/布局缓存。
 //!
-//! 后续阶段（5.x）的替换/版本/校对/阅读进度命令也归入本模块。
+//! 本模块还处理文档版本、编辑、校对与阅读进度。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,6 +27,167 @@ use crate::state::AppState;
 use crate::thumbnail::generator::{encode_media_step_with_snapshot, snap_to_tier, ThumbConfig};
 use crate::utils::format::doc_subtype;
 use crate::utils::path::resolve_media_path;
+
+/// 已授权且已入库的本地文档链接；片段已单次 URL 解码，不向前端返回磁盘路径。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentLinkTarget {
+    pub item_id: i64,
+    pub fragment: Option<String>,
+}
+
+/// 以原资产目录解析相对文档链接，仅打开同一扫描根内已入库的 TXT/MD。
+#[tauri::command]
+pub async fn resolve_document_link(
+    item_id: i64,
+    href: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<DocumentLinkTarget> {
+    let state = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || resolve_document_link_sync(&state, item_id, &href))
+        .await
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+}
+
+fn resolve_document_link_sync(
+    state: &AppState,
+    item_id: i64,
+    href: &str,
+) -> Result<DocumentLinkTarget> {
+    let invalid = || {
+        AppError::PathResolution(
+            "文档链接无效或不可用 | document link invalid or unavailable".into(),
+        )
+    };
+    let (path, fragment) = href
+        .split_once('#')
+        .map_or((href, None), |(path, hash)| (path, Some(hash)));
+    let path = decode_document_link_part(path)?;
+    let fragment = fragment
+        .map(decode_document_link_part)
+        .transpose()?
+        .filter(|value| !value.is_empty());
+    if path.is_empty() || path.starts_with('/') || path.contains(['\\', ':', '?']) {
+        return Err(invalid());
+    }
+    let conn = state.db_read_pool.get()?;
+    let source = q::get_media_item(&conn, item_id)?;
+    if source.is_deleted || source.companion_of.is_some() || source.media_type != "document" {
+        return Err(AppError::MediaNotFound(item_id));
+    }
+    if !matches!(
+        source.file_format.to_ascii_lowercase().as_str(),
+        "txt" | "md"
+    ) {
+        return Err(AppError::UnsupportedFormat(
+            "文档链接仅支持 TXT/MD | document links support TXT/MD only".into(),
+        ));
+    }
+    let directory = q::get_directory(&conn, source.directory_id)?;
+    let root = q::get_scan_root(&conn, directory.root_id)?;
+    let source_rel = if directory.rel_path.is_empty() {
+        source.file_name.clone()
+    } else {
+        format!("{}/{}", directory.rel_path, source.file_name)
+    };
+    crate::utils::path::resolve_within_root(&root.path, &source_rel)?;
+
+    // URL 的父级段先在原资产目录内消解；越过扫描根即拒，现有路径守卫仍保持拒绝原始 .. 的契约。
+    let mut parts: Vec<&str> = directory
+        .rel_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(invalid());
+                }
+            }
+            _ => {
+                #[cfg(windows)]
+                if part.ends_with(['.', ' ']) || part.contains(['<', '>', '"', '|', '*']) {
+                    return Err(invalid());
+                }
+                parts.push(part);
+            }
+        }
+    }
+    let target = crate::utils::path::resolve_within_root(&root.path, &parts.join("/"))?;
+    let root_canonical = std::fs::canonicalize(&root.path).map_err(|_| invalid())?;
+    let relative = target
+        .strip_prefix(&root_canonical)
+        .map_err(|_| invalid())?;
+    if !target.is_file() {
+        return Err(invalid());
+    }
+    let file_name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(invalid)?;
+    let extension = relative
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "md" | "txt") {
+        return Err(AppError::UnsupportedFormat(
+            "文档链接仅支持 TXT/MD | document links support TXT/MD only".into(),
+        ));
+    }
+    // canonical 路径还原真实大小写和根内链接目的地，按目录+文件名索引查找，不扫描整个媒体库。
+    let parent = relative
+        .parent()
+        .and_then(|value| value.to_str())
+        .ok_or_else(invalid)?
+        .replace('\\', "/");
+    let directory_id = q::find_directory_id(&conn, root.id, &parent)?.ok_or_else(invalid)?;
+    let mut media = q::map_media_entities(&conn, directory_id, &[file_name.to_owned()])?;
+    let (target_id, media_type) = media.remove(file_name).ok_or_else(invalid)?;
+    let target_item = q::get_media_item(&conn, target_id)?;
+    if media_type != "document" || !target_item.file_format.eq_ignore_ascii_case(&extension) {
+        return Err(AppError::UnsupportedFormat(
+            "文档链接仅支持 TXT/MD | document links support TXT/MD only".into(),
+        ));
+    }
+    Ok(DocumentLinkTarget {
+        item_id: target_id,
+        fragment,
+    })
+}
+
+// 不借助宽松 URL 解码：畸形转义、非 UTF-8 与控制字符不能变成另一个磁盘目标；百分号只解一轮。
+fn decode_document_link_part(value: &str) -> Result<String> {
+    let invalid =
+        || AppError::PathResolution("文档链接编码无效 | invalid document link encoding".into());
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = bytes
+                .get(index + 1)
+                .and_then(|byte| char::from(*byte).to_digit(16))
+                .ok_or_else(invalid)?;
+            let low = bytes
+                .get(index + 2)
+                .and_then(|byte| char::from(*byte).to_digit(16))
+                .ok_or_else(invalid)?;
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).map_err(|_| invalid())?;
+    if decoded.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    Ok(decoded)
+}
 
 /// 前端创建/更新替换规则的载荷（§5.2）。`id=None` → 插入。
 #[derive(Debug, Deserialize)]
@@ -105,27 +266,20 @@ fn documents_dir(state: &AppState, item_id: i64) -> PathBuf {
 
 /// 读取某版本引用的文本：`None` = 源文件基线；`Some(id)` = 已存版本。
 ///
-/// 编码 seam(阅读器 R1,§5.1):读**字节**再经 `reader::encoding::decode_bytes` 解码为 UTF-8,
-/// 取代原 `std::fs::read_to_string`(遇 GBK/Big5/Shift_JIS 等非 UTF-8 直接 InvalidData 报错)。
-/// 一处修活四链路:阅读(get_document_text)、编辑、版本 diff(diff_versions/get_version_content)、
-/// AI 校对(读生效文本)。R1 不接每书编码覆盖(reader_book_prefs 属 R3),故 override=None。
+/// 全文编辑、版本 diff 与阅读章节共用来源编码：源文件尊重每书覆盖，内部版本固定 UTF-8。
 fn read_ref_text(state: &AppState, item_id: i64, r: Option<i64>) -> Result<String> {
-    let path = match r {
-        None => {
-            let pool = state.db_read_pool.get()?;
-            let (root, rel, name) = q::get_item_path_info(&pool, item_id)?;
-            resolve_media_path(&root, &rel, &name)
-        }
+    let version = match r {
+        None => None,
         Some(vid) => {
             let pool = state.db_read_pool.get()?;
-            let v = q::get_version(&pool, vid)?.ok_or_else(|| {
+            Some(q::get_version(&pool, vid)?.ok_or_else(|| {
                 AppError::Internal(format!("version {vid} not found | 版本不存在"))
-            })?;
-            v.abs_path
+            })?)
         }
     };
-    let bytes = std::fs::read(&path).map_err(AppError::from)?;
-    Ok(crate::reader::encoding::decode_bytes(&bytes, None).text)
+    let reference = resolve_text_ref(state, item_id, version, None)?;
+    let bytes = std::fs::read(&reference.path).map_err(AppError::from)?;
+    Ok(crate::reader::encoding::decode_bytes(&bytes, reference.encoding_override.as_deref()).text)
 }
 
 /// 列出文档的所有版本，最旧在前（§5.3）。
@@ -165,13 +319,12 @@ pub async fn get_document_text(item_id: i64, state: State<'_, Arc<AppState>>) ->
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// 单事务写一个 appdata 版本(方案 B §3.1,原为「插行→写文件→回填」两步非原子):
+/// 单事务写一个 appdata 版本:
 /// 插行(拿 id)→ 派生 `{id}.{ext}` 路径 → 写原子文件 → 回填路径 → commit。
 ///
 /// **文件写在 commit 之前** → 已提交的行必有文件在盘;文件写失败则整事务回滚、行不落库,
-/// 最多留可 GC 的孤儿 tmp(write_atomic 自身失败即清)。杜绝旧两步在①插行 commit 后、
-/// ③写文件前崩溃残留的「committed 行 + 空 abs_path + 无文件」(备份据此产假完整包)。
-/// 抽为纯函数以便单测崩溃语义;**须在持 `db_writer` 锁的 blocking 上下文调用**。
+/// 最多留可 GC 的孤儿 tmp(write_atomic 自身失败即清)。避免提交行指向空路径或缺失文件。
+/// **须在持 `db_writer` 锁的 blocking 上下文调用**。
 /// `&tx` 经 `Transaction: Deref<Target=Connection>` 自动强转喂给收 `&Connection` 的 DAO。
 #[allow(clippy::too_many_arguments)]
 fn write_version_tx(
@@ -202,6 +355,65 @@ fn write_version_tx(
     q::update_version_path(&tx, id, &path.to_string_lossy())?;
     tx.commit()?;
     Ok(id)
+}
+
+fn overwrite_document_source(
+    conn: &rusqlite::Connection,
+    dir: &Path,
+    item_id: i64,
+    src_path: &Path,
+    ext: &str,
+    content: &str,
+) -> Result<i64> {
+    // 源文件可能是旧编码；备份版本按项目版本模型统一存 UTF-8。
+    // 除源不存在外，读取失败必须中止，不能在没有旧源备份时覆盖。
+    let src_bytes = match std::fs::read(src_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(AppError::from(e)),
+    };
+    let source_prefs = q::get_reader_book_prefs(conn, item_id)?;
+    let source_encoding = source_prefs.as_deref().and_then(stored_encoding_override);
+    let src_text =
+        crate::reader::encoding::decode_bytes(&src_bytes, source_encoding.as_deref()).text;
+    let backup_id = write_version_tx(
+        conn,
+        dir,
+        item_id,
+        None,
+        Some("覆盖前自动备份 | auto-backup"),
+        "user",
+        ext,
+        &src_text,
+    )?;
+    // 覆盖后源文件就是生效稿，不能继续让旧的 is_current 版本遮住新内容。
+    // 备份先独立提交；文件替换失败时回滚指针与编码偏好，旧源与备份都仍可用。
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE document_versions SET is_current=0 WHERE item_id=?1",
+        params![item_id],
+    )?;
+    // 保存契约统一输出 UTF-8，新字符可能超出旧编码；只更新编码，保留其余每书偏好。
+    // 先写事务内状态再替换文件，JSON/数据库写入失败时不触碰源文件。
+    tx.execute(
+        "INSERT INTO reader_book_prefs (item_id, prefs, updated_at)
+         VALUES (?1, json_object('encoding', 'UTF-8'), strftime('%s','now'))
+         ON CONFLICT(item_id) DO UPDATE SET
+             prefs=json_set(reader_book_prefs.prefs, '$.encoding', 'UTF-8'),
+             updated_at=strftime('%s','now')",
+        params![item_id],
+    )?;
+    // 自写必须显式失效索引，兼顾低精度文件系统或保留时间戳的等长修改；替换失败随事务回滚。
+    tx.execute(
+        "DELETE FROM text_book_index WHERE item_id=?1",
+        params![item_id],
+    )?;
+    crate::thumbnail::generator::write_atomic(src_path, content.as_bytes())
+        .map_err(AppError::from)?;
+    // 文件替换后若 commit 失败则报错：新源与已提交旧源备份均保留。
+    // 这不是跨文件/DB 原子事务；不能盲目回写原文，避免覆盖期间发生的外部编辑。
+    tx.commit()?;
+    Ok(backup_id)
 }
 
 /// Save edited text. `target`:
@@ -248,7 +460,7 @@ pub async fn save_version(
 
         // 单事务写版本(方案 B §3.1):db_writer 写锁在小体量文档文件落盘期间被持有
         // (文档快照通常 KB~MB 级,可接受),换取「已提交行必有文件」的一致性。逻辑抽到
-        // `write_version_tx` 纯函数以便单测崩溃语义。
+        // `write_version_tx` 负责事务与文件写入的一致性。
         let write_version =
             |label: Option<&str>, parent: Option<i64>, src: &str, text: &str| -> Result<i64> {
                 let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -256,30 +468,8 @@ pub async fn save_version(
             };
 
         if target == "overwrite" {
-            // 编码 seam(R1):源文件可能是 GBK 等,读字节再解码(原 read_to_string 遇非 UTF-8 会吞成空备份,
-            // 造成覆盖前备份丢失)。备份版本按项目版本模型统一存 UTF-8。
-            // 读失败处置(2026-07-10 审查 B1):备份的意义正是覆盖前保底,保底失败仍覆盖会让用户
-            // 唯一副本被无备份替换——除「源不存在」(空备份是准确语义)外,一律中止覆盖。
-            let src_bytes = match std::fs::read(&src_path) {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(e) => return Err(AppError::from(e)),
-            };
-            let src_text = crate::reader::encoding::decode_bytes(&src_bytes, None).text;
-            let backup_id = write_version(
-                Some("覆盖前自动备份 | auto-backup"),
-                None,
-                "user",
-                &src_text,
-            )?;
-            // 原子覆盖(2026-07-06 审查 R9):这是**用户源文件**,直写崩溃留半截比缓存更不可接受
-            // (虽有先行备份可救,但不应依赖救援路径)。同卷 tmp→rename。
-            crate::thumbnail::generator::write_atomic(
-                std::path::Path::new(&src_path),
-                content.as_bytes(),
-            )
-            .map_err(AppError::from)?;
-            Ok(backup_id)
+            let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+            overwrite_document_source(&conn, &dir, item_id, Path::new(&src_path), &ext, &content)
         } else {
             write_version(
                 label.as_deref(),
@@ -413,10 +603,11 @@ pub async fn set_reading_progress(
 
 // ── txt 分章/分段(阅读器 R1,§5.2/§6.3)────────────────────────────────────────
 
-/// 生效文本引用:路径 + 源指纹(缓存键)。源文件用 mtime+size,当前版本用版本 id;附编码覆盖位。
+/// 生效文本引用：路径、实际解码编码与缓存指纹。源文件用纳秒 mtime+size，内部版本用版本 id。
 struct EffectiveRef {
     path: String,
     src_key: String,
+    encoding_override: Option<String>,
 }
 
 /// 前端可见的一章元数据(字节偏移不出 Rust)。
@@ -444,10 +635,24 @@ pub struct TextBookIndexDto {
 pub struct TextChapterContent {
     title: String,
     paragraphs: Vec<String>,
+    /// 与 paragraphs 一一对应的绝对零基源行号，按原文 LF 计数。
+    paragraph_source_lines: Vec<usize>,
+    /// 本章首个非空源行；空章没有可定位标题。
+    title_source_line: Option<usize>,
+    /// 解码原文的 UTF-8 SHA-256；换行也必须相同，才能复用 LF 行号。
+    source_hash: String,
+}
+
+/// 行号与全文身份必须随同一份章节索引缓存，不能把新章节和旧文本摘要混用。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextIndexSnapshot {
+    chapters: Vec<crate::reader::text_index::ChapterMeta>,
+    source_hash: String,
 }
 
 /// 解析 item 的「生效文本」引用(当前版本文件 或 源文件)+ 缓存指纹键。
-/// 指纹随「当前版本 / 源文件 mtime+size / 编码覆盖」变化 → text_book_index 缓存自动失效重建。
+/// 指纹随当前版本、源文件纳秒 mtime+size 或实际编码变化，令 text_book_index 缓存自动失效重建。
 fn effective_text_ref(
     state: &AppState,
     item_id: i64,
@@ -457,13 +662,24 @@ fn effective_text_ref(
         let pool = state.db_read_pool.get()?;
         q::get_current_version(&pool, item_id)?
     };
-    let ov = override_label.unwrap_or("");
-    match cur {
+    resolve_text_ref(state, item_id, cur, override_label)
+}
+
+/// 路径、缓存指纹与解码编码必须来自同一来源，避免将源文件的 GBK 偏好套在 UTF-8 版本上。
+fn resolve_text_ref(
+    state: &AppState,
+    item_id: i64,
+    version: Option<DocumentVersion>,
+    explicit_encoding: Option<&str>,
+) -> Result<EffectiveRef> {
+    match version {
         Some(v) => Ok(EffectiveRef {
-            src_key: format!("ver:{}:{}", v.id, ov),
+            src_key: format!("ver:{}:UTF-8", v.id),
             path: v.abs_path,
+            encoding_override: Some("UTF-8".into()),
         }),
         None => {
+            let encoding_override = resolve_encoding_override(state, item_id, explicit_encoding)?;
             let (root, rel, name) = {
                 let pool = state.db_read_pool.get()?;
                 q::get_item_path_info(&pool, item_id)?
@@ -474,11 +690,18 @@ fn effective_text_ref(
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
+                // 保留文件系统提供的亚秒精度，避免同一秒内等长编辑复用旧标题与字节边界。
+                .map(|d| d.as_nanos())
                 .unwrap_or(0);
             Ok(EffectiveRef {
-                src_key: format!("src:{}:{}:{}", mtime, meta.len(), ov),
+                src_key: format!(
+                    "src:{}:{}:{}",
+                    mtime,
+                    meta.len(),
+                    encoding_override.as_deref().unwrap_or("")
+                ),
                 path,
+                encoding_override,
             })
         }
     }
@@ -518,40 +741,43 @@ fn ensure_text_index(
     state: &AppState,
     item_id: i64,
     eref: &EffectiveRef,
-    override_label: Option<&str>,
-) -> Result<(String, String, Vec<crate::reader::text_index::ChapterMeta>)> {
+) -> Result<(String, String, TextIndexSnapshot)> {
+    // v3 给既有章节边界补原文行号和摘要；旧数组不能提供可靠编辑定位，必须重建。
+    let cache_key = format!("index-v3:{}", eref.src_key);
     // 查缓存
     let cached = {
         let pool = state.db_read_pool.get()?;
         q::get_text_book_index(&pool, item_id)?
     };
     if let Some((src_key, encoding, confidence, chapters_json)) = cached {
-        if src_key == eref.src_key {
-            if let Ok(chapters) =
-                serde_json::from_str::<Vec<crate::reader::text_index::ChapterMeta>>(&chapters_json)
-            {
-                return Ok((encoding, confidence, chapters));
+        if src_key == cache_key {
+            if let Ok(snapshot) = serde_json::from_str::<TextIndexSnapshot>(&chapters_json) {
+                return Ok((encoding, confidence, snapshot));
             }
             // JSON 解析失败(格式漂移)→ 落到重建。
         }
     }
     // 重建:读全文 → 检测编码 + 分章。100MB 级一次顺序读 + 正则,在 blocking 线程可接受;结果入缓存。
     let bytes = std::fs::read(&eref.path).map_err(AppError::from)?;
-    let index = crate::reader::text_index::build_index(&bytes, override_label);
-    let chapters_json = serde_json::to_string(&index.chapters)
+    let index = crate::reader::text_index::build_index(&bytes, eref.encoding_override.as_deref());
+    let snapshot = TextIndexSnapshot {
+        chapters: index.chapters,
+        source_hash: index.source_hash,
+    };
+    let chapters_json = serde_json::to_string(&snapshot)
         .map_err(|e| AppError::Internal(format!("chapters serialize | 章节序列化失败: {e}")))?;
     {
         let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
         q::upsert_text_book_index(
             &conn,
             item_id,
-            &eref.src_key,
+            &cache_key,
             &index.encoding,
             &index.confidence,
             &chapters_json,
         )?;
     }
-    Ok((index.encoding, index.confidence, index.chapters))
+    Ok((index.encoding, index.confidence, snapshot))
 }
 
 /// 读取文件的字节区间 [start, end)(章节按需取,不整读大文件)。宽容短读(文件被截断不 panic)。
@@ -569,8 +795,8 @@ fn read_byte_range(path: &str, start: usize, end: usize) -> Result<Vec<u8>> {
 }
 
 /// 取 txt 文档的章节索引(阅读器 R1,§6.3):首开检测编码 + 分章并落缓存;命中缓存直接返回。
-/// 字节偏移不出 Rust;前端只见「编码 / 置信度 / 章标题 + 字符数」。`encoding_override`:显式一次性
-/// 覆盖(预览用);为 None 时回落每书持久化 prefs.encoding(§5.1 手动切换编码),再否则自动检测。
+/// 字节偏移不出 Rust；前端只见编码、置信度、章标题与字符数。内部版本固定按 UTF-8 读取。
+/// 源文件的 `encoding_override` 用于一次性预览；缺省时使用每书 prefs.encoding，再否则自动检测。
 #[tauri::command]
 pub async fn get_text_book_index(
     item_id: i64,
@@ -581,14 +807,13 @@ pub async fn get_text_book_index(
     let _span = crate::logging::SpanTimer::info("ipc:get_text_book_index");
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || -> Result<TextBookIndexDto> {
-        let ov = resolve_encoding_override(&state, item_id, encoding_override.as_deref())?;
-        let eref = effective_text_ref(&state, item_id, ov.as_deref())?;
-        let (encoding, confidence, chapters) =
-            ensure_text_index(&state, item_id, &eref, ov.as_deref())?;
+        let eref = effective_text_ref(&state, item_id, encoding_override.as_deref())?;
+        let (encoding, confidence, snapshot) = ensure_text_index(&state, item_id, &eref)?;
         Ok(TextBookIndexDto {
             encoding,
             confidence,
-            chapters: chapters
+            chapters: snapshot
+                .chapters
                 .into_iter()
                 .map(|c| TextChapterDto {
                     title: c.title,
@@ -614,33 +839,59 @@ pub async fn get_text_chapter(
     // span 埋点(W1,D-312 info 档:load_document 类,seek+解码+分段,真实 IO/CPU 工作)。
     let _span = crate::logging::SpanTimer::info("ipc:get_text_chapter");
     let state = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> Result<TextChapterContent> {
-        let ov = resolve_encoding_override(&state, item_id, encoding_override.as_deref())?;
-        let eref = effective_text_ref(&state, item_id, ov.as_deref())?;
-        let (encoding, _confidence, chapters) =
-            ensure_text_index(&state, item_id, &eref, ov.as_deref())?;
-        let ch = chapters.get(chapter_index).ok_or_else(|| {
-            AppError::Internal(format!(
-                "chapter index {chapter_index} out of range (total {}) | 章节序号越界",
-                chapters.len()
-            ))
-        })?;
-        let enc =
-            encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
-        let slice = read_byte_range(&eref.path, ch.byte_start, ch.byte_end)?;
-        let (text, _, _) = enc.decode(&slice);
-        // 标题剥离前移到 segment 之前按行进行(2026-07-10 审查 B2):原「分段后比对首段」在
-        // reflow 下必然失配——标题行无句末标点,重排会把它与下一行黏成一段,标题既重复渲染
-        // 又污染正文首段。精确匹配语义与旧实现一致(截断标题不剥,见 strip_title_line 文档)。
-        let body = crate::reader::paragraph::strip_title_line(&text, &ch.title);
-        let paragraphs = crate::reader::paragraph::segment(body, reflow);
-        Ok(TextChapterContent {
-            title: ch.title.clone(),
-            paragraphs,
-        })
+    tokio::task::spawn_blocking(move || {
+        load_text_chapter(
+            &state,
+            item_id,
+            chapter_index,
+            reflow,
+            encoding_override.as_deref(),
+        )
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+}
+
+fn load_text_chapter(
+    state: &AppState,
+    item_id: i64,
+    chapter_index: usize,
+    reflow: bool,
+    encoding_override: Option<&str>,
+) -> Result<TextChapterContent> {
+    let eref = effective_text_ref(state, item_id, encoding_override)?;
+    let (encoding, _confidence, snapshot) = ensure_text_index(state, item_id, &eref)?;
+    let ch = snapshot.chapters.get(chapter_index).ok_or_else(|| {
+        AppError::Internal(format!(
+            "chapter index {chapter_index} out of range (total {}) | 章节序号越界",
+            snapshot.chapters.len()
+        ))
+    })?;
+    let enc = encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    let slice = read_byte_range(&eref.path, ch.byte_start, ch.byte_end)?;
+    let (text, _, _) = enc.decode(&slice);
+    let title_source_line = text
+        .split('\n')
+        .position(|line| !line.trim().is_empty())
+        .map(|line| ch.start_line + line);
+    // 先剥标题再分段，保持既有重排内容；被剥行数仅平移行号，不从渲染文本反查。
+    let body = crate::reader::paragraph::strip_title_line(&text, &ch.title);
+    let removed_lines = text[..text.len() - body.len()]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let segmented = crate::reader::paragraph::segment(body, reflow);
+    Ok(TextChapterContent {
+        title: ch.title.clone(),
+        paragraphs: segmented.paragraphs,
+        paragraph_source_lines: segmented
+            .source_lines
+            .into_iter()
+            .map(|line| ch.start_line + removed_lines + line)
+            .collect(),
+        title_source_line,
+        source_hash: snapshot.source_hash,
+    })
 }
 
 /// 简繁转换(阅读器 §5.10/§6.3):按 config 批量转换文本(config 见 zh_convert::builtin_config,
@@ -1103,10 +1354,10 @@ pub async fn store_doc_thumbnail(
                 size: snap_to_tier(thumb_size),
                 skip_max_bytes: 0,
                 strategy: String::new(),
+                gpu_engine: String::new(),
                 ai_hq_cache: false, // 文档缩略图（前端驱动栅格化）非 CLIP 分析对象，不产 AI 缓存
                 webp_quality,
                 ai_cache_short_edge: crate::thumbnail::cache::AI_CACHE_SHORT_EDGE, // 未用(ai_hq_cache=false)
-                output_fingerprint: None,
             };
             let res = encode_media_step_with_snapshot(
                 item_id,
@@ -1151,4 +1402,355 @@ pub async fn store_doc_thumbnail(
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+}
+
+#[cfg(test)]
+mod tests {
+    fn text_test_state(
+        temp: &Path,
+        source_bytes: &[u8],
+        prefs: &str,
+    ) -> (AppState, tracing_appender::non_blocking::WorkerGuard) {
+        let db_path = temp.join("test.db");
+        let writer = crate::db::create_write_connection(&db_path).unwrap();
+        std::fs::write(temp.join("story.txt"), source_bytes).unwrap();
+        {
+            let conn = writer.lock().unwrap();
+            crate::db::schema::initialize_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO scan_roots (id, path, alias) VALUES (1, ?1, 'Root')",
+                params![temp.to_string_lossy()],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'Root');
+                 INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime,
+                     file_format, media_type, sort_datetime, cache_key)
+                 VALUES (42, 10, 'story.txt', 30, 1, 'txt', 'document', 1, 42);",
+            )
+            .unwrap();
+            q::set_reader_book_prefs(&conn, 42, prefs).unwrap();
+        }
+        let pool = crate::db::create_read_pool(&db_path, 1).unwrap();
+        let (config, _) =
+            crate::config::ConfigManager::load_or_init(temp.join("config.toml")).unwrap();
+        let (log_writer, log_guard) = tracing_appender::non_blocking(std::io::sink());
+        let state = AppState::new(
+            writer,
+            pool,
+            Arc::new(config),
+            temp.join("cache"),
+            temp.join("logs"),
+            crate::logging::LogRingBuffer::new(Arc::from("text-version-encoding-test"), 1),
+            log_writer.error_counter(),
+            temp.to_path_buf(),
+            temp.join("exotic"),
+            256,
+            0,
+            "balanced".into(),
+            "cpu".into(),
+            false,
+            80,
+            Arc::new(crate::exotic::catalog::CatalogStore::with_snapshot(
+                crate::exotic::catalog::CatalogSnapshot::empty(),
+            )),
+        );
+        (state, log_guard)
+    }
+
+    #[test]
+    fn document_link_rejects_unsafe_unregistered_and_unavailable_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (state, _guard) = text_test_state(temp.path(), b"source", "{}");
+        std::fs::write(temp.path().join("unregistered.md"), b"unregistered").unwrap();
+        std::fs::write(temp.path().join("manual.pdf"), b"not a text document").unwrap();
+        std::fs::write(temp.path().join("deleted.md"), b"deleted").unwrap();
+        std::fs::write(temp.path().join("companion.md"), b"companion").unwrap();
+        std::fs::write(temp.path().join("valid.md"), b"valid").unwrap();
+        std::fs::write(outside.path().join("outside.md"), b"outside").unwrap();
+        {
+            let conn = state.db_writer.lock().unwrap();
+            conn.execute_batch("INSERT INTO media_items(id,directory_id,file_name,file_size,file_mtime,file_format,media_type,sort_datetime,cache_key,is_deleted,companion_of) VALUES
+                (60,10,'manual.pdf',6,1,'pdf','document',1,60,0,NULL),
+                (61,10,'deleted.md',6,1,'md','document',1,61,1,NULL),
+                (62,10,'companion.md',6,1,'md','document',1,62,0,42),
+                (64,10,'valid.md',5,1,'md','document',1,64,0,NULL);").unwrap();
+        }
+        for href in [
+            "../outside.md",
+            "/story.txt",
+            "//server/story.txt",
+            "C:/story.txt",
+            "file:story.txt",
+            "https://example.invalid/a.md",
+            "story.txt:stream",
+            "story.txt?x",
+            "bad%",
+            "%ff.md",
+            "%00.md",
+            "#heading",
+            "unregistered.md",
+            "missing.md",
+            "manual.pdf",
+            "deleted.md",
+            "companion.md",
+        ] {
+            let error = resolve_document_link_sync(&state, 42, href).unwrap_err();
+            let serialized = serde_json::to_string(&error).unwrap();
+            assert!(!serialized.contains(temp.path().to_str().unwrap()));
+            assert!(!serialized.contains(outside.path().to_str().unwrap()));
+        }
+        #[cfg(unix)]
+        let link = std::os::unix::fs::symlink(
+            outside.path().join("outside.md"),
+            temp.path().join("escape.md"),
+        );
+        #[cfg(windows)]
+        let link = std::os::windows::fs::symlink_file(
+            outside.path().join("outside.md"),
+            temp.path().join("escape.md"),
+        );
+        if link.is_ok() {
+            state.db_writer.lock().unwrap().execute("INSERT INTO media_items(id,directory_id,file_name,file_size,file_mtime,file_format,media_type,sort_datetime,cache_key) VALUES(63,10,'escape.md',7,1,'md','document',1,63)", []).unwrap();
+            assert!(resolve_document_link_sync(&state, 42, "escape.md").is_err());
+        } else {
+            eprintln!("document link fixture: external symlink unavailable on this host");
+        }
+        assert_eq!(
+            resolve_document_link_sync(&state, 42, "valid.md")
+                .unwrap()
+                .item_id,
+            64
+        );
+        state
+            .db_writer
+            .lock()
+            .unwrap()
+            .execute("UPDATE media_items SET file_format='pdf' WHERE id=42", [])
+            .unwrap();
+        assert!(matches!(
+            resolve_document_link_sync(&state, 42, "valid.md"),
+            Err(AppError::UnsupportedFormat(_))
+        ));
+        state
+            .db_writer
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE media_items SET file_format='txt',is_deleted=1 WHERE id=42",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            resolve_document_link_sync(&state, 42, "valid.md"),
+            Err(AppError::MediaNotFound(42))
+        ));
+    }
+
+    use super::*;
+
+    fn seed_overwrite_document(
+        temp: &std::path::Path,
+    ) -> (
+        rusqlite::Connection,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        i64,
+    ) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, ?1, 'Root')",
+            rusqlite::params![temp.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'Root');
+             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime,
+                 file_format, media_type, sort_datetime, cache_key)
+             VALUES (42, 10, 'story.md', 15, 1, 'md', 'document', 1, 42);",
+        )
+        .unwrap();
+        let source = temp.join("story.md");
+        // 短 GBK 文本不能依赖自动检测；覆盖前备份也必须遵循用户已指定的源编码。
+        let (source_bytes, _, had_errors) = encoding_rs::GBK.encode("中");
+        assert!(!had_errors);
+        std::fs::write(&source, &source_bytes).unwrap();
+        crate::db::queries::set_reader_book_prefs(
+            &conn,
+            42,
+            r#"{"v":1,"encoding":"GBK","reflow":true,"theme":"sepia","custom":{"retain":true}}"#,
+        )
+        .unwrap();
+        let versions = temp.join("versions");
+        std::fs::create_dir(&versions).unwrap();
+        let selected = super::write_version_tx(
+            &conn,
+            &versions,
+            42,
+            None,
+            Some("历史稿"),
+            "user",
+            "md",
+            "# Selected old draft",
+        )
+        .unwrap();
+        crate::db::queries::set_current_version(&conn, 42, Some(selected)).unwrap();
+        q::upsert_text_book_index(&conn, 42, "retained-source-metadata", "GBK", "manual", "[]")
+            .unwrap();
+        (conn, source, versions, selected)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_overwrite_keeps_selected_version_source_and_prewrite_backup() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (conn, source, versions, selected) = seed_overwrite_document(temp.path());
+        let original_bytes = std::fs::read(&source).unwrap();
+        let original_prefs = crate::db::queries::get_reader_book_prefs(&conn, 42).unwrap();
+        let original_index = q::get_text_book_index(&conn, 42).unwrap();
+        // 允许备份读取，禁止替换原文件，真实触发同卷 rename 的共享冲突。
+        let _locked_source = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&source)
+            .unwrap();
+        let result = super::overwrite_document_source(
+            &conn,
+            &versions,
+            42,
+            &source,
+            "md",
+            "# Unsaved latest draft",
+        );
+        assert!(result.is_err());
+        assert_eq!(q::get_text_book_index(&conn, 42).unwrap(), original_index);
+        assert_eq!(std::fs::read(&source).unwrap(), original_bytes);
+        assert_eq!(
+            crate::db::queries::get_reader_book_prefs(&conn, 42).unwrap(),
+            original_prefs
+        );
+        assert_eq!(
+            crate::db::queries::get_current_version(&conn, 42)
+                .unwrap()
+                .unwrap()
+                .id,
+            selected
+        );
+        let all = crate::db::queries::list_versions(&conn, 42).unwrap();
+        let backup = all.iter().find(|version| version.id != selected).unwrap();
+        assert_eq!(std::fs::read_to_string(&backup.abs_path).unwrap(), "中");
+    }
+
+    fn seeded_doc_thumb_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
+             INSERT INTO media_items
+                 (id, directory_id, file_name, file_size, file_mtime, file_format,
+                  media_type, width, height, sort_datetime, cache_key, source_revision)
+             VALUES (1, 10, 'doc.pdf', 10, 100, 'pdf', 'document', 0, 0, 100, 42, 7);
+             INSERT INTO media_derivations (item_id, kind, status)
+             VALUES (1, 'doc_thumb', 0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn stale_doc_thumb_success_is_discarded_before_persistent_writes() {
+        let conn = seeded_doc_thumb_db();
+        conn.execute(
+            "UPDATE media_items SET source_revision=8, cache_key=43 WHERE id=1",
+            [],
+        )
+        .unwrap();
+
+        let persisted = finish_doc_thumb_if_current(
+            &conn,
+            1,
+            DocThumbSnapshot {
+                source_revision: 7,
+                cache_key: 42,
+            },
+            2,
+            1,
+            Some("256/old/stale.webp"),
+            None,
+            Some(&[9]),
+            Some(99),
+            "pdf",
+        )
+        .unwrap();
+        assert!(persisted.is_none(), "过期成功结果必须被丢弃");
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT source_revision, cache_key, thumb_status, thumb_path
+                 FROM media_items WHERE id=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap(),
+            (8, 43, 0, None)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status, payload_path FROM media_derivations
+                 WHERE item_id=1 AND kind='doc_thumb'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+            (0, None)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM document_meta WHERE item_id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "过期成功结果不得写 document_meta"
+        );
+    }
+
+    /// 方案 B §3.1 崩溃语义(核心):文件写失败 → 整事务回滚 → document_versions 零残留行。
+    /// 用不存在的目录作 dir 使 write_atomic 的 std::fs::write 失败(父目录缺失即 NotFound)。
+    /// 旧「插行→写文件」两步在此会残留 committed 行 + 空 abs_path + 无文件,备份据此产假完整包。
+    #[test]
+    fn write_version_tx_rollback_leaves_no_row_on_file_failure() {
+        use rusqlite::Connection;
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+
+        let missing = std::env::temp_dir()
+            .join(format!("scrollery_wvt_missing_{}", std::process::id()))
+            .join("does-not-exist");
+        let r = super::write_version_tx(&c, &missing, 42, None, None, "user", "txt", "x");
+        assert!(r.is_err(), "文件写失败应返回 Err");
+
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM document_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "文件写失败后不得残留任何 document_versions 行(旧两步会残留)"
+        );
+    }
 }

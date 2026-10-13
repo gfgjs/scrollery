@@ -1,8 +1,9 @@
-//! 导出引擎(方案 A §3):staging 复制 + 命名 + manifest + 库内目标判定。纯函数式设计(不碰
-//! `AppState`/DB),时间戳/job_id/取消令牌均由调用方注入,便于单测确定性(同 `backup::core` 姿态,
-//! IPC/门闩/进度事件的 app 层接线在 `ipc::export_commands`)。
+//! 导出引擎：检查目标、命名、暂存复制和 manifest 写入。
+//! 不直接访问 `AppState` 或 DB；时间戳、job_id 和取消令牌由调用方注入。
+//! IPC、门闩和进度事件由 `ipc::export_commands` 编排。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tokio_util::sync::CancellationToken;
@@ -17,6 +18,7 @@ pub const CODE_TARGET_INVALID: &str = "export_target_invalid";
 pub const CODE_TARGET_NOT_WRITABLE: &str = "export_target_not_writable";
 pub const CODE_CANCELLED: &str = "export_cancelled";
 pub const CODE_IO: &str = "export_io";
+pub const CODE_CLEANUP_FAILED: &str = "export_cleanup_failed";
 
 /// 单项失败的稳定码(§3.3「单文件结果」)。与 `AppError` 的任务级码是两套独立集合——单项
 /// 失败不中断整批,只作为结果数据,不经 `AppError` 传播。
@@ -76,17 +78,8 @@ fn cancelled() -> AppError {
     err(CODE_CANCELLED, "导出已取消 | export cancelled")
 }
 
-fn rand_suffix() -> String {
-    use ring::rand::{SecureRandom, SystemRandom};
-    let mut buf = [0u8; 8];
-    if SystemRandom::new().fill(&mut buf).is_ok() {
-        return crate::utils::hash::to_hex_lower(&buf);
-    }
-    format!("{:x}", std::process::id())
-}
-
-/// 目的父目录合法性 + 可写性(方案 §3.2.1)。随机前缀探测文件立即清理(同 backup 的
-/// `ensure_dest_writable` 姿态)。返回 canonicalize 后的路径,供后续库内判定复用。
+/// 目的父目录合法性 + 可写性；匿名探针由句柄生命周期清理，不写删用户文件名。
+/// 返回 canonicalize 后的路径，供后续库内判定复用。
 pub fn ensure_target_writable(target_parent: &Path) -> Result<PathBuf> {
     let canon = dunce::canonicalize(target_parent).map_err(|_| {
         err(
@@ -100,15 +93,8 @@ pub fn ensure_target_writable(target_parent: &Path) -> Result<PathBuf> {
             "目的父目录不是目录 | target parent is not a directory",
         ));
     }
-    let probe = canon.join(format!(
-        ".scrollery-export-writable-probe-{}",
-        rand_suffix()
-    ));
-    match std::fs::write(&probe, b"ok") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            Ok(canon)
-        }
+    match tempfile::tempfile_in(&canon).and_then(|mut probe| probe.write_all(b"ok")) {
+        Ok(()) => Ok(canon),
         Err(_) => Err(err(
             CODE_TARGET_NOT_WRITABLE,
             "目的父目录不可写 | target parent not writable",
@@ -134,6 +120,28 @@ fn final_dir_name(timestamp_label: &str) -> String {
 
 fn staging_dir_name(job_id: &str) -> String {
     format!(".scrollery-export-{job_id}.tmp")
+}
+
+fn cleanup_staging(staging_dir: &Path) -> Result<()> {
+    // 清理未完成优先于原取消/失败原因，防止遗留暂存却报告干净取消；保留残余供手动处理。
+    std::fs::remove_dir_all(staging_dir).map_err(|_| {
+        err(
+            CODE_CLEANUP_FAILED,
+            "导出暂存清理失败，请关闭占用后手动清理目标目录内本任务的暂存目录 | export staging cleanup failed; release file locks and manually remove this job's staging directory",
+        )
+    })
+}
+
+fn publish_staging(staging_dir: &Path, final_dir: &Path) -> Result<()> {
+    // 名称探测之后仍可能出现第三方目录，拒绝覆盖必须由同一个原子操作保证。
+    if crate::utils::fs::rename_no_replace(staging_dir, final_dir).is_err() {
+        cleanup_staging(staging_dir)?;
+        return Err(err(
+            CODE_IO,
+            "导出目录改名落盘失败 | export dir rename failed",
+        ));
+    }
+    Ok(())
 }
 
 /// 根别名缺省时回退根路径的最后一段(不落绝对路径全串,只取目录名作可读标签)。
@@ -200,16 +208,16 @@ pub fn run_export(
 ) -> Result<ExportOutcome> {
     let staging_dir = params.target_parent.join(staging_dir_name(params.job_id));
 
-    std::fs::create_dir_all(&staging_dir)
+    // 只有独占创建成功才拥有清理权，不能接管同名旧目录。
+    std::fs::create_dir(&staging_dir)
         .map_err(|_| err(CODE_IO, "创建导出暂存目录失败 | create staging dir failed"))?;
 
     let total = items.len();
     let progress_stride = (total / 200).max(1); // 至多约 200 次事件,大批量不淹没 IPC
     let mut used_names: HashSet<String> = HashSet::with_capacity(total);
+    let mut next_suffixes = HashMap::new();
     if params.include_manifest {
-        // 审查 P2:预占 manifest 文件名——否则某导出项(Original 档 + 源文件同名)的最终名恰为
-        // `manifest.scrollery.json` 时,manifest 的 tmp→rename 会静默覆盖该已导出文件,
-        // 而 `succeeded`/manifest 仍记其存在。
+        // 预占 manifest 文件名，避免同名源文件被 manifest 发布覆盖。
         used_names.insert(MANIFEST_FILE_NAME.to_lowercase());
     }
     let mut manifest_items = Vec::with_capacity(total);
@@ -219,14 +227,12 @@ pub fn run_export(
 
     for (i, meta) in items.iter().enumerate() {
         if cancel.is_cancelled() {
-            let _ = std::fs::remove_dir_all(&staging_dir);
+            cleanup_staging(&staging_dir)?;
             return Err(cancelled());
         }
 
         let index = i + 1;
-        // 审查 P3:进度回调须在每次迭代必经处触发——此前挂在循环尾,离线/冲突/路径过长等分支
-        // 全靠前面的 `continue` 跳过它;若末尾若干项连续被跳过,进度条会停在 <100% 直到终态事件
-        // 才推进。挪到循环体最前面,与后续任何 `continue` 分支解耦。
+        // 进度回调置于所有 `continue` 之前，跳过项也计入处理进度。
         if index % progress_stride == 0 || index == total {
             on_progress(index, total);
         }
@@ -251,6 +257,7 @@ pub fn run_export(
             &candidate,
             &used_names,
             params.conflict == ExportConflict::Rename,
+            &mut next_suffixes,
         ) else {
             record_item_issue(
                 meta.file_name.clone(),
@@ -261,6 +268,13 @@ pub fn run_export(
             continue;
         };
 
+        #[cfg(windows)]
+        let full_len = {
+            use std::os::windows::ffi::OsStrExt as _;
+            // Windows 按 UTF-16 单元限制路径；字节数会把中文等合法路径误判为过长。
+            staging_dir.as_os_str().encode_wide().count() + 1 + final_name.encode_utf16().count()
+        };
+        #[cfg(not(windows))]
         let full_len = staging_dir.as_os_str().len() + 1 + final_name.len();
         if full_len > MAX_STAGING_PATH_LEN {
             record_item_issue(
@@ -272,25 +286,43 @@ pub fn run_export(
             continue;
         }
 
-        // 审查 P2:tmp 名与最终名脱钩(用循环下标而非 final_name 派生)——此前 `.{final_name}.tmp`
-        // 与最终名共用同一目录命名空间,若某项最终名恰为 `.X.tmp`(Original 档下源文件本名如此),
-        // 后续最终名为 `X` 的项复制时会直接覆盖它再 rename 走,前者从产出中消失但已计入 succeeded。
-        let tmp_target = staging_dir.join(format!(".export-tmp-{index}"));
+        // 临时名也可能是合法原名；避开已发布项和本项正式名，不能仅换一个固定前缀。
+        let tmp_prefix = format!(".export-tmp-{index}");
+        let mut tmp_name = tmp_prefix.clone();
+        let mut tmp_suffix = 2usize;
+        while used_names.contains(&tmp_name.to_lowercase())
+            || tmp_name.eq_ignore_ascii_case(&final_name)
+        {
+            tmp_name = format!("{tmp_prefix}-{tmp_suffix}");
+            tmp_suffix += 1;
+        }
+        let tmp_target = staging_dir.join(tmp_name);
         let final_target = staging_dir.join(&final_name);
 
         let copy_result: std::io::Result<()> = (|| {
             let mut source = super::source::open(&meta.root_path, &meta.rel_path, &meta.file_name)?;
-            let mut target = std::fs::File::create(&tmp_target)?;
-            copy_cancellable(&mut source, &mut target, cancel)?;
-            target.set_permissions(source.metadata()?.permissions())?;
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_target)?;
+            let result = (|| {
+                copy_cancellable(&mut source, &mut target, cancel)?;
+                // 先用已打开的句柄写时间，再复制只读属性；否则 Windows 重新写开会被拒绝。
+                let mtime = filetime::FileTime::from_unix_time(meta.file_mtime, 0);
+                filetime::set_file_handle_times(&target, None, Some(mtime))?;
+                target.set_permissions(source.metadata()?.permissions())
+            })();
             drop(target);
-            let mtime = filetime::FileTime::from_unix_time(meta.file_mtime, 0);
-            filetime::set_file_mtime(&tmp_target, mtime)?;
-            std::fs::rename(&tmp_target, &final_target)
+            let result = result.and_then(|()| std::fs::rename(&tmp_target, &final_target));
+            // 仅清理由本项 create_new 成功创建的临时文件，不碰创建失败时已存在的条目。
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp_target);
+            }
+            result
         })();
 
         if cancel.is_cancelled() {
-            let _ = std::fs::remove_dir_all(&staging_dir);
+            cleanup_staging(&staging_dir)?;
             return Err(cancelled());
         }
 
@@ -318,10 +350,9 @@ pub fn run_export(
                 }
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp_target);
                 if e.kind() == std::io::ErrorKind::StorageFull {
                     // 任务级故障(§3.2.4):磁盘满不是单项问题,继续只会耗尽整批,停任务。
-                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    cleanup_staging(&staging_dir)?;
                     return Err(err(CODE_IO, "磁盘空间不足 | disk full"));
                 }
                 record_item_issue(
@@ -335,13 +366,13 @@ pub fn run_export(
     }
 
     if cancel.is_cancelled() {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        cleanup_staging(&staging_dir)?;
         return Err(cancelled());
     }
     if params.include_manifest {
         let manifest = Manifest::new(params.source.clone(), exported_at_utc, manifest_items);
         if let Err(e) = manifest.write_into(&staging_dir) {
-            let _ = std::fs::remove_dir_all(&staging_dir);
+            cleanup_staging(&staging_dir)?;
             return Err(e);
         }
     }
@@ -359,16 +390,10 @@ pub fn run_export(
     }
 
     if cancel.is_cancelled() {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        cleanup_staging(&staging_dir)?;
         return Err(cancelled());
     }
-    if std::fs::rename(&staging_dir, &final_dir).is_err() {
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        return Err(err(
-            CODE_IO,
-            "导出目录改名落盘失败 | export dir rename failed",
-        ));
-    }
+    publish_staging(&staging_dir, &final_dir)?;
 
     Ok(ExportOutcome {
         final_dir,
@@ -408,42 +433,229 @@ mod tests {
         p
     }
 
-    #[test]
-    fn export_rejects_source_parent_traversal() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("root");
-        let outside = fixture.path().join("outside");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        write_src(&outside, "secret.txt");
-        let target = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    fn export_with_locked_copy(cancel_requested: bool) -> AppError {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let first = write_src(source.path(), "first.txt");
+        let second = write_src(source.path(), "second.txt");
+        let sentinel = write_src(parent.path(), "keep.txt");
+        let other_staging = parent.path().join(staging_dir_name("other-job"));
+        std::fs::create_dir(&other_staging).unwrap();
+        let other_file = write_src(&other_staging, "foreign.txt");
+        let staging = parent.path().join(staging_dir_name("locked-copy"));
+        let items = [
+            meta(
+                1,
+                &source.path().to_string_lossy(),
+                "",
+                "first.txt",
+                "online",
+            ),
+            meta(
+                2,
+                &source.path().to_string_lossy(),
+                "",
+                "second.txt",
+                "online",
+            ),
+        ];
         let params = ExportParams {
-            target_parent: target.path(),
-            job_id: "boundary",
+            target_parent: parent.path(),
+            job_id: "locked-copy",
+            naming: NamingScheme::Original,
+            conflict: ExportConflict::Rename,
+            include_manifest: false,
+            source: ExportSource::Selection,
+        };
+        let cancel = CancellationToken::new();
+        let mut held = None;
+        let result = run_export(
+            &params,
+            &items,
+            &cancel,
+            "locked-copy",
+            "now".into(),
+            |index, _| {
+                if index == 2 {
+                    let copied = staging.join("first.txt");
+                    assert_eq!(std::fs::read(&copied).unwrap(), b"abc");
+                    // 第 2 项回调时首项已关闭并落名；独占句柄确定性阻止删除及目录发布。
+                    held = Some(
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .share_mode(0)
+                            .open(copied)
+                            .unwrap(),
+                    );
+                    if cancel_requested {
+                        cancel.cancel();
+                    }
+                }
+            },
+        );
+        assert!(held.is_some());
+        assert!(staging.is_dir(), "清理失败后应保留可手动处理的暂存目录");
+        assert!(!parent.path().join(final_dir_name("locked-copy")).exists());
+        let error = result.unwrap_err();
+        println!("locked copy: cancel={cancel_requested}, observed={error}");
+        assert!(std::fs::remove_file(staging.join("first.txt")).is_err());
+        drop(held);
+        assert_eq!(std::fs::read(staging.join("first.txt")).unwrap(), b"abc");
+        std::fs::remove_dir_all(&staging).unwrap();
+        assert!(!staging.exists());
+        assert_eq!(std::fs::read(first).unwrap(), b"abc");
+        assert_eq!(std::fs::read(second).unwrap(), b"abc");
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"abc");
+        assert_eq!(std::fs::read(other_file).unwrap(), b"abc");
+        assert_eq!(std::fs::read_dir(source.path()).unwrap().count(), 2);
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 2);
+        println!(
+            "handle released: manual cleanup succeeded; sources and adjacent content unchanged"
+        );
+        error
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancel_cleanup_failure_reports_stable_error() {
+        let error = export_with_locked_copy(true);
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::json!({
+                "code": "export_cleanup_failed",
+                "message": "导出暂存清理失败，请关闭占用后手动清理目标目录内本任务的暂存目录 | export staging cleanup failed; release file locks and manually remove this job's staging directory"
+            })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publish_cleanup_failure_reports_stable_error() {
+        let error = export_with_locked_copy(false);
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::json!({
+                "code": "export_cleanup_failed",
+                "message": "导出暂存清理失败，请关闭占用后手动清理目标目录内本任务的暂存目录 | export staging cleanup failed; release file locks and manually remove this job's staging directory"
+            })
+        );
+    }
+
+    #[test]
+    fn preexisting_staging_is_never_adopted_or_deleted() {
+        let parent = tempfile::tempdir().unwrap();
+        let staging = parent.path().join(staging_dir_name("occupied"));
+        std::fs::create_dir(&staging).unwrap();
+        let sentinel = write_src(&staging, "foreign.txt");
+        let params = ExportParams {
+            target_parent: parent.path(),
+            job_id: "occupied",
+            naming: NamingScheme::Original,
+            conflict: ExportConflict::Rename,
+            include_manifest: false,
+            source: ExportSource::Selection,
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = run_export(&params, &[], &cancel, "occupied", "now".into(), |_, _| {});
+        assert!(sentinel.exists(), "已有目录内容不得由本次取消删除");
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"abc");
+        assert!(matches!(
+            result,
+            Err(AppError::Export { code: CODE_IO, .. })
+        ));
+    }
+
+    #[test]
+    fn cancel_after_readonly_item_copied_cleans_owned_staging() {
+        let source = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let first = write_src(source.path(), "first.txt");
+        write_src(source.path(), "second.txt");
+        let original_permissions = std::fs::metadata(&first).unwrap().permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&first, readonly).unwrap();
+        let sentinel = write_src(parent.path(), "keep.txt");
+        let staging = parent.path().join(staging_dir_name("partial"));
+        let items = [
+            meta(
+                1,
+                &source.path().to_string_lossy(),
+                "",
+                "first.txt",
+                "online",
+            ),
+            meta(
+                2,
+                &source.path().to_string_lossy(),
+                "",
+                "second.txt",
+                "online",
+            ),
+        ];
+        let params = ExportParams {
+            target_parent: parent.path(),
+            job_id: "partial",
             naming: NamingScheme::Original,
             conflict: ExportConflict::Rename,
             include_manifest: true,
             source: ExportSource::Selection,
         };
-        let items = [meta(
-            1,
-            &root.to_string_lossy(),
-            "../outside",
-            "secret.txt",
-            "online",
-        )];
+        let cancel = CancellationToken::new();
+        let mut observed_completed_item = false;
         let result = run_export(
             &params,
             &items,
-            &CancellationToken::new(),
-            "boundary",
+            &cancel,
+            "partial",
             "now".into(),
-            |_, _| {},
-        )
-        .unwrap();
-        assert_eq!(result.succeeded, 0);
-        assert_eq!(result.skipped_or_failed_total, 1);
-        assert!(!result.final_dir.join("secret.txt").exists());
+            |index, _| {
+                if index == 2 {
+                    let copied = staging.join("first.txt");
+                    assert_eq!(std::fs::read(&copied).unwrap(), b"abc");
+                    assert!(std::fs::metadata(copied).unwrap().permissions().readonly());
+                    observed_completed_item = true;
+                    cancel.cancel();
+                }
+            },
+        );
+        assert!(observed_completed_item);
+        assert!(matches!(
+            result,
+            Err(AppError::Export {
+                code: CODE_CANCELLED,
+                ..
+            })
+        ));
+        assert!(!staging.exists());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"abc");
+        assert_eq!(std::fs::read(&first).unwrap(), b"abc");
+        assert!(std::fs::metadata(&first).unwrap().permissions().readonly());
+        std::fs::set_permissions(first, original_permissions).unwrap();
+    }
+
+    #[test]
+    fn publish_rejects_target_created_after_name_selection() {
+        let parent = tempfile::tempdir().unwrap();
+        let staging = parent.path().join(staging_dir_name("publish"));
+        std::fs::create_dir(&staging).unwrap();
+        write_src(&staging, "exported.txt");
+        let final_dir = parent.path().join(final_dir_name("publish"));
+        assert!(!final_dir.exists());
+        std::fs::create_dir(&final_dir).unwrap();
+        let result = publish_staging(&staging, &final_dir);
+        assert!(matches!(
+            result,
+            Err(AppError::Export { code: CODE_IO, .. })
+        ));
+        assert!(final_dir.is_dir());
+        assert_eq!(std::fs::read_dir(final_dir).unwrap().count(), 0);
+        assert!(!staging.exists());
     }
 
     #[test]
@@ -483,6 +695,66 @@ mod tests {
             })
         ));
         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    }
+
+    /// staging → 正式目录:成功导出后 staging 消失、正式目录含全部文件 + manifest,mtime 保留。
+    #[test]
+    fn run_export_happy_path_renames_to_final_dir() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let checked_parent = ensure_target_writable(parent.path()).unwrap();
+        assert!(checked_parent.is_absolute());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+        write_src(src_dir.path(), "a.jpg");
+        write_src(src_dir.path(), "b.jpg");
+
+        let items = vec![
+            meta(1, &src_dir.path().to_string_lossy(), "", "a.jpg", "online"),
+            meta(2, &src_dir.path().to_string_lossy(), "", "b.jpg", "online"),
+        ];
+        let params = ExportParams {
+            target_parent: parent.path(),
+            job_id: "job1",
+            naming: NamingScheme::Sequence,
+            conflict: ExportConflict::Rename,
+            include_manifest: true,
+            source: ExportSource::Selection,
+        };
+        let cancel = CancellationToken::new();
+        let outcome = run_export(
+            &params,
+            &items,
+            &cancel,
+            "20260719-000000",
+            "2026-07-19T00:00:00Z".into(),
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(outcome.succeeded, 2);
+        assert!(outcome.final_dir.is_dir());
+        assert!(!parent.path().join(staging_dir_name("job1")).exists());
+        assert!(outcome.final_dir.join("001-a.jpg").exists());
+        assert!(outcome.final_dir.join("002-b.jpg").exists());
+        assert!(outcome
+            .final_dir
+            .join(super::super::manifest::MANIFEST_FILE_NAME)
+            .exists());
+
+        // mtime 来自 DB 记录的 `meta.file_mtime`(1_700_000_000),不是复制瞬间源文件在磁盘上的
+        // 实际 mtime(`write_src` 刚写入,应为「现在」)——这正是要验证的契约:显式回写 DB 值,
+        // 不依赖 std::fs::copy 在某些平台「碰巧」保留源 mtime。
+        let dst_mtime = std::fs::metadata(outcome.final_dir.join("001-a.jpg"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            dst_mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1_700_000_000,
+        );
     }
 
     /// 取消:只删本 job 的 staging 目录,不产出正式目录,不影响 target_parent 里的其它内容。
@@ -530,18 +802,23 @@ mod tests {
         assert!(parent.path().join("untouched.txt").exists());
     }
 
-    /// 审查 P2:tmp 名与最终名脱钩——此前 `.{final_name}.tmp` 与最终名共用同一命名空间,若某项
-    /// 最终名恰为 `.x.tmp`(源文件本名如此),会被后续最终名为 `x` 的项的 tmp 写入悄悄覆盖再消失
-    /// (succeeded 已计数但产出物不见)。两项均须完整、内容互不污染。
+    /// 临时名仍可能是合法原名：先导出的 `.export-tmp-2` 不得被第二项临时写入覆盖再消失。
+    /// 两项均须完整、内容互不污染，且原始资产不变。
     #[test]
     fn run_export_tmp_name_decoupled_from_final_name_no_clobber() {
         let src_dir = tempfile::tempdir().unwrap();
         let parent = tempfile::tempdir().unwrap();
-        std::fs::write(src_dir.path().join(".x.tmp"), b"A-content").unwrap();
+        std::fs::write(src_dir.path().join(".export-tmp-2"), b"A-content").unwrap();
         std::fs::write(src_dir.path().join("x"), b"B-content").unwrap();
 
         let items = vec![
-            meta(1, &src_dir.path().to_string_lossy(), "", ".x.tmp", "online"),
+            meta(
+                1,
+                &src_dir.path().to_string_lossy(),
+                "",
+                ".export-tmp-2",
+                "online",
+            ),
             meta(2, &src_dir.path().to_string_lossy(), "", "x", "online"),
         ];
         let params = ExportParams {
@@ -565,56 +842,22 @@ mod tests {
 
         assert_eq!(outcome.succeeded, 2);
         assert_eq!(
-            std::fs::read_to_string(outcome.final_dir.join(".x.tmp")).unwrap(),
+            std::fs::read_to_string(outcome.final_dir.join(".export-tmp-2")).unwrap(),
             "A-content"
         );
         assert_eq!(
             std::fs::read_to_string(outcome.final_dir.join("x")).unwrap(),
             "B-content"
         );
-    }
-
-    /// 审查 P2:manifest 文件名预占——导出项的最终名恰与 `MANIFEST_FILE_NAME` 相同(Original 档 +
-    /// 源文件同名)时,该项须被冲突去重改名,不得被 manifest 的写入静默覆盖。
-    #[test]
-    fn run_export_reserves_manifest_file_name_from_item_collision() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let parent = tempfile::tempdir().unwrap();
-        write_src(src_dir.path(), MANIFEST_FILE_NAME);
-
-        let items = vec![meta(
-            1,
-            &src_dir.path().to_string_lossy(),
-            "",
-            MANIFEST_FILE_NAME,
-            "online",
-        )];
-        let params = ExportParams {
-            target_parent: parent.path(),
-            job_id: "job7",
-            naming: NamingScheme::Original,
-            conflict: ExportConflict::Rename,
-            include_manifest: true,
-            source: ExportSource::Selection,
-        };
-        let cancel = CancellationToken::new();
-        let outcome = run_export(
-            &params,
-            &items,
-            &cancel,
-            "20260719-000000",
-            "2026-07-19T00:00:00Z".into(),
-            |_, _| {},
-        )
-        .unwrap();
-
-        assert_eq!(outcome.succeeded, 1);
-        // 冲突去重在 stem/扩展名之间插 `-2`(resolve_conflict 姿态)。
-        let renamed = outcome.final_dir.join("manifest.scrollery-2.json");
-        assert!(renamed.exists(), "撞名项应被改名而非覆盖 manifest");
-        let manifest_text =
-            std::fs::read_to_string(outcome.final_dir.join(MANIFEST_FILE_NAME)).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-        assert_eq!(parsed["items"][0]["file"], "manifest.scrollery-2.json");
+        assert_eq!(outcome.skipped_or_failed_total, 0);
+        assert_eq!(std::fs::read_dir(&outcome.final_dir).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(src_dir.path().join(".export-tmp-2")).unwrap(),
+            "A-content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(src_dir.path().join("x")).unwrap(),
+            "B-content"
+        );
     }
 }

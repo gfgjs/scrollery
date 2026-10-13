@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod cache_identity;
 pub mod connection;
 pub mod models;
 pub mod queries;

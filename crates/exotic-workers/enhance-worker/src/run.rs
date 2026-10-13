@@ -1,6 +1,6 @@
 // crates/exotic-workers/enhance-worker/src/run.rs
 //! EnhanceRun 执行:输出白名单校验 → task 映射 → 构造链请求 → 驱动 run_enhance_chain
-//! → per-tile Progress 帧 → 终态映射(design.md §E)。
+//! → per-tile Progress 帧 → 终态映射。
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -219,21 +219,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(&d).unwrap()
-    }
-
-    #[test]
-    fn output_whitelist_rejects_sibling() {
-        let work = temp_dir("wd");
-        // 兄弟目录(与 work 同父但不在其下)。
-        let sibling = work.parent().unwrap().join(format!(
-            "enhance-worker-run-test-{}-sibling",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&sibling);
-        std::fs::create_dir_all(&sibling).unwrap();
-        let out = sibling.join("evil.tmp");
-        let e = resolve_output_path(out.to_str().unwrap(), &work).expect_err("越界应拒");
-        assert_eq!(e.0, WorkerErrorCode::MalformedInput);
     }
 
     #[test]

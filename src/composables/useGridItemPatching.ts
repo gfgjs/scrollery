@@ -9,6 +9,13 @@ export interface GridItemPatchingDeps {
   activeRows: () => LayoutRow[]
   bumpCanvasPatchTick: () => void
   isSelected: (id: number) => boolean
+  readContext: () => {
+    selectionEpoch: number
+    layoutVersion: number
+    viewKey: string
+    semanticKey: string | null
+  }
+  compute: () => Promise<void>
 }
 
 export function useGridItemPatching(deps: GridItemPatchingDeps) {
@@ -57,10 +64,28 @@ export function useGridItemPatching(deps: GridItemPatchingDeps) {
     deps.bumpCanvasPatchTick()
   }
 
+  /** 在批量写入发出前捕获选区与视图；回执不能修改用户后来选中的其它资产。 */
+  function captureSelectionPatch(): (apply: (item: LayoutRowItem) => void) => Promise<void> {
+    const captured = deps.readContext()
+    return async (apply) => {
+      const current = deps.readContext()
+      if (
+        captured.selectionEpoch !== current.selectionEpoch ||
+        captured.layoutVersion !== current.layoutVersion ||
+        captured.viewKey !== current.viewKey ||
+        captured.semanticKey !== current.semanticKey
+      ) {
+        await deps.compute()
+        return
+      }
+      patchVisibleSelected(apply)
+    }
+  }
+
   return {
     patchVisibleRating,
     patchVisibleFavorite,
     patchVisibleColorLabel,
-    patchVisibleSelected,
+    captureSelectionPatch,
   }
 }

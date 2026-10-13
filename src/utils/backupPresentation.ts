@@ -8,6 +8,9 @@ const RESTORE_ERROR_KEYS: Readonly<Record<string, string>> = {
   restore_document_missing: 'backup.restoreErrorDocument',
   restore_rollback_failed: 'backup.restoreErrorRollback',
   restore_io: 'backup.restoreErrorIo',
+  restore_pending: 'backup.restoreErrorPending',
+  restore_stage_stale: 'backup.restoreErrorStageStale',
+  restore_marker_corrupt: 'backup.restoreErrorMarker',
   file_job_busy: 'backup.restoreErrorBusy',
 }
 

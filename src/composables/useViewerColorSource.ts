@@ -1,7 +1,7 @@
 // src/composables/useViewerColorSource.ts
-// 查看器渲染色域换源状态机(2026-07-23 自定义 ICC 与色域切换,方案 B §0⑥):
+// 查看器渲染色域换源状态机：
 // 「原图先显 + 完成后换源」——切换查看项/target 时保持当前显示不变,后台发起 IPC 求新派生 URL,
-// 就绪后原地换源;srgb/移动端/非 image 恒不发起 IPC(D-413/D-414,零派生)。
+// 就绪后原地换源；sRGB/非 image 不发起 IPC，直接显示原图。
 
 import { ref, watch, type Ref } from 'vue'
 import { invokeIpc } from '../utils/ipc'
@@ -17,12 +17,10 @@ export interface ViewerColorSourceInput {
   target: () => string
   /** 自定义 ICC id;后端从 config 单源读取实际生效值,这里仅作 watch 依赖(target 热切换感知)。 */
   customId: () => string
-  /** 平台门控(D-414):移动端恒不发起,直显原图,不受 target 影响。 */
-  isMobile: boolean
 }
 
 export interface ViewerColorSource {
-  /** 派生渲染文件的 asset URL;null=直显原图(sRGB/移动端/非 image/尚未就绪/失败回退)。 */
+  /** 派生渲染文件的 asset URL；null=直显原图(sRGB/非 image/尚未就绪/失败回退)。 */
   displayUrl: Ref<string | null>
   /**
    * `<img>` @error 前置分支调用(边界情况11:命中判定与前端加载间被 LRU 驱逐):当前显示源若是
@@ -43,7 +41,6 @@ export function useViewerColorSource(input: ViewerColorSourceInput): ViewerColor
     const target = input.target()
     if (
       !item ||
-      input.isMobile ||
       item.mediaType !== 'image' ||
       target === 'srgb' ||
       (target === 'custom' && !input.customId())
@@ -67,7 +64,7 @@ export function useViewerColorSource(input: ViewerColorSourceInput): ViewerColor
   watch(
     () => [input.detail()?.id, input.detail()?.mediaType] as const,
     (_next, prev) => {
-      // 查看项(id)变化:新项先落回原图,再发请求换源(plan-B §0⑥ 语义)。
+      // 查看项（id）变化：新项先落回原图，再发请求换源。
       // prev 为 undefined 时是首次挂载(immediate watch 无上一值),不属于「切项」不清空。
       if (prev !== undefined) displayUrl.value = null
       void refresh()

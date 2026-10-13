@@ -1,13 +1,7 @@
 <template>
   <AppShell>
-    <!-- 自绘标题栏(顶栏重构 L1)。全宽置顶,承载窗口三键 + 拖拽区(P1);内容槽内嵌 ContextualToolbar(P3)。
-         沉浸模式(2026-07-10 用户裁决):不再整条隐藏(frameless 下这是唯一拖拽区/三键,藏死则窗口
-         不可移动/关闭),改「鼠标移入顶部滑入显示」——host 变 fixed 出流(内容全屏)+ translateY 收起,
-         指针贴顶滑入、移出滑走。
-         2026-07-16:自动隐藏的**来源**从「仅查看器沉浸」推广为 chromeAutoHidden(查看器沉浸 ∪ F11 全屏),
-         底栏(AppShell 的 app-statusbar)同款对称处理。唤出态跨组件,故迁入 useChromeReveal 单例。
-         唤出后不可拖窗:那是窗口三态的推论(全屏 → canDragWindow=false),由 useWindowDrag 直读
-         useWindowMode 落实,此处无需也不应再管一份。 -->
+    <!-- 标题栏承载窗口控件与拖拽区。沉浸或全屏时移出文档流并收起，指针贴顶可唤出；
+         顶栏与底栏的唤出状态由 useChromeReveal 共享。 -->
     <template #titlebar>
       <!-- inert:收起态标题栏虽 translateY 出视口,控件仍在 Tab 序——键盘用户会 Tab 进
            一排看不见的按钮;inert 一并移出焦点序,F10 唤出即解除。 -->
@@ -23,14 +17,13 @@
         @focusout="onTitlebarFocusOut"
       >
         <WindowChrome>
-          <!-- 品牌标识常驻标题栏左端(Phase G, logo 从侧栏移入) -->
+          <!-- 品牌标识常驻标题栏左端。 -->
           <TitlebarBrand />
           <!-- 标题栏承载窗口级/上下文导航命令。 -->
           <ContextualToolbar />
-          <!-- merged 模式(默认,Phase G 合并):Gallery 工具栏并入标题栏同一行,与窗口三键共享拖拽区;
-               分离模式(S3 分层)走下方独立 #toolbar 槽。二者由 useTitlebarMode 的 merged 开关互斥切换。
+          <!-- 合并模式下 Gallery 工具栏与窗口控件同排；分离模式走下方 #toolbar 槽。
                AppToolbar 是多根 fragment(.toolbar__left + .toolbar__foldable〔flex:1〕),两根直接作 flex 子项
-               流入 .window-chrome__content——不加 class(多根无法继承,且会触发 Vue 警告),布局同 Phase G。 -->
+               流入 .window-chrome__content；多根组件不能继承单个 class。 -->
           <AppToolbar v-if="showGalleryToolbar && titlebarMerged" />
           <span
             v-if="viewer.activeViewer"
@@ -48,10 +41,9 @@
       <AppSidebar v-if="settingsReady" />
     </template>
 
-    <!-- 分离模式(!titlebarMerged):Gallery 工具栏独立成标题栏下方第二条 bar(S3 分层)。
+    <!-- 分离模式(!titlebarMerged):Gallery 工具栏独立成标题栏下方第二条 bar。
          合并模式则 AppToolbar 已并入上方 WindowChrome,此槽不渲染。
-         **常驻**(2026-07-16 用户裁决):此前本槽还要 showGalleryToolbar 为真才给,于是进合集/人物等非画廊页
-         时整条消失、内容上跳 48px——分离模式的价值恰是「有一条稳定的第二轨道」。设置工作区是专用
+         此槽在非画廊页仍常驻，避免内容上跳。设置工作区是专用
          chrome，因此刻意不继承这条全局页面标题轨道；其余非查看器路由只渲染页面标题。
          查看器路由(/view /doc /audio)仍不给:那里要的是最大内容面积,且各查看器自持局部控制条。
          AppToolbar 本身仍严格 v-if 在画廊路由——它挂 document 级 keydown 分发(注册表),若在总览/设置页
@@ -62,8 +54,7 @@
     </template>
 
     <!-- 默认插槽：媒体内容或语义搜索面板 -->
-    <!-- 语义搜索面板显示在主库血统视图(smart-album + folder 筛选)。S2-c 前这些视图全停在 '/',故此前判据是
-         route.path === '/';拆分为多路径后平移到 isPrimaryGalleryRoute 以保持同一集合(不含 collection/person 详情)。 -->
+    <!-- 语义搜索面板只显示在主库血统视图；isPrimaryGalleryRoute 涵盖智能相册与文件夹筛选路径。 -->
     <!-- 启动设置就绪门控(设置集中保存 §5.1 + 演示打码回归):中央快照到达前不渲染任何会展示用户
          资产的内容——演示打码等「默认安全」值在快照就位前只是占位,此时渲染画廊会先露一帧真实内容;
          读取失败同样不放行,只给可重试的错误面板。门内只有资产内容:窗口外壳(标题栏/侧栏/底栏)与
@@ -98,9 +89,7 @@
   </AppShell>
   <PerformancePanel />
 
-  <!-- 顶栏重构 P4-b:详情覆盖层已退役,图/视迁为 /view/:id 路由(ContentViewer),不再全局挂载。 -->
-
-  <!-- 文档缩略图离屏渲染器（P4, §3.4）—— 隐藏、节流 -->
+  <!-- 文档缩略图离屏渲染器：隐藏、节流。 -->
   <DocThumbRenderer />
 
   <!-- 吐司通知 -->
@@ -109,13 +98,13 @@
   <!-- 关闭确认弹窗 -->
   <CloseConfirmDialog />
 
-  <!-- 首启向导（T17，§3.8）：3 步引导（目录/主题/语言），first_launch 缺省时显示,完成或跳过后写 false 不再弹 -->
+  <!-- 首启向导依次设置目录、主题和语言；完成或跳过后关闭 first_launch。 -->
   <OnboardingWizard v-if="showOnboarding" @done="onOnboardingDone" />
 
   <!-- 详细首次使用引导手册:首启向导完成/跳过后若未看过手册,自动接续弹出;设置页头部随时可重开。 -->
   <UserGuide v-if="ui.userGuideOpen" />
 
-  <!-- 导出整理成果对话框(方案 A §4):全局单例,任意入口经 exportStore.openExportDialog 唤出。 -->
+  <!-- 导出对话框由 exportStore.openExportDialog 唤出。 -->
   <ExportDialog />
 </template>
 
@@ -210,14 +199,13 @@ const contentViewerRoute = computed(() => isContentViewerRoute(route.path))
 // 不会重复下载查看器 chunk。
 const ContentViewerOverlay = defineAsyncComponent(loadViewerComponent)
 
-// S2-b:Gallery 筛选 ↔ URL query 双向同步（画廊路由内生效,深链/刷新可恢复筛选）。
+// 画廊筛选与 URL query 双向同步，深链和刷新可恢复筛选。
 useGalleryQuerySync()
 
 // 参数化视图 route 是 Collection/Person 当前内容的单一事实源。Collection 需要实体元数据用于
 // backend filter，深链首次进入时先加载列表再水合；token 防快速导航时旧请求回写新 route。
 // 监听 route.path 而非 fullPath：视图维度只由路径段（collection/person id）决定，与 query 无关。
-// 若监听 fullPath，S2-b 的筛选 query 同步（router.replace 改 query）会误触发本 watcher →
-// 在收藏夹/人物视图切一个筛选就 setActiveX(同一个) → clearSelection + 重跑水合（S2-b 引入的回归）。
+// 若监听 fullPath，筛选 query 更新会误触发本 watcher，清空选区并重跑水合。
 let viewRouteToken = 0
 watch(
   () => route.path,
@@ -241,11 +229,11 @@ watch(
       return
     }
 
-    // S2-c:smart-album / folder 筛选态从 path 回填 viewStore(深链/刷新恢复)。侧栏点击已同步设过 viewStore,
+    // smart-album / folder 筛选态从 path 回填 viewStore(深链/刷新恢复)。侧栏点击已同步设过 viewStore,
     // 相等守卫使此处跳过、不重复 clearSelection;完备守卫须连同 collection/person 一起比对——例如从
     // /collections/5 导航到 '/' 时 activeSmartAlbum 恰为 'all'(setActiveCollection 会置 'all'),若只比 album
     // 会漏清 activeCollection。folder 仅模式B(/folder/:id)进此分支;模式A 滚动锚点态停在 '/'(album 'all'),
-    // 其滚动位置由 pendingScrollDirId 承载不进 URL(见 findings 会话续23)。
+    // 其滚动位置由 pendingScrollDirId 承载，不进 URL。
     const rv = routeToView(route.path)
     if (rv) {
       if (rv.kind === 'smartAlbum') {
@@ -285,7 +273,7 @@ const showToolbarBar = computed(
 // 非画廊页在该条上显示的页面标题(i18n 键存在 route.meta.title,与窗口标题同源;取法同 router/index.ts)。
 const pageTitleKey = computed(() => route.meta.title as string | undefined)
 
-useTauriListen(EVENTS.OFFICIAL_LICENSE_CHANGED, () => {
+useTauriListen(EVENTS.FEATURE_ACTIVATION_CHANGED, () => {
   resetOcrStatusCache()
   void useEnhanceStore().fetchStatus()
 })
@@ -314,20 +302,16 @@ useChromeRevealListeners(() => {
   })
 })
 
-// 指针收起走 useChromeReveal 内的几何判据(不再靠 mouseleave —— 那条与几何唤出不对称,是真机
-// 「移入变隐藏、移出变显示」的病根,见该文件顶注)。此处只留焦点路径。
+// 指针收起走 useChromeReveal 的几何判据；此处只处理焦点路径。
 // 焦点离开标题栏(Tab 穿出/点击查看器)→ 收起;inert 化会自动把残留焦点逐出,无需手动还焦。
 function onTitlebarFocusOut(e: FocusEvent) {
   if (shouldCollapseOnFocusOut('top', e.relatedTarget as Node | null)) collapseTop()
 }
 
-// 主题初始化已并入 uiStore 的启动配置批(appearance 三键随 get_startup_config 一次读取,
-// R2-4 纪律);原 useTheme composable 的独立 IPC 已删除。
 // 自动启动派生流水线（视频封面/关键帧、音频封面、epub 封面）。
-// 此前无任何触发入口 → 流水线从未运行 → 视频封面不出现，本调用即根因修复。
 useDerivationAutoStart()
 
-// 外置配置文件（config.toml，批次B）：在 App 根组件（等价于 App 生命周期，永不卸载）挂全局
+// 外置配置文件：在 App 根组件挂全局
 // config-file-changed/config-file-error 监听——热更新须任意页面都生效，不局限于设置页
 // 打开期间。设置页（SettingsView.vue）再次调用同一 composable 只是复用同一份共享状态，
 // 不会重复注册监听（见 useConfigFile.ts 头注）。
@@ -400,6 +384,9 @@ function sendFrontendHeartbeat(): void {
 onMounted(async () => {
   // 关闭监听和心跳必须在首次 await 前装配。启动配置 IPC 卡住或失败时，任务栏关闭仍应可用。
   void listenAppEvent('window-close-requested', () => ui.requestAppClose())
+  void listenAppEvent('app-exit-requested', () => {
+    void ui.requestAppExit().catch((error) => logger.error('Explicit app exit failed', { error }))
+  })
   // 退出前 flush 协议同样必须在首次 await 前装配:启动 IPC 卡住时,退出仍应能请求落盘。
   void installSettingsLifecycle().catch(() => {})
   sendFrontendHeartbeat()

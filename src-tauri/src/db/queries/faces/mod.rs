@@ -1,8 +1,5 @@
-//! 人脸域 DAO:face 状态机、persons、人工审批、增量聚类、全量重聚类、rejection,
-//! 以及全文件唯一真跨域事务 `delete_media_item_hard`(硬删 + person 聚合重算,§4.3)
-//! (T 线拆分自 queries.rs,SQL/事务边界/aggregate 不变量不变;第一轮不二拆,D-005)。
-//! (二拆 facade,2026-07-25:faces.rs 单文件换成本目录,子模块按职责群拆分,
-//! 外部调用方 `crate::db::queries::<symbol>` 零改动,见拆分方案 analysis/faces-rs.md。)
+//! 人脸域 DAO：face 状态机、persons、人工审批、聚类、rejection，
+//! 以及跨域事务 `delete_media_item_hard`（硬删与 person 聚合重算）。
 
 mod approval;
 mod clustering;

@@ -596,7 +596,7 @@ fn open_hash_file(path: &Path) -> std::io::Result<File> {
 /// `O_NOFOLLOW`/`FILE_FLAG_OPEN_REPARSE_POINT` 只约束最终目录项；若历史数据库路径的
 /// 父目录后来被替换成链接，单独依赖这两个标志仍可能把摘要读到扫描根之外。这里在每个
 /// 路径状态复核点检查整条祖先链；竞态替换仍会由句柄物理身份和末尾路径复核拦截。
-fn reject_link_components(path: &Path) -> Result<(), HashError> {
+pub(crate) fn reject_link_components(path: &Path) -> Result<(), HashError> {
     for ancestor in path.ancestors() {
         if ancestor.as_os_str().is_empty() {
             continue;
@@ -642,7 +642,7 @@ fn system_time_to_ns(time: SystemTime) -> Result<i128, HashError> {
 }
 
 #[cfg(unix)]
-fn physical_identity_for_file(
+pub(crate) fn physical_identity_for_file(
     _file: &File,
     metadata: &Metadata,
 ) -> Result<PhysicalIdentity, HashError> {
@@ -655,7 +655,7 @@ fn physical_identity_for_file(
 }
 
 #[cfg(windows)]
-fn physical_identity_for_file(
+pub(crate) fn physical_identity_for_file(
     file: &File,
     _metadata: &Metadata,
 ) -> Result<PhysicalIdentity, HashError> {
@@ -684,7 +684,7 @@ fn physical_identity_for_file(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn physical_identity_for_file(
+pub(crate) fn physical_identity_for_file(
     _file: &File,
     _metadata: &Metadata,
 ) -> Result<PhysicalIdentity, HashError> {
@@ -851,7 +851,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 

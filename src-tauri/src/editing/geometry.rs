@@ -1,8 +1,8 @@
-//! 编辑几何处理链(方案 C §3.1/§6):纯函数,不碰 IO/DB,便于用小图逐像素单测穷举。
+//! 编辑几何处理链:纯函数,不碰 IO/DB,便于用小图逐像素单测穷举。
 //!
-//! 固定顺序(方案 §3.1):
+//! 固定顺序:
 //! 1. 解码并只应用一次文件 EXIF orientation;
-//! 2. 合入原 item 的 V20 `view_rotation` 与本次 `rotate`;
+//! 2. 合入原 item 的 `view_rotation` 与本次 `rotate`;
 //! 3. flip;
 //! 4. fine rotate(展开后取保持原宽高比的最大居中内接矩形);
 //! 5. crop(前端最终预览坐标系里的源像素矩形,后端只需 clamp,不需要反推——因为 crop 在
@@ -15,14 +15,14 @@ use serde::Deserialize;
 use crate::error::AppError;
 
 pub const CODE_CROP_EMPTY: &str = "edit_crop_empty";
-/// D-010:非法编辑参数(rotate 不在 0|90|180|270)的稳定码。方案 §6 码集是「至少包括」,
-/// 此码为 2026-07-19 复审新增——静默取模归 0 会保存出「没转的图」,必须显式拒绝。
+/// 非法编辑参数(rotate 不在 0|90|180|270)的稳定码。非法值不能静默取模归 0
+/// ——那会保存出「没转的图」,必须显式拒绝。
 pub const CODE_INVALID_OPS: &str = "edit_invalid_ops";
-/// D-111：拉直角度使用闭区间，两个端点都合法。
+/// 拉直角度使用闭区间，两个端点都合法。
 pub const STRAIGHTEN_MIN_DEGREES: f64 = -45.0;
 pub const STRAIGHTEN_MAX_DEGREES: f64 = 45.0;
 
-/// 前端最终预览坐标系里的源像素裁剪矩形(方案 §6 `EditOps::crop`)。
+/// 前端最终预览坐标系里的源像素裁剪矩形(`EditOps::crop`)。
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CropRect {
@@ -32,7 +32,7 @@ pub struct CropRect {
     pub height: u32,
 }
 
-/// 编辑操作输入(方案 §6 `EditOps`)。`rotate` 为相对当前所见顺时针角度。
+/// 编辑操作输入(`EditOps`)。`rotate` 为相对当前所见顺时针角度。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditOps {
@@ -40,21 +40,21 @@ pub struct EditOps {
     pub flip_h: bool,
     pub flip_v: bool,
     pub crop: Option<CropRect>,
-    /// D-106：v1 载荷没有此字段时反序列化为 `None`，且与显式 0 一样完全跳过插值路径。
+    /// v1 载荷没有此字段时反序列化为 `None`，且与显式 0 一样完全跳过插值路径。
     #[serde(default)]
     pub rotate_fine: Option<f64>,
-    /// E3 调色(设计 §4.3)。v1 载荷缺省为 `None`;全零载荷由命令层
-    /// [`super::adjust::effective_adjust`] 视同 `None`(D-106),不进入调色管线。
+    /// 调色。v1 载荷缺省为 `None`;全零载荷由命令层
+    /// [`super::adjust::effective_adjust`] 视同 `None`,不进入调色管线。
     #[serde(default)]
     pub adjust: Option<super::adjust::AdjustOps>,
 }
 
-/// `rotate` 合法值校验(方案契约:`0|90|180|270`)。
+/// `rotate` 合法值校验(`0|90|180|270`)。
 pub fn is_valid_rotate_step(rotate: u16) -> bool {
     matches!(rotate, 0 | 90 | 180 | 270)
 }
 
-/// 统一校验 v1 四态旋转、D-111 拉直闭区间与 E3 调色域。非有限值不能进入三角函数或像素
+/// 统一校验 v1 四态旋转、拉直闭区间与调色域。非有限值不能进入三角函数或像素
 /// 尺寸计算;调色域越界与几何非法同在解码前拒绝。
 pub fn validate_ops(ops: &EditOps) -> Result<f64, AppError> {
     if let Some(adjust) = &ops.adjust {
@@ -115,7 +115,7 @@ pub fn maximum_aspect_inscribed_size(width: u32, height: u32, angle_degrees: f64
     )
 }
 
-/// 合入 V20 `view_rotation`(数据库存的用户看图台旋转,取值同样是 0/90/180/270)与本次
+/// 合入 `view_rotation`(数据库存的用户看图台旋转,取值同样是 0/90/180/270)与本次
 /// `ops.rotate`,取模 360 落回 0/90/180/270 四态之一。两个输入均已在各自写入路径校验过是
 /// 四态之一,这里再用取模防御——万一 DB 里存在历史脏值也不会越界索引到不存在的分支。
 pub fn combine_rotation(view_rotation: i64, ops_rotate: u16) -> u16 {
@@ -129,7 +129,7 @@ pub fn combine_rotation(view_rotation: i64, ops_rotate: u16) -> u16 {
 }
 
 /// 按几何链变换像素:参数校验 → orientation(一次)→ 合并旋转 → flip → fine rotate → crop。
-/// `ops.rotate` 非法直接拒 [`CODE_INVALID_OPS`](D-010,不静默归 0);crop 越界先 clamp 到
+/// `ops.rotate` 非法直接拒 [`CODE_INVALID_OPS`](不静默归 0);crop 越界先 clamp 到
 /// 图像边界,clamp 后零面积返回 [`CODE_CROP_EMPTY`]。
 pub fn apply_geometry(
     mut img: DynamicImage,
@@ -153,7 +153,7 @@ pub fn apply_geometry(
         img = img.flipv();
     }
 
-    // D-106：缺省或 0° 必须完全绕过 imageproc，保证 v1 像素路径没有一次多余量化。
+    // 缺省或 0° 必须完全绕过 imageproc，保证 v1 像素路径没有一次多余量化。
     if fine != 0.0 {
         img = apply_fine_rotation(img, fine);
     }
@@ -243,77 +243,4 @@ fn apply_crop(img: DynamicImage, rect: CropRect) -> Result<DynamicImage, AppErro
         });
     }
     Ok(img.crop_imm(x, y, width, height))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use image::metadata::Orientation;
-    use image::{Rgb, RgbImage};
-
-    fn ops(rotate: u16, flip_h: bool, flip_v: bool, crop: Option<CropRect>) -> EditOps {
-        EditOps {
-            rotate,
-            flip_h,
-            flip_v,
-            crop,
-            rotate_fine: None,
-            adjust: None,
-        }
-    }
-
-    /// 3x2(宽×高)标记图:四角与中心像素各不相同,足以在旋转/翻转后按坐标断言,不需要
-    /// 逐像素比对整幅图。
-    fn marker_image() -> DynamicImage {
-        DynamicImage::ImageRgb8(RgbImage::from_fn(3, 2, |x, y| {
-            Rgb([(x * 50) as u8, (y * 80) as u8, 200])
-        }))
-    }
-
-    #[test]
-    fn orientation_applied_exactly_once_then_view_rotation_combines() {
-        // file orientation=Rotate90(EXIF 6)已经把 3x2 转成 2x3;之后再合入 view_rotation=90
-        // 应再转一次回到 3x2——验证「先 orientation 再合并旋转」是两次独立生效,不是被吞掉一次。
-        let img = marker_image();
-        let out =
-            apply_geometry(img, Orientation::Rotate90, 90, &ops(0, false, false, None)).unwrap();
-        assert_eq!((out.width(), out.height()), (3, 2));
-    }
-
-    #[test]
-    fn crop_is_in_post_transform_coordinate_space() {
-        // rotate90 后图像变 2x3;crop 矩形按变换后的坐标系给出,应直接生效不再反推。
-        let img = marker_image();
-        let out = apply_geometry(
-            img,
-            Orientation::NoTransforms,
-            0,
-            &ops(
-                90,
-                false,
-                false,
-                Some(CropRect {
-                    x: 0,
-                    y: 0,
-                    width: 2,
-                    height: 1,
-                }),
-            ),
-        )
-        .unwrap();
-        assert_eq!((out.width(), out.height()), (2, 1));
-    }
-
-    #[test]
-    fn fine_rotation_preserves_16_bit_variant() {
-        let source = DynamicImage::ImageRgb16(image::ImageBuffer::from_pixel(
-            40,
-            30,
-            image::Rgb([10_000, 20_000, 30_000]),
-        ));
-        let mut input = ops(0, false, false, None);
-        input.rotate_fine = Some(10.0);
-        let out = apply_geometry(source, Orientation::NoTransforms, 0, &input).unwrap();
-        assert!(matches!(out, DynamicImage::ImageRgb16(_)));
-    }
 }

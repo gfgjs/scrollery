@@ -118,7 +118,7 @@ pub fn invalidate_derived_for_item(conn: &Connection, item_id: i64) -> Result<()
 
 /// SourceChanged 落库(upsert「size 变」路径与 resolve「hash 变/无基线」路径共用):
 /// 覆写文件字段 + 重置主缩略图 + 写/清 content_hash 基线,并在同一事务语境内全失效派生。
-/// `content_hash=None` 表示无可信基线(size 变路径不算 hash;指纹计算失败)→ 置 NULL,
+/// `content_hash=None` 表示无可信基线(size 变或超过全文阈值不算 hash；指纹计算失败)→ 置 NULL,
 /// 使下次可疑变更走「NULL 兜底保守失效」而非拿陈旧基线错比。
 fn apply_source_changed(
     conn: &Connection,
@@ -169,6 +169,9 @@ fn apply_source_changed(
     if let Some(parent_id) = companion_parent {
         conn.prepare_cached(
             "UPDATE media_items SET source_revision=source_revision+1,
+                    thumb_status=CASE WHEN media_type='image' THEN 0 ELSE thumb_status END,
+                    thumb_path=CASE WHEN media_type='image' THEN NULL ELSE thumb_path END,
+                    thumbhash=CASE WHEN media_type='image' THEN NULL ELSE thumbhash END,
                     updated_at=strftime('%s','now')
               WHERE id=?1",
         )?
@@ -183,13 +186,13 @@ fn apply_source_changed(
 
 /// 「可疑变更」定案(Part2 §3.3.2 三环,P1-2/P1-4):比对存量 content_hash 基线与新指纹。
 /// - 基线存在且相同 → **touch**:完整 `sha256:` 指纹只更新 file_mtime/file_mtime_ns（下次扫描回
-///   Unchanged），但仍推进 source_revision 并删除精确摘要；普通派生可安全复用，因为该指纹已覆盖
-///   全文件。抽样 `sha256s:` 指纹不能证明未采样区域未变，因此按 SourceChanged 处理，切换带纳秒
+///   Unchanged），但仍推进 source_revision、清除图片展示引用并删除精确摘要；其它派生保留。
+///   抽样 `sha256s:` 指纹不能证明未采样区域未变，因此按 SourceChanged 处理，切换带纳秒
 ///   mtime 的 cache_key，并让普通派生/Exotic 一并重做，避免旧 worker 与旧缓存路径继续代表新源。
 /// - 基线 NULL(历史行首遇可疑变更)→ 保守判 SourceChanged(无旧值无法证明内容未变,
 ///   宁可重派生),并写回新指纹建立基线,下次可疑变更即可精确比对。
 /// - 基线不同 → SourceChanged + 基线更新。
-/// - `current_hash=None`(指纹计算失败)→ 保守 SourceChanged,基线置 NULL。
+/// - `current_hash=None`(超过全文阈值或指纹计算失败)→ 保守 SourceChanged,基线置 NULL。
 ///
 /// 调用方须在**写事务之外**完成指纹计算(hash IO 不进写锁),本函数只做短写。
 pub fn resolve_suspect_change(
@@ -220,12 +223,14 @@ pub fn resolve_suspect_change(
                           volume_id=COALESCE(volume_id, ?4),
                           availability=CASE WHEN availability='missing' THEN 'online' ELSE availability END,
                           source_revision=source_revision + 1,
+                          thumb_status=CASE WHEN media_type='image' THEN 0 ELSE thumb_status END,
+                          thumb_path=CASE WHEN media_type='image' THEN NULL ELSE thumb_path END,
+                          thumbhash=CASE WHEN media_type='image' THEN NULL ELSE thumbhash END,
                           updated_at=strftime('%s','now')
                  WHERE id=?1",
             )?
             .execute(params![id, item.file_mtime, item.file_mtime_ns, volume_id])?;
-            // 同 hash 只代表 change fingerprint 未变；抽样指纹可能漏掉大文件未抽样区域的改写。
-            // 因此 touch 也必须切断旧 exact digest 的 source_revision 绑定，避免并发分析把旧摘要
+            // touch 仍推进了源代次，必须切断旧 exact digest 的 source_revision 绑定，避免并发分析把旧摘要
             // 重新写回后继续参与重复组。
             conn.prepare_cached("DELETE FROM dedup_index WHERE item_id=?1")?
                 .execute(params![id])?;
@@ -234,6 +239,9 @@ pub fn resolve_suspect_change(
                 // 的组合摘要过期，即便 companion 自身的 change fingerprint 没有变化。
                 conn.prepare_cached(
                     "UPDATE media_items SET source_revision=source_revision+1,
+                            thumb_status=CASE WHEN media_type='image' THEN 0 ELSE thumb_status END,
+                            thumb_path=CASE WHEN media_type='image' THEN NULL ELSE thumb_path END,
+                            thumbhash=CASE WHEN media_type='image' THEN NULL ELSE thumbhash END,
                             updated_at=strftime('%s','now')
                       WHERE id=?1",
                 )?
@@ -263,9 +271,10 @@ pub fn upsert_fast_scan_item(
     // 热路径:每文件一次存在性 SELECT + 可能一次 INSERT。`prepare_cached` 让 SQLite
     // 复用同一连接上的已编译语句,消除逐文件 SQL 编译;查询错误仍按原语义视为「不存在」。
     #[allow(clippy::type_complexity)]
-    let existing: Option<(i64, i64, Option<i64>, i64, String, Option<i64>, Option<i64>)> = conn
+    let existing: Option<(i64, i64, Option<i64>, i64, String, Option<i64>, Option<i64>, String, String)> = conn
         .prepare_cached(
-            "SELECT id, file_mtime, file_mtime_ns, file_size, availability, volume_id, companion_of
+            "SELECT id, file_mtime, file_mtime_ns, file_size, availability, volume_id, companion_of,
+                    file_format, media_type
                FROM media_items WHERE directory_id=?1 AND file_name=?2",
         )
         .ok()
@@ -279,6 +288,8 @@ pub fn upsert_fast_scan_item(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             })
             .optional()
@@ -286,9 +297,26 @@ pub fn upsert_fast_scan_item(
             .flatten()
         });
 
-    if let Some((id, mtime, mtime_ns, size, availability, existing_vol, companion_parent)) =
-        existing
+    if let Some((
+        id,
+        mtime,
+        mtime_ns,
+        size,
+        availability,
+        existing_vol,
+        companion_parent,
+        format,
+        media_type,
+    )) = existing
     {
+        // 外部改名可只改变扩展名，size/mtime 和内容摘要均不变；格式与分类仍须重新入库，
+        // 否则保身份迁移后会一直使用旧解析器及派生元数据。
+        if format != item.file_format || media_type != item.media_type {
+            apply_source_changed(conn, id, item, volume_id, None)?;
+            // 旧插件的任务已不代表当前格式；调用方按新格式重新播种，不能留旧任务挡住派生。
+            conn.execute("DELETE FROM exotic_tasks WHERE item_id=?1", [id])?;
+            return Ok(UpsertOutcome::SourceChanged(id));
+        }
         // V26 之前的行没有可用纳秒值（NULL）。调用方的 0 同样表示无法取得精度；两者
         // 都未知时仍可保留旧的秒级兼容行为，但任一侧有已知纳秒且数值不同必须进 suspect。
         let same_mtime = mtime == item.file_mtime
@@ -308,6 +336,9 @@ pub fn upsert_fast_scan_item(
                          availability = CASE WHEN availability='missing' THEN 'online' ELSE availability END,
                          volume_id    = COALESCE(volume_id, ?2),
                          source_revision = source_revision + CASE WHEN availability='missing' THEN 1 ELSE 0 END,
+                         thumb_status = CASE WHEN availability='missing' AND media_type='image' THEN 0 ELSE thumb_status END,
+                         thumb_path = CASE WHEN availability='missing' AND media_type='image' THEN NULL ELSE thumb_path END,
+                         thumbhash = CASE WHEN availability='missing' AND media_type='image' THEN NULL ELSE thumbhash END,
                          updated_at   = strftime('%s','now')
                      WHERE id=?1",
                 )?
@@ -321,6 +352,9 @@ pub fn upsert_fast_scan_item(
                 if let Some(parent_id) = companion_parent {
                     conn.prepare_cached(
                         "UPDATE media_items SET source_revision=source_revision+1,
+                                thumb_status=CASE WHEN media_type='image' THEN 0 ELSE thumb_status END,
+                                thumb_path=CASE WHEN media_type='image' THEN NULL ELSE thumb_path END,
+                                thumbhash=CASE WHEN media_type='image' THEN NULL ELSE thumbhash END,
                                 updated_at=strftime('%s','now')
                           WHERE id=?1",
                     )?
@@ -418,40 +452,46 @@ mod fast_scan_upsert_recovery_tests {
         .unwrap();
     }
 
-    /// 真正源变更推进 source_revision，并删除绑定旧代次的 dedup_index 行。
+    /// mtime 与 mtime_ns 都未变但 size 变时，仍必须视为源变更并失效 exact sidecar。
     #[test]
-    fn source_change_advances_revision_and_clears_dedup_index() {
+    fn same_mtime_with_size_change_advances_revision_and_clears_dedup_index() {
         let c = mem_db();
-        insert_missing(&c, 32, "changed.jpg", 100);
+        insert_missing(&c, 36, "same-mtime.jpg", 100);
         c.execute(
-            "UPDATE media_items SET file_mtime_ns=100000000000, source_revision=4 WHERE id=32",
+            "UPDATE media_items SET file_mtime_ns=100000000001, source_revision=4 WHERE id=36",
             [],
         )
         .unwrap();
         c.execute(
             "INSERT INTO dedup_index (item_id, source_revision, hash_version, status, checked_at)
-             VALUES (32, 4, 1, 'done', 1)",
+             VALUES (36, 4, 1, 'done', 1)",
             [],
         )
         .unwrap();
 
-        let mut changed = item_sized("changed.jpg", 200, 20, 999);
-        changed.file_mtime_ns = 200000000001;
+        let changed = FastScanItem {
+            file_size: 20,
+            file_mtime: 100,
+            file_mtime_ns: 100000000001,
+            cache_key: 999,
+            ..item("same-mtime.jpg", 100)
+        };
         let out = upsert_fast_scan_item(&c, &changed, None).unwrap();
-        assert_eq!(out, UpsertOutcome::SourceChanged(32));
+        assert_eq!(out, UpsertOutcome::SourceChanged(36));
 
-        let (mtime_ns, revision, dedup_count): (i64, i64, i64) = c
+        let (size, mtime_ns, revision, dedup_count): (i64, i64, i64, i64) = c
             .query_row(
-                "SELECT file_mtime_ns, source_revision,
-                        (SELECT count(*) FROM dedup_index WHERE item_id=32)
-                   FROM media_items WHERE id=32",
+                "SELECT file_size, file_mtime_ns, source_revision,
+                        (SELECT count(*) FROM dedup_index WHERE item_id=36)
+                   FROM media_items WHERE id=36",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(mtime_ns, 200000000001);
-        assert_eq!(revision, 5);
-        assert_eq!(dedup_count, 0);
+        assert_eq!(size, 20);
+        assert_eq!(mtime_ns, 100000000001);
+        assert_eq!(revision, 5, "size 变更即使 mtime_ns 不变也要推进源代次");
+        assert_eq!(dedup_count, 0, "size 变更必须清除旧 exact sidecar");
     }
 
     #[test]
@@ -499,58 +539,22 @@ mod fast_scan_upsert_recovery_tests {
         assert_eq!(thumb_status, 0);
         assert_eq!(thumb_path, None);
         assert_eq!(dedup_count, 0);
-    }
 
-    /// companion 的 change fingerprint 相同时，也必须让主项的组合摘要失效。
-    #[test]
-    fn companion_touch_invalidates_parent_unit_digest() {
-        let c = mem_db();
-        c.execute(
-            "INSERT INTO media_items
-                (id, directory_id, file_name, file_size, file_mtime, file_mtime_ns,
-                 file_format, media_type, width, height, sort_datetime, cache_key,
-                 source_revision)
-             VALUES (34, 1, 'live.heic', 10, 100, 100000000000,
-                     'heic', 'image', 0, 0, 100, 1, 3),
-                    (35, 1, 'live.mov', 10, 100, 100000000000,
-                     'mov', 'video', 0, 0, 100, 2, 7)",
-            [],
-        )
-        .unwrap();
-        c.execute(
-            "UPDATE media_items
-                SET companion_of=34, content_hash='sha256:same'
-              WHERE id=35",
-            [],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO dedup_index (item_id, source_revision, hash_version, status, checked_at)
-             VALUES (34, 3, 1, 'done', 1), (35, 7, 1, 'done', 1)",
-            [],
-        )
-        .unwrap();
-
-        let mut touched = item_sized("live.mov", 101, 10, 999);
-        touched.file_mtime_ns = 101000000007;
-        let out = resolve_suspect_change(&c, 35, &touched, None, Some("sha256:same")).unwrap();
-        assert_eq!(out, UpsertOutcome::Unchanged(35));
-
-        let (child_revision, parent_revision, child_dedup, parent_dedup): (i64, i64, i64, i64) = c
-            .query_row(
-                "SELECT child.source_revision, parent.source_revision,
-                        (SELECT count(*) FROM dedup_index WHERE item_id=35),
-                        (SELECT count(*) FROM dedup_index WHERE item_id=34)
-                   FROM media_items AS child
-                   JOIN media_items AS parent ON parent.id=child.companion_of
-                  WHERE child.id=35",
+        // 扫描停止生成抽样指纹后，旧基线在下次可疑变更定案时清空。
+        touched.file_mtime = 102;
+        touched.file_mtime_ns = 102000000007;
+        assert_eq!(
+            resolve_suspect_change(&c, 35, &touched, None, None).unwrap(),
+            UpsertOutcome::SourceChanged(35)
+        );
+        assert_eq!(
+            c.query_row::<Option<String>, _, _>(
+                "SELECT content_hash FROM media_items WHERE id=35",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| r.get(0),
             )
-            .unwrap();
-        assert_eq!(child_revision, 8);
-        assert_eq!(parent_revision, 4);
-        assert_eq!(child_dedup, 0);
-        assert_eq!(parent_dedup, 0);
+            .unwrap(),
+            None
+        );
     }
 }

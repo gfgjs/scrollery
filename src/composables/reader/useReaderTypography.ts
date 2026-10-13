@@ -1,15 +1,7 @@
 // src/composables/reader/useReaderTypography.ts
-// 排版全参数 + 变更处理（结构拆分自 DocumentViewer.vue §S4 + §S31 + §S33 对应 10 项设置的启动引导）。
-//
-// 红线（§3 风险 1）：readerTypography computed 的字段名/结构必须与 BookReader.vue 的 :typography
-// prop 精确匹配（deep watch 消费），仅实变时才产新对象——不可在此边界改变 identity 语义。
-// 红线（§3 风险 2）：verticalChanged 是**仅有的两条**需 capture-first 的 remount 路径之一，必须先
-// captureCurrentPosition() 再 reloadToken++，顺序不可颠倒；该顺序由 root 注入的 requestRemount
-// 统一实现（本文件不自写 capture+bump，只调用 deps.requestRemount(true)）。
-//
-// 存储（设置集中保存，批次B）：14 个 doc_reader_* 键由后端 schema 注册。读入分两路——启动水合与
-// 「恢复默认/外部编辑」到达都走 applySettings()（只应用，不回写）；用户改动经本文件显式批量提交，
-// 且只提交真正变化的键（防步进连点时的冗余写）。
+// 排版设置与持久化；typography 字段须匹配 BookReader 的 prop，仅依赖实变时更新对象。
+// 版式变化经 requestRemount(true) 先捕获位置再重挂载。
+// 启动及外部快照只应用设置；用户操作批量提交实变键，避免重复写盘。
 import { ref, computed, watch, type Ref } from 'vue'
 import { readSetting, writeSettings } from '../../stores/settingsPersistence'
 import { normalizeReaderThemeId } from '../../themes/readerThemes'
@@ -32,7 +24,7 @@ export interface TypographyChangePayload {
 }
 
 export interface UseReaderTypographyDeps {
-  /** ReaderSettingsPanel 的变更事件同时携带自动翻页速率与主题槽（S5/S6，留根） */
+  /** 自动翻页速率与主题槽由 root 持有，并随排版设置一同更新。 */
   readerAutoScrollSec: Ref<number>
   readerThemeLight: Ref<string>
   readerThemeDark: Ref<string>
@@ -79,22 +71,19 @@ function readChoice<T extends string>(key: string, allowed: readonly T[]): T | u
 }
 
 export function useReaderTypography(deps: UseReaderTypographyDeps) {
-  // 阅读排版参数（R2-6a/b，全局偏好）：字号 / 行距 / 字体族 / 栏宽。与 readerStyles 默认对齐。
+  // 全局排版默认值与 readerStyles 对齐。
   const readerFontSize = ref(19)
   const readerLineHeight = ref(1.75)
   const readerFontFamily = ref<'serif' | 'sans'>('serif')
   const readerPageWidth = ref(720)
-  // 排版全参数（R3）：字重 / 字距(em) / 正文对齐 / 章题缩放。默认即 readerStyles 内置默认（零回归）。
   const readerFontWeight = ref(400)
   const readerLetterSpacing = ref(0)
   const readerTextAlign = ref<'justify' | 'left'>('justify')
   const readerTitleScale = ref(1)
-  // 段距（R5-c）：段落间距 em，默认 0.4（比原 0.15 更明显，与 readerStyles 默认对齐）。
+  // 段落间距单位为 em。
   const readerParagraphSpacing = ref(0.4)
-  // 翻页动画（R6）：none 瞬切 / slide 滑动（默认）/ curl 仿真翻页。透传 BookReader :page-turn。
   const readerPageTurn = ref<'none' | 'slide' | 'curl'>('slide')
-  // 版式（R5 竖排竹简）：off 横排 / vertical-rl 竖排右起 / vertical-lr 左起。切换须 remount（进 reloadToken）：
-  // foliate getDirection 仅在 section load 探测 writing-mode，改 prop 不重探测已加载 section。
+  // foliate 仅在章节加载时探测 writing-mode，切换版式需重挂载。
   const readerVertical = ref<'off' | 'vertical-rl' | 'vertical-lr'>('off')
   // 传给 BookReader 的 typography（computed → 仅实变时产新对象，配合 deep watch 精准重排）。
   const readerTypography = computed(() => ({
@@ -109,7 +98,7 @@ export function useReaderTypography(deps: UseReaderTypographyDeps) {
     paragraphSpacingEm: readerParagraphSpacing.value,
   }))
 
-  // 排版全参数（R3）读入：各带范围守卫，越界/非法/缺键保持当前值（默认）。
+  // 越界、非法或缺键时保持当前值。
   // 启动水合与恢复默认/外部编辑都经此路径——只应用，不写回设置。
   // 第一次调用是启动同步：此时阅读器尚未按用户位置工作，不能也不必重挂载（会把开卷位置冲掉）；
   // 之后的调用来自权威快照变化（恢复默认 / 外部改文件），版式实变必须走与用户切换同一条
@@ -165,7 +154,7 @@ export function useReaderTypography(deps: UseReaderTypographyDeps) {
     },
   )
 
-  // 自动翻页速率与阅读主题日夜槽也随权威快照水合（不再逐键 GET_APP_CONFIG）：
+  // 自动翻页速率与阅读主题日夜槽也随权威快照水合：
   // 缺键/非法/越界保持当前值；只应用，不写回。
   function applySharedSlots() {
     const autoScrollSec = readNumberInRange(KEYS.autoScrollSec, 2, 30, true)
@@ -189,8 +178,7 @@ export function useReaderTypography(deps: UseReaderTypographyDeps) {
   // remount 前用实时阅读位置刷新 initialPos(BookReader 重挂载据此从 :initial 恢复)。getCurrentLocation
   // 首次 relocate 前返回 null → 保持原 initialPos(开卷位置)。locator 形如 "cfi:...",与 restorePosition 同源。
   function onTypographyChange(v: TypographyChangePayload) {
-    // 版式（R5）唯一需重挂载的项：foliate getDirection 仅在 section load 探测 writing-mode，
-    // 改 prop 不会重探测已加载 section，故竖排↔横排切换须 remount 让 onLoad 重注 + getDirection 重探测。
+    // 排版项中仅版式变化需要重挂载，以重新探测章节 writing-mode。
     const verticalChanged = v.vertical !== readerVertical.value
     // 主题槽归一化(写库/比较均用归一化值,避免别名抖动导致假写入)。
     const nextThemeLight = normalizeReaderThemeId(v.readerThemeLight, 'light')
@@ -200,8 +188,7 @@ export function useReaderTypography(deps: UseReaderTypographyDeps) {
     const nextFontSize = Math.round(v.fontSizePx)
     const nextPageWidth = Math.round(v.maxInlineSizePx)
     const nextAutoScrollSec = Math.round(v.autoScrollSec)
-    // 逐键收集 (key,新值,旧值):旧值取当前 ref(须在下方落 ref 之前采集)。只写真正变化的键——否则
-    // 每次步进点击都要 14 次写盘,连点即成倍冗余写(审查报告 §ASIDE)。
+    // 更新 ref 前捕获旧值，只提交真正变化的键，避免步进连点重复写入。
     const cfgWrites: { key: string; next: string; prev: string }[] = [
       { key: KEYS.fontSize, next: String(nextFontSize), prev: String(readerFontSize.value) },
       { key: KEYS.lineHeight, next: String(v.lineHeight), prev: String(readerLineHeight.value) },
@@ -242,7 +229,7 @@ export function useReaderTypography(deps: UseReaderTypographyDeps) {
     readerTitleScale.value = v.titleScale
     readerParagraphSpacing.value = v.paragraphSpacingEm
     readerVertical.value = v.vertical
-    // 阅读主题槽（R3）：归一化后落 ref（BookReader watch 实时重着色，不 remount）+ 持久化。
+    // 主题槽归一化后实时重着色，无需重挂载。
     deps.readerThemeLight.value = nextThemeLight
     deps.readerThemeDark.value = nextThemeDark
     // 只提交真正变化的键(prev 已在函数顶部落 ref 之前采集):一次批量提交,连点时由中央集合合并。
