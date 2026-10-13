@@ -403,13 +403,13 @@ fn insert_face_row(conn: &Connection, model_name: &str, r: &NewFace) -> Result<(
     Ok(())
 }
 
-/// Face 条件完成写(2026-07-10 审查 X1,语义同 `batch_finish_ai_items`):仅 `cache_key`
+/// Face 条件完成写：仅源版本、`cache_key` 相同且未删除的项
 /// 仍等于领取时快照的项才「先删后插 faces + face_status=Done」;失效项整体跳过(其旧 faces
 /// 已被 invalidate_derived_for_item 删除,新结果又是旧内容算的,一并丢弃)。
 /// 返回真正完成(仍新鲜)的 item_id 集——调用方只把这些排进聚类队列。
 pub fn batch_finish_face_items(
     conn: &Connection,
-    items: &[(i64, i64)], // (item_id, cache_key 快照)
+    items: &[(i64, i64, i64)], // (item_id, cache_key, source_revision 快照)
     model_name: &str,
     rows: &[NewFace],
 ) -> Result<Vec<i64>> {
@@ -418,11 +418,11 @@ pub fn batch_finish_face_items(
     }
     let tx = conn.unchecked_transaction()?;
     let mut fresh_ids: Vec<i64> = Vec::with_capacity(items.len());
-    for (id, cache_key) in items {
+    for (id, cache_key, source_revision) in items {
         let fresh = tx.execute(
             "UPDATE media_items SET face_status=2, updated_at=strftime('%s','now')
-              WHERE id=?1 AND cache_key=?2",
-            params![id, cache_key],
+              WHERE id=?1 AND cache_key=?2 AND source_revision=?3 AND is_deleted=0",
+            params![id, cache_key, source_revision],
         )?;
         if fresh == 0 {
             continue;
@@ -451,7 +451,7 @@ pub fn batch_finish_face_items(
 /// X1 条件状态写(face 侧 Error 等失败路径,语义同 `batch_update_ai_status_guarded`)。
 pub fn batch_update_face_status_guarded(
     conn: &Connection,
-    items: &[(i64, i64)], // (item_id, cache_key 快照)
+    items: &[(i64, i64, i64)], // (item_id, cache_key, source_revision 快照)
     status: i64,
 ) -> Result<usize> {
     if items.is_empty() {
@@ -459,13 +459,217 @@ pub fn batch_update_face_status_guarded(
     }
     let tx = conn.unchecked_transaction()?;
     let mut n = 0usize;
-    for (id, cache_key) in items {
+    for (id, cache_key, source_revision) in items {
         n += tx.execute(
             "UPDATE media_items SET face_status=?1, updated_at=strftime('%s','now')
-              WHERE id=?2 AND cache_key=?3",
-            params![status, id, cache_key],
+              WHERE id=?2 AND cache_key=?3 AND source_revision=?4 AND is_deleted=0",
+            params![status, id, cache_key, source_revision],
         )?;
     }
     tx.commit()?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod x1_conditional_finish_tests {
+    //! 2026-07-10 审查 X1 回归钉:在途批 vs SourceChanged 失效的迟到落库必须整项落空——
+    //! 旧内容算出的向量/faces + status=2 不得永久留库(缩略图线 P1-4 同款病灶的 AI/face 半边)。
+    use super::*;
+    use crate::db::queries::ai::batch_finish_ai_items;
+
+    fn seeded() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
+             -- 1=在途中未失效(cache_key=11);2=在途中被 SourceChanged 失效(status 已回 0、换 key 23)
+             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, ai_status, face_status) VALUES
+                 (1, 10, 'a.jpg', 1, 1, 'jpg', 'image', 10, 10, 100, 11, 1, 1),
+                 (2, 10, 'b.jpg', 1, 2, 'jpg', 'image', 10, 10, 200, 23, 0, 0);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn ai_state(c: &Connection, id: i64) -> (i64, i64) {
+        let status: i64 = c
+            .query_row(
+                "SELECT ai_status FROM media_items WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let vecs: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM ai_embeddings WHERE item_id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (status, vecs)
+    }
+
+    #[test]
+    fn stale_ai_flush_lands_nowhere() {
+        let c = seeded();
+        let emb = vec![0u8; 8];
+        // Writer 的快照:item 2 领取时 key=22,落库时行内已是 23(被失效)。
+        let done = batch_finish_ai_items(
+            &c,
+            &[
+                (1, "m".into(), emb.clone(), 1, 11, 1),
+                (2, "m".into(), emb, 1, 22, 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(done, 1, "仅新鲜项完成");
+        assert_eq!(ai_state(&c, 1), (2, 1), "新鲜项:Done + 向量入库");
+        assert_eq!(ai_state(&c, 2), (0, 0), "失效项:保持 Pending、零向量");
+    }
+
+    fn one_face(item_id: i64) -> NewFace {
+        NewFace {
+            item_id,
+            bbox_x: 0.1,
+            bbox_y: 0.1,
+            bbox_w: 0.2,
+            bbox_h: 0.2,
+            landmarks: vec![0u8; 40],
+            det_score: 0.95,
+            quality: 0.5,
+            embedding: vec![0u8; 8],
+        }
+    }
+
+    #[test]
+    fn same_key_new_revision_and_deleted_sources_reject_late_face_results() {
+        let c = seeded();
+        c.execute_batch(
+            "UPDATE media_items SET source_revision=2,face_status=0 WHERE id=1;
+                         UPDATE media_items SET cache_key=22,is_deleted=1 WHERE id=2;",
+        )
+        .unwrap();
+        let items = [(1, 11, 1), (2, 22, 1)];
+        let fresh = batch_finish_face_items(&c, &items, "m", &[one_face(1), one_face(2)]).unwrap();
+        assert!(fresh.is_empty());
+        assert_eq!(batch_update_face_status_guarded(&c, &items, 3).unwrap(), 0);
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM faces", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM face_coverage", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT face_status FROM media_items WHERE id=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            batch_finish_face_items(&c, &[(1, 11, 2)], "m", &[]).unwrap(),
+            vec![1]
+        );
+    }
+}
+
+#[cfg(test)]
+mod face_approval_tests {
+    //! Part4 T3 §3.5.1 批量审批命令单测（confirm/reassign/unassign/reject/create + list 分组）。
+    //! FK 关闭以免铺设完整 media 链；list_likely_matches 的 media JOIN 为 LEFT JOIN，缺失项
+    //! 缩略图路径记 None、不影响分组与相似度断言。
+    use super::*;
+    use crate::db::queries::merge_persons;
+
+    fn mem() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        c
+    }
+
+    fn bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_face(
+        c: &Connection,
+        id: i64,
+        item_id: i64,
+        person_id: Option<i64>,
+        model: &str,
+        emb: &[f32],
+        quality: f32,
+        confirmed: bool,
+    ) {
+        c.execute(
+            "INSERT INTO faces (id, item_id, person_id, model_name, bbox_x, bbox_y, bbox_w, bbox_h,
+                                landmarks, det_score, quality, embedding, is_confirmed)
+             VALUES (?1, ?2, ?3, ?4, 0.1, 0.1, 0.2, 0.2, NULL, 0.9, ?5, ?6, ?7)",
+            params![
+                id,
+                item_id,
+                person_id,
+                model,
+                quality,
+                bytes(emb),
+                confirmed as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    fn add_person(
+        c: &Connection,
+        id: i64,
+        name: Option<&str>,
+        model: &str,
+        centroid: &[f32],
+        n: i64,
+    ) {
+        c.execute(
+            "INSERT INTO persons (id, name, is_named, model_name, centroid, face_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, name, name.is_some() as i64, model, bytes(centroid), n],
+        )
+        .unwrap();
+    }
+
+    fn face_person(c: &Connection, id: i64) -> Option<i64> {
+        c.query_row(
+            "SELECT person_id FROM faces WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn person_exists(c: &Connection, id: i64) -> bool {
+        c.query_row(
+            "SELECT COUNT(*) FROM persons WHERE id=?1",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn merge_cross_model_rejected() {
+        // 2026-07-10 审查 F1 回归钉:merge 曾是三个归属命令中唯一缺同模型守卫的。
+        let c = mem();
+        add_person(&c, 1, None, "m128", &[1.0, 0.0], 1);
+        add_person(&c, 2, None, "m512", &[0.0, 1.0], 1);
+        add_face(&c, 10, 100, Some(1), "m128", &[1.0, 0.0], 0.5, false);
+        assert!(merge_persons(&c, &[1], 2).is_err(), "跨模型合并必须拒绝");
+        assert!(person_exists(&c, 1), "拒绝后事务回滚、src 仍在");
+        assert_eq!(face_person(&c, 10), Some(1), "脸未被改派");
+    }
 }

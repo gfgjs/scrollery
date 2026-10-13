@@ -1,7 +1,7 @@
-// exotic 插件发行链共享签名/打包原语(Part8 D1 签发端的本地原型层)。
+// exotic 插件发行链共享签名与打包原语。
 //
 // 消费者:exotic-dev-registry.mjs(开发期 file:// 源)、exotic-internal-registry.mjs
-// (内测 HTTPS 源)、exotic-issue-license.mjs(License token 签发)。
+// (内测 HTTPS 源)。
 // 契约对端:src-tauri exotic::{registry,install} 与 crates/scrollery-exotic-trust——
 // 本库产物必须能通过 installer.rs 的 #[ignore] 核验测试(生产同一套校验链,勿双轨漂移)。
 
@@ -10,38 +10,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /**
- * 官方版商品配置(唯一可信源):`src-tauri/resources/official-product.json`。
- * 签发器、registry 生成器与发行检查都从这里取 product_id/sku,避免各脚本各自硬编码
- * 单项 SKU 或期限。字段缺失一律抛错(fail-fast),不静默回退占位值。
- */
-export function loadOfficialProduct(repoDir) {
-  const file = path.join(repoDir, 'src-tauri', 'resources', 'official-product.json');
-  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-  if (typeof raw.product_id !== 'string' || raw.product_id.length === 0) {
-    throw new Error(`${file} 缺 product_id`);
-  }
-  if (typeof raw.sku !== 'string' || raw.sku.length === 0) {
-    throw new Error(`${file} 缺 sku`);
-  }
-  if (typeof raw.sales_open !== 'boolean') {
-    throw new Error(`${file} 缺 sales_open(布尔)`);
-  }
-  if (raw.store_url !== null && typeof raw.store_url !== 'string') {
-    throw new Error(`${file} 的 store_url 须为字符串或 null`);
-  }
-  return {
-    productId: raw.product_id,
-    sku: raw.sku,
-    salesOpen: raw.sales_open,
-    storeUrl: raw.store_url ?? null,
-  };
-}
-
-/**
- * 与 crates/exotic-protocol/src/frame.rs 的 `PROTOCOL_VERSION` **手动**同步(worker 帧协议版本)。
- * ⚠ 无自动门禁:frame.rs 升版本时必须同步改这里,否则本工具生成/发布的插件包清单会烙上旧版本号,
- *   被 installer.rs 的启动前复核判为 protocol_mismatch 拒装(2026-07-13 事故:host=3 而此处滞留=2,
- *   已发布 registry 的 psd 包因此永久拒装;根因是升 host 时漏改本常量)。
+ * 与 crates/exotic-protocol/src/frame.rs 的 `PROTOCOL_VERSION` 保持一致；
+ * scripts/check-exotic-protocol-sync.mjs 在 CI 中校验两者，避免包清单因版本不符被拒装。
  */
 export const PROTOCOL_VERSION = 3;
 
@@ -80,14 +50,9 @@ export function sha256hex(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
-/** Ed25519 对原始字节签名(index/package-manifest/license payload 统一用此形态)。 */
+/** Ed25519 对原始字节签名(index/package-manifest 统一用此形态)。 */
 export function signBytes(privateKey, bytes) {
   return crypto.sign(null, bytes, privateKey);
-}
-
-/** base64url 无填充(License token 两段;与 exotic-trust b64url_encode 对齐)。 */
-export function b64url(buf) {
-  return Buffer.from(buf).toString('base64url');
 }
 
 function crc32(buf) {
@@ -232,36 +197,6 @@ export function signIndex({ keyId, releaseKey, seq, generatedAt, expiresAt, plug
     )
   );
   return { indexBytes, sigBytes: signBytes(releaseKey, indexBytes) };
-}
-
-/**
- * 签发 License token(exotic-trust §5.2):`b64url(payload_json) + "." + b64url(sig)`,
- * 签名覆盖 payload 原始字节,Verifier 不重序列化。expiresAt=null 即永久授权(v3 首发主路径)。
- */
-export function signLicenseToken({
-  licenseKey,
-  keyId,
-  licenseId,
-  pluginId,
-  sku,
-  issuedAt,
-  notBefore,
-  expiresAt,
-}) {
-  const payload = Buffer.from(
-    JSON.stringify({
-      version: 1,
-      key_id: keyId,
-      license_id: licenseId,
-      plugin_id: pluginId,
-      sku,
-      subject_hash: null,
-      issued_at: issuedAt,
-      not_before: notBefore,
-      expires_at: expiresAt,
-    })
-  );
-  return `${b64url(payload)}.${b64url(signBytes(licenseKey, payload))}`;
 }
 
 /** 单调序号(registry_sequence/package_sequence 防回滚基线):读取 +1 并回写。 */

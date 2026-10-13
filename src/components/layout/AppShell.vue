@@ -272,8 +272,6 @@ function onKeyDown(e: KeyboardEvent) {
   // ③ mod+W 关窗(#12):与标题栏 ✕ 同语义,走 closeBehavior(托盘隐藏/退出/询问)而非
   //    直接 EXIT_APP——尊重「最小化到托盘」偏好。刻意独立于①的守卫:查看器内、输入框内
   //    也生效(桌面惯例 mod+W 是窗口指令非文本键,WebView2 无默认行为,无冲突)。
-  //    ESC 兜底隐藏未做(留决策):ESC 已被查看器/全屏守卫/对话框/选区/backBar 五处强消费,
-  //    全局兜底极易误触,方案留档 docs/planning/2026-07-17-批量15项问题清单。
   if (
     (e.ctrlKey || e.metaKey) &&
     !e.shiftKey &&

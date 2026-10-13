@@ -3,6 +3,7 @@ import {
   uiHarnessAvail,
   uiHarnessAvailRatio,
   uiHarnessAppearance,
+  uiHarnessHoverCards,
   uiHarnessItems,
   uiHarnessRenderMode,
   uiHarnessRowHeight,
@@ -14,12 +15,101 @@ import { DEFAULT_THEME_DEFINITION } from '../themes/presets'
 import type { ThemeSeed } from '../themes/types'
 import type { IpcCommand } from '../utils/ipc'
 import type { LayoutRow, LayoutRowItem, LayoutSummary, MediaMeta } from '../types/layout'
-import type { AppStats, DirNode, MediaDetail, MediaType, ScanRoot, ThumbResult } from '../types/media'
+import type {
+  AppStats,
+  DirNode,
+  MediaDetail,
+  MediaType,
+  ScanRoot,
+  ThumbResult,
+  ThumbStatus,
+} from '../types/media'
 import type { DedupStatusSnapshot } from '../types/ipc'
 import type { SettingsChange, SettingsSnapshot, StartupPayload } from '../types/config'
+import type { PersonSummary } from '../types/person'
 
 const SCENE_VERSION = 1
-let officialHarnessActivated = false
+const activatedHarnessFeatures = new Set<string>()
+const freeActivationIds = ['feature-editing', 'exotic-ocr', 'exotic-enhance', 'exotic-image-psd']
+
+// 阅读编辑验收使用独立深链样例，不改变图库数量，也不会读写真实文件。
+// /doc/900001?engine=markdown-editor；本页内保存到内存，刷新后恢复样例。
+const markdownFixtures = new Map<number, string>([
+  [
+    900001,
+    '# 阅读与编辑样例\n\n这是一段 **粗体** 与 *斜体* 的中文 Markdown。\n\n## 清单\n\n- 第一项\n- 第二项\n\n## 代码\n\n```ts\nconst answer = 42\n```\n\n## 表格\n\n| 名称 | 状态 |\n| --- | --- |\n| 样例 | 就绪 |\n',
+  ],
+  [900002, '# 第二篇文档\n\n用于验证切换文档后的保存归属。\n'],
+  // 长段落用于验证查找滚动到命中文字，而非只滚到段落边界。
+  [
+    900003,
+    `# 长段落查找样例\n\n${'这是一段用于检查长文定位的连续正文。'.repeat(240)}定位终点\n\n## 文档结尾\n\n长段落样例结束。\n`,
+  ],
+  [
+    900004,
+    '# 相对图片样例\n\n![目录内的图片](<images/示例 image.svg>)\n\n![上级目录的图片](../shared/reference.svg)\n\n相对路径在编辑保存后应继续可移植。\n',
+  ],
+  [
+    900005,
+    '纯文本阅读与编辑\n\n进入编辑后仍采用阅读字号，并可保存后继续写作。\n\n取消前应保留尚未保存的草稿。\n',
+  ],
+])
+let markdownVersionId = 1
+const markdownVersions = new Map<number, { itemId: number; content: string }>()
+const markdownCurrentVersions = new Map<number, number>()
+const readerBookPrefs = new Map<number, string>()
+
+function effectiveDocumentText(itemId: unknown): string {
+  return (
+    markdownVersions.get(markdownCurrentVersions.get(Number(itemId)) ?? -1)?.content ??
+    markdownFixture(itemId)
+  )
+}
+
+function markdownFixture(itemId: unknown): string {
+  const content = markdownFixtures.get(Number(itemId))
+  if (content === undefined) throw new Error('[UI harness] 未定义该文档样例')
+  return content
+}
+
+// 人物墙编辑验证只用合成人物，不加载真实人脸或磁盘内容。
+const personFixtures: PersonSummary[] = [
+  {
+    id: 1,
+    name: '示例人物',
+    isNamed: true,
+    isHidden: false,
+    faceCount: 3,
+    coverItemId: null,
+    coverThumbPath: null,
+    coverThumbStatus: null,
+    coverBbox: null,
+  },
+  {
+    id: 2,
+    name: null,
+    isNamed: false,
+    isHidden: false,
+    faceCount: 1,
+    coverItemId: null,
+    coverThumbPath: null,
+    coverThumbStatus: null,
+    coverBbox: null,
+  },
+]
+const ignoredPersonFixtures: PersonSummary[] = [
+  {
+    id: 3,
+    name: '示例误检',
+    isNamed: true,
+    isHidden: false,
+    faceCount: 1,
+    coverItemId: null,
+    coverThumbPath: null,
+    coverThumbStatus: null,
+    coverBbox: null,
+  },
+]
 
 const samples = [
   ['山湖晨雾', '#6f8f9d', '#d9e7e8', 1.45],
@@ -75,6 +165,70 @@ function kindOf(index: number): { mediaType: MediaType; fileFormat: string } {
   return NON_IMAGE_SAMPLES[baseSampleIndex(index)] ?? { mediaType: 'image', fileFormat: 'jpg' }
 }
 
+/**
+ * `&hoverCards=1` 的固定悬停样本(仅该显式参数开启时生效,默认时所有样本与既有主题截图/性能
+ * 场景逐字节一致):覆盖「在线无缩略图 MD 文档卡 / missing 无缩略图 MD / 正常图片 / 视频」四条
+ * 悬停路径,并给两篇 MD 配上评分与收藏,配合长文件名核对悬停卡信息行的碰撞。
+ *
+ * mediaType=document + fileFormat=md + thumbStatus=2(失败) + thumbPath=null 即真实的「文档缩略图
+ * 未生成」纸张卡路径;md 按 typeBadgeOf 不出 DOC 角标,与生产一致。视频只覆盖播放角标与 <video>
+ * 挂载:harness 没有真实视频字节,不保证浏览器能解码 HOVER_VIDEO_ABS_PATH 的内容。
+ */
+type HoverFixturePatch = {
+  mediaType: MediaType
+  fileFormat?: string
+  thumbStatus?: ThumbStatus
+  thumbPath?: string | null
+  isFavorited?: boolean
+  rating?: number
+  availability?: string
+  durationMs?: number | null
+}
+
+const HOVER_VIDEO_ABS_PATH = `${typeof window === 'undefined' ? '' : (window.location?.origin ?? '')}/harness/documents/hover-card-sample-video.mp4`
+
+const HOVER_FIXTURES: Readonly<Record<number, HoverFixturePatch>> = {
+  // 0=在线无缩略图 MD 文档卡(已评分/收藏)
+  0: {
+    mediaType: 'document',
+    fileFormat: 'md',
+    thumbStatus: 2,
+    thumbPath: null,
+    isFavorited: true,
+    rating: 5,
+  },
+  // 1=missing 无缩略图 MD(已评分/收藏),配合超长元数据文件名验证信息行碰撞
+  1: {
+    mediaType: 'document',
+    fileFormat: 'md',
+    thumbStatus: 2,
+    thumbPath: null,
+    isFavorited: true,
+    rating: 4,
+    availability: 'missing',
+  },
+  // 2 保持正常图片(不覆盖)
+  // 3=视频:直接源无路径，核对无位图占位与播放角标。
+  3: { mediaType: 'video', fileFormat: 'mp4', thumbStatus: 3, thumbPath: null, durationMs: 12_000 },
+}
+
+/** 仅 GET_META_FOR_VIEWPORT 用:长文件名样本用于悬停卡信息行碰撞验证。 */
+const HOVER_FIXTURE_FILE_NAMES: Readonly<Record<number, string>> = {
+  0: '悬停卡样例-在线MD文档-缩略图未生成.md',
+  1: '悬停卡样例-季度结算与预算复核说明-编号2026-Q4-终版-请勿修改-超长文件名用于悬停卡信息行碰撞.md',
+  3: '悬停卡样例-城市延时短片.mp4',
+}
+
+function hoverFixtureOverride(index: number): HoverFixturePatch | null {
+  if (!uiHarnessHoverCards) return null
+  return HOVER_FIXTURES[baseSampleIndex(index)] ?? null
+}
+
+function hoverFixtureFileName(index: number): string | null {
+  if (!uiHarnessHoverCards) return null
+  return HOVER_FIXTURE_FILE_NAMES[baseSampleIndex(index)] ?? null
+}
+
 /** 高占比可用性场景(&avail=&availRatio=):前 ratio 比例条目按序标 offline/missing,其余 online。 */
 function availabilityOf(index: number): LayoutRowItem['availability'] {
   if (uiHarnessAvail && index < Math.floor(fixtureItemCount * uiHarnessAvailRatio)) {
@@ -87,7 +241,7 @@ function createItem(index: number, x: number, y: number, w: number, h: number): 
   const baseIndex = baseSampleIndex(index)
   const [, dark, , ratio] = sampleAt(index)
   const kind = kindOf(index)
-  return {
+  const item: LayoutRowItem = {
     id: index + 1,
     x,
     w,
@@ -111,6 +265,9 @@ function createItem(index: number, x: number, y: number, w: number, h: number): 
     originalHeight: 1800,
     sortDatetime: 1_767_225_600 - index * 18_000,
   }
+  // &hoverCards=1:前几条固定样本换成悬停卡验证组(见 HOVER_FIXTURES);默认关时原样返回。
+  const hoverPatch = hoverFixtureOverride(index)
+  return hoverPatch ? { ...item, ...hoverPatch } : item
 }
 
 let layoutRows: LayoutRow[] = []
@@ -118,13 +275,17 @@ let layoutSummary: LayoutSummary = {
   totalRows: 0,
   totalHeight: 0,
   layoutVersion: SCENE_VERSION,
-    orderVersion: SCENE_VERSION,
+  orderVersion: SCENE_VERSION,
   totalItems: fixtureItemCount,
   separators: [],
   monthBuckets: [],
 }
 
-function computeFixtureLayout(containerWidth: number, targetHeight: number, gap: number): LayoutSummary {
+function computeFixtureLayout(
+  containerWidth: number,
+  targetHeight: number,
+  gap: number,
+): LayoutSummary {
   const width = Math.max(640, containerWidth)
   const rows: LayoutRow[] = []
   const separators: LayoutSummary['separators'] = []
@@ -181,9 +342,7 @@ function computeFixtureLayout(containerWidth: number, targetHeight: number, gap:
     orderVersion: SCENE_VERSION,
     totalItems: fixtureItemCount,
     separators,
-    monthBuckets: [
-      { year: 2026, month: 1, count: fixtureItemCount, y: 0, groupId: '2026-01' },
-    ],
+    monthBuckets: [{ year: 2026, month: 1, count: fixtureItemCount, y: 0, groupId: '2026-01' }],
   }
   return layoutSummary
 }
@@ -204,19 +363,23 @@ const scanRoot: ScanRoot = {
 
 // 与 NON_IMAGE_SAMPLES 保持一致:侧栏计数若和网格里实际渲染的类型对不上,harness 自己就成了
 // 一个会误导人的假页面。
-const fixtureKinds = Array.from({ length: fixtureItemCount }, (_, index) => kindOf(index).mediaType)
+const fixtureKinds = Array.from(
+  { length: fixtureItemCount },
+  (_, index) => hoverFixtureOverride(index)?.mediaType ?? kindOf(index).mediaType,
+)
 const audioCount = fixtureKinds.filter((kind) => kind === 'audio').length
 const documentCount = fixtureKinds.filter((kind) => kind === 'document').length
-const nonImageCount = audioCount + documentCount
+const videoCount = fixtureKinds.filter((kind) => kind === 'video').length
+const nonImageCount = audioCount + documentCount + videoCount
 
 const stats: AppStats = {
   totalItems: fixtureItemCount,
   totalImages: fixtureItemCount - nonImageCount,
-  totalVideos: 0,
+  totalVideos: videoCount,
   totalAudios: audioCount,
   totalDocuments: documentCount,
   totalFavorited: Array.from({ length: fixtureItemCount }, (_, index) =>
-    [2, 9, 14].includes(baseSampleIndex(index)),
+    hoverFixtureOverride(index)?.isFavorited ?? [2, 9, 14].includes(baseSampleIndex(index)),
   ).filter(Boolean).length,
   totalDeleted: 0,
   totalLivePhotos: Array.from({ length: fixtureItemCount }, (_, index) =>
@@ -237,7 +400,11 @@ const SETTINGS_FIXTURE: Record<string, string> = {
   enable_thumb_hover_scale: 'true',
   // 行高:显式 &rowHeight= 优先;否则视觉场景 220 / perf 场景 60(既有行为)。
   grid_row_height:
-    uiHarnessRowHeight !== null ? String(uiHarnessRowHeight) : uiHarnessItems === null ? '220' : '60',
+    uiHarnessRowHeight !== null
+      ? String(uiHarnessRowHeight)
+      : uiHarnessItems === null
+        ? '220'
+        : '60',
   group_by: 'date',
   sort_within_group: 'datetime',
   layout_mode: 'justified',
@@ -248,7 +415,9 @@ const SETTINGS_FIXTURE: Record<string, string> = {
   // 缩略图信息开满,好让主题矩阵覆盖到徽章类 token(size 半透明黑底 / type 绿橙底 —— 正是 S7
   // 修的那批)。生产默认另有其值(showThumbInfo 默认开、elements 默认空 → 观感无徽章)。
   show_thumb_info: 'true',
-  thumb_info_elements: '["type","size","status"]',
+  thumb_info_elements: uiHarnessHoverCards
+    ? '["filename","type","size","status","favorite"]'
+    : '["type","size","status"]',
   hover_autoplay: 'false',
   appearance: 'light',
   // 主题参数按新模型落两份扁平种子(结构转换由 themes/config.ts 负责,harness 不另拼形状);
@@ -275,6 +444,10 @@ const SETTINGS_FIXTURE: Record<string, string> = {
   window_opacity: '90',
   // 画廊渲染引擎:留生产默认 canvas;截图矩阵的 &render=dom 覆盖它,好让两条绘制路径都出图。
   gallery_render_mode: 'canvas',
+  gallery_blend_enabled: 'false',
+  gallery_blend_edge_width: '2',
+  gallery_blend_blur_radius: '3',
+  gallery_blend_strength: '100',
 }
 
 /**
@@ -393,26 +566,40 @@ function mediaDetail(id: number): MediaDetail {
   // 与网格同源取类型:两路不一致会让「网格显示 AUDIO、点进去却是 image」这种 harness 自造的
   // 假象被当成产品 bug 追。
   const kind = kindOf(index)
+  const hoverPatch = hoverFixtureOverride(index)
+  // 与网格同源:悬停卡组里被覆盖的条目,查看器/预览解析也必须返回同一 mediaType/缩略图态,
+  // 否则「格上无图、点进去却有图」又是 harness 自造的假象。
+  const overlay: Pick<HoverFixturePatch, 'mediaType' | 'fileFormat' | 'thumbStatus'> | null =
+    hoverPatch
+      ? {
+          mediaType: hoverPatch.mediaType,
+          fileFormat: hoverPatch.fileFormat,
+          thumbStatus: hoverPatch.thumbStatus,
+        }
+      : null
+  const mediaType = overlay ? overlay.mediaType : kind.mediaType
+  const fileFormat = overlay?.fileFormat ?? kind.fileFormat
+  const thumbStatus = overlay?.thumbStatus ?? 3
   return {
     id: index + 1,
     directoryId: 101,
-    fileName: `${label}.${kind.fileFormat}`,
+    fileName: hoverPatch ? `${label}.${fileFormat}` : `${label}.${kind.fileFormat}`,
     fileSize: 1_200_000 + index * 83_000,
     fileMtime: 1_767_225_600 - index * 18_000,
-    fileFormat: kind.fileFormat,
-    mediaType: kind.mediaType,
+    fileFormat,
+    mediaType,
     width: Math.round(1800 * ratio),
     height: 1800,
-    durationMs: null,
+    durationMs: hoverPatch?.durationMs ?? null,
     sortDatetime: 1_767_225_600 - index * 18_000,
     cacheKey: index + 1,
-    thumbStatus: 3,
-    thumbPath: sampleSvg(index),
+    thumbStatus,
+    thumbPath: hoverPatch ? (hoverPatch.thumbPath ?? null) : sampleSvg(index),
     thumbhash: null,
-    isFavorited: index === 2 || index === 9 || index === 14,
+    isFavorited: hoverPatch?.isFavorited ?? (index === 2 || index === 9 || index === 14),
     isDeleted: false,
     deletedAt: null,
-    rating: index % 6 === 0 ? 4 : 0,
+    rating: hoverPatch?.rating ?? (index % 6 === 0 ? 4 : 0),
     colorLabel: index % 7 === 0 ? 4 : 0,
     viewRotation: 0,
     playbackPositionMs: 0,
@@ -422,9 +609,9 @@ function mediaDetail(id: number): MediaDetail {
     contentHash: null,
     createdAt: 1_767_225_600,
     updatedAt: 1_767_225_600,
-    absPath: sampleSvg(index),
+    absPath: mediaType === 'video' ? HOVER_VIDEO_ABS_PATH : sampleSvg(index),
     imageMeta: null,
-    availability: 'online',
+    availability: hoverPatch?.availability ?? 'online',
     videoMeta: null,
   }
 }
@@ -507,6 +694,9 @@ const dedupFixtureStatus: DedupStatusSnapshot = {
 }
 
 /** 真实页面使用的 DEV-only IPC fixture；未覆盖命令会记录出来，便于补齐场景。 */
+// 与真实 IPC 一样按批登记，定时结果可逐项取消。
+const viewportRequests = new Map<string, Map<number, ReturnType<typeof setTimeout>>>()
+
 export async function invokeHarness<T>(
   cmd: IpcCommand,
   args?: Record<string, unknown>,
@@ -654,7 +844,11 @@ export async function invokeHarness<T>(
       const ids = Array.isArray(args?.ids) ? (args.ids as number[]) : []
       return ids.map<MediaMeta>((id) => ({
         id,
-        fileName: `${sampleAt(id - 1)[0]}.${kindOf(id - 1).fileFormat}`,
+        // 与 createItem 同源取类型与文件名:否则悬停卡信息行的「文件名/类型」来自另一份 fixture,
+        // 长文件名碰撞验证会失准(默认关闭 &hoverCards=1 时与原式逐字节一致)。
+        fileName:
+          hoverFixtureFileName(id - 1) ??
+          `${sampleAt(id - 1)[0]}.${hoverFixtureOverride(id - 1)?.fileFormat ?? kindOf(id - 1).fileFormat}`,
         dirPath: 'C:/Scrollery 示例图库',
         gpsLat: null,
         gpsLng: null,
@@ -667,19 +861,155 @@ export async function invokeHarness<T>(
         exifIso: null,
       })) as T
     }
+    case IPC.GET_KEYFRAME_SPRITE:
+      // 固定视频样本的关键帧由浏览器验收拦截提供；默认夹具仍无 sprite。
+      return (
+        uiHarnessHoverCards && args?.itemId === 4
+          ? `${window.location.origin}/harness/documents/hover-card-sprite.svg`
+          : null
+      ) as T
     case IPC.GET_MEDIA_DETAIL:
+      if (markdownFixtures.has(Number(args?.id))) {
+        const id = Number(args?.id)
+        const fileFormat = id === 900005 ? 'txt' : 'md'
+        return {
+          ...mediaDetail(1),
+          id,
+          fileName: `阅读编辑样例-${id}.${fileFormat}`,
+          mediaType: 'document',
+          fileFormat,
+          absPath: `${window.location.origin}/harness/documents/${id}.${fileFormat}`,
+          fileSize: new TextEncoder().encode(markdownFixture(id)).length,
+          thumbPath: null,
+          width: null,
+          height: null,
+        } as T
+      }
       return mediaDetail(Number(args?.id ?? 1)) as T
+    case IPC.GET_DOCUMENT_TEXT:
+      return effectiveDocumentText(args?.itemId) as T
+    case IPC.GET_TEXT_BOOK_INDEX:
+      return {
+        encoding: 'UTF-8',
+        confidence: 'detected',
+        chapters: [{ title: '', charLen: effectiveDocumentText(args?.itemId).length }],
+      } as T
+    case IPC.GET_TEXT_CHAPTER:
+      return {
+        title: '',
+        paragraphs: effectiveDocumentText(args?.itemId).trim().split(/\n\n/),
+      } as T
+    case IPC.SAVE_VERSION: {
+      markdownFixture(args?.itemId)
+      if (typeof args?.content !== 'string') {
+        throw new Error('[UI harness] 文档保存缺少文本')
+      }
+      const versionId = markdownVersionId++
+      const itemId = Number(args.itemId)
+      if (args.target === 'overwrite') {
+        markdownFixtures.set(itemId, args.content)
+        markdownCurrentVersions.delete(itemId)
+      } else {
+        markdownVersions.set(versionId, { itemId, content: args.content })
+      }
+      return versionId as T
+    }
+    case IPC.SET_CURRENT_VERSION: {
+      const itemId = Number(args?.itemId)
+      const versionId = Number(args?.versionId)
+      if (markdownVersions.get(versionId)?.itemId !== itemId) {
+        throw new Error('[UI harness] 版本不属于当前文档')
+      }
+      markdownCurrentVersions.set(itemId, versionId)
+      return undefined as T
+    }
+    case IPC.GET_CURRENT_VERSION:
+      return (
+        markdownCurrentVersions.has(Number(args?.itemId))
+          ? { id: markdownCurrentVersions.get(Number(args?.itemId)) }
+          : null
+      ) as T
+    case IPC.GET_READER_BOOK_PREFS:
+      return (readerBookPrefs.get(Number(args?.itemId)) ?? null) as T
+    case IPC.SET_READER_BOOK_PREFS:
+      markdownFixture(args?.itemId)
+      if (typeof args?.prefs !== 'string') throw new Error('[UI harness] 阅读偏好缺少JSON')
+      readerBookPrefs.set(Number(args.itemId), args.prefs)
+      return undefined as T
+    case IPC.GET_READING_PROGRESS:
+      return null as T
+    case IPC.GET_EFFECTIVE_REPLACEMENTS:
+    case IPC.LIST_READER_BOOKMARKS:
+      return [] as T
+    case IPC.SET_READING_PROGRESS:
+      return undefined as T
     case IPC.LIST_FEATURE_OFFERINGS:
       return {
-        entitlement: { pluginId: 'scrollery-official', availability: officialHarnessActivated ? 'authorized' : 'installedUnlicensed', sourceTag: 'harness', sku: 'scrollery-official-onetime', storeUrl: null },
         features: [
-          { id: 'feature-editing', name: 'Image editing', paid: true, builtin: true, availability: 'installedUnlicensed', resources: 'ready' },
-          { id: 'exotic-ocr', name: 'OCR', paid: true, builtin: true, availability: 'availableUninstalled', resources: 'modelMissing' },
-          { id: 'exotic-enhance', name: 'Enhancement', paid: true, builtin: true, availability: 'availableUninstalled', resources: 'manifestUnready' },
-          { id: 'exotic-image-psd', name: 'PSD', paid: true, builtin: false, availability: 'availableUninstalled', resources: 'needsInstall' },
-          { id: 'exotic-image-raw', name: 'RAW', paid: false, builtin: true, availability: 'authorized', resources: 'included' },
-          { id: 'video-extended', name: 'Video formats', paid: false, builtin: true, availability: 'authorized', resources: 'included' },
-        ],
+          {
+            id: 'feature-editing',
+            name: 'Image editing',
+            activationRequired: true,
+            activated: false,
+            builtin: true,
+            availability: 'inactive',
+            resources: 'ready',
+          },
+          {
+            id: 'exotic-ocr',
+            name: 'OCR',
+            activationRequired: true,
+            activated: false,
+            builtin: true,
+            availability: 'availableUninstalled',
+            resources: 'modelMissing',
+          },
+          {
+            id: 'exotic-enhance',
+            name: 'Enhancement',
+            activationRequired: true,
+            activated: false,
+            builtin: true,
+            availability: 'availableUninstalled',
+            resources: 'manifestUnready',
+          },
+          {
+            id: 'exotic-image-psd',
+            name: 'PSD',
+            activationRequired: true,
+            activated: false,
+            builtin: false,
+            availability: 'availableUninstalled',
+            resources: 'needsInstall',
+          },
+          {
+            id: 'exotic-image-raw',
+            name: 'RAW',
+            activationRequired: false,
+            activated: false,
+            builtin: true,
+            availability: 'ready',
+            resources: 'included',
+          },
+          {
+            id: 'video-extended',
+            name: 'Video formats',
+            activationRequired: false,
+            activated: false,
+            builtin: true,
+            availability: 'ready',
+            resources: 'included',
+          },
+        ].map((feature) => ({
+          ...feature,
+          activated: activatedHarnessFeatures.has(feature.id),
+          availability:
+            feature.activationRequired && feature.builtin
+              ? activatedHarnessFeatures.has(feature.id)
+                ? 'ready'
+                : 'inactive'
+              : feature.availability,
+        })),
       } as T
     case IPC.FETCH_EXOTIC_REGISTRY:
       return { pluginCount: 0 } as T
@@ -687,22 +1017,22 @@ export async function invokeHarness<T>(
     case IPC.LIST_INSTALLED_EXOTIC_PLUGINS:
       return [] as T
     case IPC.GET_EXOTIC_PROCESSING_STATUS:
-      return { running: false, pending: 0, processing: 0, done: 0, error: 0, blockedByAvailability: 0 } as T
-    case IPC.ACTIVATE_OFFICIAL_LICENSE:
-      if (args?.token !== 'harness-official') throw { code: 'bad_signature', message: 'Invalid harness token' }
-      officialHarnessActivated = true
-      return undefined as T
-    case IPC.DEACTIVATE_OFFICIAL_LICENSE:
-      officialHarnessActivated = false
-      return undefined as T
-    case IPC.GET_OFFICIAL_ENTITLEMENT:
       return {
-        pluginId: 'scrollery-official',
-        availability: officialHarnessActivated ? 'authorized' : 'installedUnlicensed',
-        sourceTag: 'harness',
-        sku: 'scrollery-official-onetime',
-        storeUrl: null,
+        running: false,
+        pending: 0,
+        processing: 0,
+        done: 0,
+        error: 0,
+        blockedByAvailability: 0,
       } as T
+    case IPC.ACTIVATE_FEATURE:
+    case IPC.GET_FEATURE_ACTIVATION: {
+      const featureId = String(args?.featureId ?? '')
+      if (!freeActivationIds.includes(featureId))
+        throw { code: 'unknown_feature', message: 'Unknown feature' }
+      if (cmd === IPC.ACTIVATE_FEATURE) activatedHarnessFeatures.add(featureId)
+      return { featureId, activated: activatedHarnessFeatures.has(featureId) } as T
+    }
     case IPC.GET_EDIT_PREVIEW:
       return editPreviewPacket() as T
     case IPC.SAVE_EDITED_IMAGE:
@@ -738,6 +1068,22 @@ export async function invokeHarness<T>(
         analysisActive: false,
         waitingOn: [],
       } as T
+    case IPC.LIST_FACE_PERSONS:
+      return personFixtures.map((person) => ({ ...person })) as T
+    case IPC.LIST_IGNORED_FACE_PERSONS:
+      return ignoredPersonFixtures.map((person) => ({ ...person })) as T
+    case IPC.LIST_LIKELY_FACE_MATCHES:
+      return [] as T
+    case IPC.RENAME_FACE_PERSON: {
+      const person = [...personFixtures, ...ignoredPersonFixtures].find(
+        (p) => p.id === args?.personId,
+      )
+      if (!person) throw new Error('harness person not found')
+      const name = String(args?.name ?? '').trim()
+      person.name = name || null
+      person.isNamed = name.length > 0
+      return undefined as T
+    }
     case IPC.GET_FACE_STATUS:
       return {
         provider: '',
@@ -746,8 +1092,8 @@ export async function invokeHarness<T>(
         totalItems: fixtureItemCount,
         processedItems: 0,
         pendingItems: 0,
-        personCount: 0,
-        faceCount: 0,
+        personCount: personFixtures.length,
+        faceCount: personFixtures.reduce((count, person) => count + person.faceCount, 0),
         errorItems: 0,
         isAnalyzing: false,
         analysisActive: false,
@@ -789,8 +1135,8 @@ export async function invokeHarness<T>(
     case IPC.RESTORE_STAGE:
       return {
         backupId: '00112233445566778899aabbccddeeff',
-        stagingDir:
-          'C:/Scrollery UI Harness/restore-staging/00112233445566778899aabbccddeeff',
+        stagingToken: 'harness-staging-generation',
+        stagingDir: 'C:/Scrollery UI Harness/restore-staging/00112233445566778899aabbccddeeff',
         schemaVersion: 34,
         kind: 'auto',
         createdAtUtc: '2026-07-19T09:00:00Z',
@@ -799,6 +1145,9 @@ export async function invokeHarness<T>(
         externalDocumentVersions: 1,
         appdataDocumentCount: 6,
       } as T
+    // 目录移动恢复清单：后端契约是 Result<Vec<MoveRecoveryReport>>，未覆盖命令时不能再落回
+    // default 的兜底 null——那会把「模拟器缺实现」变成生产端必须承担的兼容分支。显式给空数组。
+    case IPC.LIST_PENDING_DIRECTORY_MOVES:
     case IPC.LIST_PENDING_DOC_THUMBS:
     case IPC.LIST_ICC_PROFILES:
     case IPC.LIST_EXOTIC_FORMAT_RESOLUTIONS:
@@ -842,30 +1191,51 @@ export async function invokeHarness<T>(
     case IPC.LOG_FRONTEND_EVENTS:
     case IPC.ENSURE_DOC_THUMB_QUEUE:
     case IPC.REGENERATE_MISSING_THUMB:
-    case IPC.CANCEL_VIEWPORT_THUMBNAIL_REQUEST:
     case IPC.START_BACKUP:
     case IPC.STOP_BACKUP:
     case IPC.RESTORE_ARM:
+    case IPC.RESTORE_DISCARD:
     case IPC.RELAUNCH_APP:
     case IPC.OPEN_LOG_WINDOW:
       return undefined as T
+    case IPC.CANCEL_VIEWPORT_THUMBNAIL_REQUEST: {
+      const a = args as { requestId: string; itemIds: number[] }
+      const pending = viewportRequests.get(a.requestId)
+      for (const id of a.itemIds) {
+        clearTimeout(pending?.get(id))
+        pending?.delete(id)
+      }
+      if (pending?.size === 0) viewportRequests.delete(a.requestId)
+      return undefined as T
+    }
     case IPC.BATCH_REQUEST_THUMBNAILS: {
-      // 「未生成冷库首览」基准场景的模拟生成器(&thumbStatus=0):逐项延迟经 Channel 送达
-      // 结果(状态 3 + favicon 走原图管线,与极密性能场景同源)。invoke 仅确认受理；
-      // harness 无真实 worker,这里以 30ms/项 的节流近似生成吞吐。
-      const a = args as
-        | { itemIds?: number[]; onResult?: { onmessage: (r: ThumbResult & { pending: boolean }) => void } }
-        | undefined
-      const ids = Array.isArray(a?.itemIds) ? (a!.itemIds as number[]) : []
-      const ch = a?.onResult
-      if (!ch || ids.length === 0) return undefined as T
-      ids.forEach((id, i) => {
-        setTimeout(
-          () => ch.onmessage({ itemId: id, thumbStatus: 3, thumbPath: '/favicon.png', thumbhash: null, pending: false }),
-          30 * (i + 1),
+      const a = args as {
+        requestId: string
+        itemIds: number[]
+        onResult: { onmessage: (r: ThumbResult & { outcome: 'complete' }) => void }
+      }
+      const pending = new Map<number, ReturnType<typeof setTimeout>>()
+      if (a.itemIds.length) viewportRequests.set(a.requestId, pending)
+      a.itemIds.forEach((id, i) => {
+        pending.set(
+          id,
+          setTimeout(
+            () => {
+              pending.delete(id)
+              if (pending.size === 0) viewportRequests.delete(a.requestId)
+              a.onResult.onmessage({
+                itemId: id,
+                thumbStatus: 3,
+                thumbPath: '/favicon.png',
+                thumbhash: null,
+                outcome: 'complete',
+              })
+            },
+            30 * (i + 1),
+          ),
         )
       })
-      return new Promise<void>((resolve) => setTimeout(resolve, 30 * ids.length + 50)) as T
+      return undefined as T
     }
     default:
       console.warn(`[UI harness] 尚未覆盖 IPC: ${cmd}`, args)

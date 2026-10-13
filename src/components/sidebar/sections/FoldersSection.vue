@@ -439,7 +439,6 @@ import {
   fileIcon,
   fileTitle as fileTitleImpl,
 } from './folderTree.helpers'
-import { isMobilePlatform } from '../../../utils/platform'
 import { summarizeTreeCategories } from './treeCategoryMenu.helpers'
 
 defineProps<{ order: number }>()
@@ -469,24 +468,14 @@ const folderTree = useFolderTree(
   () => treeFilter.selectedCategories,
 )
 
-// ── Flattened display rows: dirs interleaved with their (lazy-loaded) files ──────
-// Folders-first (VSCode-style): within a directory, subfolders (and their expanded
-// subtrees) come first, then the directory's OWN files. `folderTree.nodes` is already
-// a pre-order DFS of dirs; we emit a dir's files only once its whole subtree has been
-// walked — i.e. when we hit the next node at the same-or-shallower depth — so a
-// folder's structure stays navigable even when it holds many loose files.
 // 拍平的显示行：文件夹优先（VSCode 风格）——某目录内先列子文件夹（及其已展开子树），
 // 再列该目录「自身」的文件。`folderTree.nodes` 已是目录的前序 DFS；我们仅在某目录整个
 // 子树遍历完毕后（即遇到同级或更浅深度的下一个节点）才发射其文件，使文件夹结构在含大量
 // 散落文件时仍可导航。
 const displayRows = computed(() => flattenFolderRows(folderTree.nodes.value))
 
-// ── 树虚拟化(T1-a/T1-b)+ 双身份索引(D-013)基础设施 ──────────────────────────
-// 装配顺序说明(拆分方案 §2.2 依赖方向):virtualization/indices 是基础设施层,dragDrop 消费
-// 二者;KeyboardNav 需要 onNodeClick/onFileClick/onFileDblClick/AutoLoadMore.onLoadMore 作
-// 回调,故放在这些函数与 autoLoadMore 之后创建——kbNav 产出的 activeIndex 被更早定义的
-// onFileClick/onNodeClick 及 autoLoadMore 的 syncActiveIndex 以闭包形式前向引用,运行期由
-// Vue setup 的同步执行顺序保证赋值先于任何用户交互触发,是标准的 composable 互引用写法。
+// virtualization 与 indices 先创建，供 dragDrop 消费。KeyboardNav 依赖下方的点击和加载回调，
+// 因此在这些回调之后创建；此前闭包对 activeIndex 的引用会在用户交互前完成赋值。
 const {
   treeRef,
   scrollAreaEl,
@@ -521,20 +510,20 @@ const {
 // ── 文件行激活路由决策(组件对外行为契约核心,不再下沉)────────────────────────
 // 从树中打开文件——与画廊卡片单击（handleCardClick）共用 openMediaRoute 按类型分发;
 // 查看器已打开时用 replace 而非 push（树在查看器旁仍可点,push 会叠 history,
-// 关闭要按 N+1 次 ESC 才能回画廊,2026-07-10 深审问题2）。
+// 关闭时要多按 ESC 才能回画廊）。
 function onFileClick(file: DirFile, idx?: number) {
   if (idx !== undefined) activeIndex.value = idx // 鼠标点击同步键盘 active 行,方向键从此处接续
   // 拖拽(D-003)松手后的尾随 click 忽略,与 onNodeClick 同姿态——否则拖完一个**可打开**
   // 文件会顺手把它路由进查看器。
   if (consumeSuppressClick()) return
-  // 🔴 未入库的文件(格式未注册,或在被扫描器剪掉的隐藏目录里)**单击只选中**,不路由(§4.2)。
+  // 未入库的文件（格式未注册，或处于扫描器跳过的目录）单击只选中，不路由。
   // 绝不伪造 id 顶上:mediaRoute 对非 doc/audio 兜底到 /view/{id},假 id 不会报错,
-  // 会把一个 .exe 静默送进图片查看器。双击 reveal 由 P1-b-3 接入。
+  // 会把一个 .exe 静默送进图片查看器。双击使用 reveal。
   if (!isOpenableInApp(file)) return
   openMediaRoute(router, file.id, file.mediaType)
 }
 
-// 文本预览目标(问题②方案 B v1):非空即弹层展示;取数/错误态由 FilePreviewDialog 自持。
+// 文本预览目标非空时显示弹层；取数与错误态由 FilePreviewDialog 管理。
 const filePreview = ref<FilePreviewRequest | null>(null)
 
 // 双击 → 在系统文件管理器中**显示**(reveal),不是「用默认应用打开」(D-001,🔴 安全)。
@@ -552,15 +541,11 @@ function onFileDblClick(file: DirFile) {
   // 后端会把 relPath 当**不可信输入**过 resolve_within_root(逐段拒 `..` + canonicalize + 根边界)。
   const parent = nodesByKey.value.get(file.parentKey)
   if (!parent) return
-  // 纯文本白名单 → 应用内只读预览(问题②方案 B v1)。移动端同样可用:预览是纯应用内动作,
-  // 不依赖 opener。白名单外才落到 reveal。
+  // 纯文本白名单走应用内只读预览；白名单外在文件管理器中定位。
   if (isTextPreviewable(file.fileName)) {
     filePreview.value = { fileName: file.fileName, rootId: parent.rootId, relPath: file.relPath }
     return
   }
-  // 移动端 opener 不支持 reveal(D-001):UI 侧直接不发起,后端 unsupported_platform 只是
-  // 被直调时的兜底(审查 R-09)。tooltip(fileTitle)同步不承诺该动作。
-  if (isMobilePlatform) return
   invokeIpc(IPC.REVEAL_TREE_ENTRY, { rootId: parent.rootId, relPath: file.relPath }).catch(
     (err) => {
       logger.error('[FoldersSection] reveal tree entry failed', { error: err })
@@ -610,12 +595,9 @@ const ghostLabel = computed(() => {
   return t('demoPrivacy.aliasFile')
 })
 
-// ── Tree node click / selection ─────────────────────────────────────────────
 // ── 树节点点击 / 选择 ─────────────────────────────────────────────────────────
-// 模式B「文件夹作筛选」的统一导航助手(S2-c):同步设 viewStore(保 MediaGrid getViewKey 读取时序)+
-// 导航到可寻址 /folder/:id(深链/刷新可恢复;watcher 相等守卫跳过重复设值)。三处入口(点击/新增根后/移动
-// 后自动选中)共用本助手,避免各自手写 push 目标导致漂移。**关键**:这三处此前 push('/'),在 S2-c 后
-// watcher 会把 '/' 回填为 smart-album 'all' → 清掉刚设的 directory;故必须改为 push('/folder/:id')。
+// 文件夹筛选先更新 viewStore，再导航到 /folder/:id，使深链和刷新可恢复同一视图。
+// 点击、新增根和移动后自动选中共用此入口，避免路由与所选目录分叉。
 function navigateToFolder(id: number) {
   viewStore.setActiveDirectory(id)
   const target = folderToPath(id)
@@ -645,8 +627,7 @@ function onNodeClick(node: DirNode, idx?: number) {
 }
 
 function showAll() {
-  // setSmartAlbum('all') 已保证互斥(清 directory/collection/person),去掉此前冗余的第二次
-  // setActiveDirectory(null)(会二次 clearSelection);S2-c 补导航到 '/' 使 route 反映「全部」视图。
+  // setSmartAlbum('all') 会清除其它筛选；导航到 '/' 使路由反映「全部」视图。
   viewStore.setSmartAlbum('all')
   if (route.path !== '/') router.push('/')
 }

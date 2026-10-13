@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::db::queries as q;
-use crate::editing::entitlement;
 use crate::editing::geometry::{self, EditOps};
 use crate::editing::{adjust, ingest, io as edit_io, memory_budget, metadata, naming, preview};
 use crate::error::{AppError, Result};
@@ -50,7 +49,11 @@ pub struct EditOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum EditSaveResult {
     Saved {
         new_item_id: i64,
@@ -64,6 +67,37 @@ pub enum EditSaveResult {
         /// 所在 scan_root id,供前端「立即扫描」按钮直接调用既有 rescan 命令。
         root_id: i64,
     },
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+
+    #[test]
+    fn saved_result_exposes_new_item_id_to_viewer() {
+        let result = serde_json::to_value(EditSaveResult::Saved { new_item_id: 42 }).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({ "status": "saved", "newItemId": 42 })
+        );
+    }
+
+    #[test]
+    fn partial_result_exposes_recovery_fields_to_editor() {
+        let result = serde_json::to_value(EditSaveResult::SavedNeedsIndex {
+            path_hint: "edited.png".into(),
+            recovery_code: CODE_SAVED_NEEDS_INDEX.into(),
+            root_id: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "status": "savedNeedsIndex", "pathHint": "edited.png",
+                "recoveryCode": CODE_SAVED_NEEDS_INDEX, "rootId": 7,
+            })
+        );
+    }
 }
 
 /// 返回 E0 raw preview packet；二进制主体不走 serde JSON，前端解析固定包头后创建 blob URL。
@@ -160,9 +194,11 @@ fn run_save_edited_image(
     ops: &EditOps,
     output: &EditOutput,
 ) -> Result<(EditSaveResult, Option<i64>)> {
-    // 后端真门放在阻塞主链入口：绕过前端直接 invoke 也无法使用付费能力。
-    let provider = state.entitlement_provider();
-    entitlement::require_editing_entitlement(provider.as_ref())?;
+    // 阻塞主链入口读取同一免费激活记录。
+    {
+        let conn = state.db_read_pool.get().map_err(AppError::from)?;
+        crate::feature_activation::require_activated(&conn, "feature-editing")?;
+    }
     // 在打开/解码源图前先拒绝非法角度；apply_geometry 会在纯函数边界再次校验，防止旁路调用。
     let fine_rotation = geometry::validate_ops(ops)?;
 
@@ -332,8 +368,10 @@ fn run_save_edited_image(
 }
 
 fn run_get_edit_preview(state: &AppState, item_id: i64) -> Result<Vec<u8>> {
-    let provider = state.entitlement_provider();
-    entitlement::require_editing_entitlement(provider.as_ref())?;
+    {
+        let conn = state.db_read_pool.get().map_err(AppError::from)?;
+        crate::feature_activation::require_activated(&conn, "feature-editing")?;
+    }
 
     let detail = {
         let conn = state.db_read_pool.get().map_err(AppError::from)?;

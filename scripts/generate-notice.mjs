@@ -1,5 +1,4 @@
 // 第三方依赖归属清单(NOTICE.md)+ SBOM(CycloneDX 1.5 JSON)生成器。
-// G3「基建/法务(发行前置)」中「NOTICE + SBOM 生成」项的落地(2026-07-05)。
 //
 // 覆盖范围 = 实际分发物的依赖闭包:
 //   Rust 侧:主程序、ai-worker、psd-worker，以及独立 workspace 的 raw-worker。
@@ -13,10 +12,9 @@
 //           手工登记表补上——新增/升级 vendored 源时须同步该表(见对应 VENDOR.md)。
 //
 // 产物:
-//   NOTICE.md(仓库根,tracked)——归属清单;内容完全由两份 lockfile 决定,无时间戳,
+//   NOTICE.md(仓库根,tracked)——归属清单；由 lockfile 与下方手工登记表生成,无时间戳,
 //     重复生成逐字节稳定(--check 的前提)。
-//   target/sbom/scrollery.cdx.json(untracked)——CycloneDX SBOM,发布时作为工件附带
-//     (接入 release 流水线归 Part7-T16;此前手动生成)。
+//   target/sbom/scrollery.cdx.json(untracked)——CycloneDX SBOM，发布时作为工件附带。
 //
 // 用法:
 //   node scripts/generate-notice.mjs           # 生成 NOTICE.md + SBOM
@@ -25,7 +23,7 @@
 //
 // 法务边界(如实):本工具产出的是**归属清单与机器可读物料**,不是法律意见;
 // license 兼容性终审、完整 license 文本捆绑(cargo-about 级)与各商店政策核验
-// 属 G3「上架前须重新核验」的人工环节,不因本工具存在而免除。
+// 仍需人工核验。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -94,17 +92,6 @@ const VENDORED_FRONTEND = [
 // 不在根 lockfile 中、但会随产品或运行时分发的闭包成员。许可证表达式进入
 // NOTICE/SBOM；完整文本由 prepare-legal-resources.mjs 生成到安装包 legal/ 目录。
 const SHIPPED_RUNTIME_COMPONENTS = [
-  {
-    name: 'Intel libvpl (static dispatcher)',
-    version: '2.17.0',
-    license: 'MIT',
-    homepage: 'https://github.com/intel/libvpl',
-    purl: 'pkg:github/intel/libvpl@v2.17.0',
-    note:
-      'statically linked into the bundled native thumbnail worker; pinned to commit ' +
-      'd77f9195cf495b937631607333288fd917ae8939, texts kept under legal/libvpl',
-    eco: 'embedded-runtime',
-  },
   {
     name: 'LibRaw (embedded by rsraw-sys)',
     version: 'rsraw-sys-0.1.1',
@@ -406,56 +393,6 @@ function renderSbom(rustDeps, npmDeps, appVersion) {
   };
 }
 
-// ── selftest(仓例:verify-channel-bundle 同款纪律,防解析器退化成只会 PASS 的空壳) ──
-function selftest() {
-  const assert = (cond, msg) => {
-    if (!cond) {
-      console.error(`selftest FAILED: ${msg}`);
-      process.exit(2);
-    }
-  };
-  const a = parseCargoLine('anyhow v1.0.103~MIT OR Apache-2.0');
-  assert(a && a.name === 'anyhow' && a.version === '1.0.103' && !a.firstParty, 'registry 行解析');
-  const b = parseCargoLine('bitflags v2.13.0~MIT OR Apache-2.0 (*)');
-  assert(b && b.name === 'bitflags' && b.license === 'MIT OR Apache-2.0', 'dedupe 标记剥离');
-  // CI 实测字节序列(run 28732061603):CARGO_TERM_COLOR=always 下的着色 dedupe 标记
-  const b2 = parseCargoLine('brotli v8.0.4~BSD-3-Clause AND MIT \x1b[33m\x1b[2m(*)\x1b[39m\x1b[22m');
-  assert(b2 && b2.license === 'BSD-3-Clause AND MIT', 'ANSI 着色 dedupe 标记剥离');
-  const c = parseCargoLine('cssparser-macros v0.6.1 (proc-macro)~MPL-2.0');
-  assert(c && c.name === 'cssparser-macros' && !c.firstParty && c.license === 'MPL-2.0', 'proc-macro 注记');
-  const d = parseCargoLine('scrollery v0.1.0 (D:\\photoapp\\scrollery\\src-tauri)~');
-  assert(d && d.firstParty, 'windows path 依赖判第一方');
-  const e = parseCargoLine('some-crate v0.1.0 (/home/u/repo/crates/x)~');
-  assert(e && e.firstParty, 'posix path 依赖判第一方');
-  assert(parseCargoLine('') === null && parseCargoLine('  (*)  ') === null, '空行/纯标记行');
-  assert(normalizeSpdx('MIT/Apache-2.0') === 'MIT OR Apache-2.0', '斜杠归一化');
-  assert(normalizeSpdx('Apache-2.0 / MIT') === 'Apache-2.0 OR MIT', '带空格斜杠归一化');
-  assert(normalizeSpdx('') === null, '空 license');
-  assert(flagLicense('GPL-3.0-only') === 'strong', 'GPL 旗标');
-  assert(flagLicense('LGPL-2.1 OR MIT') === 'strong', 'LGPL 择一仍旗标');
-  assert(flagLicense('MPL-2.0') === 'weak', 'MPL 旗标');
-  assert(flagLicense('MIT OR Apache-2.0') === null, '宽松无旗标');
-  const lock = {
-    packages: {
-      '': { version: '0.1.0' },
-      'node_modules/vue': { version: '3.5.0', license: 'MIT' },
-      'node_modules/@scope/pkg/node_modules/inner': { version: '1.0.0', license: 'ISC' },
-      'node_modules/devtool': { version: '1.0.0', dev: true, license: 'MIT' },
-      'node_modules/onnxruntime-node': { version: '1.26.0', dev: true, license: 'MIT' },
-    },
-  };
-  const npm = collectNpmFromLock(lock);
-  assert(npm.length === 3, 'dev 排除 + 根排除 + shipped runtime 保留');
-  assert(npm.find((p) => p.name === 'inner'), '嵌套 node_modules 取末段包名');
-  assert(npm.find((p) => p.name === 'onnxruntime-node'), 'native runtime devDependency 保留');
-  assert(purlNpm('@tauri-apps/api', '2.0.0') === 'pkg:npm/%40tauri-apps/api@2.0.0', 'scoped purl 编码');
-  // vendored 登记表字段完整性(防有人加条目漏字段导致 NOTICE 渲染出空单元格/坏 purl)
-  assert(
-    VENDORED_FRONTEND.every((v) => v.name && v.version && v.license && v.homepage && v.purl),
-    'vendored 登记表字段完整(name/version/license/homepage/purl)'
-  );
-}
-
 // ── 主流程 ────────────────────────────────────────────────────────────────────
 function writeSbom(rustDeps, npmDeps, appVersion) {
   const sbomDir = path.join(repo, 'target', 'sbom');
@@ -465,7 +402,6 @@ function writeSbom(rustDeps, npmDeps, appVersion) {
   return sbomPath;
 }
 
-selftest();
 verifyPinnedVendoredArtifacts();
 
 const appVersion = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version;

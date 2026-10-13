@@ -169,11 +169,12 @@ pub async fn list_tree_entries(
                 rel_path: rel_path.clone(),
                 include_hidden,
             };
+            let revision = cache.revision();
             let snap = match cache.get(&key) {
                 Some(s) => s,
                 None => {
                     let s = Arc::new(list_fs_entries(&dir, include_hidden)?);
-                    cache.put(key, Arc::clone(&s));
+                    cache.put_if_current(key, Arc::clone(&s), revision);
                     s
                 }
             };
@@ -376,11 +377,8 @@ fn is_registered(e: &FsEntry, catalog: &crate::exotic::catalog::CatalogSnapshot)
 /// `tauri_plugin_opener::reveal_item_in_dir` 是 crate 根导出的**自由函数**（不需 `AppHandle`），
 /// 故插件**完全不注册**、capability 一条不授，JS 侧够不着，ACL 面为零。
 ///
-/// ## 移动端
-///
-/// 该函数在 Android/iOS 返回 `UnsupportedPlatform`，[`reveal_path`] 将其映射为稳定 IPC code
-/// `unsupported_platform`（`AppError::Reveal`，R-08）。**不得**降级为 `openPath`
-/// —— 那正好把上面挡掉的执行面放回来。UI 侧应隐藏/禁用该动作，本错误只是后端兜底。
+/// [`reveal_path`] 将 opener 错误映射为稳定 IPC code，前端显示失败提示。
+/// 失败时不得降级为 `openPath`，否则会重新引入上述执行风险。
 #[tauri::command]
 pub async fn reveal_tree_entry(
     root_id: i64,

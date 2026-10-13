@@ -1,12 +1,11 @@
-// Canvas 网格单格绘制原语 + 分隔行绘制,从 MediaGridCanvas.vue 下沉(方案 2.2 ②)。
-// 纯绘制函数:不再闭包捕获模块级 palette/props,改为显式接收 palette(和 drawSeparator
-// 额外接收 groupBy)参数——签名调整,不改变任何取值时序或绘制结果(§3.2)。
+// Canvas 网格单格绘制原语 + 分隔行绘制。
+// 纯绘制函数:palette(和 drawSeparator 的 groupBy)经参数显式传入,不闭包捕获外部状态。
 import type { LayoutRowSeparator } from '../../types/layout'
 import { docBadgeKind } from './mediaGrid.helpers'
 import { starPoints, clampStickyLabelY } from './mediaGridCanvas.helpers'
 import type { Palette } from './mediaGridCanvas.palette'
 
-// 拖拽手柄几何(drawHandle 绘制 / hitHandleAt 命中 同源,防两处漂移——§3.3 单一来源,
+// 拖拽手柄几何(drawHandle 绘制 / hitHandleAt 命中 同源,防两处漂移,
 // useCanvasHitTest.ts 从本模块 import,不得复制一份常量)。
 export const HANDLE_INSET = 4
 export const HANDLE_SIZE = 20
@@ -45,7 +44,7 @@ export function drawCheckbox(
 }
 
 /** 拖拽手柄(左上,对齐 DOM .media-thumb__drag-handle:圆角深底 + GripVertical 六点)。
- *  仅已选中格绘制(compact 亦绘 —— Canvas 画一笔零节点成本,故不按 compact 门控,符合裁决);
+ *  仅已选中格绘制(compact 亦绘 —— Canvas 画一笔零节点成本,故不按 compact 门控);
  *  (x,y) 为缩放后格左上角(随选中动画),命中判定 hitHandleAt 用 settled(0.85)几何,稳态两者对齐。 */
 export function drawHandle(ctx: CanvasRenderingContext2D, x: number, y: number, palette: Palette) {
   const hx = x + HANDLE_INSET
@@ -68,10 +67,16 @@ export function drawHandle(ctx: CanvasRenderingContext2D, x: number, y: number, 
 }
 
 /** 视频播放三角(半透明圆底 + 白三角,居中)。 */
-export function drawPlayIcon(ctx: CanvasRenderingContext2D, x: number, sy: number, w: number, h: number) {
+export function drawPlayIcon(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  sy: number,
+  w: number,
+  h: number,
+) {
   const cx = x + w / 2
   const cy = sy + h / 2
-  // 直径封顶 44px 对齐 DOM .badge-video 圆碟:悬停弹卡时圆钮不再明显缩放/变形。
+  // 直径封顶 44px 对齐 DOM .badge-video 圆碟:悬停弹卡时圆钮不变形。
   const r = Math.min(22, Math.min(w, h) * 0.16)
   ctx.fillStyle = 'rgba(0, 0, 0, 0.5)'
   ctx.beginPath()
@@ -96,6 +101,7 @@ export function drawDuration(
   h: number,
   text: string,
   palette: Palette,
+  lift = 0,
 ) {
   ctx.font = `10px ${palette.fontMono}`
   ctx.textBaseline = 'alphabetic'
@@ -105,7 +111,7 @@ export function drawDuration(
   const bw = tw + padX * 2
   const bh = 14
   const bx = x + w - bw - 6
-  const by = sy + h - bh - 6
+  const by = sy + h - bh - 6 - lift
   ctx.beginPath()
   ctx.roundRect(bx, by, bw, bh, palette.radiusSm)
   ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'
@@ -123,6 +129,7 @@ export function drawAvailBadge(
   text: string,
   bg: string,
   palette: Palette,
+  lift = 0,
 ) {
   ctx.font = '700 9px system-ui, -apple-system, sans-serif'
   ctx.textBaseline = 'alphabetic'
@@ -133,7 +140,7 @@ export function drawAvailBadge(
   const bh = 14
   const bx = x + 4
   // 左下角(让出左上给拖拽手柄;与 DOM .media-thumb__avail / .media-card__pending-badge 的 bottom:4 对齐)。
-  const by = sy + h - 4 - bh
+  const by = sy + h - 4 - bh - lift
   ctx.beginPath()
   ctx.roundRect(bx, by, bw, bh, palette.radiusSm)
   ctx.fillStyle = bg
@@ -176,7 +183,8 @@ export function drawTextCard(
   ctx.fillRect(x, y, w, 3)
   // 仿文本行(padding 14%/12%,行高 5px 圆角 2,宽 65/100/92/55%)
   const padX = w * 0.12
-  const padY = h * 0.14
+  // 格式徽章放到纸张顶端，避免与底部信息、状态行争用同一位置。
+  const padY = Math.max(31, h * 0.14)
   const innerW = w - padX * 2
   const lineH = 5
   const gap = (h - padY * 2) * 0.09
@@ -189,7 +197,7 @@ export function drawTextCard(
     ctx.fill()
     ly += lineH + gap
   }
-  // 扩展名徽章(左下,按格式品牌色)
+  // 扩展名徽章(左上,按格式品牌色)
   const text = (fmt || '').toUpperCase()
   ctx.font = `700 11px ${palette.fontMono}`
   ctx.textAlign = 'left'
@@ -198,7 +206,7 @@ export function drawTextCard(
   const bh = 17
   const bw = tw + 12
   const bx = x + padX
-  const by = y + h - padY - bh
+  const by = y + 6
   ctx.beginPath()
   ctx.roundRect(bx, by, bw, bh, 3)
   ctx.fillStyle = palette.badgeDoc[docBadgeKind(fmt)]
@@ -216,10 +224,10 @@ export function drawStars(
   rating: number,
   palette: Palette,
   lift = 0,
+  size = 12,
 ) {
-  const size = 12
   const gap = 2
-  // lift:左下角有可用态/待删角标时上抬一档避让(与 DOM .media-thumb--missing 的 rating-slot 抬升对齐)。
+  // lift 由共享底部布局给定，悬停前后使用同一操作槽。
   const top = y + h - 4 - size - lift
   ctx.save()
   ctx.shadowColor = 'rgba(0, 0, 0, 0.7)'
@@ -393,7 +401,7 @@ export function drawSeparator(
   const padX = 4
   const flowY = sy + Math.max(2, (row.height - contentH) / 2)
   // 行内 sticky 只钳标签 y:重复组头(§6.1)与 folder 分隔符行内跟随,date 维持随滚即走。
-  // 标题行不再铺底色/投影/分隔线(2026-09-12 裁决:与画廊底沉浸融合)。
+  // 标题行不铺底色/投影/分隔线:与画廊底沉浸融合。
   const sticky = isDupGroup || groupBy === 'folder'
   const py = sticky ? clampStickyLabelY(flowY, sy + row.height, contentH) : flowY
 

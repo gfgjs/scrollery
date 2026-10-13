@@ -52,7 +52,7 @@ export function useGalleryContextMenu(deps: GalleryContextMenuDeps) {
       if (item) break
     }
 
-    // 收敛(P2-3):共享项(复制图像/资源管理器显示/壁纸-仅图片)从命令注册表按 when 生成——
+    // 共享项（复制图像/资源管理器显示/壁纸仅图片）从命令注册表按 when 生成，
     // 「壁纸仅图片」条件此前在本组件与 MediaDetailOverlay 各硬编码一份,现单点定义于 global.ts。
     // move/copy 是本地 Command(批量流→批量对话框):右键项**已在选区内**则保留整个选区、作用于所有已选;
     // 右键项**不在选区**才替换为它(经典「右键未选项 = 选中并作用于它」)。此前无条件清选区→单张,
@@ -100,7 +100,7 @@ export function useGalleryContextMenu(deps: GalleryContextMenuDeps) {
         group: 'organize',
         order: 50,
         run: () => {
-          // 同 move/copy:右键项已在选区内则保留整个选区,否则替换为该项(方案 A §4)。
+          // 同 move/copy：右键项已在选区内则保留整个选区，否则替换为该项。
           if (!selection.isSelected(id)) {
             selection.clearSelection()
             selection.toggleSelect(id)

@@ -1,5 +1,5 @@
 // src/composables/useSidebarResize.ts
-// 侧边栏拖拽调整大小 (§14.2)
+// 侧边栏拖拽调整大小。
 
 import { ref, onBeforeUnmount } from 'vue'
 import { useUiStore } from '../stores/uiStore'

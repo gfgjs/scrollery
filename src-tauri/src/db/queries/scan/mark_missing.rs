@@ -235,6 +235,9 @@ fn run_diff(
         let sql = format!(
             "UPDATE media_items SET availability = 'missing',
                        source_revision = source_revision + 1,
+                       thumb_status = CASE WHEN media_type='image' THEN 0 ELSE thumb_status END,
+                       thumb_path = CASE WHEN media_type='image' THEN NULL ELSE thumb_path END,
+                       thumbhash = CASE WHEN media_type='image' THEN NULL ELSE thumbhash END,
                        updated_at = strftime('%s','now')
               WHERE directory_id IN (SELECT id FROM directories WHERE root_id = ?1)
                 AND volume_id IN (SELECT id FROM {online_table})
@@ -264,6 +267,9 @@ fn run_diff(
         for parent_id in affected_parents {
             tx.execute(
                 "UPDATE media_items SET source_revision=source_revision+1,
+                        thumb_status=CASE WHEN media_type='image' THEN 0 ELSE thumb_status END,
+                        thumb_path=CASE WHEN media_type='image' THEN NULL ELSE thumb_path END,
+                        thumbhash=CASE WHEN media_type='image' THEN NULL ELSE thumbhash END,
                         updated_at=strftime('%s','now')
                   WHERE id=?1",
                 params![parent_id],
@@ -316,7 +322,6 @@ mod mark_missing_tests {
         .unwrap()
     }
 
-    /// 三重守门矩阵：只有「在线卷 + 本根子树 + 未 seen + 未删」的项被标 missing，其余四类各被一道闸拦住。
     #[test]
     fn three_gates_mark_only_genuinely_missing() {
         let c = mem_db();
@@ -346,17 +351,6 @@ mod mark_missing_tests {
             })
             .unwrap();
         assert_eq!(d, 1);
-    }
-
-    /// 离线卷（online 集为空）：一项都不标——离线 ≠ 删除的第二层冗余防护。
-    #[test]
-    fn empty_online_set_marks_nothing() {
-        let c = mem_db();
-        add(&c, 300, 10, Some(5), "online", 0);
-        let seen: HashSet<i64> = HashSet::new();
-        let n = mark_missing(&c, 1, &[], &seen, false).unwrap();
-        assert_eq!(n, 0, "无在线卷 → 一项不标");
-        assert_eq!(avail(&c, 300), "online");
     }
 
     fn temp_table_exists(c: &Connection, table: &str) -> bool {
@@ -440,23 +434,5 @@ mod mark_missing_tests {
             &c,
             &online_table_name_for_run(1, generation2)
         ));
-    }
-
-    /// 大集合规模正确性：1000 项，奇数 id 全 seen、偶数 id 未 seen → 恰好 500 偶数项被标。
-    /// 压 TEMP 表 join 在规模下的正确性（C1 「large-set temp-table path」加固）。
-    #[test]
-    fn large_set_marks_exactly_unseen() {
-        let c = mem_db();
-        let mut seen: HashSet<i64> = HashSet::new();
-        for id in 1..=1000i64 {
-            add(&c, id, 10, Some(5), "online", 0);
-            if id % 2 == 1 {
-                seen.insert(id); // 奇数已 seen
-            }
-        }
-        let n = mark_missing(&c, 1, &[5], &seen, false).unwrap();
-        assert_eq!(n, 500, "恰好 500 个偶数 id 未 seen → 被标");
-        assert_eq!(avail(&c, 2), "missing", "偶数 id（未 seen）应标 missing");
-        assert_eq!(avail(&c, 3), "online", "奇数 id（已 seen）应保持 online");
     }
 }

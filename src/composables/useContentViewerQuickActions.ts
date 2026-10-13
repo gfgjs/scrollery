@@ -1,10 +1,8 @@
 // src/composables/useContentViewerQuickActions.ts
-// 从 ContentViewer.vue 下沉(超长文件拆分方案 2.1):收藏/评分/色标/资源管理器定位/Live Photo。
-// 纯逻辑搬迁,不改变原调用点/参数/时序——见 docs/planning/2026-07-25-超长文件拆分方案/analysis/ContentViewer-vue.md。
+// 查看器快捷动作:收藏/评分/色标/资源管理器定位/Live Photo。
 
 import { invokeIpc, type IpcError } from '../utils/ipc'
 import { logger } from '../utils/logger'
-import { isMobilePlatform } from '../utils/platform'
 import { resolveAssetUrl } from '../utils/assetUrl'
 import { IPC } from '../constants/ipc'
 import type { MediaDetail } from '../types/media'
@@ -51,8 +49,6 @@ export function useContentViewerQuickActions(options: {
   async function showInExplorer() {
     const target = detail()
     if (!target) return
-    // 移动端 opener 不支持 reveal(D-001/R-09):不发起;两处入口按钮已 v-if 隐藏,此为兜底。
-    if (isMobilePlatform) return
     // reveal 统一到 opener 后(F-015)后端会校验路径存在并同步等结果,「文件已被外部删除」
     // 成了常见真实失败;裸 await 会变成 unhandled rejection——用户只看到「点了没反应」。
     try {
@@ -88,7 +84,7 @@ export function useContentViewerQuickActions(options: {
         state.isPlayingLive.value = true
       } catch (e) {
         if (detail()?.id !== target.id) return
-        // 卷离线(T13):后端返 VolumeOffline{message=卷标签} → 提示「请插入设备 <label>」而非泛化错误。
+        // 卷离线：后端返 VolumeOffline{message=卷标签}，提示插入对应设备。
         const err = e as IpcError
         if (err?.code === 'VolumeOffline') {
           toast.addToast('error', t('detail.volumeOffline', { label: err.message }))

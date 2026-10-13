@@ -1,5 +1,4 @@
-// src-tauri/src/video/worker_service/runner.rs
-//! 桥接真实 worker 进程的 [`VideoJobRunner`] 适配层(自 worker_service.rs 结构性拆分,tierB-1)。
+//! 桥接真实 worker 进程的 [`VideoJobRunner`] 适配层。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -107,20 +106,8 @@ impl VideoJobRunner for WorkerVideoRunner {
             tracing::warn!("创建 video work_dir 失败:{e}");
             return Err(VideoServiceError::SessionInitFailed);
         }
-        // hash:下发基准改为 tools.rs manifest 钉定常量(防换包闭环,§2.4 深审 V4-4)——本地对
-        // ffmpeg.exe 现算保留,但降级为「本地损坏预检」:现算 ≠ manifest 即判定运行期被篡改/
-        // 磁盘损坏,本地报错不 init(install 期 `.ready` 门本应保证一致,错误信息不含路径不入 IPC)。
-        let local_sha256 = match crate::utils::hash::sha256_hex_of_file(&ffmpeg_exe) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!("ffmpeg.exe 哈希失败:{e}");
-                return Err(VideoServiceError::NeedsComponent);
-            }
-        };
-        if !local_sha256.eq_ignore_ascii_case(crate::exotic::tools::FFMPEG_EXE_SHA256) {
-            tracing::error!("ffmpeg.exe 现算 hash 与 manifest 不符(本地损坏预检未过),拒绝 init");
-            return Err(VideoServiceError::NeedsComponent);
-        }
+        // 只下发固定发行摘要，由真正使用 FFmpeg 的 worker 在初始化时核验一次。
+        // 失败仍走下方 FfmpegUnavailable 出口，host 不再紧邻重复整读同一可执行文件。
         let req = RequestBody::VideoSessionInit {
             session_id: self.session_id,
             ffmpeg_exe_path: ffmpeg_exe.to_string_lossy().into_owned(),
@@ -174,6 +161,7 @@ fn raw_outcome_label(o: &RawOutcome) -> &'static str {
         RawOutcome::Success { .. } => "success",
         RawOutcome::Failure(_) => "failure",
         RawOutcome::TimedOut => "timeout",
+        RawOutcome::Cancelled => "cancelled",
         RawOutcome::Disconnected => "disconnected",
         RawOutcome::Protocol(_) => "protocol_violation",
     }

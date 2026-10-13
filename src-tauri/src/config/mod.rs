@@ -162,7 +162,7 @@ impl ConfigManager {
     ///
     pub fn load_or_init(path: PathBuf) -> Result<(Self, Vec<KeyWarning>), ConfigFileError> {
         if !path.exists() {
-            file::write_atomic(&path, &file::render_template(&BTreeMap::new()))?;
+            file::write_atomic(&path, &file::render_template(&BTreeMap::new())?)?;
         }
         let loaded = file::load(&path)?;
 
@@ -247,7 +247,9 @@ impl ConfigManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut doc = self.read_doc_for_edit()?;
-        file::set_value(&mut doc, key, value);
+        let def =
+            SettingDef::find(key).ok_or_else(|| ConfigFileError::UnknownKey(key.to_string()))?;
+        file::set_value(&mut doc, def, value)?;
         let content = doc.to_string();
         let fp = file::write_atomic(&self.path, &content)?;
         {
@@ -405,7 +407,7 @@ impl ConfigManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = self.effective_values();
-        let content = file::render_template(&BTreeMap::new());
+        let content = file::render_template(&BTreeMap::new())?;
         let fp = file::write_atomic(&self.path, &content)?;
         {
             let mut values = self
@@ -444,7 +446,9 @@ impl ConfigManager {
     ) -> Result<CommitOutcome, ConfigFileError> {
         let mut doc = self.read_doc_for_edit()?;
         for (key, val) in patch {
-            file::set_value(&mut doc, key, val);
+            let def =
+                SettingDef::find(key).ok_or_else(|| ConfigFileError::UnknownKey(key.clone()))?;
+            file::set_value(&mut doc, def, val)?;
         }
         let content = doc.to_string();
         let fp = file::write_atomic(&self.path, &content)?;
@@ -549,7 +553,7 @@ impl ConfigManager {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                file::render_template(&BTreeMap::new())
+                file::render_template(&BTreeMap::new())?
             }
             Err(e) => return Err(ConfigFileError::Io(e)),
         };
@@ -617,94 +621,9 @@ mod tests {
 
     // ── 重置 ────────────────────────────────────────────────────────────────
 
-    /// 重置**只动配置文件**:内部状态键不在 schema 内,故重置既不读也不写它们
-    /// (「重置不重放引导、不改变任务启停意图」在配置层的表述)。
+    /// 写默认模板失败时,不得提交重置后的快照与代次。
     #[test]
-    fn reset_all_touches_only_settings_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let (manager, _) = ConfigManager::load_or_init(path.clone()).unwrap();
-        let patch = BTreeMap::from([
-            ("thumb_fast_threads".into(), "6".into()),
-            ("thumb_tail_threads".into(), "2".into()),
-            ("thumb_gpu_inflight".into(), "4".into()),
-            ("thumb_gpu_per_adapter".into(), "3".into()),
-            ("thumb_process_memory_mb".into(), "1024".into()),
-            ("thumb_total_memory_mb".into(), "1536".into()),
-            ("thumb_workset_mb".into(), "1024".into()),
-        ]);
-        let patch = super::settings::canonicalize_patch(&patch).unwrap();
-        let committed = manager.commit_batch(&patch, 0).unwrap();
-        assert_eq!(
-            committed.restart_required.len(),
-            patch
-                .iter()
-                .filter(|(key, value)| crate::config::schema::SettingDef::find(key)
-                    .unwrap()
-                    .default
-                    != value.as_str())
-                .count()
-        );
-        let (reloaded, _) = ConfigManager::load_or_init(path).unwrap();
-        let limits =
-            crate::thumbnail::limits::ThumbnailLimits::from_reader(|key| reloaded.get(key));
-        assert_eq!(limits.fast_threads_for(10), 6);
-        assert_eq!(
-            (
-                limits.tail_threads,
-                limits.gpu_inflight,
-                limits.gpu_per_adapter
-            ),
-            (2, 4, 3)
-        );
-        assert_eq!(limits.process_memory_bytes(), 1024 * 1024 * 1024);
-        assert_eq!(limits.total_memory_bytes(), 1536 * 1024 * 1024);
-        assert_eq!(limits.workset_bytes(), 1024 * 1024 * 1024);
-        let wire = serde_json::to_string(&limits).unwrap();
-        let worker_limits: crate::thumbnail::limits::ThumbnailLimits =
-            serde_json::from_str(&wire).unwrap();
-        assert_eq!(worker_limits.gpu_per_adapter, 3);
-        assert!(super::settings::canonicalize_patch(&BTreeMap::from([(
-            "thumb_fast_threads".into(),
-            "65".into()
-        )]))
-        .is_err());
-        assert!(super::settings::canonicalize_patch(&BTreeMap::from([(
-            "thumb_workset_mb".into(),
-            "0".into()
-        )]))
-        .is_err());
-        let outcome = manager.reset_all().unwrap();
-        let defaults =
-            crate::thumbnail::limits::ThumbnailLimits::from_reader(|key| manager.get(key));
-        assert_eq!(defaults.fast_threads_for(10), 8);
-        assert_eq!(
-            (
-                defaults.tail_threads,
-                defaults.gpu_inflight,
-                defaults.gpu_per_adapter
-            ),
-            (2, 2, 1)
-        );
-        assert_eq!(defaults.process_memory_bytes(), 1024 * 1024 * 1024);
-        assert_eq!(defaults.total_memory_bytes(), 2048 * 1024 * 1024);
-        for key in outcome.keys {
-            assert!(
-                SettingDef::find(&key).is_some(),
-                "{key} 不在设置清单内,重置不该触碰它"
-            );
-            assert!(
-                !super::schema::STATE_KEYS.contains(&key.as_str()),
-                "{key} 是内部状态键,配置重置不得涉及"
-            );
-        }
-    }
-
-    // ── 外部重读:函数自己读盘,不接受调用方带进来的旧内容 ─────────────────────────
-
-    /// 语法错的读取**不改动当前生效值**:较新的有效状态不会被一次失败的重读抹掉。
-    #[test]
-    fn failed_reload_keeps_effective_values() {
+    fn failed_reset_keeps_file_values_and_versions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let (manager, _) = ConfigManager::load_or_init(path.clone()).unwrap();
@@ -714,13 +633,23 @@ mod tests {
                 0,
             )
             .unwrap();
-        std::fs::write(&path, "this is not toml = = =\n").unwrap();
-        assert!(manager.reload_from_disk().is_err());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let values_before = manager.effective_values();
+        let revision_before = manager.revision();
+        let generation_before = manager.generation();
+        let fingerprint_before = *manager.fingerprint_lock().lock().unwrap();
+        // 同名目录让临时文件写入失败,原配置文件仍然有效。
+        std::fs::create_dir(path.with_extension("toml.tmp")).unwrap();
+        assert!(matches!(manager.reset_all(), Err(ConfigFileError::Io(_))));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+        assert_eq!(manager.effective_values(), values_before);
+        assert_eq!(manager.revision(), revision_before);
+        assert_eq!(manager.generation(), generation_before);
         assert_eq!(
-            manager.get("thumb_size").as_deref(),
-            Some("256"),
-            "重读失败时生效值必须保持"
+            *manager.fingerprint_lock().lock().unwrap(),
+            fingerprint_before
         );
-        assert!(manager.load_error_status().is_some());
     }
+
+    // ── 外部重读:函数自己读盘,不接受调用方带进来的旧内容 ─────────────────────────
 }

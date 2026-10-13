@@ -1,10 +1,6 @@
 <script setup lang="ts">
-// UiToggle — 全局 `.toggle` 开关组件的类型化包裹（S1 UI primitive）。
-// 收敛此前各处手写的裸三元 DOM 结构,复用已过 contrast 门禁的全局 `.toggle` / `.toggle__thumb` 样式;
-// 选中/滑动/焦点态全走纯 CSS(`:has(input:checked)`、`input:checked ~ .toggle__thumb`、`:focus-within`),
-// 无 JS 态,构造即视觉等价。
-// compact 等作用域变体经 class fallthrough 合并到根 <label>:单根组件默认 inheritAttrs,父作用域 scoped
-// 选择器借 child-root 携带的父 data-v 仍命中(与 UiIconButton 迁移同理)。
+// 复用全局 `.toggle` 样式；选中、滑动和焦点态由 CSS 处理。
+// compact 等变体通过 class fallthrough 合并到根 <label>，父组件的 scoped 样式仍可命中。
 defineProps<{
   /** 当前开关值(v-model)。 */
   modelValue: boolean
@@ -16,7 +12,7 @@ defineProps<{
 
 const emit = defineEmits<{ 'update:modelValue': [boolean] }>()
 
-// v-model on native checkbox 语义:读 checked、监听 change 写回布尔(与原 `v-model` 行为一致)。
+// 按原生 checkbox 的 change 事件回写布尔值。
 function onChange(e: Event) {
   emit('update:modelValue', (e.target as HTMLInputElement).checked)
 }

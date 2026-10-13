@@ -1,7 +1,7 @@
 // crates/exotic-workers/enhance-worker/src/main.rs
-//! 影像增强 Worker 主循环(降噪/超分子系统 design.md §A):独立进程,承接降噪/去伪影/
+//! 影像增强 Worker 主循环：独立进程承接降噪/去伪影/
 //! 超分推理。契约照 ai-worker 样板 + enhance 会话族 op:
-//!   - **stdout 只走协议帧**;日志只写 stderr(单行 JSON WorkerLogLine,D-313/D-314)。
+//!   - **stdout 只走协议帧**；日志只写 stderr 的单行 JSON WorkerLogLine。
 //!   - 进程握手快而恒定(Hello→Ready):**不承载模型加载**。模型加载 = 显式
 //!     EnhanceSessionInit 请求,加载期流式 Progress 心跳(照 CLIP SessionInit 先例)。
 //!   - host 主导会话生命周期(EnhanceSessionClose 显式卸载);本端兜底**空闲自杀 300s**

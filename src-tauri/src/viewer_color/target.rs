@@ -1,9 +1,9 @@
-//! 查看器渲染目标色域的解析与 profile 装配(方案 §0②③④)。
+//! 查看器渲染目标色域的解析与 profile 装配。
 //!
 //! `ViewerColorTarget` 从 config 的 `viewer_color_target` + `viewer_color_custom_id` 两键派生
 //! (config 单源,前端不传 target,防口径分叉)。srgb / 未选自定义 → `None`(无派生,直显原图)。
 //! `resolve_profile` 同时给出 CMS 变换用的 `ColorProfile` 对象与要嵌入输出的**同一份字节**
-//! (D-412 构造性成立:内置走 `encode()`,自定义走导入原字节,绝不重编码)。
+//! （内置走 `encode()`，自定义使用导入原字节）。
 
 use std::path::{Path, PathBuf};
 

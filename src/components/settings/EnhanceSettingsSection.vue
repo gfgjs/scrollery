@@ -1,34 +1,17 @@
-<!-- 影像增强模型分节（降噪/超分子系统 P0 批 5）：模型卡片列表（名称/任务标签/体量占位/下载进度/
-     下载/删除）。模板照 OcrModelSection.vue（固定模型组下载形态）。未授权态分节仍显示——模型下载
-     免费，enhance_start 才验 license（D-OCR-6 同型）；顶部小字提示授权态 + 商店链接。 -->
+<!-- 影像增强的模型准备与免费激活分别展示。 -->
 <template>
   <CollapsibleCard id="enhanceModels" :title="$t('settings.enhanceTitle')">
-    <!-- 队列进度（批 5.5）：提交后即使关闭对话框，此处仍可见结果——终态另有 toast 即时反馈。
+    <!-- 提交后即使关闭对话框，此处仍可见队列结果；终态另有 toast 反馈。
          面板内部按 queue 是否非空自行显隐；本处始终挂载以维持 subscribeQueue 订阅。 -->
     <EnhanceQueuePanel class="enh-models__queue" />
     <p class="enh-models__hint">{{ $t('settings.enhanceHint') }}</p>
 
-    <!-- 授权态提示：未授权也可预下载模型，enhance_start 才验 license（D-OCR-6）。 -->
-    <div
-      v-if="status?.models.some((model) => model.readiness === 'unlicensed')"
-      class="enh-models__auth"
-    >
-      {{
-        status?.availability === 'licenseExpired'
-          ? $t('enhance.errUnlicensed')
-          : $t('enhance.gateUnlicensed')
-      }}
-      <a
-        v-if="status?.storeUrl"
-        :href="status.storeUrl"
-        target="_blank"
-        rel="noopener noreferrer"
-        class="enh-models__auth-link"
-        >{{ $t('store.builtinTitle') }}</a
-      >
+    <div v-if="status?.availability === 'inactive'" class="enh-models__auth">
+      {{ $t('enhance.gateUnlicensed') }}
+      <RouterLink to="/plugins">{{ $t('exotic.activateAction') }}</RouterLink>
     </div>
 
-    <!-- 逐档判定：任一档清单未就绪即提示（URL 待回填）。 -->
+    <!-- 任一档模型清单未就绪即提示。 -->
     <div v-if="!status" class="enh-models__unready">
       {{ $t('enhance.errStatusUnavailable') }}
     </div>
@@ -45,7 +28,7 @@
         <span class="enh-model__tag">{{ taskLabel(model.task) }}</span>
       </div>
       <div class="enh-model__meta">
-        <!-- 体量占位：后端 EnhanceModelDto 暂无 size 字段（资产清单 URL 待批 6 回填）。 -->
+        <!-- 模型状态未提供体量时显示占位文案。 -->
         <span>{{ $t('settings.enhanceModelSizePlaceholder') }}</span>
       </div>
       <div class="enh-model__status">

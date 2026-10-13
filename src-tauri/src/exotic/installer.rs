@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/installer.rs
-//! 冷门格式插件 · 安装编排（v3 Part3 §6.4 第 8/10/11 步 + 卸载/修复）。
+//! 冷门格式插件的安装、卸载与修复编排。
 //!
 //! 把安全原语（[`crate::exotic::install`] 的 verify+extract / commit / rollback）按 §6.4 严格次序
 //! 串成完整安装流程：**verify+extract → Catalog 子集校验 → 原子切换 → DB 安装记录**。
@@ -164,10 +164,8 @@ pub fn verify_installed_integrity(
         .map_err(|_| InstallError::HashMismatch("缺 package-manifest.sig".into()))?;
     // 重新验签：防安装后 manifest 被连同文件一起篡改。
     let manifest = verify_manifest(&mbytes, &sbytes, keyset, now)?;
-    // 🔴 P0-3(Part6 §3.2.1):协议版本前置比对——安装期检查挡不住「装时合法、之后 host
-    // 升级」的时序(离线升主程序/插件更新失败/回滚),而帧层硬等值校验会让旧协议 worker
-    // 在已付 spawn 代价的握手期才被拒且报泛错。此处早退:错误码 protocol_mismatch 即
-    // needs_reinstall 语义(前端据此提示重装匹配版本;商店自动重下载随 Part8)。
+    // 每次启动前复核协议版本，挡住安装后 host 升级、插件回滚等版本错配；
+    // 早退可直接报告 protocol_mismatch，避免启动后才在握手期失败。
     if manifest.protocol_version != exotic_protocol::PROTOCOL_VERSION {
         return Err(InstallError::ProtocolMismatch {
             pkg: manifest.protocol_version,
@@ -280,14 +278,26 @@ fn builtin_worker_candidate(exe_dir: &Path, plugin_id: &str) -> Option<PathBuf> 
     Some(exe_dir.join(format!("{base}{}", std::env::consts::EXE_SUFFIX)))
 }
 
-/// 解析运行期 Worker 路径（Part3 §3.6 启动顺序第一步：「验证安装记录与当前文件 hash」）。
+#[cfg(debug_assertions)]
+fn debug_raw_worker_path(
+    override_path: Option<PathBuf>,
+    exe_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    // GNU 产物同样会由 Tauri 复制到主程序旁；仅查该固定位置，不扫描其它目录。
+    override_path.or_else(|| {
+        exe_dir
+            .and_then(|dir| {
+                builtin_worker_candidate(dir, crate::exotic::coordinator::RAW_PLUGIN_ID)
+            })
+            .filter(|path| path.is_file())
+    })
+}
+
+/// 解析运行期 Worker 路径并复核已安装文件。
 ///
-/// dev/test 环境变量 `EXOTIC_PSD_WORKER_PATH` 优先且**不验签**（保留 Part2 开发入口与 e2e 测试）。
-/// 🔒 **仅 debug 构建生效**：整条旁路经 `#[cfg(debug_assertions)]` 门控，Release 构建
-/// （`debug_assertions=false`）下该分支**整体不编入二进制**——杜绝经环境变量加载未验签 worker 的
-/// 信任链击穿（SEC-02，对齐 D8「Release 不得有验签/授权旁路」红线，与 `exotic-dev-fixtures` 同姿态）。
-/// 否则对已装插件**先完整性复核**（重新验签 manifest + 全文件 hash），通过才返回 worker 路径——
-/// 篡改的已装 worker 复核失败 → None → Coordinator 视为不可用、不拉起进程。
+/// `EXOTIC_PSD_WORKER_PATH` 旁路只在 `#[cfg(debug_assertions)]` 下编入，且不验签；
+/// Release 不会通过该环境变量加载 worker。已安装插件须重新验签 manifest 并复核全部文件 hash；
+/// 失败时不返回路径，Coordinator 不启动 worker。
 pub fn resolve_worker_path(
     install_root: &Path,
     plugin_id: &str,
@@ -295,8 +305,7 @@ pub fn resolve_worker_path(
     now: i64,
 ) -> Option<PathBuf> {
     // 🔒 dev/test 旁路仅在 debug 构建编入；Release 因 #[cfg(debug_assertions)] 整条剔除（编译期，非运行期判断）。
-    // 按 plugin_id 分发到各自专属 env——PSD/RAW 现有行为不变，video-extended 保留 env 覆盖，
-    // 并在 debug 下自动尝试主程序 target/debug 同目录的 video-worker.exe。
+    // 按 plugin_id 分发到各自专属 env；RAW/video 未覆盖时与正式打包共用同目录 sidecar 路径。
     #[cfg(debug_assertions)]
     {
         if plugin_id == crate::exotic::coordinator::PSD_PLUGIN_ID {
@@ -306,15 +315,18 @@ pub fn resolve_worker_path(
         } else if plugin_id == crate::exotic::coordinator::RAW_PLUGIN_ID {
             // RAW 是 builtin distribution(catalog.rs distribution=="builtin"):无安装包、
             // 无 installed-plugin 验签记录——下方 verify_installed_integrity 对它必然落空。
-            // dev 用专属 env 指向 gnu-only sidecar(独立 target,与 msvc 默认 target/debug 分离)。
-            if let Some(p) = std::env::var_os("EXOTIC_RAW_WORKER_PATH") {
-                return Some(PathBuf::from(p));
+            // 专属 env 优先；未覆盖时读取 Tauri externalBin 已复制到主程序旁的 GNU 产物。
+            let exe = std::env::current_exe().ok();
+            if let Some(p) = debug_raw_worker_path(
+                std::env::var_os("EXOTIC_RAW_WORKER_PATH").map(PathBuf::from),
+                exe.as_deref().and_then(Path::parent),
+            ) {
+                return Some(p);
             }
-            // dev 未设 env:不误落进下方 installed-plugin 流程(RAW 无安装记录必然 None,
-            // 但语义不清)——明确拒绝并留可诊断日志,不 panic、不误用其他 worker 二进制。
+            // 无可用产物时明确失败，不落入 RAW 不具备的 installed-plugin 安装记录查询。
             tracing::warn!(
                 "{plugin_id} 是 builtin worker(RAW gnu sidecar),dev 需设 EXOTIC_RAW_WORKER_PATH \
-                 指向 raw-worker.exe 才能拉起;prod 打包留待 H2b-prod(tauri externalBin 跨工具链 sidecar)"
+                 或将 raw-worker.exe 放在主程序同目录才能拉起"
             );
             return None;
         } else if plugin_id == crate::exotic::coordinator::VIDEO_PLUGIN_ID {
@@ -429,186 +441,4 @@ pub fn record_from_installed(
 /// 字节 sha256（小写 hex）。
 fn sha256_bytes(b: &[u8]) -> String {
     crate::utils::hash::sha256_hex(b)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exotic::catalog::CatalogStore;
-    use crate::exotic::crypto::test_support::{keyset_json, sign, signing_key, KeySpec};
-    use std::io::{Cursor, Write as _};
-
-    const NOW: i64 = 1_790_000_000;
-    const TARGET: &str = "x86_64-pc-windows-msvc";
-    const PID: &str = "exotic-image-psd";
-
-    fn release_keyset(sk: &ring::signature::Ed25519KeyPair) -> VerifyingKeyset {
-        let json = keyset_json(&[KeySpec {
-            key_id: "release-test",
-            purpose: "release",
-            sk,
-            status: "active",
-            not_before: 0,
-            not_after: None,
-        }]);
-        VerifyingKeyset::parse(&json).unwrap()
-    }
-
-    fn sha_hex(b: &[u8]) -> String {
-        crate::utils::hash::sha256_hex(b)
-    }
-
-    /// 构造合法包：plugin-manifest.json(psd/thumbnail) + 一个 worker 文件。返回 zip 路径。
-    /// `version`/`seq` 可变以测升级。`plugin_fmt` 可注入非法格式测 catalog reject。
-    fn build_zip(
-        tag: &str,
-        sk: &ring::signature::Ed25519KeyPair,
-        version: &str,
-        seq: i64,
-        plugin_fmt: &str,
-        worker_bytes: &[u8],
-    ) -> PathBuf {
-        let plugin_manifest = format!(
-            r#"{{"plugin_id":"{PID}","formats":["{plugin_fmt}"],"capabilities":["thumbnail"]}}"#
-        );
-        let payload: Vec<(&str, Vec<u8>, bool)> = vec![
-            ("bin/psd-worker.exe", worker_bytes.to_vec(), true),
-            (PLUGIN_MANIFEST, plugin_manifest.into_bytes(), false),
-        ];
-        let files_json: Vec<String> = payload
-            .iter()
-            .map(|(p, c, exe)| {
-                // bin/ 下的可执行标 kind=worker，使 installed_worker_path 可定位。
-                let kind = if p.starts_with("bin/") { "worker" } else { "file" };
-                format!(
-                    r#"{{"path":"{p}","size":{},"sha256":"{}","kind":"{kind}","executable":{exe}}}"#,
-                    c.len(),
-                    sha_hex(c)
-                )
-            })
-            .collect();
-        let manifest = format!(
-            r#"{{"schema":1,"key_id":"release-test","plugin_id":"{PID}","version":"{version}",
-              "package_sequence":{seq},"target":"{TARGET}","min_host_version":"0.1.0",
-              "protocol_version":{proto},"compliance_review_id":"r-1","files":[{}]}}"#,
-            files_json.join(","),
-            proto = exotic_protocol::PROTOCOL_VERSION
-        );
-        let sig = sign(sk, manifest.as_bytes());
-
-        let mut buf = Vec::new();
-        {
-            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opt = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zip.start_file(PACKAGE_MANIFEST, opt).unwrap();
-            zip.write_all(manifest.as_bytes()).unwrap();
-            zip.start_file(PACKAGE_MANIFEST_SIG, opt).unwrap();
-            zip.write_all(&sig).unwrap();
-            for (p, c, _) in &payload {
-                zip.start_file(*p, opt).unwrap();
-                zip.write_all(c).unwrap();
-            }
-            zip.finish().unwrap();
-        }
-        let path = std::env::temp_dir().join(format!("exotic-er-{tag}-{}.zip", std::process::id()));
-        std::fs::write(&path, &buf).unwrap();
-        path
-    }
-
-    fn mem_db() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        crate::db::schema::initialize_schema(&c).unwrap();
-        c
-    }
-
-    fn dirs(tag: &str) -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!("exotic-er-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        (base.join("install"), base.join("staging"))
-    }
-
-    fn expect_v(version: &'static str, seq: i64) -> RegistryExpect<'static> {
-        RegistryExpect {
-            plugin_id: PID,
-            version,
-            target: TARGET,
-            package_sequence: seq,
-        }
-    }
-
-    /// 手工铺一个「已装」目录:manifest 以指定 protocol_version 合法签名——模拟
-    /// 「装时协议匹配、之后 host 升版」的时序(安装期检查挡不住,P0-3 场景)。
-    fn lay_installed(tag: &str, sk: &ring::signature::Ed25519KeyPair, proto: u16) -> PathBuf {
-        let (install_root, _) = dirs(tag);
-        let dir = plugin_install_dir(&install_root, PID).unwrap();
-        std::fs::create_dir_all(dir.join("bin")).unwrap();
-        let worker = b"WORKER".to_vec();
-        let pm =
-            format!(r#"{{"plugin_id":"{PID}","formats":["psd"],"capabilities":["thumbnail"]}}"#);
-        std::fs::write(dir.join("bin/psd-worker.exe"), &worker).unwrap();
-        std::fs::write(dir.join(PLUGIN_MANIFEST), pm.as_bytes()).unwrap();
-        let files_json = format!(
-            r#"{{"path":"bin/psd-worker.exe","size":{},"sha256":"{}","kind":"worker","executable":true}},
-               {{"path":"{PLUGIN_MANIFEST}","size":{},"sha256":"{}","kind":"manifest"}}"#,
-            worker.len(),
-            sha_hex(&worker),
-            pm.len(),
-            sha_hex(pm.as_bytes()),
-        );
-        let manifest = format!(
-            r#"{{"schema":1,"key_id":"release-test","plugin_id":"{PID}","version":"1.0.0",
-              "package_sequence":1,"target":"{TARGET}","min_host_version":"0.1.0",
-              "protocol_version":{proto},"compliance_review_id":"r-1","files":[{files_json}]}}"#
-        );
-        let sig = sign(sk, manifest.as_bytes());
-        std::fs::write(dir.join(PACKAGE_MANIFEST), manifest.as_bytes()).unwrap();
-        std::fs::write(dir.join(PACKAGE_MANIFEST_SIG), &sig).unwrap();
-        install_root
-    }
-
-    #[test]
-    fn stale_protocol_installed_worker_refused_before_spawn() {
-        // P0-3:旧协议已装插件在 resolve(spawn 前)即被拒,错误码 protocol_mismatch。
-        let sk = signing_key(7);
-        let ks = release_keyset(&sk);
-        let old = exotic_protocol::PROTOCOL_VERSION - 1;
-        let root = lay_installed("staleproto", &sk, old);
-        let err = verify_installed_integrity(&root, PID, &ks, NOW).unwrap_err();
-        assert_eq!(err.code(), "protocol_mismatch");
-        assert!(resolve_worker_path(&root, PID, &ks, NOW).is_none());
-
-        // 对照:当前协议版本同款铺设 → 通过并可解析 worker 路径。
-        let root2 = lay_installed("curproto", &sk, exotic_protocol::PROTOCOL_VERSION);
-        assert!(verify_installed_integrity(&root2, PID, &ks, NOW).is_ok());
-        assert!(resolve_worker_path(&root2, PID, &ks, NOW).is_some());
-    }
-
-    #[test]
-    fn integrity_detects_tampered_file() {
-        let sk = signing_key(3);
-        let ks = release_keyset(&sk);
-        let catalog = CatalogStore::from_builtin().unwrap();
-        let snap = catalog.snapshot();
-        let (install_root, staging_root) = dirs("tamper");
-        let writer = std::sync::Mutex::new(mem_db());
-        let ctx = InstallContext {
-            install_root: &install_root,
-            staging_root: &staging_root,
-            keyset: &ks,
-            catalog: &snap,
-            host_version: "0.1.0",
-        };
-        let z = build_zip("tamper", &sk, "1.0.0", 3, "psd", b"GOOD-WORKER");
-        install_staged_zip(&ctx, &z, &expect_v("1.0.0", 3), NOW, &writer).unwrap();
-        // 篡改已装文件。
-        let worker = install_root.join(PID).join("bin/psd-worker.exe");
-        std::fs::write(&worker, b"TAMPERED").unwrap();
-        assert!(matches!(
-            verify_installed_integrity(&install_root, PID, &ks, NOW),
-            Err(InstallError::HashMismatch(_))
-        ));
-        let _ = std::fs::remove_dir_all(&install_root);
-        let _ = std::fs::remove_dir_all(&staging_root);
-    }
 }

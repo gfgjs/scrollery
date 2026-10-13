@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-通用 Chinese-CLIP `.pt` → ONNX 导出脚本（适配 .models/ 子文件夹结构 + 可配置 batch 轴）。
+通用 Chinese-CLIP `.pt` → ONNX 导出脚本（按模型子文件夹组织产物，可配置 batch 轴）。
 
-本脚本由 tools/export_clip_l14_336_onnx.py 泛化而来，主要差异：
+导出行为：
 
-  1. 适配新的 .models/ 目录结构 —— 每个模型在自己的子文件夹下：
-         .models/clip_cn_<arch>/clip_cn_<arch>.pt   (+ huggingface 的 config.json)
+  1. 每个模型在模型根目录自己的子文件夹下：
+         <模型根>/clip_cn_<arch>/clip_cn_<arch>.pt   (+ huggingface 的 config.json)
      产物（.onnx + .extra_file）也落回**同一个子文件夹**。
 
   2. batch 轴可由命令行配置，便于基准测试不同轴的耗时/性能（见 bench_clip_onnx.py）：
@@ -19,7 +19,7 @@
          <prefix>.txt.<prec>.onnx          （文本塔，batch 恒为 1，无标签）
      其中 <prefix> = 去掉 clip_cn_ 前缀的 arch（如 vit-l-14-336），<prec> = fp16/fp32。
 
-  4. --arch 选单个模型；--all 批量导出 .models/ 下所有**已存在 .pt** 的模型。
+  4. --arch 选单个模型；--all 批量导出模型根目录下所有已存在 .pt 的模型。
 
   5. 精度：默认 **fp32**（cn-clip 的 BERT 文本编码器在 fp16 下数值塌缩，见踩坑 #6）；
      --fp16 走「转 fp16 + 加载/数值双验证 + 不达标自动回退 fp32」流程（轻量化场景如 B/16 可试）。
@@ -43,16 +43,16 @@
      逐条余弦 ≥0.99。CLIP 的 BERT 文本编码器在 fp16 下数值不稳（注意力/softmax/LayerNorm 溢出），
      会「能加载但算错」（所有文本塌缩成几乎相同向量）。任一验证不过 → 该编码器回退 fp32。
 
-依赖（全局 Python311 已装齐）：
+依赖：
   torch 2.12 / torchvision / cn_clip 1.6 / onnx 1.21 / onnxruntime 1.26 / onnxscript / six
 
-用法示例（PowerShell，在仓库根或任意目录均可，脚本自解析自身位置）：
-  python .models/export_clip_onnx.py --arch ViT-L-14-336                 # 固定 batch=1, fp32
-  python .models/export_clip_onnx.py --arch ViT-L-14-336 --batch 8       # 固定 batch=8, fp32
-  python .models/export_clip_onnx.py --arch ViT-L-14-336 --dynamic-batch # 动态 batch, fp32
-  python .models/export_clip_onnx.py --arch ViT-B-16 --fp16              # B/16 fp16（带回退）
-  python .models/export_clip_onnx.py --all --batch 4                     # 所有已存在模型, 固定 batch=4
-  python .models/export_clip_onnx.py --arch ViT-L-14 --batch 8 --skip-text  # 只导图像塔（测 batch 用）
+用法示例（PowerShell，在仓库根执行；模型根按脚本位置解析）：
+  python tools/export_clip_onnx.py --arch ViT-L-14-336                 # 固定 batch=1, fp32
+  python tools/export_clip_onnx.py --arch ViT-L-14-336 --batch 8       # 固定 batch=8, fp32
+  python tools/export_clip_onnx.py --arch ViT-L-14-336 --dynamic-batch # 动态 batch, fp32
+  python tools/export_clip_onnx.py --arch ViT-B-16 --fp16              # B/16 fp16（带回退）
+  python tools/export_clip_onnx.py --all --batch 4                     # 所有已存在模型, 固定 batch=4
+  python tools/export_clip_onnx.py --arch ViT-L-14 --batch 8 --skip-text  # 只导图像塔（测 batch 用）
 """
 
 import argparse
@@ -71,7 +71,7 @@ from onnx import load_model_from_string, save_model
 # ORT 自带 fp16 转换器：正确处理视觉模型里的 Cast 节点（onnxconverter_common 不行）。
 from onnxruntime.transformers.float16 import convert_float_to_float16
 
-# 脚本现位于 .models/ 自身 → 模型根就是脚本所在目录。
+# 模型根按脚本所在的 tools/ 目录解析。
 MODELS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONTEXT_LENGTH = 52
@@ -86,9 +86,9 @@ def derive_paths(arch: str):
 
     例：ViT-L-14-336
         ckpt_name = clip_cn_vit-l-14-336.pt
-        子目录    = .models/clip_cn_vit-l-14-336/        （= ckpt 去掉 .pt 的 stem）
-        checkpoint= .models/clip_cn_vit-l-14-336/clip_cn_vit-l-14-336.pt
-        产物前缀  = .models/clip_cn_vit-l-14-336/vit-l-14-336   （去掉 clip_cn_）
+        子目录    = tools/clip_cn_vit-l-14-336/        （= ckpt 去掉 .pt 的 stem）
+        checkpoint= tools/clip_cn_vit-l-14-336/clip_cn_vit-l-14-336.pt
+        产物前缀  = tools/clip_cn_vit-l-14-336/vit-l-14-336   （去掉 clip_cn_）
     """
     ckpt_name = _MODELS[arch][1]                          # clip_cn_vit-l-14-336.pt
     stem = ckpt_name.removesuffix(".pt")                  # clip_cn_vit-l-14-336（= 子文件夹名）

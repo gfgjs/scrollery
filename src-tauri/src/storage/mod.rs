@@ -1,14 +1,12 @@
 // src-tauri/src/storage/mod.rs
-//! 存储后端**连接测试**（P5 8B，§1.4.1 / §3.8）：设置页在保存前验证一条网络盘配置是否可达、
+//! 存储后端连接测试：设置页在保存前验证网络盘配置是否可达、
 //! 凭据是否有效，并返回 base 目录下的项数。
 //!
-//! 变体边界（§1.1）：`local`/`smb` 走纯 `std::fs`（OS 挂载盘 / UNC 即一条本地路径，8A 形态），
+//! `local`/`smb` 走 `std::fs`（OS 挂载盘 / UNC 即本地路径），
 //! 两变体都含；`webdav`（原生 WebDAV，无需 OS 挂载）依赖 `reqwest_dav`，仅 `netfs`(perf) 编入，
-//! 轻量版返回「需性能版」错误以便降级到 8A。
+//! 轻量版返回「需性能版」错误。
 //!
-//! 当前范围（2026-09-15 P15 消融后）：**只做连接测试**。远程目录遍历与流式 Range 代理尚未接入，
-//! 扫描不经本模块、走本地路径（OS 映射盘 / UNC）；原先预留的 `RemoteEntry` DTO、`StorageBackend`
-//! trait 与 `Box<dyn StorageBackend>` 工厂因无生产消费者已删除，届时按真实需求重新引入。
+//! 扫描走本地路径（OS 映射盘 / UNC），不经本模块。
 
 pub mod local;
 #[cfg(feature = "netfs")]

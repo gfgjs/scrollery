@@ -1,12 +1,4 @@
-// src/composables/selection/types.ts
-// Part5 T4a · 选区协议层类型 —— 把选区从「DOM 节点集合」改为「稳定 id 的判别联合」。
-//
-// 🔴 开发期不冻结契约（用户约束 no-contract-freeze-during-dev）：
-//   本文件定义的 SelectionState / SelectionIntent / SelectionMode 外形均为「当前临时协议」，
-//   开发期可随实测/反馈演进。两层结构（协议层 Intent / 策略层 Mode）的目的是让这类改动
-//   影响面收敛、让多方案能并存比较，**不是**为了焊死其中一种语义。
-//
-// 设计依据：docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §3/§5/§6。
+// 选区由稳定资产 id 表示；Intent 描述操作，Mode 决定操作如何改变选区。
 
 // ── 选区状态（脱离 DOM 的根）─────────────────────────────────────────────
 //
@@ -48,7 +40,7 @@ export function isEmptySelection(state: SelectionState): boolean {
 
 // ── 后端描述符出口（toDescriptor）───────────────────────────────────────
 //
-// R1-2（T4c）已定形：kind 取值对齐后端 serde tag 的**小驼峰变体名**（'explicit' / 'selectAll'），
+// kind 取值对齐后端 serde tag 的小驼峰变体名（'explicit' / 'selectAll'），
 // 由后端锁测试钉死（queries.rs::selection_descriptor_wire_format_locks_camel_case）。
 // 泛型 V 保留 —— 协议层不依赖具体 ViewDescriptorDto，调用侧（useSelection）绑定实型。
 export type SelectionDescriptor<V> =
@@ -96,7 +88,7 @@ export interface SelectionContext {
  * 纯函数（旧态 + 意图 + 上下文 → 新态，无副作用）→ 易测、易换、可与其它模式并存比较。
  */
 export interface SelectionMode {
-  /** 唯一 id：'classic' | 'rubber-band' | 'lasso' | …（未来） */
+  /** 选择模式的唯一 id。 */
   readonly id: string
   /** 设置页展示名 */
   readonly label: string

@@ -78,3 +78,30 @@ fn assets_installed(models_dir: &Path, assets: &[ModelAsset]) -> bool {
                 .is_ok_and(|m| m.is_file() && m.len() == asset.size_bytes)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn pinned_assets_require_regular_files_of_expected_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let asset = ModelAsset {
+            url: "https://example.invalid/model.onnx".into(),
+            mirror_url: None,
+            dest: "model.onnx".into(),
+            size_bytes: 2,
+            sha256: Some("a".repeat(64)),
+        };
+        let assets = [asset];
+        assert!(!assets_installed(tmp.path(), &assets));
+        fs::create_dir(tmp.path().join("model.onnx")).unwrap();
+        assert!(!assets_installed(tmp.path(), &assets));
+        fs::remove_dir(tmp.path().join("model.onnx")).unwrap();
+        fs::write(tmp.path().join("model.onnx"), b"x").unwrap();
+        assert!(!assets_installed(tmp.path(), &assets));
+        fs::write(tmp.path().join("model.onnx"), b"xx").unwrap();
+        assert!(assets_installed(tmp.path(), &assets));
+    }
+}

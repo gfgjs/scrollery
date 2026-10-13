@@ -2,8 +2,8 @@
 //!
 //! # 为什么要「批」而不是逐键
 //! 逐键应用会重复触发同一件事:一次提交里同时改缩略图尺寸与编码质量,逐键处理就是两轮
-//! 「复位全部已完成缩略图 + 失效布局缓存 + bump 数据版本」;而重置会一次改动几十个键,
-//! 逐键更是灾难。故入口只接受一批差异,内部先归约成若干**动作**(全量缩略图复位、直接显示项复位、
+//! 「复位展示引用 + 失效布局缓存 + bump 数据版本」;而重置会一次改动几十个键,
+//! 逐键更是灾难。故入口只接受一批差异,内部先归约成若干**动作**(图片/封面展示引用复位、
 //! 缓存目录换址、日志级别重载、窗口材质切换),每个动作至多执行一次。
 //!
 //! # 与应用失败的关系
@@ -17,6 +17,7 @@ use tracing_subscriber::{reload::Handle, EnvFilter, Registry};
 
 use crate::error::{AppError, Result};
 use crate::state::AppState;
+use crate::thumbnail::generator::ThumbConfig;
 
 /// 日志级别热重载句柄(logging 模块在装配 subscriber 时经 config_commands 的再导出写入)。
 pub static LOG_RELOAD: std::sync::OnceLock<Handle<EnvFilter, Registry>> =
@@ -43,6 +44,77 @@ const DERIVATION_RESTART_KEYS: &[&str] = &[
     "ai_hq_cache_enabled",
 ];
 
+#[derive(Default)]
+struct ThumbnailConfigChanges {
+    image_reset_keys: Vec<String>,
+    cover_reset_keys: Vec<String>,
+    cache_dir: Option<(String, std::path::PathBuf)>,
+}
+
+// 先合并最终镜像，再用产物身份的同一策略比较决定失效，尺寸不改变普通图片策略。
+fn update_thumbnail_config(
+    cfg: &mut ThumbConfig,
+    changed: &[(String, String)],
+) -> ThumbnailConfigChanges {
+    let before = cfg.clone();
+    let mut effects = ThumbnailConfigChanges::default();
+    for (key, value) in changed {
+        match key.as_str() {
+            "thumb_skip_max_kb" => {
+                if let Ok(val) = value.parse::<u64>() {
+                    cfg.skip_max_bytes = val * 1024;
+                    effects.image_reset_keys.push(key.clone());
+                }
+            }
+            "thumb_size" => {
+                if let Ok(val) = value.parse::<u32>() {
+                    cfg.size = val;
+                    effects.cover_reset_keys.push(key.clone());
+                }
+            }
+            "thumb_webp_quality" => {
+                if let Ok(val) = value.parse::<u8>() {
+                    cfg.webp_quality = val.clamp(1, 100);
+                    effects.image_reset_keys.push(key.clone());
+                    effects.cover_reset_keys.push(key.clone());
+                }
+            }
+            "thumb_strategy" => {
+                cfg.strategy = value.clone();
+                effects.image_reset_keys.push(key.clone());
+            }
+            "gpu_engine" => {
+                cfg.gpu_engine = value.clone();
+                effects.image_reset_keys.push(key.clone());
+            }
+            "ai_hq_cache_enabled" => {
+                cfg.ai_hq_cache = value == "true";
+                effects.image_reset_keys.push(key.clone());
+            }
+            "ai_cache_short_edge" => {
+                if let Ok(val) = value.parse::<u32>() {
+                    cfg.ai_cache_short_edge = val;
+                    effects.image_reset_keys.push(key.clone());
+                }
+            }
+            "thumb_cache_dir" => {
+                let path = std::path::PathBuf::from(value);
+                cfg.cache_dir = path.clone();
+                effects.cache_dir = Some((key.clone(), path));
+                effects.image_reset_keys.push(key.clone());
+            }
+            _ => {}
+        }
+    }
+    if cfg.same_policy(&before) {
+        effects.image_reset_keys.clear();
+    }
+    if cfg.size == before.size && cfg.webp_quality == before.webp_quality {
+        effects.cover_reset_keys.clear();
+    }
+    effects
+}
+
 /// 应用一批已提交的变更;`changed` 只含**真正变了**的键与它们的最终值(规范文本)。
 ///
 /// 返回值:值已落盘、但运行时影响没能应用上的键(空 = 全部应用成功)。
@@ -55,63 +127,18 @@ pub async fn apply_batch(
     let mut failed: Vec<String> = Vec::new();
 
     // 本批触发的动作与触发它们的键(用于失败时回报具体是哪些键没应用上)。
-    let mut full_reset_keys: Vec<String> = Vec::new();
-    let mut direct_reset_keys: Vec<String> = Vec::new();
-    let mut cache_dir: Option<(String, std::path::PathBuf)> = None;
     let mut log_level: Option<(String, String)> = None;
     let mut material: Option<(String, String)> = None;
     let mut derivation_touched: Option<String> = None;
 
     // 缩略图运行时配置镜像:一次性取锁写完,避免同批内反复加解锁。
-    {
+    let thumbnail_changes = {
         let mut cfg = state
             .thumb_config
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        for (key, value) in changed {
-            match key.as_str() {
-                "thumb_skip_max_kb" => {
-                    if let Ok(val) = value.parse::<u64>() {
-                        cfg.skip_max_bytes = val * 1024;
-                        direct_reset_keys.push(key.clone());
-                    }
-                }
-                "thumb_size" => {
-                    if let Ok(val) = value.parse::<u32>() {
-                        cfg.size = val;
-                        // 档位失效(2026-07-06 审查 R1):生成器 CACHE_HIT 只看 status=1+文件存在、
-                        // 不含档位,不重置则存量图永远端出旧档缓存,设置项对存量库形同虚设。
-                        full_reset_keys.push(key.clone());
-                    }
-                }
-                "thumb_webp_quality" => {
-                    if let Ok(val) = value.parse::<u8>() {
-                        cfg.webp_quality = val.clamp(1, 100); // 1..=99 有损,100=无损
-                        full_reset_keys.push(key.clone());
-                    }
-                }
-                "thumb_strategy" => {
-                    cfg.strategy = value.clone();
-                    direct_reset_keys.push(key.clone());
-                }
-                "ai_hq_cache_enabled" => cfg.ai_hq_cache = value == "true",
-                "ai_cache_short_edge" => {
-                    // 同 thumb_webp_quality 惯例,运行时即时生效:下一次 AI 高清缓存路径的解码/
-                    // 编码即用新短边。不触发存量缓存失效——旧短边缓存仍是合法缓存,分析侧本就按需
-                    // 下采样,不会因短边变化而读出错误结果。
-                    if let Ok(val) = value.parse::<u32>() {
-                        cfg.ai_cache_short_edge = val;
-                    }
-                }
-                "thumb_cache_dir" => {
-                    let path = std::path::PathBuf::from(value);
-                    cfg.cache_dir = path.clone();
-                    cache_dir = Some((key.clone(), path));
-                }
-                _ => {}
-            }
-        }
-    }
+        update_thumbnail_config(&mut cfg, changed)
+    };
 
     for (key, value) in changed {
         match key.as_str() {
@@ -125,45 +152,34 @@ pub async fn apply_batch(
         }
     }
 
-    // 动作 1:全量复位已生成的缩略图(档位/质量变更),每批至多一次。
-    if !full_reset_keys.is_empty() {
-        match reset_completed_thumbnail_rows(state).await {
+    // 动作 1:按最终图片策略和封面参数，一次事务撤销展示引用；历史 artifact 保留。
+    let reset_images = !thumbnail_changes.image_reset_keys.is_empty();
+    let reset_covers = !thumbnail_changes.cover_reset_keys.is_empty();
+    if reset_images || reset_covers {
+        match reset_thumbnail_rows(state, reset_images, reset_covers).await {
             Ok((items, covers)) => {
                 tracing::info!(
-                    "[Config] 缩略图档位/质量变更 → 复位 {items} 个已完成项与 {covers} 个封面派生待重生成"
+                    "[Config] 缩略图配置变更 → 复位 {items} 个展示引用与 {covers} 个封面派生待重生成"
                 );
                 invalidate_layout_caches(state);
             }
             Err(e) => {
-                tracing::warn!("缩略图全量复位失败(设置已保存) | full thumbnail reset failed: {e}");
-                failed.append(&mut full_reset_keys.clone());
+                tracing::warn!("缩略图展示复位失败(设置已保存) | thumbnail reset failed: {e}");
+                for key in thumbnail_changes
+                    .image_reset_keys
+                    .iter()
+                    .chain(&thumbnail_changes.cover_reset_keys)
+                {
+                    if !failed.contains(key) {
+                        failed.push(key.clone());
+                    }
+                }
             }
         }
     }
 
-    // 动作 2:复位「直接显示」项(跳过阈值/策略变更),每批至多一次。二者可同时命中。
-    if !direct_reset_keys.is_empty() {
-        match reset_direct_thumbnail_rows(state).await {
-            Ok(affected) => {
-                tracing::info!(
-                    "[Config] 缩略图跳过阈值/策略变更 → 复位 {affected} 个直接显示项为待处理"
-                );
-                *state
-                    .layout_cache
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "缩略图直接显示项复位失败(设置已保存) | direct thumbnail reset failed: {e}"
-                );
-                failed.append(&mut direct_reset_keys.clone());
-            }
-        }
-    }
-
-    // 动作 3:缓存目录换址(建目录 + 授权 assetProtocol 作用域)。
-    if let Some((key, path)) = cache_dir {
+    // 动作 2:缓存目录换址(建目录 + 授权 assetProtocol 作用域)。
+    if let Some((key, path)) = thumbnail_changes.cache_dir {
         // 建目录是阻塞 IO,下沉 spawn_blocking(硬约束:IO 不占 UI 线程)。
         let dir = path.clone();
         let prepared = tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir)).await;
@@ -188,7 +204,7 @@ pub async fn apply_batch(
         }
     }
 
-    // 动作 4:日志级别热重载。
+    // 动作 3:日志级别热重载。
     if let Some((key, value)) = log_level {
         let directive = crate::logging::build_env_filter_directive(&value);
         let mut ok = false;
@@ -213,7 +229,7 @@ pub async fn apply_batch(
         }
     }
 
-    // 动作 5:窗口材质热切换(前端 uiStore 经同一事件翻转 data-glass,两侧同拍)。
+    // 动作 4:窗口材质热切换(前端 uiStore 经同一事件翻转 data-glass,两侧同拍)。
     if let Some((key, value)) = material {
         // apply 内部已把失败按「排入主线程队列失败」记了 warn,并自带「窗口不存在则跳过」语义
         // (辅助窗口场景),故此处不再重复判错,也不把它算作应用失败。
@@ -221,7 +237,7 @@ pub async fn apply_batch(
         let _ = key;
     }
 
-    // 动作 6:按最终配置重启派生流水线(每批至多一次,故放在所有镜像更新之后)。
+    // 动作 5:按最终配置重启派生流水线(每批至多一次,故放在所有镜像更新之后)。
     if let Some(key) = derivation_touched {
         if let Err(e) = restart_derivation(app, state, origin).await {
             tracing::warn!("派生流水线重启失败(设置已保存) | restarting derivation failed: {e}");
@@ -279,10 +295,12 @@ fn invalidate_layout_caches(state: &Arc<AppState>) {
     state.bump_data_version();
 }
 
-/// 复位已生成的缩略图:撤销在途 worker,并让复位与旧结果的最终写入共享同一 lifecycle 写区。
-/// 封面派生行必须一并复位——只退 media_items 的话,video/audio/epub 封面会被主生成器打成
-/// UNSUPPORTED_TYPE,而派生行仍 done 不重跑(2026-07-10 深审 defer ⑧)。
-async fn reset_completed_thumbnail_rows(state: &Arc<AppState>) -> Result<(usize, usize)> {
+/// 撤销在途 worker，并让展示引用复位与旧结果最终写入共享同一 lifecycle 写区。
+async fn reset_thumbnail_rows(
+    state: &Arc<AppState>,
+    reset_images: bool,
+    reset_covers: bool,
+) -> Result<(usize, usize)> {
     let state_arc = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         state_arc.with_thumbnail_reset_exclusive(|| -> Result<(usize, usize)> {
@@ -290,40 +308,83 @@ async fn reset_completed_thumbnail_rows(state: &Arc<AppState>) -> Result<(usize,
                 .db_writer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let tx = conn.unchecked_transaction()?;
-            let items = tx.execute(
-                "UPDATE media_items SET thumb_status = 0, thumb_path = NULL \
-                 WHERE thumb_status = 1 AND is_deleted = 0",
-                [],
-            )?;
-            let covers = tx.execute(
-                "UPDATE media_derivations SET status = 0, payload_path = NULL \
-                 WHERE status = 2 AND kind IN ('video_cover','audio_cover','doc_thumb')",
-                [],
-            )?;
-            crate::db::queries::reset_image_thumbnail_leases(&tx)?;
-            crate::db::queries::reset_native_video_cover_leases(&tx)?;
-            tx.commit()?;
-            Ok((items, covers))
+            crate::db::queries::reset_thumbnail_config_references(&conn, reset_images, reset_covers)
         })
     })
     .await
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// 跳过阈值/策略改变只需复位 direct-display 项,但同样必须撤销旧 worker,避免旧结果在新配置
-/// 生效后重新写回。
-async fn reset_direct_thumbnail_rows(state: &Arc<AppState>) -> Result<usize> {
-    let state_arc = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        state_arc.with_thumbnail_reset_exclusive(|| -> Result<usize> {
-            let conn = state_arc
-                .db_writer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::db::queries::reset_direct_thumbnail_rows_for_config(&conn)
-        })
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+#[cfg(test)]
+mod thumbnail_invalidation_tests {
+    use crate::db::queries::reset_thumbnail_config_references;
+    use rusqlite::Connection;
+
+    fn seeded() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO scan_roots(id,path) VALUES(1,'C:/photos');
+             INSERT INTO directories(id,root_id,rel_path,name) VALUES(1,1,'','photos');
+             INSERT INTO media_items(id,directory_id,file_name,file_size,file_mtime,
+                 file_format,media_type,sort_datetime,cache_key,thumb_status,thumb_path,thumbhash,is_deleted) VALUES
+                 (1,1,'a.jpg',1,1,'jpg','image',1,11,1,'display',x'07',0),
+                 (2,1,'b.jpg',1,1,'jpg','image',1,12,3,'original',x'07',0),
+                 (3,1,'c.jpg',1,1,'jpg','image',1,13,2,NULL,NULL,0),
+                 (4,1,'d.jpg',1,1,'jpg','image',1,14,1,'deleted',x'07',1),
+                 (10,1,'v.mp4',1,1,'mp4','video',1,20,1,'video',x'07',0),
+                 (11,1,'a.mp3',1,1,'mp3','audio',1,21,1,'audio',x'07',0),
+                 (12,1,'d.pdf',1,1,'pdf','document',1,22,1,'document',x'07',0),
+                 (13,1,'e.psd',1,1,'psd','image',1,23,1,'exotic',x'07',0),
+                 (14,1,'f.raw',1,1,'raw','image',1,24,1,'catalog',x'07',0);
+             INSERT INTO media_derivations(item_id,kind,status,payload_path) VALUES
+                 (10,'video_cover',2,'video'),(11,'audio_cover',2,'audio'),(12,'doc_thumb',2,'document');
+             INSERT INTO exotic_tasks(item_id,plugin_id,capability,status) VALUES(13,'plugin','thumbnail',2);
+             INSERT INTO exotic_catalog_formats(format,plugin_id,display_name,media_kind,
+                 capabilities_json,license_tier,platforms_json,min_host_version,catalog_sequence,source)
+             VALUES('raw','plugin','RAW','image','[\"thumbnail\"]','free','[]','1',1,'builtin');
+             INSERT INTO image_artifacts(item_id,source_revision,cache_key,kind,fingerprint,status,path) VALUES
+                 (1,1,11,'display','policy:64',1,'display'),
+                 (1,1,11,'display','policy:128',1,'large'),
+                 (1,1,11,'display','old:64',1,'old'),
+                 (1,1,11,'ai','ai:336',1,'ai_thumbs/input');",
+        )
+        .unwrap();
+        conn
+    }
+
+    type DisplayReference = (i64, i64, Option<String>, Option<Vec<u8>>);
+
+    fn references(conn: &Connection) -> Vec<DisplayReference> {
+        conn.prepare("SELECT id,thumb_status,thumb_path,thumbhash FROM media_items ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn artifacts(conn: &Connection) -> Vec<(String, String, String)> {
+        conn.prepare("SELECT kind,fingerprint,path FROM image_artifacts ORDER BY kind,fingerprint")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn cover_reset_failure_rolls_back_image_references() {
+        let conn = seeded();
+        let old_refs = references(&conn);
+        let old_artifacts = artifacts(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_cover BEFORE UPDATE ON media_derivations
+             BEGIN SELECT RAISE(ABORT,'forced'); END;",
+        )
+        .unwrap();
+        assert!(reset_thumbnail_config_references(&conn, true, true).is_err());
+        assert_eq!(references(&conn), old_refs);
+        assert_eq!(artifacts(&conn), old_artifacts);
+    }
 }

@@ -12,7 +12,7 @@
       </button>
     </div>
 
-    <div class="toc-panel__list">
+    <div ref="listEl" class="toc-panel__list">
       <div v-if="!flatItems.length" class="toc-panel__empty">{{ t('doc.tocEmpty') }}</div>
       <button
         v-for="(item, i) in flatItems"
@@ -30,9 +30,9 @@
 </template>
 
 <script setup lang="ts">
-// 目录（TOC）面板（阅读器方案 R2-3）。接收 foliate book.toc 树，扁平化为带深度的列表渲染
+// 目录面板接收 foliate book.toc 树，扁平化为带深度的列表渲染
 // （避免递归组件），点击 emit 'navigate'(href) 由 DocumentViewer 调 BookReader.goToHref 跳转。
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { X } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
 import type { FoliateTocItem } from '../../vendor/foliate-js/view.js'
@@ -69,6 +69,18 @@ const flatItems = computed(() => {
   flatten(props.toc ?? [], 0, out)
   return out
 })
+
+const listEl = ref<HTMLDivElement | null>(null)
+watch([() => props.activeHref, flatItems, listEl], () => {
+  const list = listEl.value
+  const active = list?.querySelector<HTMLButtonElement>('.toc-item.active')
+  if (!list || !active) return
+  const listRect = list.getBoundingClientRect()
+  const activeRect = active.getBoundingClientRect()
+  // 只移动目录自己的滚动区域；正文和键盘焦点不应跟着目录定位变化。
+  if (activeRect.top < listRect.top) list.scrollTop += activeRect.top - listRect.top
+  else if (activeRect.bottom > listRect.bottom) list.scrollTop += activeRect.bottom - listRect.bottom
+}, { flush: 'post' })
 </script>
 
 <style scoped>

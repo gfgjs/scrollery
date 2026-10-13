@@ -1,8 +1,8 @@
 // src-tauri/src/exotic/fetch.rs
-//! 冷门格式插件 · 包下载（v3 Part3 §6.4 第 2 步）。
+//! 冷门格式插件的包与模型资产下载。
 //!
-//! **R10 收敛后（Part6 §3.1.2）的薄适配器**：下载机制（安全 client / Range / 镜像回退 / sha256 /
-//! `.part` 原子改名）已下沉 `crate::download` 通用引擎；本文件只保留 exotic 的**领域契约**——
+//! 下载机制（安全 client / Range / 镜像回退 / sha256 / `.part` 原子改名）由
+//! `crate::download` 提供；本文件保留 exotic 的领域契约——
 //! 稳定的 `FetchError` 错误码（供 `exotic_commands` 跨 IPC 边界使用，调用方零改动）+ Registry/包
 //! 两个下载入口。机制不再在此重复实现。
 //!
@@ -127,8 +127,7 @@ static VERIFY_EXEC_PROBE: VerifyExecProbe = VerifyExecProbe::new();
 /// 下载 `url` 到 `dest`，对照 `expected_size`/`expected_sha256` 校验通过后原子就位。
 /// 失败不留下 `dest`（清理 `.part`）。`expected_size` 即硬上限：候选源失败回退时据此判断残留续传。
 ///
-/// 包体量小（MB 级），暂不接进度回调（插件商店安装进度 UI 待 Part8）；但已走通用引擎，
-/// **Range 续传/镜像回退能力随引擎天然具备**，后续接入仅需传候选源列表 + 进度回调。
+/// 包体量小（MB 级），此入口不提供进度回调；下载引擎支持 Range 续传。
 pub async fn fetch_package(
     url: &str,
     dest: &Path,
@@ -159,7 +158,7 @@ pub async fn fetch_package(
     Ok(())
 }
 
-/// 下载模型权重 blob 到 `dest`(Part4 §3.7.1/T12 分步下载)。与 [`fetch_package`] 同构,但:
+/// 下载模型权重 blob 到 `dest`。与 [`fetch_package`] 同构，但：
 /// - `TimeoutPolicy::LargeFile`(GB 级传输);
 /// - **幂等跳过**:`dest` 已存在且 size+sha256 全符 → 不触网直接 Ok(安装重试/多插件
 ///   共享同名权重时天然去重);

@@ -1,10 +1,5 @@
 // src-tauri/src/reader/encoding.rs
-//! txt 编码自动识别 + 解码 seam（阅读器完善方案 §5.1）。
-//!
-//! 现状缺陷:`get_document_text`/`read_ref_text` 用 `std::fs::read_to_string`,非 UTF-8 文件
-//! （GBK/GB18030/Big5/Shift_JIS…）直接 `InvalidData` 报错,连带阅读/编辑/版本/AI 校对全废;
-//! 前端 `fetch().text()` 兜底又按 UTF-8 强解出乱码。本模块是「一次修三链路」的 seam:
-//! 字节 → 检测编码（可被每书 prefs 覆盖）→ 解码为 UTF-8 String + 元数据(编码名/置信度/替换率)。
+//! txt 编码识别与解码：字节经用户覆盖或自动检测后转为 UTF-8，返回编码名、置信度与替换率。
 //!
 //! 检测顺序(顺序本身是正确性关键,见各步注释):
 //!   1. 手动覆盖(每书 prefs)—— 尊重用户;
@@ -15,11 +10,10 @@
 use encoding_rs::Encoding;
 
 /// 替换率(U+FFFD 占比)告警阈值:超过即把置信度降级为 `Lossy`,UI 据此亮「编码可能误判」。
-/// 0.5% 取自方案 §5.1;正常解码近 0,误判编码通常远超此值。
+/// 正常解码替换率接近零，超过 0.5% 时提示可能误判。
 const REPLACEMENT_WARN_THRESHOLD: f32 = 0.005;
 
-/// chardetng 采样上限:前 64KB。取值理由(方案 §5.1):Firefox 用 1KB 首猜、VS Code 用 64KB 上限、
-/// legado 用 8KB——64KB 是折中,因为中文小说开头常有大段 ASCII 广告/版权声明,样本太短会误判。
+/// chardetng 采样上限：前 64KB；小说开头可能有较长的 ASCII 内容，样本过短易误判。
 const SNIFF_SAMPLE_BYTES: usize = 64 * 1024;
 
 /// UTF-16 零字节启发的采样上限(无需扫全文,4KB 足以判断 ASCII 密集的 UTF-16)。

@@ -192,8 +192,10 @@ impl Iterator for MediaWalker<'_> {
             if entry.file_type().is_dir() {
                 // 目录条目仍要下降:quick 剪枝只跳**直接文件**,不递归剪掉子目录。
                 if let Some(pruner) = self.dir_pruner {
-                    let rel_path = crate::utils::path::dir_rel_path(&self.root, path);
-                    let rel_path_norm = crate::utils::path::normalize_db_path(&rel_path);
+                    // 这里是目录自身；文件路径助手会取 parent，导致错误复用父目录剪枝基线。
+                    let rel_path = path.strip_prefix(&self.root).unwrap_or(Path::new(""));
+                    let rel_path_norm =
+                        crate::utils::path::normalize_db_path(&rel_path.to_string_lossy());
                     if pruner.should_prune_dir(path, &rel_path_norm) {
                         self.pruned_dirs.push((depth, path.to_path_buf()));
                     }

@@ -1,9 +1,9 @@
 // crates/exotic-workers/ai-worker/src/ocr.rs
-//! OcrSessionInit 校验 + OcrBatch 处理(D-OCR-1/2/4;T5)。
+//! OcrSessionInit 校验与 OcrBatch 处理。
 //!
 //! 两段式镜像 session.rs 纪律:[`validate_ocr_init`](纯校验,零 ort,可单测)→
 //! `main.rs` 内同步 `OcrEngine::init`(OCR 会话装载是秒级 CPU 小模型,无需 SessionInit
-//! 那套流式 Progress 心跳,D-OCR-2)。OCR 会话独立于 CLIP 会话(D-OCR-1):worker 内
+//! 那套流式 Progress 心跳)。OCR 会话独立于 CLIP 会话：worker 内
 //! 双槽并存(`main.rs` 的 `sess`/`ocr_sess` 两个各自 `Option`),互不干扰。
 //!
 //! 校验清单(全部对**明文**,同 session.rs::validate_and_resolve):
@@ -26,15 +26,14 @@ use scrollery_ai_core::ocr_profile::{find_ocr_profile, OcrProfile};
 
 use crate::session::{verify_descriptor, InitError};
 
-/// OcrBatch 单批项数上限(交互场景一批一图为主,批口面向未来;超限= host bug)。
+/// OcrBatch 单批项数上限；超限表示 host 请求错误。
 const MAX_OCR_ITEMS: usize = 8;
 
 /// source_path 回退解码的源文件字节上限。
-/// **镜像自 `batch.rs:27`(`MAX_SOURCE_FILE_BYTES`),勿双向漂移**——batch.rs 是他线
-/// 在途改动(施工期不触碰),本卡在此本地复制同值常量,而非改 batch.rs 可见性。
+/// 与 `batch.rs` 的 `MAX_SOURCE_FILE_BYTES` 保持一致。
 const MAX_SOURCE_FILE_BYTES: u64 = 512 << 20;
 
-/// 单项识别文本总字节上限(D-OCR-4 防御 cap):超限该项判 `ResourceLimit`(逐项不连坐)。
+/// 单项识别文本总字节上限；超限该项判 `ResourceLimit`，不连坐其它项。
 const MAX_ITEM_TEXT_BYTES: usize = 512 * 1024;
 
 /// 源像素上限(宽×高)。**镜像自 `crates/exotic-workers/psd-worker/src/decode.rs` 的
@@ -131,13 +130,10 @@ fn batch_failure(request_id: u64, code: WorkerErrorCode, message: String) -> Fra
 }
 
 /// 单项源解码:仅 `source_path`(信任语义同 `Thumbnail.source_path`,host 提供绝对路径)。
-/// **镜像自 `batch.rs:380-403`(`load_face_image`)的 source_path 分支,勿双向漂移**——
-/// batch.rs 是他线在途改动,本卡不碰该文件。`cache_key` 分支未接入:`OcrSessionInit`
-/// 协议未携带 `ai_cache_dir`(与 CLIP `SessionInit` 不同),且已弃方案裁定 OCR 图片恒走
-/// `source_path`(ai_cache webp ≤640 级,文字分辨率不足,见 construction-plan §5)——
-/// `OcrItem.cache_key` 字段仅为与 `FaceItem` 同构预留,当前忽略,不视为契约缺陷。
+/// OCR 图片读取 `source_path`；`OcrSessionInit` 未携带 AI 缓存根，
+/// 且较小的 ai_cache WebP 不适合文字识别，因此当前忽略 `OcrItem.cache_key`。
 ///
-/// 像素级设防(深审裁决①):`MAX_SOURCE_FILE_BYTES` 的 stat 只拦压缩字节数——一张
+/// 像素级上限：`MAX_SOURCE_FILE_BYTES` 的 stat 只拦压缩字节数，一张
 /// 30MB PNG 可解出 400MB+ RGBA。先用 `ImageReader::into_dimensions` 只解头拿声明
 /// 尺寸(不解像素数据),超 `MAX_SOURCE_PIXELS` 即该项 `ResourceLimit`,不进入真正
 /// 解码分配;通过后才调用 `load_from_memory` 做完整解码。
@@ -172,26 +168,16 @@ fn ocr_one(sess: &OcrSessionState, item: &OcrItem) -> Result<OcrItemResult, Work
         WorkerErrorCode::InternalError
     })?;
 
-    let profile = &sess.engine.profile;
-    // engine.recognize 内部已按 max_lines_per_image 截断(ocr/mod.rs);此处仍显式判断
-    // 并 take 封顶——双重收紧,防御 ai-core 一侧行为漂移(契约自检,非冗余噪音)。
-    let truncated = out.lines.len() > profile.max_lines_per_image;
-    let mut lines: Vec<OcrLine> =
-        Vec::with_capacity(out.lines.len().min(profile.max_lines_per_image));
+    // 同进程 recognize 已按注册 profile 限制行数;这里只转换协议字段并保留文本字节限额。
+    let mut lines: Vec<OcrLine> = Vec::with_capacity(out.lines.len());
     let mut total_text_bytes = 0usize;
-    for l in out.lines.into_iter().take(profile.max_lines_per_image) {
+    for l in out.lines {
         total_text_bytes += l.text.len();
         lines.push(OcrLine {
             text: l.text,
             quad: l.quad,
             confidence: l.confidence,
         });
-    }
-    if truncated {
-        log_warn(format!(
-            "item {} OCR 行数截断至 max_lines_per_image={}",
-            item.item_id, profile.max_lines_per_image
-        ));
     }
     if total_text_bytes > MAX_ITEM_TEXT_BYTES {
         return Err(WorkerErrorCode::ResourceLimit);
@@ -207,7 +193,7 @@ fn ocr_one(sess: &OcrSessionState, item: &OcrItem) -> Result<OcrItemResult, Work
 }
 
 /// 处理 OcrBatch:逐项串行(交互场景一批一图为主,不组批;`MAX_OCR_ITEMS` 上限防御)。
-/// 单项失败不连坐整批(D-OCR-4);终帧 JSON 长度双保险。
+/// 单项失败不连坐整批；终帧 JSON 长度另设上限。
 pub fn handle_ocr_batch(sess: &OcrSessionState, request_id: u64, items: &[OcrItem]) -> Frame {
     let batch_t0 = std::time::Instant::now();
     if items.len() > MAX_OCR_ITEMS {
@@ -243,8 +229,7 @@ pub fn handle_ocr_batch(sess: &OcrSessionState, request_id: u64, items: &[OcrIte
         ..Default::default()
     };
     // 终帧 JSON 长度防御(理论不可达,双保险):行数/单项字节 cap 已在 ocr_one 内拦下。
-    // 有意整批降级:单项用法下不可达(行数/单项字节 cap 在前),多项批未来若需严格
-    // 不连坐再改逐项预算;勿当 bug 统一。
+    // 超过整帧上限时整批失败；单项场景先受行数与文本字节上限限制。
     if let Ok(bytes) = serde_json::to_vec(&body) {
         if bytes.len() > MAX_OCR_RESPONSE_JSON_BYTES {
             return batch_failure(
@@ -267,4 +252,76 @@ pub fn handle_ocr_batch(sess: &OcrSessionState, request_id: u64, items: &[OcrIte
     ));
 
     Frame::with_blob(FrameType::Success, request_id, &body, Vec::new()).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每测试独立临时目录(进程 id + 名字),避免并行测试互踩(镜像 session.rs::temp_dir)。
+    fn temp_dir(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("ai-worker-ocr-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 标准 CRC-32(zlib/PNG 用,polynomial 0xEDB88320,reflected,init/final 0xFFFFFFFF)。
+    /// 构造畸形 IHDR fixture 需要在改字段后自行重算 chunk CRC。
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn oversized_pixel_header_rejected_before_full_decode() {
+        // 编码一张真实可解的 1×1 PNG,再原地改写 IHDR 的 width/height 声明为超上限值
+        // 并重算 chunk CRC——into_dimensions 只解头不解像素,超限判定必须发生在真正
+        // 解码分配之前(深审裁决①:stat 只拦压缩字节,像素级设防补在此)。
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let img = image::RgbImage::from_pixel(1, 1, image::Rgb([0u8, 0, 0]));
+            let mut cursor = std::io::Cursor::new(&mut bytes);
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .unwrap();
+        }
+        // IHDR 是签名(8 字节)后第一个 chunk(PNG 规范强制):
+        // [8..12]=length(13) [12..16]="IHDR" [16..20]=width [20..24]=height [29..33]=CRC。
+        assert_eq!(
+            &bytes[12..16],
+            b"IHDR",
+            "PNG 编码器必须把 IHDR 作为首个 chunk"
+        );
+        let (huge_w, huge_h): (u32, u32) = (20_000, 20_000); // 4e8 像素 > MAX_SOURCE_PIXELS(1e8)
+        bytes[16..20].copy_from_slice(&huge_w.to_be_bytes());
+        bytes[20..24].copy_from_slice(&huge_h.to_be_bytes());
+        let crc = crc32(&bytes[12..29]); // chunk type(4) + data(13)
+        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
+
+        let dir = temp_dir("oversized-pixels");
+        let path = dir.join("huge_header.png");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let item = OcrItem {
+            item_id: 1,
+            cache_key: None,
+            source_path: Some(path.to_string_lossy().into_owned()),
+            fingerprint: "fp".into(),
+        };
+        let err = load_ocr_image(&item).unwrap_err();
+        assert_eq!(
+            err,
+            WorkerErrorCode::ResourceLimit,
+            "超像素上限应在解码前判 ResourceLimit(不连坐)"
+        );
+    }
 }

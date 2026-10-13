@@ -41,40 +41,12 @@ if not exist "Chinese-CLIP" (
     git clone https://github.com/OFA-Sys/Chinese-CLIP.git
 )
 
-:: ==============================================================================
-:: [IMPORTANT MANUAL PATCH INSTRUCTION / 重要手动修改指南]
-::
-:: [EN] If you are running this in a fresh environment where 'Chinese-CLIP' was just cloned,
-::      you MUST manually edit the Python file before the export step will work!
-:: [CN] 如果您在一个全新的环境中运行此脚本（刚刚全新 Clone 了 Chinese-CLIP），
-::      在执行导出步骤前，您必须手动修改 Python 源码，否则一定会报错！
-:: 
-:: File to edit / 需要修改的文件: 
-:: Chinese-CLIP\cn_clip\deploy\pytorch_to_onnx.py
-:: 
-:: Why? / 为什么？
-:: [EN] The original script attempts to convert FP32 models to FP16 models. This uses 
-::      a dependency called `onnxmltools`, which fundamentally conflicts with modern 
-::      PyTorch/ONNX versions and causes 'mapping' and 'unflatten' crashes.
-:: [CN] 原版脚本会尝试将模型转换为 FP16（半精度）。这会引入对 `onnxmltools` 的依赖，
-::      而该库与最新版的 PyTorch 和 ONNX 存在根本性的底层冲突，会导致崩溃。
-:: 
-:: What to do / 怎么做：
-:: Open `pytorch_to_onnx.py` and completely comment out/delete:
-:: 打开 `pytorch_to_onnx.py` 文件，将以下代码彻底注释掉或删除：
-::
-:: 1. The import at the top / 顶部的 import 引入: 
-::    `from onnxmltools.utils import convert_float_to_float16`
-:: 2. The entire FP16 text conversion block (around line 125) / 整个 FP16 文本模型转换代码块 (约 125 行):
-::    `text_fp16_onnx_path = ...` down to `convert_attribute=True)`
-:: 3. The entire FP16 vision conversion block (around line 155) / 整个 FP16 图像模型转换代码块 (约 155 行):
-::    `vision_fp16_onnx_path = ...` down to `convert_attribute=True)`
-:: 
-:: [EN] If you don't do this, the script will crash at the end. Since we only need FP32 
-::      for Scrollery desktop inference, skipping FP16 avoids the dependency hell entirely.
-:: [CN] 如果不这么做，脚本会在最后阶段崩溃。因为 Scrollery 在电脑端推理只需要 FP32
-::      原精度模型，跳过 FP16 转换可以帮我们完美绕开依赖地狱。
-:: ==============================================================================
+:: 上游 Chinese-CLIP 的 pytorch_to_onnx.py 会调用 onnxmltools 转换 FP16；
+:: 该依赖与此脚本安装的 PyTorch/ONNX 版本不兼容。导出前需手动跳过 FP16 转换：
+::   1. 删除或注释顶部的 from onnxmltools.utils import convert_float_to_float16；
+::   2. 删除或注释 text_fp16_onnx_path 对应的文本转换块；
+::   3. 删除或注释 vision_fp16_onnx_path 对应的图像转换块。
+:: 文件：Chinese-CLIP\cn_clip\deploy\pytorch_to_onnx.py。保留 FP32 导出。
 
 echo.
 echo Starting ONNX export...

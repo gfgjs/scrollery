@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 **A local-first, high-performance media asset manager built for large personal libraries.**
 
-Scrollery is a desktop-first application for organizing, browsing, and finding media without sending the library to a remote service. Its architecture is designed around responsive gallery browsing, background processing, and predictable performance as a library grows from thousands to hundreds of thousands of items.
+Scrollery is a local-first desktop application for organizing, browsing, and finding media in large personal libraries. Its architecture is designed around responsive gallery browsing, background processing, and predictable performance as a library grows from thousands to hundreds of thousands of items.
 
 > [!IMPORTANT]
 > Scrollery is currently in **Public Preview** and under active development. Preview builds are intended for testing and may contain incomplete features, compatibility changes, or breaking data migrations. Keep backups of important libraries.
@@ -15,7 +15,7 @@ We want the transition from preview to a stable release to be clear from the beg
 
 - Official preview builds are free during the Public Preview period.
 - The official stable distribution is planned as a **paid, one-time purchase**. Pricing, upgrade coverage, and transition details will be announced before the stable release.
-- The application source code — desktop frontend, Rust host, bundled workers, and the licensing implementation — is published under the [GNU Affero General Public License, version 3 only](LICENSE) (AGPL-3.0-only), including the right to build it independently and to use it commercially.
+- The application source code — desktop frontend, Rust host, bundled workers, and the feature activation implementation — is published under the [GNU Affero General Public License, version 3 only](LICENSE) (AGPL-3.0-only), including the right to build it independently and to use it commercially.
 - A [limited additional permission](ADDITIONAL-PERMISSION.md) permits the bundled Graphviz 2.40.1 / Viz.js 2.1.2 combination. Third-party licenses and the source-provision requirements remain applicable.
 - The planned [commercial offerings](COMMERCIAL.md) are separate from the AGPL release: a one-time purchase of the official stable release under an end-user commercial license, and a negotiated license for enterprise / OEM use that the AGPL does not fit. Ordinary commercial use of the AGPL-licensed source requires neither.
 - Future independent commercial components are planned to be licensed separately; **no open-source commitment is made for them in advance**.
@@ -67,19 +67,6 @@ After cloning the repository:
 
 ```bash
 npm install
-```
-
-On Windows x64, `npm run tauri dev` automatically prepares the pinned Intel VPL dispatcher when its source or installed static library is missing, including after removing `target/native-vpl`. The first run downloads and compiles third-party source using Visual Studio's C++ and CMake tools; subsequent runs reuse it. An existing source checkout must match the pinned commit.
-
-Before a release build, prepare the dispatcher explicitly if it is missing:
-
-```bash
-node scripts/build-vpl-dispatcher.mjs
-```
-
-Start development:
-
-```bash
 npm run tauri dev
 ```
 
@@ -101,11 +88,11 @@ cargo check --manifest-path src-tauri/Cargo.toml --tests
 
 Builds produced from this repository are community/self-built distributions. They do not include the project's release signing keys, code-signing certificates, purchase entitlements, or the official update service.
 
-## Official edition activation
+## Free feature activation
 
-Features & Plugins manages one perpetual official-edition license for advanced image editing, OCR, enhancement, and the PSD engine. RAW decoding and video format extensions remain free. Licensing, plugin installation, and model preparation are shown separately. Uninstalling a plugin preserves the license; removing the local license preserves files, models, and plugins.
+In Features & Plugins, advanced image editing, OCR, image enhancement, and the PSD engine each have an **Activate for free** button. One click saves a local state without a license key or online verification. Each feature activates independently; restarts, plugin uninstallation, and settings resets preserve the records. RAW decoding and video format extensions remain free.
 
-Purchasing is not yet available. Production storefront, public keys, and release delivery remain pending. Enhancement also requires release model assets and is not currently usable just by activating a license. This change has focused tests and browser-harness UI checks; end-to-end usage in a new installer has not been verified.
+Plugin installation, platform support, and model preparation are shown separately. Enhancement release models are still missing. Focused source tests and browser-harness interaction checks cover activation; native multi-window events and a new installer have not been verified. Commercial plans are described in [COMMERCIAL.md](COMMERCIAL.md).
 
 ## Repository layout
 

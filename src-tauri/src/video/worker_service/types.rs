@@ -1,5 +1,4 @@
-// src-tauri/src/video/worker_service/types.rs
-//! 视频服务纯类型/枚举 + 结果映射(自 worker_service.rs 结构性拆分,tierB-1)。
+//! 视频服务类型、枚举与结果映射。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,7 +70,7 @@ pub enum VideoPriority {
 /// `Probe` 语义相同(仍是一次 VideoProbe 请求),但**去重键**独立——不与源 probe 共
 /// `(item_id, VideoKind::Probe)` 键,避免并发窗口内两者互相挂靠/误取消。仅经
 /// [`VideoWorkerService::probe_verify`] 使用,不出现在任何 [`VideoOp`] 变体映射中
-/// (`VideoOp::kind()` 恒不产出此值,故其余处的穷尽匹配只需补空臂)。
+/// (`VideoOp::kind()` 恒不产出此值)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoKind {
     Probe,
@@ -290,26 +289,24 @@ impl From<VideoServiceError> for AppError {
     }
 }
 
-/// worker 侧原始应答 → host 结果(host 不信任 worker:按 op kind 取对应应答体,缺失即通路失败)。
+/// worker 侧原始应答 → host 结果(host 不信任 worker:按实际操作取对应应答体,缺失即通路失败)。
 /// ffmpeg stderr / worker message **只进 tracing**,不进 [`VideoServiceError`](§6 泄漏面红线)。
 pub(super) fn map_outcome(
     op: &VideoOp,
     outcome: RawOutcome,
 ) -> Result<VideoOutput, VideoServiceError> {
     match outcome {
-        RawOutcome::Success { body, blob } => match op.kind() {
-            // ProbeVerify 只是去重键、从不由 `VideoOp::kind()` 产出(见该变体注释),此臂为
-            // 穷尽匹配占位,实际不可达。
-            VideoKind::Probe | VideoKind::ProbeVerify => body
+        RawOutcome::Success { body, blob } => match op {
+            VideoOp::Probe { .. } => body
                 .video_probe
                 .map(VideoOutput::Probe)
                 .ok_or(VideoServiceError::WorkerFailed),
-            VideoKind::Playable => body
+            VideoOp::Remux { .. } | VideoOp::Transcode { .. } => body
                 .video_out
                 .map(VideoOutput::Out)
                 .ok_or(VideoServiceError::WorkerFailed),
-            // V4 只做传输:blob(WebP)的独立解码复核 + 雪碧条切格归 V5 缩略图后端桥。
-            VideoKind::Cover | VideoKind::Keyframes => Ok(VideoOutput::Frames {
+            // WebP 独立解码复核与雪碧条切格由缩略图后端桥处理。
+            VideoOp::Frames { .. } => Ok(VideoOutput::Frames {
                 blob: Arc::new(blob),
                 info: body.video_frames,
             }),
@@ -319,6 +316,7 @@ pub(super) fn map_outcome(
             Err(map_worker_code(fb.code))
         }
         RawOutcome::TimedOut => Err(VideoServiceError::Timeout),
+        RawOutcome::Cancelled => Err(VideoServiceError::Cancelled),
         RawOutcome::Disconnected => Err(VideoServiceError::WorkerFailed),
         RawOutcome::Protocol(p) => {
             tracing::warn!("video-worker 协议违例:{p}");

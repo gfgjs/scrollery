@@ -1,11 +1,5 @@
-// 视频查看器专属命令(视频播放器重构 GD 批)。VideoPlayer 经 ContentViewer viewerApi 透传
-// PlayerApi(playPause/seekBy/volumeBy/toggleMute/setRate/rateStep/toggleLoop/togglePip/
-// toggleFullscreenPair/captureFrame),本册命令经 ctx.activeViewer.api 调用具体动作;when 谓词
-// 按 activeViewer.kind==='video' 收窄(仿 viewer-image.ts 的 when 谓词模式)。
-//
-// 快捷键裁决(task_plan「快捷键:视频上下文夺走 ←/→ 作 seek」):video 上下文 ←/→ 语义从
-// viewer-image 的「切条目」改为「seek」,切条目改 Shift+←/→(navigation 组沿用 viewer.prev/next
-// 的顶栏位;viewer-image.ts 的 viewer.prev/next when 已收窄到 isImage,本册在此接管 video)。
+// 视频命令通过 ContentViewer 暴露的播放器 API 执行。视频中的 ←/→ 用于 seek，
+// Shift+←/→ 用于切换条目；when 谓词按 video 上下文收窄，避免与图片键位冲突。
 
 import { markRaw } from 'vue'
 import { ChevronLeft, ChevronRight } from '@lucide/vue'

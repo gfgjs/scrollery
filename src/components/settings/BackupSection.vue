@@ -45,7 +45,7 @@
       </div>
       <UiToggle
         :model-value="autoEnabled"
-        :disabled="!canEnableAuto"
+        :disabled="!autoEnabled && !canEnableAuto"
         :label="bt('backup.automaticTitle')"
         @update:model-value="setAutoEnabled"
       />
@@ -225,7 +225,6 @@ const latestStatusLabel = computed(() => {
 onMounted(async () => {
   applyStrategy()
   await refreshLastAutoSuccess()
-  if (destination.value) await refreshAll()
 })
 
 /** 后端只应用:权威快照变化(启动水合 / 恢复默认 / 外部改文件)→ 同步策略显示,不写回。 */
@@ -242,6 +241,23 @@ watch(
     readSetting('backup_retention'),
   ],
   applyStrategy,
+)
+
+let preflightRequest = 0
+let listRequest = 0
+let destinationRefresh: Promise<void> = Promise.resolve()
+watch(
+  destination,
+  () => {
+    // 目的地一变，旧目录的可写性和备份包就失去效力；设置快照与手动改选共用此入口。
+    preflightRequest++
+    listRequest++
+    preflight.value = null
+    backups.value = []
+    listLoading.value = false
+    destinationRefresh = refreshAll()
+  },
+  { flush: 'sync' },
 )
 
 watch(
@@ -284,12 +300,13 @@ async function chooseDestination() {
   })
   if (!selected || typeof selected !== 'string') return
 
-  destination.value = selected
+  if (destination.value === selected) destinationRefresh = refreshAll()
+  else destination.value = selected
   await persist({ backup_dir: selected })
-  await refreshAll()
+  await destinationRefresh
 
   // 改选既有目录时保留用户当前自动策略；只在首次设置目的地时给出 B-1 显式建议。
-  if (hadDestination) return
+  if (hadDestination || destination.value !== selected) return
   // 不可写或文档不一致时后端必拒绝；此时不建议开启一个注定失败的定时任务。
   if (!canEnableAuto.value) return
 
@@ -300,9 +317,12 @@ async function chooseDestination() {
     confirmText: bt('backup.enableDaily'),
     cancelText: bt('backup.manualOnly'),
   })
+  // 外部设置可在确认期间换目录；旧确认不能修改新目录的自动备份和保留策略。
+  if (destination.value !== selected || !canEnableAuto.value) return
   retention.value = 5
-  await persist({ backup_retention: '5' })
-  await setAutoEnabled(confirmed)
+  autoEnabled.value = confirmed
+  // 一次提交整套已确认策略，避免两次保存之间目录变化而误开启新目录。
+  await persist({ backup_retention: '5', backup_auto_enabled: String(confirmed) })
 }
 
 async function setAutoEnabled(enabled: boolean) {
@@ -322,35 +342,46 @@ async function refreshAll() {
 }
 
 async function refreshPreflight() {
+  const request = ++preflightRequest
+  const dest = destination.value
+  preflight.value = null
+  if (!dest) return
   try {
-    preflight.value = await backup.preflightBackup(destination.value)
+    const result = await backup.preflightBackup(dest)
+    if (request === preflightRequest) preflight.value = result
   } catch (error) {
-    preflight.value = null
+    if (request !== preflightRequest) return
     const code = error instanceof IpcError ? error.code : undefined
     toast.addToast('error', bt(backupErrorKey(code)))
   }
 }
 
 async function refreshBackups() {
-  if (!destination.value || listLoading.value) return
+  const request = ++listRequest
+  const dest = destination.value
+  if (!dest) return
   listLoading.value = true
   try {
-    backups.value = await backup.listBackups(destination.value)
+    const result = await backup.listBackups(dest)
+    if (request === listRequest) backups.value = result
   } catch (error) {
+    if (request !== listRequest) return
     const code = error instanceof IpcError ? error.code : undefined
     toast.addToast('error', bt(backupErrorKey(code)))
   } finally {
-    listLoading.value = false
+    if (request === listRequest) listLoading.value = false
   }
 }
 
 async function startManualBackup() {
   if (starting.value) return
+  const dest = destination.value
   starting.value = true
   try {
     await refreshPreflight()
-    if (!canStart.value) return
-    await backup.startBackup(destination.value)
+    // 预检期间改选目录后须重新点击备份，不能把旧点击转移到新目的地。
+    if (destination.value !== dest || !canStart.value) return
+    await backup.startBackup(dest)
     toast.addToast('info', bt('backup.startedToast'))
   } catch (error) {
     const code = error instanceof IpcError ? error.code : undefined

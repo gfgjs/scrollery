@@ -1,10 +1,4 @@
-// src/types/selectionCommand.ts
-// 选区批量动作的数据驱动描述子（SelectionBar 合并/分离一键切换方案 C1）。
-//
-// 背景:SelectionToolbar 原本以 9 条写死的 @emit 暴露动作,折叠(收窄时溢出到 ⋯ 菜单)要求
-// 同一组动作既能作为条上按钮、又能作为菜单里的「图标+文字标签」行再渲染一遍 → 动作必须是
-// 数据而非模板按钮。MediaGrid 组装本数组(handler=既有函数引用,零迁移),经单一 :commands
-// prop 传入 SelectionToolbar/SelectionActions,tooltip 文案/图标两处内联收敛单源。
+// 选区批量动作的数据描述子；同一命令集供工具条与溢出菜单渲染。
 import type { Component } from 'vue'
 
 /** 单条选区批量动作。 */

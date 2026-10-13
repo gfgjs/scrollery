@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/package.rs
-//! 冷门格式插件 · 包清单与安全相对路径净化（v3 Part3 §6.3/§6.4）。
+//! 冷门格式插件的包清单与安全相对路径净化。
 //!
 //! `package-manifest.json` 列出包内**全部** payload 文件的规范相对路径、大小、SHA-256、类型、
 //! 执行位（仅排除无法自哈希的 manifest 自身与其 `.sig`）。manifest 由 release key 签名（覆盖原始

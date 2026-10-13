@@ -38,6 +38,8 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
   const muted = ref(false)
   const loop = ref(false)
   const pipActive = ref(false)
+  // 零音量也被控件视为静音；取消时恢复最近非零值，无历史则沿用元素默认音量。
+  let lastNonZeroVolume = 1
 
   // ── 时长计算:el.duration 非有限(直播流/部分容器元数据缺失)时,退而取
   // seekable range 末端作为有效时长(边界 2 恢复:seekable 非空即可 seek/显示进度)。
@@ -123,6 +125,16 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
     waiting.value = false
     seeking.value = false
   }
+  function onEmptied(): void {
+    const el = videoRef.value
+    if (!el) return
+    // 换源清空不会保证补发 pause/durationchange，控件不能继续沿用旧源状态。
+    clearTransientLoadingState()
+    paused.value = el.paused
+    ended.value = el.ended
+    onLoadedMetadata()
+    computeBuffered()
+  }
   function onRateChange(): void {
     rate.value = videoRef.value?.playbackRate ?? 1
   }
@@ -131,6 +143,7 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
     if (!el) return
     volume.value = el.volume
     muted.value = el.muted
+    if (el.volume > 0) lastNonZeroVolume = el.volume
   }
   function onEnterPip(): void {
     pipActive.value = true
@@ -154,7 +167,7 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
     ['seeked', onSeeked as EventListener],
     ['playing', onPlaying as EventListener],
     ['abort', clearTransientLoadingState as EventListener],
-    ['emptied', clearTransientLoadingState as EventListener],
+    ['emptied', onEmptied as EventListener],
     ['error', clearTransientLoadingState as EventListener],
     ['ratechange', onRateChange as EventListener],
     ['volumechange', onVolumeChange as EventListener],
@@ -167,8 +180,7 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
     // 元素可能已带初值(autoplay 已开始):立即同步一次镜像。
     paused.value = el.paused
     rate.value = el.playbackRate
-    volume.value = el.volume
-    muted.value = el.muted
+    onVolumeChange()
     loop.value = el.loop
     duration.value = computeDuration()
     currentTime.value = el.currentTime
@@ -196,11 +208,12 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
     const el = videoRef.value
     if (!el) return
     // play() 返回 Promise:autoplay 策略拦截时 reject,此时不会触发 'play' 事件,
-    // 故显式把镜像置为 paused,让上层显大播放键覆层(边界 5)。
+    // 故回读当前元素的暂停状态,让上层显大播放键覆层(边界 5)。
     const p = el.play()
     if (p && typeof p.then === 'function') {
       p.catch(() => {
-        paused.value = true
+        // 换源中断的旧请求可能晚于新源 playing；失败本身不能证明当前仍暂停。
+        if (videoRef.value === el) paused.value = el.paused
       })
     }
   }
@@ -231,6 +244,8 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
     if (!el) return
     const clamped = Math.min(1, Math.max(0, v))
     el.volume = clamped
+    // 连续输入可先于异步 volumechange 到达，不能等事件回读才记住恢复值。
+    if (clamped > 0) lastNonZeroVolume = clamped
     // 拉动音量即隐含解除静音(除非音量归零)。
     if (clamped > 0 && el.muted) el.muted = false
   }
@@ -243,12 +258,20 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
   function toggleMute(): void {
     const el = videoRef.value
     if (!el) return
-    el.muted = !el.muted
+    if (el.muted || el.volume <= 0) {
+      if (el.volume <= 0) el.volume = lastNonZeroVolume
+      el.muted = false
+    } else {
+      el.muted = true
+    }
   }
   function setRate(r: number): void {
     const el = videoRef.value
     if (!el) return
-    el.playbackRate = clampRate(r)
+    const clamped = clampRate(r)
+    // 换源会把播放倍速重置为默认倍速；两者同步，避免 ratechange 将 1 倍速回存偏好。
+    el.defaultPlaybackRate = clamped
+    el.playbackRate = clamped
   }
   /** 倍速按档步进(< / >);dir=+1 提速、-1 降速。 */
   function rateStep(dir: 1 | -1): void {
@@ -266,7 +289,7 @@ export function useVideoPlayback(videoRef: Ref<HTMLVideoElement | null>) {
       }
     }
     const next = Math.min(PLAYBACK_RATES.length - 1, Math.max(0, idx + dir))
-    el.playbackRate = PLAYBACK_RATES[next]
+    setRate(PLAYBACK_RATES[next])
   }
   function toggleLoop(): void {
     const el = videoRef.value

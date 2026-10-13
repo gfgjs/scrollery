@@ -3,7 +3,6 @@
   inset: 0;
   display: flex;
   flex-direction: column;
-  /* 原 --color-bg-base 为不存在的幽灵 token 且无 fallback——实际渲染透明(S5 修) */
   background: var(--color-bg-primary);
   z-index: 5;
 }
@@ -56,9 +55,13 @@
   cursor: pointer;
   font-size: var(--font-size-sm);
 }
-.doc-viewer__btn:hover {
+.doc-viewer__btn:hover:not(:disabled) {
   background: var(--color-bg-hover);
   color: var(--color-text-primary);
+}
+.doc-viewer__btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .doc-viewer__btn.is-active {
   background: var(--color-accent-subtle);
@@ -122,7 +125,7 @@
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
-  /* 窄窗防线(2026-07-17):禁换行——旧版无此规则,挤压时「0% · 第一章」逐字竖排(真机截图);
+  /* 窄窗禁换行，避免进度与章名逐字竖排；
      收缩走 ellipsis,上限让给控件区。 */
   white-space: nowrap;
   overflow: hidden;
@@ -132,8 +135,8 @@
   flex-shrink: 1;
 }
 
-/* ── 工具栏折叠容器(2026-07-17,契约同 AppToolbar §G5):接替旧 .doc-viewer__spacer 的右对齐,
-   gap:0 + 逐项 margin-inline-end(折叠归 0 无碎屑;引擎测量含 margin)。 ── */
+/* 工具栏折叠容器：保持右对齐，
+   gap:0 + 逐项 margin-inline-end，折叠归零且测量包含 margin。 */
 .doc-viewer__foldable {
   flex: 1;
   min-width: 0;
@@ -256,6 +259,7 @@
   padding: 0 var(--spacing-xs);
 }
 .doc-viewer__body {
+  position: relative;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -288,16 +292,18 @@
 .doc-edit__bar {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--spacing-sm);
+  gap: var(--spacing-xs);
   min-height: var(--toolbar-height);
-  padding: 0 var(--spacing-md);
+  padding: var(--spacing-xs) var(--spacing-md);
   border-bottom: 1px solid var(--color-divider);
   background: var(--color-bg-primary);
 }
 .doc-edit__label {
-  flex: 1;
-  min-width: 0;
+  /* 窄窗时先换行，不能让操作按钮把版本标签挤到只剩边框。 */
+  flex: 1 1 200px;
+  min-width: min(180px, 100%);
   height: var(--control-size-default);
   background: var(--color-input-bg);
   border: 1px solid var(--color-input-border);
@@ -314,10 +320,22 @@
   resize: none;
   border: none;
   outline: none;
-  padding: 24px clamp(16px, 8vw, 120px);
+  padding: 24px max(24px, calc((100% - var(--doc-edit-width)) / 2));
   background: var(--color-bg-primary);
   color: var(--color-text-primary);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-  line-height: 1.7;
+  font-family: var(--doc-edit-font-family);
+  font-size: var(--doc-edit-font-size);
+  line-height: var(--doc-edit-line-height);
+}
+.doc-edit__status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border-top: 1px solid var(--color-divider);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
 }

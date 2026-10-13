@@ -12,7 +12,7 @@ pub enum AiProvider {
     DirectML,
     /// NVIDIA CUDA
     CUDA,
-    /// Apple CoreML（macOS/iOS）
+    /// Apple CoreML（macOS）
     CoreML,
     /// Intel OpenVINO
     OpenVINO,
@@ -64,7 +64,7 @@ pub struct ProviderInfo {
 
 /// 检测当前平台上可用的最优 AI 执行提供者。
 ///
-/// 目前使用编译期平台检测。未来版本可能会添加运行时 GPU 探测（如 DirectML 能力检测、CUDA 设备查询）。
+/// 按编译目标平台选择执行提供器。
 pub fn detect_best_provider() -> ProviderInfo {
     #[cfg(target_os = "windows")]
     {

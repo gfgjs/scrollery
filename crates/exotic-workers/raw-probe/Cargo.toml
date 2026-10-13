@@ -1,5 +1,5 @@
 # crates/exotic-workers/raw-probe/Cargo.toml
-# RAW 技术去险 spike(阶段 B 前置)。实验 crate，独立 workspace（不进根 members——见下）。
+# RAW 技术探针，独立 workspace。
 # 目的：证 rsraw（vendored LibRaw C++，CDDL/LGPL 双证）能否在 x86_64-pc-windows-gnu
 # 工具链上真编出来 + API 面可用 + 畸形输入 panic 安全。
 # 锁定精确版本（`=0.1.1`），结论只对该版本成立；升级须重跑探针。

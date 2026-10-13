@@ -17,7 +17,7 @@ import type { LayoutRowItem } from '../types/layout'
 
 export interface GalleryKeyboardDeps {
   selectionDescriptor: () => BackendSelectionDescriptor
-  patchVisibleSelected: (apply: (item: LayoutRowItem) => void) => void
+  captureSelectionPatch: () => (apply: (item: LayoutRowItem) => void) => Promise<void>
   compute: (width?: number) => Promise<void>
   /** §8.1 browse-only 谓词:重复镜头激活时旁路 document 级选择语义（宿主从 duplicateLensStore 注入）。 */
   lensActive: () => boolean
@@ -83,23 +83,24 @@ export function useGalleryKeyboard(deps: GalleryKeyboardDeps) {
         if (selection.selectedCount.value > 0) {
           e.preventDefault()
           const rating = Number(e.key)
+          const patch = deps.captureSelectionPatch()
           media
             .batchSetRating(deps.selectionDescriptor(), rating)
             .then(async (n) => {
-              // 乐观刷新选区星级（rating 已入布局行，可即时显形）。
-              deps.patchVisibleSelected((it) => {
-                it.rating = rating
-              })
+              // 筛选本就要求重算时只读一次；否则按发起时的选区决定就地回写或重取。
+              if (filter.minRating > 0 && rating < filter.minRating) {
+                await deps.compute()
+              } else {
+                await patch((it) => {
+                  it.rating = rating
+                })
+              }
               toast.addToast(
                 'success',
                 rating === 0
                   ? t('selection.ratingCleared', { count: n })
                   : t('selection.rated', { count: n, rating }),
               )
-              // 「≥N 星」筛选激活且批量评分跌破阈值 → 这些项应离开视图，重算。
-              if (filter.minRating > 0 && rating < filter.minRating) {
-                await deps.compute()
-              }
             })
             .catch((err) => {
               toast.addToast(

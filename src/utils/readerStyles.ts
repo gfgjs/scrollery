@@ -45,7 +45,7 @@ export interface ReaderTypography {
 }
 
 /** 阅读正文字体栈：CJK 优先，回落西文与系统字体。衬线贴近纸书，无衬线屏幕更清晰。 */
-const FONT_STACKS: Record<ReaderFontFamily, string> = {
+export const FONT_STACKS: Record<ReaderFontFamily, string> = {
   serif:
     '"Noto Serif CJK SC", "Source Han Serif SC", "Songti SC", STSong, SimSun, Georgia, "Times New Roman", serif',
   sans: '"Noto Sans CJK SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", system-ui, sans-serif',
@@ -71,6 +71,8 @@ export interface ReaderCSSOptions {
    * false）行为逐像素不变。writing-mode 本身由 BookReader onLoad 注入文档根，不在此。
    */
   vertical?: boolean
+  /** 分页时把不可分片的表格及代码滚动区限制在一页内；滚动流不限制高度。 */
+  paginated?: boolean
 }
 
 /**
@@ -132,8 +134,9 @@ export function buildReaderCSS(
     // ── md 专属（.sate-md 隔离，txt/epub 文档无此 class）──
     // renderMarkdown 输出无内联样式，全靠此处赋形。边框 / 底色用中性灰 rgba（iframe 取不到 app 变量，
     // 灰阶在明暗主题下都可读）；段落不缩进（markdown 惯例左对齐、空行分段）。块级间距/边框用逻辑属性适配竖排。
-    `.sate-md { text-align: left; }`,
-    `.sate-md p { text-indent: 0; margin-block: 0.8em; }`,
+    // 滚动流首开不带分页器的长词换行规则，长链接须在正文栏内可读；pre 的空白格式仍由自身保留。
+    `.sate-md { text-align: left; overflow-wrap: anywhere; }`,
+    `.sate-md p { text-indent: 0; margin-block: ${paraGapEm}em; }`,
     `.sate-md h1, .sate-md h2, .sate-md h3, .sate-md h4 { line-height: 1.3; font-weight: 700; margin-block: 1.4em 0.6em; }`,
     `.sate-md h1 { font-size: 1.8em; border-block-end: 1px solid rgba(128,128,128,0.35); padding-block-end: 0.2em; }`,
     `.sate-md h2 { font-size: 1.45em; }`,
@@ -141,8 +144,22 @@ export function buildReaderCSS(
     `.sate-md ul, .sate-md ol { margin-block: 0.6em; padding-inline-start: 1.6em; }`,
     `.sate-md li { margin-block: 0.25em; }`,
     `.sate-md code { font-family: monospace; font-size: 0.88em; background: rgba(128,128,128,0.16); padding: 0.1em 0.35em; border-radius: 3px; }`,
-    `.sate-md pre { background: rgba(128,128,128,0.12); padding: 12px 14px; border-radius: 6px; overflow-x: auto; }`,
+    `.sate-md pre { background: rgba(128,128,128,0.12); padding: 12px 14px; border-radius: 6px; overflow-x: auto; box-sizing: border-box;${opts.paginated ? ` max-block-size: ${vertical ? '100vw' : '100vh'};` : ''} }`,
     `.sate-md pre code { background: none; padding: 0; }`,
+    // 仅显示层的工具按钮：DOM 仍 append 于 code 后，CSS 排到前方并固定在局部双轴滚动区。
+    `.sate-md pre.sate-md-code-container { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }`,
+    `.sate-md-code-container > code { flex: none; min-inline-size: 100%; inline-size: max-content; }`,
+    `.sate-md-code-copy { order: -1; flex: none; align-self: flex-end; position: sticky; inset-block-start: 0; inset-inline-start: calc(100% - 32px); z-index: 1; inline-size: 32px; block-size: 30px; padding: 6px; border: 1px solid rgba(128,128,128,0.5); border-radius: 4px; background: ${colors.background}; color: ${colors.text}; cursor: pointer; }`,
+    `.sate-md-code-copy svg { display: block; width: 18px; height: 18px; }`,
+    `.sate-md-code-copy:hover { border-color: currentColor; }`,
+    `.sate-md-code-copy:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }`,
+    // 横滚容器不能跨页分片；分页时沿块轴限于一页，长表改用内部滚动以免末行被裁。
+    `.sate-md .sate-md-table { max-inline-size: 100%; overflow-x: auto; margin-block: 0.8em;${opts.paginated ? ` max-block-size: ${vertical ? '100vw' : '100vh'};` : ''} }`,
+    `.sate-md table { border-collapse: collapse; width: max-content; min-width: 100%; overflow-wrap: normal; }`,
+    `.sate-md th, .sate-md td { border: 1px solid rgba(128,128,128,0.35); padding: 0.4em 0.65em; }`,
+    `.sate-md th { font-weight: 600; background: rgba(128,128,128,0.12); }`,
+    `.sate-md .sate-md-task-item { list-style: none; }`,
+    `.sate-md .sate-md-task-item input[type="checkbox"] { margin-inline-end: 0.45em; }`,
     `.sate-md blockquote { margin-block: 0.8em; padding-inline: 1em; border-inline-start: 3px solid rgba(128,128,128,0.4); opacity: 0.85; }`,
     `.sate-md hr { border: none; border-block-start: 1px solid rgba(128,128,128,0.4); margin-block: 1.5em; }`,
   ]

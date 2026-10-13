@@ -83,8 +83,7 @@
 </template>
 
 <script setup lang="ts">
-// AI 校对面板（§5.4，远程）。配置（base_url/model/key）→ 分块逐块校对 → track-changes 预览 →
-// 接受后存为新版本（source='ai-remote'，接 §5.3）。本期为「全部接受」；逐条接受/拒绝为后续增强。
+// 远程 AI 校对：配置服务后分块校对、预览修订，接受整份结果后存为新版本。
 import { ref, reactive, computed, onMounted } from 'vue'
 import { X, Settings, Sparkles } from '@lucide/vue'
 import { useI18n } from 'vue-i18n'
@@ -148,7 +147,7 @@ async function loadCfg() {
 }
 
 async function saveConfig() {
-  // P1-16:此前无 try/catch,配置写失败静默,用户以为已保存。
+  // 配置写入失败须提示，避免用户误认为已保存。
   try {
     await invokeIpc(IPC.SET_PROOFREAD_CONFIG, {
       baseUrl: form.baseUrl.trim(),
@@ -200,7 +199,7 @@ async function run() {
 
 async function accept() {
   if (corrected.value == null) return
-  // P1-16:接受 AI 校对稿并存版本,失败须告警(否则用户以为已采纳,实则未落库)。
+  // 接受校对稿并存为版本失败时须提示，避免误认为已经入库。
   try {
     const newId = await invokeIpc<number>(IPC.SAVE_VERSION, {
       itemId: props.itemId,

@@ -1,5 +1,5 @@
 // src/composables/reader/useReaderNav.ts
-// 导航/TOC（结构拆分自 DocumentViewer.vue §S13 + §S20 的 onLocate/onToc/onTocNavigate + §S21 toggleToc 部分）。
+// 导航/TOC。
 import { ref, type Ref } from 'vue'
 import type { FoliateTocItem } from '../../vendor/foliate-js/view.js'
 import type { ReaderApi } from './readerApiTypes'
@@ -11,7 +11,7 @@ export interface UseReaderNavDeps {
 }
 
 export function useReaderNav(deps: UseReaderNavDeps) {
-  // 导航（R2-3）：全书进度 0..1 / 当前章名 / 目录树 / TOC 面板开关。foliate 渲染器（txt/epub/md）用。
+  // foliate 渲染器的全书进度为 0..1。
   const readerFraction = ref<number | null>(null)
   const readerTocLabel = ref('')
   // 当前章 href（TOC 面板高亮当前章用；由 BookReader locate 事件透传 foliate 的 tocItem.href）。
@@ -29,13 +29,12 @@ export function useReaderNav(deps: UseReaderNavDeps) {
   }
   function onTocNavigate(href: string) {
     deps.readerRef.value?.goToHref?.(href)
-    showToc.value = false
   }
   function toggleToc() {
     showToc.value = !showToc.value
     if (showToc.value) deps.closeOtherPanels()
   }
-  /** 换文档时调用（showToc 有意不复位——与原 load() 行为一致，面板开合态跨文档保留）。 */
+  /** 换文档时复位目录数据，保留面板开合状态。 */
   function reset() {
     readerFraction.value = null
     readerTocLabel.value = ''

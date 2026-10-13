@@ -1,4 +1,4 @@
-//! 查看器色域派生的渲染主体(方案 §0②③)。解码源图 → 内存预算准入 → orientation 烤入像素 →
+//! 查看器色域派生的渲染主体。解码源图 → 内存预算准入 → orientation 烤入像素 →
 //! CMS 投影到 target 色域(复用 `editing::color::to_target_rgba8`)→ 按 alpha 判定编码格式
 //! (有 alpha→PNG 无损;无 alpha→JPEG q92)嵌入 target ICC → 同卷原子落盘。
 //!

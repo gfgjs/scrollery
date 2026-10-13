@@ -39,7 +39,18 @@
 
     <!-- ── 特例:缩略图尺寸档 segmented ─────────────────────────── -->
     <template v-else-if="settingKey === 'thumbSize'">
-      <div class="segmented-control" :class="{ 'compact-segmented': compact }">
+      <UiSelect
+        v-if="compact"
+        :model-value="String(config.thumbSize)"
+        :label="$t('settings.thumbSize')"
+        class="compact-select-wrap"
+        @update:model-value="config.setThumbSize(Number($event))"
+      >
+        <option v-for="tier in THUMB_SIZE_TIERS" :key="tier" :value="String(tier)">
+          {{ getTierLabel(tier) }}
+        </option>
+      </UiSelect>
+      <div v-else class="segmented-control">
         <button
           v-for="tier in THUMB_SIZE_TIERS"
           :key="tier"
@@ -54,7 +65,7 @@
 
     <!-- ── 开关类(注册表 control='toggle',绑定见 toggleBindings)──── -->
     <template v-else-if="spec?.control === 'toggle' && hasToggleBinding">
-      <UiToggle v-model="toggleModel" :label="$t(spec.label)" :class="{ 'compact-toggle': compact }" />
+      <UiToggle v-model="toggleModel" :label="$t(spec.label)" />
     </template>
 
     <!-- ── 下拉类(control='select',选项表来自注册表)────────────── -->
@@ -108,23 +119,26 @@
       </button>
     </template>
 
-    <!-- ── 兜底:钉住区不支持的复杂项(目录/引擎状态/全量生成等特例行)── -->
+    <!-- 复杂项复用设置页完整控件，侧栏提供所属分类入口。 -->
     <template v-else>
-      <span class="unsupported-hint">{{ $t('settings.unsupportedQuickAction') }}</span>
+      <UiButton
+        v-if="compact && settingsSection"
+        class="btn-sm related-settings-button"
+        @click="router.push(`/settings/${settingsSection}`)"
+      >
+        {{ $t('settings.openRelatedSettings') }}
+      </UiButton>
+      <span v-else class="unsupported-hint">{{ $t('settings.unsupportedQuickAction') }}</span>
     </template>
   </div>
 </template>
 
 <script setup lang="ts">
-// 注册式控件分派(设计 §8):按 SETTINGS_MAP.control 类型分派模板,替代原按
-// settingKey 的 625 行 v-else-if 长链。「控件长什么样」在注册表声明,「读写哪个
-// store」在下方三张同构绑定表声明——新增常规设置项零模板改动。
-// 行为等价性依据:ui/config 两 store 的 setter 均自带状态赋值,writable computed
-// 直调 setter 与原「v-model 先赋值 + @change 再调 setter」观察行为一致(checkbox/
-// select 的 v-model 本就只在 change 时刻写入)。number 类保留「输入进本地缓冲、
-// change 才提交」的原语义,避免逐键击发 IPC。
+// SETTINGS_MAP.control 决定控件形态；下方绑定表决定各设置项的读写源。
+// 数字输入先写本地缓冲，change 时才提交，避免逐键触发 IPC。
 import { ref, computed, watch } from 'vue'
 import type { Component } from 'vue'
+import { useRouter } from 'vue-router'
 import { invokeIpc } from '../../utils/ipc'
 import { IPC } from '../../constants/ipc'
 import { useUiStore } from '../../stores/uiStore'
@@ -138,10 +152,12 @@ import { useAiStore } from '../../stores/aiStore'
 import { useI18n } from 'vue-i18n'
 import { THUMB_SIZE_TIERS } from '../../constants/defaults'
 import { getSettingSpec } from '../../constants/settingsMap'
+import { SETTINGS_GROUPS } from '../../constants/settingsLayout'
 import { RotateCcw, Database, Gauge, Paintbrush, Terminal } from '@lucide/vue'
 import UiIconButton from '../ui/UiIconButton.vue'
 import UiToggle from '../ui/UiToggle.vue'
 import UiSelect from '../ui/UiSelect.vue'
+import UiButton from '../ui/UiButton.vue'
 import { useConfirm } from '../../composables/useConfirm'
 import { useRenderMode, type RenderMode } from '../../composables/useRenderMode'
 import { useTitlebarMode } from '../../composables/useTitlebarMode'
@@ -157,6 +173,7 @@ const props = defineProps<{
 }>()
 
 const ui = useUiStore()
+const router = useRouter()
 // 外观模式归主题域(见 stores/themeStore):本组件只读偏好、写偏好,不碰主题参数与草稿。
 const theme = useThemeStore()
 const toast = useToastStore()
@@ -179,10 +196,17 @@ const toolbarAlign = useToolbarAlign()
 const performanceMonitor = usePerformanceMonitor()
 
 const spec = computed(() => getSettingSpec(props.settingKey))
+const settingsSection = computed(
+  () => SETTINGS_GROUPS.find((group) => group.keys.some((key) => key === props.settingKey))?.section,
+)
 
 /* ── 绑定表:声明各键「读哪、写哪」;控件形态由注册表声明 ─────────────── */
 
 const toggleBindings: Record<string, { get: () => boolean; set: (v: boolean) => void }> = {
+  galleryBlendEnabled: {
+    get: () => config.galleryBlendEnabled,
+    set: (v) => void config.setGalleryBlendEnabled(v),
+  },
   hoverScale: {
     get: () => config.enableHoverScale,
     set: (v) => void config.setEnableHoverScale(v),
@@ -267,6 +291,18 @@ const selectBindings: Record<string, { get: () => string; set: (v: string) => vo
 }
 
 const numberBindings: Record<string, { get: () => number; set: (v: number) => void }> = {
+  galleryBlendEdgeWidth: {
+    get: () => config.galleryBlendEdgeWidth,
+    set: (v) => void config.setGalleryBlendEdgeWidth(v),
+  },
+  galleryBlendBlurRadius: {
+    get: () => config.galleryBlendBlurRadius,
+    set: (v) => void config.setGalleryBlendBlurRadius(v),
+  },
+  galleryBlendStrength: {
+    get: () => config.galleryBlendStrength,
+    set: (v) => void config.setGalleryBlendStrength(v),
+  },
   uiFontSize: { get: () => config.uiFontSize, set: (v) => void config.setUiFontSize(v) },
   // 跳过阈值变更须同步失效布局(缩略图形态随之改变)。
   thumbSkipMaxKb: {
@@ -281,13 +317,6 @@ const numberBindings: Record<string, { get: () => number; set: (v: number) => vo
     set: (v) => void config.setThumbCacheMaxMb(v),
   },
   // 编码质量(100=无损):后端复位存量项后 data_version 已 bump,布局出口自会取到新状态。
-  thumbFastThreads: { get: () => config.thumbFastThreads, set: (v) => void config.setThumbFastThreads(v) },
-  thumbTailThreads: { get: () => config.thumbTailThreads, set: (v) => void config.setThumbTailThreads(v) },
-  thumbGpuInflight: { get: () => config.thumbGpuInflight, set: (v) => void config.setThumbGpuInflight(v) },
-  thumbGpuPerAdapter: { get: () => config.thumbGpuPerAdapter, set: (v) => void config.setThumbGpuPerAdapter(v) },
-  thumbProcessMemoryMb: { get: () => config.thumbProcessMemoryMb, set: (v) => void config.setThumbProcessMemoryMb(v) },
-  thumbTotalMemoryMb: { get: () => config.thumbTotalMemoryMb, set: (v) => void config.setThumbTotalMemoryMb(v) },
-  thumbWorksetMb: { get: () => config.thumbWorksetMb, set: (v) => void config.setThumbWorksetMb(v) },
   thumbWebpQuality: {
     get: () => config.thumbWebpQuality,
     set: (v) => void config.setThumbWebpQuality(v),
@@ -325,7 +354,7 @@ const selectModel = computed<string>({
 })
 
 // number 类本地缓冲:输入不触发提交,change 才写 store(并跟随 store 外部变更回同步)。
-const numberLocal = ref(0)
+const numberLocal = ref<number | string>(0)
 watch(
   () => numberBindings[props.settingKey]?.get(),
   (v) => {
@@ -334,7 +363,19 @@ watch(
   { immediate: true },
 )
 function commitNumber() {
-  numberBindings[props.settingKey]?.set(numberLocal.value)
+  const binding = numberBindings[props.settingKey]
+  if (!binding) return
+  // 数字框清空时 v-model.number 仍返回空字符串，不能让数值转换把它提交成 0。
+  if (typeof numberLocal.value !== 'number' || !Number.isFinite(numberLocal.value)) {
+    numberLocal.value = binding.get()
+    return
+  }
+  // HTML min/max 不阻止手工超限输入；先同步本地缓冲，避免保存值不变时 watch 无法回填。
+  numberLocal.value = Math.min(
+    spec.value?.max ?? Infinity,
+    Math.max(spec.value?.min ?? -Infinity, Math.round(numberLocal.value)),
+  )
+  binding.set(numberLocal.value)
 }
 
 /* ── 危险清理按钮表(icon=全尺寸按钮图标;compact 统一 RotateCcw)────── */
@@ -416,7 +457,7 @@ function getTierLabel(tier: number): string {
   return labels[tier] ?? `${tier}px`
 }
 
-/* ── 危险清理按钮 handlers(与重构前逐行一致)────────────────────── */
+/* 危险清理操作。 */
 
 async function handleClearDb() {
   // 清库=极度危险且不可恢复,走「输入确认」强门(requireText):须原样键入库名关键词才放行,
@@ -447,7 +488,6 @@ async function handleClearSettings() {
   })
   if (!confirmed) return
   // 重置只刷新设置:资产、阅读进度、任务状态与引导标记都留在各自业务表里,不重放首启向导。
-  // 不再用 window.location.reload 冒充「重启」——那既没重启后端,也会丢掉前端会话态。
   try {
     const change = await resetSettings()
     // 需重启才生效的项如实告知(热应用项已成默认值并即刻生效)。
@@ -501,12 +541,11 @@ async function handleClearAllThumbnails() {
 
 function handleClearBrowserCache() {
   // 「清浏览器缓存」语义是纯前端:带 cache-busting 查询串重载,绕过 webview 已缓存的图片。
-  // 不存在 `clear_browser_cache` 后端命令——此前调它必失败弹错误 toast(与 SettingsView 同名实现对齐后修复)。
   window.location.href = window.location.pathname + '?clear=' + Date.now()
 }
 
 async function handleOpenLogWindow() {
-  // 日志能力重构 S4(方案 §5):建窗/聚焦既有窗口全在后端(open_log_window 一并翻转环形缓冲
+  // 建窗或聚焦既有日志窗口由后端 open_log_window 处理，并更新环形缓冲
   // 订阅标志),前端只管调用 + 失败提示。
   try {
     await invokeIpc(IPC.OPEN_LOG_WINDOW)
@@ -521,10 +560,16 @@ async function handleOpenLogWindow() {
   display: flex;
   align-items: center;
   gap: var(--spacing-xs);
+  min-width: 0;
+  max-width: 100%;
 }
 .number-control__unit {
+  flex-shrink: 0;
   color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
+}
+.compact .number-control {
+  flex-wrap: wrap;
 }
 /* ── Segmented Control ─────────────────────────────────────────────────── */
 .segmented-control {
@@ -564,60 +609,62 @@ async function handleOpenLogWindow() {
 
 .dynamic-control.compact {
   justify-content: flex-start;
-  margin-top: 4px;
+  min-width: 0;
   width: 100%;
 }
 
 .compact-select-wrap {
-  width: 100% !important;
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
 }
 /* select 迁入 UiSelect 后携子组件 data-v(非本组件),故后代选择器须经 :deep() 穿透子组件边界重锚——
    否则 `.compact-select-wrap[data-v-本] .select[data-v-本]` 因内层 data-v 失配,紧凑面板 select 尺寸静默退回默认。
    .compact-select-wrap 类经 fallthrough 落在 UiSelect 根(仍带父 data-v),故左侧锚点不变、仅去 .select 的 data-v 约束。 */
 .compact-select-wrap :deep(.select) {
-  padding: 4px 24px 4px 8px;
-  font-size: 12px;
-  height: 26px;
-  min-height: 26px;
+  padding: 0 28px 0 var(--spacing-sm);
+  font-size: var(--font-size-xs);
+  height: var(--control-size-compact);
+  min-height: var(--control-size-compact);
+  min-width: 0;
   width: 100%;
+  text-overflow: ellipsis;
 }
 
 .compact-input {
-  width: 60px;
-  padding: 2px 6px;
-  font-size: 12px;
-  height: 26px;
-}
-
-.compact-toggle {
-  transform: scale(0.8);
-  transform-origin: left center;
-}
-
-.compact-segmented {
-  flex-wrap: wrap;
-  gap: 2px;
-}
-.compact-segmented .segmented-btn {
-  padding: 2px 6px;
-  font-size: 11px;
+  width: 104px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0 var(--spacing-sm);
+  font-size: var(--font-size-xs);
+  height: var(--control-size-compact);
+  min-height: var(--control-size-compact);
 }
 
 .danger-icon {
   color: var(--color-error);
 }
 
-/* ── AI 批大小提示(原内联 style 收进 class,S6)─────────────────────── */
+/* AI 批大小提示。 */
 .batch-size-stack {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
 }
+.compact .batch-size-stack {
+  align-items: flex-start;
+  min-width: 0;
+  width: 100%;
+}
 .batch-hint {
   font-size: 11px;
   white-space: nowrap;
+}
+.compact .batch-hint {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .batch-hint--ok {
   color: var(--color-success);
@@ -635,5 +682,14 @@ async function handleOpenLogWindow() {
 .unsupported-hint {
   font-size: 12px;
   color: var(--color-text-tertiary);
+  overflow-wrap: anywhere;
+}
+.btn.related-settings-button {
+  max-width: 100%;
+  height: auto;
+  padding-block: var(--spacing-xs);
+  white-space: normal;
+  line-height: 1.4;
+  text-align: left;
 }
 </style>

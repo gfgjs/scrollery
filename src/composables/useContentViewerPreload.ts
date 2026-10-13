@@ -51,8 +51,14 @@ export function useContentViewerPreload(options: ViewerPreloadOptions) {
     return next
   }
 
+  function isReadyToPreload(): boolean {
+    const detail = options.detail()
+    // 图片须让当前大图先加载完成；视频没有图片加载回执，不能用该标记阻止邻项预取。
+    return detail !== null && (detail.mediaType !== 'image' || options.isHighResReady())
+  }
+
   function isCurrent(context: NavigationContext, currentId: number): boolean {
-    return !disposed && !isBursting.value && options.detail()?.id === currentId &&
+    return !disposed && !isBursting.value && isReadyToPreload() && options.detail()?.id === currentId &&
       syncAdjacentCacheScope() === context
   }
 
@@ -192,9 +198,9 @@ export function useContentViewerPreload(options: ViewerPreloadOptions) {
     }
   }
 
-  // 当前大图就绪且非连翻时触发空闲预加载
+  // 当前媒体就绪且非连翻时触发空闲预加载
   watch(
-    () => [options.detail()?.id, options.isHighResReady(), syncAdjacentCacheScope()],
+    () => [options.detail()?.id, isReadyToPreload(), syncAdjacentCacheScope()],
     ([id, ready]) => {
       if (id && ready && !isBursting.value) {
         scheduleIdlePreload()

@@ -1,9 +1,5 @@
 // crates/scrollery-ai-core/src/error.rs
-//! AI 核心错误类型(T15 迁出时自 src-tauri AppError 拆分的最小子集)。
-//!
-//! 变体与原 AppError 使用面一一对应:`Ort` ← AppError::Ai、`Internal` ← AppError::Internal、
-//! `Tokenizer` ← AppError::AiTokenizer;src-tauri 侧以 `From<AiError> for AppError` 收敛回去,
-//! 调用点的 `?` 传播语义不变。
+//! AI 核心错误类型；主进程通过 `From<AiError> for AppError` 转换。
 
 use thiserror::Error;
 

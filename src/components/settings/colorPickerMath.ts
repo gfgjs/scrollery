@@ -1,4 +1,4 @@
-// 选色器的 HSV 数学(方案 §2 二维饱和度／明度面板 + 色相条)。
+// 选色器二维饱和度/明度面板与色相条的 HSV 计算。
 // 解析统一复用 utils/color.ts 的唯一实现,这里只补 HSV↔HEX 转换与钳制;纯函数,node 可单测。
 
 import { parseColorToRgb } from '../../utils/color'

@@ -1,4 +1,4 @@
-// useTauriListen —— 安全监听 Tauri 事件，消除「await listen 卸载竞态」(审查 P1-11)。
+// 安全监听 Tauri 事件，处理 await listen 与作用域销毁的竞态。
 //
 // 竞态机理:旧写法 `onMounted(async () => { unlisten = await listen(...) })` 配
 // `onBeforeUnmount(() => unlisten?.())` 存在时序错配——组件在 listen() 的 promise

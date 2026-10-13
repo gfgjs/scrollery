@@ -1,6 +1,4 @@
-// src/utils/syntheticBook.ts
-// 合成 BookModel（阅读器完善方案 R2-4）：把 txt 接入统一的 foliate-js 渲染管线，
-// 使 txt / epub 共用同一套翻页 / 排版 / 竖排 / 仿真翻页（R6）实现，退役旧 TextReader（R2-8）。
+// 为 txt 合成 BookModel，使 txt 与 epub 共用 foliate-js 的翻页与排版管线。
 //
 // foliate 的 book 契约（实读 vendored view.js / paginator.js / fb2.js 得出，见 view.d.ts）：
 //   - book.sections[]：每项 { id, size, linear?, load()→url, unload?, createDocument? }
@@ -18,7 +16,7 @@
 // 已解析，前端只认 itemId + 章号）拉取。浏览器 API（Blob URL / DOMParser）走**依赖注入 seam**，
 // 使分节 / 缓存 / 回收 / TOC 等纯逻辑在 node 环境（vitest environment=node）可单测。
 
-import type { FoliateBook, FoliateSection } from '../vendor/foliate-js/view.js'
+import type { FoliateBook, FoliateSection, FoliateTocItem } from '../vendor/foliate-js/view.js'
 import type { TextBookIndex, TextChapterContent } from '../types/reader'
 
 /** txt section 文档的 MIME：application/xhtml+xml（须良构 XML → 文本一律转义）。 */
@@ -53,15 +51,16 @@ export function escapeXml(s: string): string {
  */
 export function buildChapterXHTML(chapter: TextChapterContent, opts?: { lang?: string }): string {
   const lang = opts?.lang ?? 'zh'
+  const sourceLine = (line?: number | null) => line == null ? '' : ` data-source-line="${line}"`
   const heading = chapter.title
-    ? `<h1 class="sate-chapter-title">${escapeXml(chapter.title)}</h1>`
+    ? `<h1 class="sate-chapter-title"${sourceLine(chapter.titleSourceLine)}>${escapeXml(chapter.title)}</h1>`
     : ''
-  const body = chapter.paragraphs.map((p) => `<p>${escapeXml(p)}</p>`).join('\n')
+  const body = chapter.paragraphs.map((p, index) => `<p${sourceLine(chapter.paragraphSourceLines?.[index])}>${escapeXml(p)}</p>`).join('\n')
   // xml:lang + lang 双写：foliate languageInfo 读 metadata.language 判 CJK；文档级 lang 供断行 / 字体回落。
   return `<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="${lang}" lang="${lang}">
 <head><meta charset="utf-8"/><title>${escapeXml(chapter.title)}</title></head>
-<body><section class="sate-chapter" data-sate-chapter="">
+<body><section class="sate-chapter" data-sate-chapter=""${chapter.sourceHash ? ` data-source-hash="${escapeXml(chapter.sourceHash)}"` : ''}>
 ${heading}
 ${body}
 </section></body>
@@ -101,6 +100,7 @@ export function buildTextSyntheticBook(opts: TextSyntheticBookOptions): FoliateB
 
   // 每章 blob URL 缓存：load 建、unload / destroy 回收。Map<章号, url>。
   const urlCache = new Map<number, string>()
+  let destroyed = false
 
   const buildXHTML = async (i: number): Promise<string> =>
     buildChapterXHTML(await loadChapter(i), { lang })
@@ -110,9 +110,13 @@ export function buildTextSyntheticBook(opts: TextSyntheticBookOptions): FoliateB
     size: ch.charLen, // 进度权重代理（SectionProgress 开卷前即需，无法待 load）。
     linear: undefined, // 全部线性正文。
     load: async () => {
+      if (destroyed) return ''
       const cached = urlCache.get(i)
       if (cached) return cached
-      const url = createObjectURL(await buildXHTML(i))
+      const xhtml = await buildXHTML(i)
+      // 章节 IPC 不能同步取消；关闭后丢弃回执，避免新建无人回收的 blob。
+      if (destroyed) return ''
+      const url = createObjectURL(xhtml)
       urlCache.set(i, url)
       return url
     },
@@ -145,6 +149,7 @@ export function buildTextSyntheticBook(opts: TextSyntheticBookOptions): FoliateB
     resolveHref: (href: string) => ({ index: Number(href) }),
     isExternal: (uri: string) => /^\w+:/i.test(uri),
     destroy: () => {
+      destroyed = true
       for (const url of urlCache.values()) revokeObjectURL(url)
       urlCache.clear()
     },
@@ -156,12 +161,13 @@ export function buildTextSyntheticBook(opts: TextSyntheticBookOptions): FoliateB
  * 外层 `.sate-md` class = md 专属排版 CSS 的挂钩（与 txt 的 `.sate-chapter` 并列，选择器互斥不干扰）。
  * bodyHtml 由 renderMarkdown 产出（已 HTML 转义、协议白名单，安全），此处不再转义。
  */
-export function buildMarkdownHTML(bodyHtml: string, opts?: { lang?: string }): string {
+export function buildMarkdownHTML(bodyHtml: string, opts?: { lang?: string; sourceHash?: string }): string {
   const lang = opts?.lang ?? 'zh'
+  const sourceHash = opts?.sourceHash ? ` data-source-hash="${escapeXml(opts.sourceHash)}"` : ''
   return `<!DOCTYPE html>
 <html lang="${lang}">
 <head><meta charset="utf-8"/></head>
-<body><div class="sate-md">${bodyHtml}</div></body>
+<body><div class="sate-md"${sourceHash}>${bodyHtml}</div></body>
 </html>`
 }
 
@@ -194,16 +200,15 @@ export function hasOversizedSection(
   return sections.some((s) => (s.size ?? 0) > limit)
 }
 
-/** 分组后的 md 片:html = 该片块序列(\n 连接);tocLabel = 片首 heading 文本(无则 null)。 */
+/** 分组后的 md 片，html 为该片块序列（换行连接）。 */
 export interface MarkdownSection {
   html: string
-  tocLabel: string | null
+  /** 可选源位置，数量与本片原始块数相同；不计入 HTML 分片预算。 */
+  sourceOffsets?: number[]
 }
 
-// 块级 heading 识别:renderMarkdownBlocks 产物无属性,形如 <h1>…</h1>。h1/h2 触发分片(章级语义);
-// TOC label 取 h1–h3(h3 不触发分片,但作为片首时仍是最好的目录文案)。
+// 块级 heading 识别:renderMarkdownBlocks 产物无属性,形如 <h1>…</h1>。h1/h2 触发分片(章级语义)。
 const SPLIT_HEADING_RE = /^<h[12]>/
-const LABEL_HEADING_RE = /^<h([1-3])>([\s\S]*?)<\/h\1>/
 
 /** heading HTML → TOC 纯文本:剥行内标签 + 反转义(顺序与 escapeHtml 相反,&amp; 最后)。 */
 function headingText(html: string): string {
@@ -219,31 +224,35 @@ function headingText(html: string): string {
 
 /**
  * 按块边界把 renderMarkdownBlocks 产物分组为 section(导出供单测):
- * ① h1/h2 块起新片(md 的天然章界,heading 派生 TOC 即 R2-4b);
+ * ① h1/h2 块起新片(md 的天然章界);
  * ② 预算超限起新片(无 heading 的日志型 md 兜底);
  * ③ 单块超预算独占一片,**不内切**(切开 `<pre>`/`<ul>` 会破坏块语义;块本身已由
  *    renderMarkdownBlocks 的 MAX_PARA_LINES 断长跑约束,仅巨型代码围栏可能超限,交护栏兜底)。
  * 空输入产出一个空片(foliate 契约:sections 至少一项)。
  */
-export function groupMarkdownBlocks(blocks: string[]): MarkdownSection[] {
+export function groupMarkdownBlocks(blocks: string[], sourceOffsets?: number[]): MarkdownSection[] {
   const sections: MarkdownSection[] = []
   let buf: string[] = []
   let size = 0
+  let startIndex = 0
   const flush = () => {
     if (buf.length) {
-      const label = LABEL_HEADING_RE.exec(buf[0])
-      sections.push({ html: buf.join('\n'), tocLabel: label ? headingText(label[2]) : null })
+      sections.push({
+        html: buf.join('\n'),
+        ...(sourceOffsets ? { sourceOffsets: buf.map((_block, i) => sourceOffsets[startIndex + i]) } : {}),
+      })
       buf = []
       size = 0
     }
   }
-  for (const block of blocks) {
+  for (const [index, block] of blocks.entries()) {
     if (SPLIT_HEADING_RE.test(block) || size + block.length > MD_SECTION_BUDGET_CHARS) flush()
+    if (!buf.length) startIndex = index
     buf.push(block)
     size += block.length
   }
   flush()
-  if (!sections.length) sections.push({ html: '', tocLabel: null })
+  if (!sections.length) sections.push({ html: '' })
   return sections
 }
 
@@ -251,6 +260,10 @@ export function groupMarkdownBlocks(blocks: string[]): MarkdownSection[] {
 export interface MarkdownSyntheticBookOptions {
   /** renderMarkdownBlocks 产出的块级 HTML 数组（安全，已转义 + 协议白名单）。 */
   blocks: string[]
+  /** 各块在 LF 规范化源码中的 UTF-16 起点；只给原有顶层元素增加属性。 */
+  sourceOffsets?: number[]
+  /** 原始解码源码（未经换行规范化）的 UTF-8 SHA-256，用于编辑定位前核对快照。 */
+  sourceHash?: string
   lang?: string
   createObjectURL?: (html: string) => string
   revokeObjectURL?: (url: string) => void
@@ -260,23 +273,58 @@ export interface MarkdownSyntheticBookOptions {
 /**
  * 构造 md 的合成 BookModel（2026-07-17 起多 section）：块序列按 groupMarkdownBlocks 分片,
  * 一片 = 一个 section,foliate 按片懒加载 → paginated 只 columnize 当前片,布局成本有界。
- * heading 起头的片产 TOC 项(href = 片号,与 resolveHref/splitTOCHref 数字契约同 txt 路径)。
+ * 全部标题按级别组成 TOC 树，href 指向标题锚点；保留数字片号导航以兼容已有入口。
  */
 export function buildMarkdownSyntheticBook(opts: MarkdownSyntheticBookOptions): FoliateBook {
   const {
     blocks,
+    sourceOffsets,
+    sourceHash,
     lang = 'zh',
     createObjectURL = (s: string) => URL.createObjectURL(new Blob([s], { type: HTML_MIME })),
     revokeObjectURL = (u: string) => URL.revokeObjectURL(u),
     parseDocument = (s: string) => new DOMParser().parseFromString(s, HTML_MIME),
   } = opts
-  const parts = groupMarkdownBlocks(blocks)
+  const parts = groupMarkdownBlocks(blocks, sourceOffsets)
+  let blockIndex = 0
+  const headingSections = new Map<string, number>()
+  const headingOccurrences = new Map<string, number>()
+  const toc: FoliateTocItem[] = []
+  const headingParents: { level: number; item: FoliateTocItem }[] = []
 
   // 每片 blob URL 缓存:load 建、unload/destroy 回收(与 txt 章缓存同款生命周期)。
   const urlCache = new Map<number, string>()
 
   const sections: FoliateSection[] = parts.map((part, i) => {
-    const doc = () => buildMarkdownHTML(part.html, { lang })
+    // 分片完成后只为原标题增加属性，保持片号、CFI节点路径与原有进度权重不变。
+    const annotateHeadings = (html: string) => html.replace(/<h([1-6])>([\s\S]*?)<\/h\1>/g, (_heading, level: string, content: string) => {
+      const label = headingText(content)
+      const base = label.toLowerCase().replace(/[^\p{L}\p{N}\p{M}\s_-]/gu, '').replace(/\s+/g, '-') || 'section'
+      let occurrence = headingOccurrences.get(base) ?? 0
+      let id = occurrence ? `${base}-${occurrence}` : base
+      while (headingSections.has(id)) id = `${base}-${++occurrence}`
+      headingOccurrences.set(base, occurrence + 1)
+      headingSections.set(id, i)
+      const headingLevel = Number(level)
+      while (headingParents.length && headingParents[headingParents.length - 1].level >= headingLevel) headingParents.pop()
+      const parent = headingParents[headingParents.length - 1]?.item
+      const siblings = parent ? (parent.subitems ??= []) : toc
+      const item = { label, href: `#${id}` }
+      siblings.push(item)
+      headingParents.push({ level: headingLevel, item })
+      return `<h${level} id="${escapeXml(id)}">${content}</h${level}>`
+    })
+    const offsets = part.sourceOffsets
+    // 先按无映射属性的 HTML 完成分组与目录解析，再给原有块首标签加属性。
+    const html = offsets ? blocks.slice(blockIndex, blockIndex + offsets.length).map((block, j) => {
+      const annotated = annotateHeadings(block)
+      const offset = offsets[j]
+      return Number.isSafeInteger(offset) && offset >= 0
+        ? annotated.replace(/^<([a-z][\w:-]*)\b/i, `<$1 data-source-offset="${offset}"`)
+        : annotated
+    }).join('\n') : annotateHeadings(part.html)
+    if (offsets) blockIndex += offsets.length
+    const doc = () => buildMarkdownHTML(html, { lang, sourceHash })
     return {
       id: i,
       size: part.html.length, // 进度权重(SectionProgress 开卷前即需,HTML 长度当代理)。
@@ -301,14 +349,27 @@ export function buildMarkdownSyntheticBook(opts: MarkdownSyntheticBookOptions): 
 
   return {
     sections,
-    // heading 派生 TOC(R2-4b):仅 heading 起头的片入目录;全无 heading(日志型)→ 空目录同旧。
-    toc: parts.flatMap((p, i) => (p.tocLabel ? [{ label: p.tocLabel, href: String(i) }] : [])),
+    toc,
     metadata: { language: lang },
     dir: 'ltr',
     rendition: { layout: 'reflowable' },
-    splitTOCHref: (href: string) => href?.split('#')?.map(Number) ?? [],
-    getTOCFragment: (d: Document) => d.documentElement,
-    resolveHref: (href: string) => ({ index: Number(href) || 0 }),
+    splitTOCHref: (href: string) => {
+      if (href.startsWith('#')) {
+        const id = decodeURIComponent(href.slice(1))
+        return [headingSections.get(id), id]
+      }
+      return href?.split('#')?.map(Number) ?? []
+    },
+    getTOCFragment: (doc: Document, id: string | null) => id ? doc.getElementById(id) : doc.documentElement,
+    resolveHref: (href: string) => {
+      if (href.startsWith('#') && href.length > 1) {
+        const id = decodeURIComponent(href.slice(1))
+        const index = headingSections.get(id)
+        if (index === undefined) throw new Error('Unknown Markdown heading anchor')
+        return { index, anchor: (doc: Document) => doc.getElementById(id)! }
+      }
+      return { index: Number(href) || 0 }
+    },
     isExternal: (uri: string) => /^\w+:/i.test(uri),
     destroy: () => {
       for (const url of urlCache.values()) revokeObjectURL(url)

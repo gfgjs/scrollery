@@ -1,5 +1,4 @@
-//! 编辑保存的目标文件名派生 + 冲突原子化认领(方案 C §3.2/§6,C-3 裁决:采用
-//! `{stem}-edit.{ext}`,冲突递增 `-edit-2`)。
+//! 编辑保存的目标文件名派生与冲突时的原子认领。
 
 use std::fs::OpenOptions;
 use std::io;
@@ -8,8 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::error::AppError;
 use crate::export::naming::sanitize_component;
 
-/// 同名冲突最多尝试次数,超出视为异常(理论不可达,同 `export::naming::resolve_conflict`
-/// 的兜底口径)。
+/// 同名冲突最多尝试次数。
 const MAX_CONFLICT_ATTEMPTS: u32 = 9999;
 
 pub const CODE_TARGET_CONFLICT: &str = "edit_target_conflict";
@@ -17,9 +15,7 @@ pub const CODE_IO: &str = "edit_io";
 
 /// 目标文件名 stem(不含扩展名,扩展名恒由输出格式决定)。
 ///
-/// `custom` 非空时改用其合规化结果作 stem——v1 前端(方案 §7)未提供改名 UI,此路径是
-/// 为 `EditOutput.file_name` 的契约完整性预留,尚无消费者但类型已就位。默认(`None`
-/// 或空白):`{原文件名去扩展名}-edit`(C-3)。
+/// `custom` 非空时使用合规化结果；否则使用 `{原文件名去扩展名}-edit`。
 pub fn target_stem(custom: Option<&str>, original_file_name: &str) -> String {
     match custom {
         Some(name) if !name.trim().is_empty() => sanitize_component(name),
@@ -73,4 +69,34 @@ fn claim_target_path_with_limit(
         code: CODE_TARGET_CONFLICT,
         message: "同名文件冲突次数过多 | too many naming conflicts".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "scrollery_edit_naming_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 认领是「独占创建」——不是先 `exists()` 判断再 `create`,这里断言认领后文件确实已经
+    /// 落盘(占位),而不是仅返回一个尚不存在的候选路径(否则调用方之间仍有 TOCTOU 窗口)。
+    #[test]
+    fn claim_target_path_actually_creates_placeholder_atomically() {
+        let dir = tmp_dir("atomic_placeholder");
+        let p = claim_target_path(&dir, "x", "png").unwrap();
+        let meta = std::fs::metadata(&p).unwrap();
+        assert_eq!(
+            meta.len(),
+            0,
+            "占位文件应为空,真实内容随后写临时文件再 rename 覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

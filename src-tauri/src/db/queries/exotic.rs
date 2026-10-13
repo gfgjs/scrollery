@@ -199,30 +199,6 @@ pub fn claim_exotic_tasks(
     now: i64,
     worker_version: &str,
 ) -> Result<Vec<ExoticTaskRow>> {
-    claim_exotic_tasks_in_volume(
-        conn,
-        plugin_id,
-        capability,
-        limit,
-        instance_id,
-        now,
-        worker_version,
-        None,
-    )
-}
-
-/// 按已取得的源卷额度原子领取；Some(None) 限定尚无卷身份的源。
-#[allow(clippy::too_many_arguments)]
-pub fn claim_exotic_tasks_in_volume(
-    conn: &Connection,
-    plugin_id: &str,
-    capability: &str,
-    limit: i64,
-    instance_id: &str,
-    now: i64,
-    worker_version: &str,
-    volume: Option<Option<i64>>,
-) -> Result<Vec<ExoticTaskRow>> {
     let sql = format!(
         "UPDATE exotic_tasks
          SET status=1, claimed_at=?3, lease_owner=?4, worker_version=?6, updated_at=strftime('%s','now')
@@ -231,10 +207,6 @@ pub fn claim_exotic_tasks_in_volume(
              WHERE plugin_id=?1 AND capability=?2
                AND ( status=0 OR (status=3 AND (next_retry_at IS NULL OR next_retry_at<=?3)) )
                {EXCLUDE_HIDDEN_ROOT_ITEMS}
-               AND (?7=0 OR (SELECT r.volume_id FROM media_items m
-                    JOIN directories d ON d.id=m.directory_id
-                    JOIN scan_roots r ON r.id=d.root_id
-                    WHERE m.id=exotic_tasks.item_id) IS ?8)
              ORDER BY id LIMIT ?5 )
          RETURNING {EXOTIC_TASK_COLS}"
     );
@@ -247,9 +219,7 @@ pub fn claim_exotic_tasks_in_volume(
                 now,
                 instance_id,
                 limit,
-                worker_version,
-                volume.is_some(),
-                volume.flatten()
+                worker_version
             ],
             map_exotic_task,
         )?
@@ -607,28 +577,6 @@ pub fn has_ready_exotic_task(
     Ok(exists != 0)
 }
 
-/// 下一项就绪任务的源卷；外层 None 表示无任务，内层 None 表示卷身份未知。
-pub fn next_ready_exotic_volume(
-    conn: &Connection,
-    plugin_id: &str,
-    capability: &str,
-    now: i64,
-) -> Result<Option<Option<i64>>> {
-    let sql = format!(
-        "SELECT (SELECT r.volume_id FROM media_items m
-                 JOIN directories d ON d.id=m.directory_id
-                 JOIN scan_roots r ON r.id=d.root_id
-                 WHERE m.id=exotic_tasks.item_id)
-         FROM exotic_tasks WHERE plugin_id=?1 AND capability=?2
-           AND (status=0 OR (status=3 AND (next_retry_at IS NULL OR next_retry_at<=?3)))
-           {EXCLUDE_HIDDEN_ROOT_ITEMS}
-         ORDER BY id LIMIT 1"
-    );
-    Ok(conn
-        .query_row(&sql, params![plugin_id, capability, now], |row| row.get(0))
-        .optional()?)
-}
-
 /// 取 exotic 任务处理所需的源信息：绝对路径 + source snapshot + 小写扩展名。
 /// 经 directories JOIN scan_roots 解析绝对路径（与 `get_media_detail` 同路径解析）。
 pub fn exotic_item_source(conn: &Connection, item_id: i64) -> Result<ExoticItemSource> {
@@ -676,4 +624,147 @@ pub struct ExoticItemSource {
     pub source_revision: i64,
     pub cache_key: i64,
     pub file_format: String,
+}
+
+#[cfg(test)]
+mod exotic_dao_tests {
+    use super::*;
+
+    const PID: &str = "exotic-image-psd";
+    const CAP: &str = "thumbnail";
+
+    fn mem_db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        // 关 FK 以便用最小 media_items 夹具覆盖任务 DAO，而不构造完整目录树。
+        c.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        c
+    }
+
+    fn seed(c: &Connection, item_id: i64) {
+        c.execute(
+            "INSERT OR IGNORE INTO media_items
+                (id, directory_id, file_name, file_size, file_mtime, file_format,
+                 media_type, width, height, sort_datetime, cache_key)
+             VALUES (?1, 1, ?2, 1, 1, 'psd', 'image', 0, 0, 0, ?1)",
+            params![item_id, format!("f{item_id}.psd")],
+        )
+        .unwrap();
+        seed_exotic_tasks_for_item(c, item_id, PID, &[CAP.to_string()]).unwrap();
+    }
+
+    fn claim(c: &Connection, limit: i64, owner: &str, now: i64) -> Vec<ExoticTaskRow> {
+        claim_exotic_tasks(c, PID, CAP, limit, owner, now, "1.0.0").unwrap()
+    }
+
+    fn source_snapshot(c: &Connection, item_id: i64) -> (i64, i64) {
+        c.query_row(
+            "SELECT source_revision, cache_key FROM media_items WHERE id=?1",
+            params![item_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn finish_current(
+        c: &Connection,
+        task_id: i64,
+        instance_id: &str,
+        fingerprint: &str,
+        output_path: &str,
+        worker_version: &str,
+    ) -> bool {
+        let item_id: i64 = c
+            .query_row(
+                "SELECT item_id FROM exotic_tasks WHERE id=?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (source_revision, cache_key) = source_snapshot(c, item_id);
+        finish_exotic_task(
+            c,
+            task_id,
+            instance_id,
+            source_revision,
+            cache_key,
+            fingerprint,
+            output_path,
+            worker_version,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn atomic_claim_no_double() {
+        let c = mem_db();
+        for i in 1..=3 {
+            seed(&c, i);
+        }
+        assert_eq!(claim(&c, 2, "inst-A", 1000).len(), 2);
+        assert_eq!(claim(&c, 2, "inst-A", 1000).len(), 1); // 剩 1
+        assert_eq!(claim(&c, 2, "inst-A", 1000).len(), 0); // 全 processing
+        assert!(claim(&c, 2, "inst-A", 1000).is_empty());
+    }
+
+    #[test]
+    fn lease_guards_finish() {
+        let c = mem_db();
+        seed(&c, 1);
+        let id = claim(&c, 1, "inst-A", 1000)[0].id;
+        // 错误 owner 不能完成（旧 Writer 失租）。
+        assert!(!finish_exotic_task(&c, id, "inst-B", 1, 1, "fp", "/p.webp", "1.0.0").unwrap());
+        assert!(has_blocking_exotic_thumbnail_task(&c, 1).unwrap());
+        // 正确 owner 完成。
+        assert!(finish_current(&c, id, "inst-A", "fp", "/p.webp", "1.0.0"));
+        assert!(!has_blocking_exotic_thumbnail_task(&c, 1).unwrap()); // done 不再阻塞
+    }
+
+    #[test]
+    fn stale_source_snapshot_cannot_finish_exotic_task() {
+        let c = mem_db();
+        seed(&c, 1);
+        let id = claim(&c, 1, "inst-A", 1000)[0].id;
+        let (source_revision, cache_key) = source_snapshot(&c, 1);
+
+        // 模拟扫描在 Worker 处理期间发现同大小/同抽样指纹的源代次变化；cache_key
+        // 也变化时必须同时满足两项快照条件，旧结果不能把 processing 标成 done。
+        c.execute(
+            "UPDATE media_items
+             SET source_revision=?2, cache_key=?3, thumb_status=0, thumb_path=NULL
+             WHERE id=?1",
+            params![1, source_revision + 1, cache_key + 1],
+        )
+        .unwrap();
+        assert!(!is_exotic_source_current(&c, 1, source_revision, cache_key).unwrap());
+
+        assert!(!finish_exotic_task(
+            &c,
+            id,
+            "inst-A",
+            source_revision,
+            cache_key,
+            "old-fingerprint",
+            "480/aa/old.webp",
+            "1.0.0"
+        )
+        .unwrap());
+        let task_status: i64 = c
+            .query_row(
+                "SELECT status FROM exotic_tasks WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_status, 1, "旧结果不得结束新源的 processing 任务");
+        let (thumb_status, thumb_path): (i64, Option<String>) = c
+            .query_row(
+                "SELECT thumb_status, thumb_path FROM media_items WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(thumb_status, 0);
+        assert!(thumb_path.is_none());
+    }
 }

@@ -126,6 +126,8 @@ export const useTreeFilterStore = defineStore('treeFilter', () => {
       if (wasDirectoriesOnly) {
         // “仅目录”没有共享类型；从这里勾选 Other 时，最小且可解释的结果是
         // 只看文件树专用的 Other，而不是意外恢复全部五类。
+        // otherOnly 仅在共享数组为空时生效，必须一并清掉进入“仅目录”前保留的类别。
+        filter.setMediaTypes([])
         otherOnly.value = true
         otherOverride.value = 'on'
         return
@@ -194,11 +196,6 @@ export const useTreeFilterStore = defineStore('treeFilter', () => {
     otherOnly.value = false
   }
 
-  /** 兼容旧调用名；UI 应使用 showDirectoriesOnly，避免把“清空”误解为无筛选。 */
-  function clearCategories() {
-    showDirectoriesOnly()
-  }
-
   function isCategorySelected(category: TreeCategory): boolean {
     return selectedCategories.value.includes(category)
   }
@@ -223,7 +220,6 @@ export const useTreeFilterStore = defineStore('treeFilter', () => {
     showDirectoriesOnly,
     setDirectoriesOnly,
     setOtherOverride,
-    clearCategories,
     isCategorySelected,
   }
 })

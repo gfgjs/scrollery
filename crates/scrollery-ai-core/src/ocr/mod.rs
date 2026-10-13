@@ -2,9 +2,9 @@
 //! 自研 OCR 管线(PP-OCRv5,det→cls→rec→CTC)。
 //!
 //! 编排:检测(DB)得文本行 quad → 逐框透视裁剪 → 方向分类(按需 180° 翻转)→ 识别 + CTC 解码。
-//! 三模型 **EP 恒 CPU**(D-OCR-2:rec 是 SVTR/transformer 系,与 engine.rs 坑9 同型风险),
+//! 三模型的执行提供器恒为 CPU，避免识别模型在 GPU 提供器上的数值风险；
 //! 三 SessionPool 各容量 1(交互单发,控内存)。字典在 init 时加载,契约自检在首次 rec 推理时
-//! (rec 输出末维 C 对拍 dict.len()+1/+2,dict.rs 坑8 同型防线)。
+//! (rec 输出末维 C 对拍 dict.len()+1/+2，防止识别模型与字典错配)。
 //!
 //! 参数全部取自 [`OcrProfile`];通道序单点开关 `swap_rb`(golden 对拍定案,见 dict/det 注释)。
 

@@ -1,5 +1,5 @@
 // src-tauri/src/ai/face_pipeline/producer.rs
-//! Producer 阶段:批量查询待处理项,标记 Processing,推送任务到通道。
+//! Producer：批量查询待处理项，标记 Processing 后推送到通道。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::db::models::FaceStatus;
-use crate::db::queries::{batch_update_face_status, get_pending_face_items};
+use crate::db::queries::{batch_update_face_status_guarded, get_pending_face_items};
 use crate::state::AppState;
 
 use super::{FaceTask, BATCH_SIZE};
@@ -90,8 +90,12 @@ pub(super) fn produce_face_tasks(
 
         // 将项标记为"处理中"，避免重启时重新排队。
         let write_conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-        let ids: Vec<i64> = batch.iter().map(|it| it.id).collect();
-        if let Err(e) = batch_update_face_status(&write_conn, &ids, FaceStatus::Processing.as_i64())
+        let ids: Vec<_> = batch
+            .iter()
+            .map(|it| (it.id, it.cache_key, it.source_revision))
+            .collect();
+        if let Err(e) =
+            batch_update_face_status_guarded(&write_conn, &ids, FaceStatus::Processing.as_i64())
         {
             warn!(
                 "Failed to mark face items as processing | 标记人脸项为处理中失败: {}",
@@ -110,15 +114,14 @@ pub(super) fn produce_face_tasks(
                     item_id: item.id,
                     source_path: PathBuf::from(item.abs_path),
                     file_format: item.file_format,
-                    thumb_status: item.thumb_status,
-                    thumb_path: item.thumb_path,
                     width: item.width,
                     height: item.height,
                     cache_key: item.cache_key,
+                    source_revision: item.source_revision,
                 })
                 .is_err()
             {
-                break;
+                return; // 下游已关闭，停止继续领取并改写剩余项的状态。
             }
         }
     }

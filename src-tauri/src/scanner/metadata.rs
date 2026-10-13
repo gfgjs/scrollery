@@ -125,31 +125,7 @@ fn read_orientation_inner(path: &Path) -> Option<u32> {
     Some(read_jpeg_orientation_file(&mut file))
 }
 
-/// 从已授权打开的句柄读取 JPEG 方向；返回前恢复文件游标，供同句柄继续解码。
-pub fn read_jpeg_orientation_file(file: &mut std::fs::File) -> u32 {
-    use std::io::{Seek, SeekFrom};
-    // EXIF 快捷探测和后端回退共用句柄，调用前的游标不一定在文件起点。
-    if file.rewind().is_err() {
-        return 1;
-    }
-    let orientation = {
-        let mut reader = BufReader::new(&mut *file);
-        exif::Reader::new()
-            .read_from_container(&mut reader)
-            .ok()
-            .and_then(|exif| {
-                exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                    .and_then(|field| match field.value {
-                        exif::Value::Short(ref values) => values.first().copied(),
-                        _ => None,
-                    })
-            })
-            .map(u32::from)
-            .unwrap_or(1)
-    };
-    let _ = file.seek(SeekFrom::Start(0));
-    orientation
-}
+pub use crate::engine::orientation::read_jpeg_orientation_file;
 
 /// 头缓冲版 JPEG EXIF 方向读取(阶段5):优先从已读缓冲解析;失败且缓冲截断
 /// (EXIF 可能落在 128KB 窗口之外)才回退整文件路径,保留旧语义。
@@ -1008,4 +984,59 @@ fn parse_exif_datetime(s: &str) -> Option<i64> {
     Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
         .single()
         .map(|dt| dt.timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_keeps_disk_permit_until_actual_read_finishes() {
+        let budget = crate::scanner::hdd_io::test_budget(1);
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut context = ImageReadContext::with_disk_budget(Some(budget.clone()), &token);
+        context.ensure_file_access().unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let result = run_with_timeout(
+            Duration::from_millis(10),
+            context.permit.clone(),
+            move || {
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                42
+            },
+        );
+        assert_eq!(result, None);
+        assert!(matches!(
+            context.check_io_error(),
+            Err(AppError::ImageReadTimeout)
+        ));
+        assert!(matches!(
+            budget.acquire_header(&token),
+            Err(AppError::ImageReadTimeout)
+        ));
+        let mut waiting = ImageReadContext::with_disk_budget(Some(budget.clone()), &token);
+        assert!(matches!(
+            waiting.ensure_file_access(),
+            Err(AppError::ImageReadTimeout)
+        ));
+        drop(context);
+        // 等待者仅持有预算；另一个强引用属于实际读取的守卫。
+        assert_eq!(Arc::strong_count(&budget), 3);
+        assert!(waiting.permit.is_none());
+        drop(waiting.budget.take());
+        assert_eq!(Arc::strong_count(&budget), 2, "实际读取仍必须持有预算");
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(budget.acquire(&token), Err(AppError::ImageReadTimeout)) {
+            assert!(Instant::now() < deadline, "后台结束后应恢复预算");
+            std::thread::yield_now();
+        }
+        // 已经失败的项不能因另一个线程恰好结束就退化成可写库的普通元数据错误。
+        assert!(matches!(
+            waiting.check_io_error(),
+            Err(AppError::ImageReadTimeout)
+        ));
+    }
+
+    // ── #10 单次头读缓冲 ─────────────────────────────────────────────────────
 }

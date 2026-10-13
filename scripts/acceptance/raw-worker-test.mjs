@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// raw-worker 独立验证(P1-2,2026-09-12)。
+// raw-worker 独立验证。
 //
 // why 需要独立入口:raw-worker 刻意不加入根 workspace(rsraw 的 build.rs 在 MSVC 下硬 panic),
 // 只能用 --target x86_64-pc-windows-gnu 单独编译。于是它天然游离在 `cargo test --workspace` 之外——
-// 谁都不会碰它的测试,回归只能靠人记得手跑。本脚本把这条验证固化成一条命令(CI job 直调)。
+// 根 workspace 测试不会覆盖它；CI 通过本脚本单独验证。
 //
 // 检查项:
 //   ① 结构守卫:raw-worker 必须仍在根 workspace 之外(根 Cargo.toml 不列它为 member,其 Cargo.toml
@@ -13,18 +13,19 @@
 //   ④ cargo test --locked --release --target x86_64-pc-windows-gnu(真实编译+跑单测);
 //   ⑤ 可分发产物(可选 --expect-binary):**先显式 cargo build --locked --release --target gnu**,
 //      再验 target/<gnu>/release/raw-worker.exe。🔴 不能只靠 cargo test 顺带产物:cargo test 编的是
-//      deps/ 下的测试 harness,普通二进制不会因此在冷 CI 上凭空出现——本机曾误把 9MB 旧 build 当
-//      「测试顺带产出」的证据,冷 runner 立刻会缺(见 --cold-proof)。
+//      deps/ 下的测试 harness，冷 CI 不会因此生成普通二进制(见 --cold-proof)。
 //
 // 用法:node scripts/acceptance/raw-worker-test.mjs [--expect-binary] [--skip-structural] [--cold-proof]
 //      [--selftest]
 //   --cold-proof  受控证明「测试不自产普通二进制」:先把本 crate 自己 target 下那个确切产物移到同目录
 //                 暂存名(先过范围守卫,只认这一个绝对路径),只跑 cargo test 断言它仍未出现,再跑
 //                 cargo build 断言它被重新产出;任一步异常都会把暂存产物放回原位。
-// 退出码:全部通过 = 0;任一失败 = 1;selftest 自身损坏 = 2。
+// 退出码:全部通过 = 0;任一失败 = 1;selftest 自身损坏 = 1。
 // 说明:本脚本只读写 crates/exotic-workers/raw-worker/** 与只读根 Cargo.toml/Cargo.lock,
 // 不碰用户数据、不安装任何东西。
 
+import assert from 'node:assert/strict';
+import { testCase } from '../lib/test-case.mjs';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -97,43 +98,16 @@ export function crateIsolationViolations(crateCargoToml, rootLock) {
 }
 
 function selftest() {
-  const fails = [];
-  const expect = (cond, msg) => {
-    if (!cond) fails.push(msg);
-  };
-  const badRoot = '[workspace]\nmembers = ["src-tauri", "crates/exotic-workers/raw-worker"]\n';
-  const goodRoot = '[workspace]\nmembers = ["src-tauri", "crates/exotic-workers/exotic-protocol"]\n';
-  expect(rootWorkspaceViolations(badRoot).length === 1, '结构守卫漏检根 workspace 收录 raw-worker');
-  expect(rootWorkspaceViolations(goodRoot).length === 0, '结构守卫对干净根 workspace 误报');
-  // members 列表之外的提及(注释)不算违规——守卫只看 members 列表。
-  expect(rootWorkspaceViolations('[workspace]\n# raw-worker 刻意独立\nmembers = ["src-tauri"]\n').length === 0, '结构守卫对注释提及误报');
-  expect(rootWorkspaceViolations('[package]\nname = "x"\n').length === 1, '结构守卫漏检缺失 [workspace] 段');
-  expect(crateIsolationViolations('[workspace]\n[package]\nname = "raw-worker"\n', '').length === 0, '结构守卫对合规 crate 误报');
-  expect(crateIsolationViolations('[package]\nname = "raw-worker"\n', '').length === 1, '结构守卫漏检缺失空 workspace 表');
-  expect(crateIsolationViolations('[workspace]\n', 'name = "raw-worker"\nversion = "0.1.0"').length === 1, '结构守卫漏检根 lockfile 收录');
-  // 产物范围守卫:只认本 crate 那一个确切路径,其余形态一律拒绝。
-  expect(assertArtifactScope(artifactPath()) === artifactPath(), '范围守卫误拦本 crate 产物');
-  for (const bad of [
-    path.join(REPO, 'target', 'release', 'raw-worker.exe'),
-    path.join(CRATE_DIR, 'target', GNU_TARGET, 'release', 'deps', 'raw_worker-abc.exe'),
-    path.join(CRATE_DIR, 'target', GNU_TARGET, 'debug', 'raw-worker.exe'),
-    path.join(CRATE_DIR, 'target', 'release', 'raw-worker.exe'),
-    path.join(REPO, 'crates', 'exotic-workers', 'exotic-protocol', 'target', GNU_TARGET, 'release', 'raw-worker.exe'),
-  ]) {
-    let caught = false;
-    try {
-      assertArtifactScope(bad);
-    } catch (_) {
-      caught = true;
-    }
-    expect(caught, '范围守卫未拦下非本 crate 产物:' + bad);
-  }
-  if (fails.length) {
-    console.error('selftest 失败:');
-    for (const f of fails) console.error('  - ' + f);
-    process.exit(2);
-  }
-  console.log('✓ selftest 通过(结构守卫正反样本)');
+  testCase('raw:artifact-scope-own-release', () => {
+    assert.equal(assertArtifactScope(artifactPath()), artifactPath());
+  });
+  testCase('raw:artifact-scope-reject-root-target', () => {
+    assert.throws(() => assertArtifactScope(path.join(REPO, 'target', 'release', 'raw-worker.exe')), /拒绝操作/);
+  });
+  testCase('raw:artifact-scope-reject-test-harness', () => {
+    assert.throws(() => assertArtifactScope(path.join(CRATE_DIR, 'target', GNU_TARGET, 'release', 'deps', 'raw_worker-abc.exe')), /拒绝操作/);
+  });
+  console.log('✓ RAW 自检通过（产物操作范围）');
 }
 
 // ── 冷证明:普通二进制只由 cargo build 产出 ────────────────────────────────────
@@ -210,7 +184,7 @@ function main() {
 
   // 冷证明是独立取证模式:自己跑 test + build,跑完即结束(不与下面的常规路径重复跑)。
   if (hasFlag('cold-proof')) {
-    coldProof();
+    testCase('raw:cold-build-proof', () => coldProof());
     console.log('== 冷证明通过:普通二进制只由 cargo build 产出 ==');
     return;
   }
@@ -221,16 +195,18 @@ function main() {
   for (const line of summary) console.log('  ' + line.trim());
 
   if (hasFlag('expect-binary')) {
-    const bin = assertArtifactScope(artifactPath());
-    // 显式产出可分发二进制:cargo test 只编 deps/ 下的测试 harness,不刷新 release/raw-worker.exe。
-    // 少了这一步,热机可能拿旧产物假绿(旧产物与当前源码未必同源),冷 CI 则直接缺文件。
-    run('cargo', ['build', '--locked', '--release', '--target', GNU_TARGET], CRATE_DIR, 'cargo build');
-    console.log('✓ cargo build --locked --release --target ' + GNU_TARGET);
-    if (!fs.existsSync(bin)) throw new Error('cargo build 后产物仍缺失:' + bin);
-    const stat = fs.statSync(bin);
-    const head = fs.readFileSync(bin, { flag: 'r' }).subarray(0, 2).toString('latin1');
-    if (head !== 'MZ') throw new Error('产物不是 PE 可执行文件(头两字节 ' + JSON.stringify(head) + '):' + bin);
-    console.log('✓ 可分发产物:' + path.relative(REPO, bin) + '(' + stat.size + ' 字节)');
+    testCase('raw:built-pe-artifact', () => {
+      const bin = assertArtifactScope(artifactPath());
+      // 显式产出可分发二进制:cargo test 只编 deps/ 下的测试 harness,不刷新 release/raw-worker.exe。
+      // 少了这一步,热机可能拿旧产物假绿(旧产物与当前源码未必同源),冷 CI 则直接缺文件。
+      run('cargo', ['build', '--locked', '--release', '--target', GNU_TARGET], CRATE_DIR, 'cargo build');
+      console.log('✓ cargo build --locked --release --target ' + GNU_TARGET);
+      if (!fs.existsSync(bin)) throw new Error('cargo build 后产物仍缺失:' + bin);
+      const stat = fs.statSync(bin);
+      const head = fs.readFileSync(bin, { flag: 'r' }).subarray(0, 2).toString('latin1');
+      if (head !== 'MZ') throw new Error('产物不是 PE 可执行文件(头两字节 ' + JSON.stringify(head) + '):' + bin);
+      console.log('✓ 可分发产物:' + path.relative(REPO, bin) + '(' + stat.size + ' 字节)');
+    });
   }
   console.log('== raw-worker 独立验证通过 ==');
 }

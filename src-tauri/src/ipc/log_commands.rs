@@ -162,19 +162,15 @@ fn parse_log_line(raw: &str) -> serde_json::Value {
     })
 }
 
-/// 读取单个日志文件的一页(方案 §5 MVP)。
+/// 读取单个日志文件的一页。
 /// `before_line`:`None` = 从文件**当前末尾**取最后 `limit` 行(仅首次打开用,匹配「先看最新」的
 /// 默认视角);`Some(n)` = 取绝对行号 `[n-limit, n)` 的那一页(`n` 必须是上一页响应里的
 /// `oldest_loaded_line` 原样带回)。
 ///
-/// **为何不用「距末尾偏移量」**(旧设计,reviewer 深审 2026-07-20 指出的真实 bug):被浏览的往往是
-/// `list_log_files` 排序里最新、很可能仍在持续写入的当日文件——若偏移量按"每次重读时的当前末尾"
-/// 计算,两次分页调用之间新追加的 Δ 行会让下一页窗口整体前移 Δ,与上一页产生 Δ 行重叠(前端
-/// `loadOlderHistory` 用 concat 累加、不去重,历史视图出现重复行)。改成绝对行号锚点后,一旦首页
-/// 确定了 `oldest_loaded_line`,后续每页都钉在这个固定坐标上,不随文件持续增长漂移。
+/// 使用绝对行号锚点：文件在两次分页间追加时，按末尾偏移会使下一页与上一页重叠。
+/// 首次确定 `oldest_loaded_line` 后，后续页据此固定坐标读取。
 ///
-/// 整文件读入内存后按行切片——单日文件受 §3.5 保留策略(14 天 + 512MB 总量兜底)约束,MVP 简化
-/// 实现;若未来出现超大单日文件的真实痛点,再改为流式/索引读取(P2 分析进阶范畴)。
+/// 整文件读入内存后按行切片；单日文件受保留策略约束。
 #[tauri::command]
 pub async fn read_log_file_page(
     state: State<'_, Arc<AppState>>,
@@ -351,7 +347,7 @@ pub struct DiagnosticsPackageResult {
 /// 防单日文件很大时诊断包本身也跟着膨胀。
 const DIAGNOSTICS_TAIL_LINES: usize = 2000;
 
-/// 导出诊断包(方案 §5 P2):system-info(版本/OS/架构/缩略图策略设置/DB 大小/扫描根数量)+
+/// 导出诊断包(方案 §5 P2):system-info(版本/OS/架构/GPU 引擎设置/DB 大小/扫描根数量)+
 /// 最新日志文件尾部(脱敏后)打成一个 zip。仅落盘,不自动上传(方案 §5 明文要求)。
 #[tauri::command]
 pub async fn export_diagnostics_package(
@@ -359,18 +355,20 @@ pub async fn export_diagnostics_package(
 ) -> Result<DiagnosticsPackageResult> {
     // span 埋点(W1,D-312 info 档:system-info 查询+日志尾脱敏+zip 打包,真实 IO/CPU 工作)。
     let _span = crate::logging::SpanTimer::info("ipc:export_diagnostics_package");
-    let thumb_strategy = state
+    let gpu_engine = state
         .thumb_config
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .strategy
+        .gpu_engine
         .clone();
     let db_pool = state.db_read_pool.clone();
     let log_dir = state.log_dir.clone();
 
     tokio::task::spawn_blocking(move || -> Result<DiagnosticsPackageResult> {
         // ── system-info ──────────────────────────────────────────────────
-        // 缩略图策略是用户偏好；诊断包不把它写成已确认的 GPU 执行事实。
+        // 无现成硬件 GPU 适配器枚举工具(全仓未引入 wgpu 等 adapter 查询依赖,方案 §9.1 护栏 #1
+        // 「此外一律不引」精神下不为此新增),故 GPU 一栏取用户在设置页选择的引擎策略
+        // (thumb_config.gpu_engine,如 "auto"/"cpu"/特定后端名),明确标注为"设置值"而非硬件探测值。
         let conn = db_pool.get()?;
         let page_count: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
         let page_size: u64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
@@ -381,7 +379,7 @@ pub async fn export_diagnostics_package(
             "app_version": env!("CARGO_PKG_VERSION"),
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
-            "thumb_strategy_setting": thumb_strategy,
+            "gpu_engine_setting": gpu_engine,
             "db_size_bytes": page_count * page_size,
             "scan_root_count": scan_root_count,
             "generated_at": chrono::Local::now().to_rfc3339(),

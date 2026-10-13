@@ -1,5 +1,4 @@
-// src/stores/themeStore.ts
-// 主题运行时(方案 docs/designs/2026-09-16-主题配色全新设计.md §6/§7):配置适配 + 临时草稿 +
+// 主题运行时：配置适配、临时草稿、
 // 有效模式 + 当前色板,是 DOM 与 Canvas 的唯一色板来源。
 //
 // 三条职责边界:
@@ -153,7 +152,7 @@ export const useThemeStore = defineStore('theme', () => {
   const previewMode = ref<ThemeMode | null>(null)
   const draftInvalidation = shallowRef<DraftInvalidation | null>(null)
   /** 进入编辑时的参数快照:draftDirty 与「取消回到哪」都以它为基准。 */
-  let draftBaseline: ThemeDefinition | null = null
+  const draftBaseline = shallowRef<ThemeDefinition | null>(null)
 
   const isEditing = computed(() => draft.value !== null)
   const isPreviewing = computed(() => draft.value !== null && previewMode.value !== null)
@@ -177,7 +176,7 @@ export const useThemeStore = defineStore('theme', () => {
     isPreviewing.value && draft.value !== null ? draft.value : appliedDefinition.value,
   )
   const draftDirty = computed(
-    () => draft.value !== null && JSON.stringify(draft.value) !== JSON.stringify(draftBaseline),
+    () => draft.value !== null && JSON.stringify(draft.value) !== JSON.stringify(draftBaseline.value),
   )
 
   // ── 发布:一帧内生成色板并写 CSS 变量与材质(最多每帧一次,不写盘)──────────────
@@ -300,7 +299,7 @@ export const useThemeStore = defineStore('theme', () => {
   function dropDraft(reason: DraftInvalidation['reason']): void {
     draft.value = null
     previewMode.value = null
-    draftBaseline = null
+    draftBaseline.value = null
     draftInvalidation.value = { reason, at: Date.now() }
     schedulePublish()
   }
@@ -321,7 +320,7 @@ export const useThemeStore = defineStore('theme', () => {
   // ── 草稿会话 ──────────────────────────────────────────────────────────────
   function startDraft(definition: ThemeDefinition, mode?: ThemeMode): void {
     draft.value = cloneDefinition(definition)
-    draftBaseline = cloneDefinition(definitionFrom(settingsValues.value))
+    draftBaseline.value = cloneDefinition(definitionFrom(settingsValues.value))
     previewMode.value = mode ?? (appearanceIsDark.value ? 'dark' : 'light')
     draftInvalidation.value = null
   }
@@ -406,7 +405,16 @@ export const useThemeStore = defineStore('theme', () => {
   function finishDraft(): void {
     draft.value = null
     previewMode.value = null
-    draftBaseline = null
+    draftBaseline.value = null
+  }
+
+  function finishSubmittedDraft(submittedDraft: ThemeDefinition | null): void {
+    if (draft.value === submittedDraft) {
+      finishDraft()
+    } else if (draft.value !== null) {
+      // 保存期间仍可调色或重新开始编辑，回执只推进基线，不能清掉较新的草稿。
+      draftBaseline.value = definitionFrom(settingsConfirmedValues.value)
+    }
   }
 
   function cancelEdit(): void {
@@ -428,18 +436,21 @@ export const useThemeStore = defineStore('theme', () => {
    */
   async function applyTheme(): Promise<void> {
     if (draft.value === null) return
-    const definition = cloneDefinition(draft.value)
+    const submittedDraft = draft.value
+    const definition = cloneDefinition(submittedDraft)
     selfCommitSignature = signatureOf(definition)
     try {
       await writeSettings(definitionPatch(definition))
     } catch (error) {
       // 提交根本没落盘:清掉回执守卫,免得后面一次外部变更被误当成自己的回执吞掉。
       selfCommitSignature = null
-      previewMode.value = null
-      schedulePublish()
+      if (draft.value === submittedDraft) {
+        previewMode.value = null
+        schedulePublish()
+      }
       throw error
     }
-    finishDraft()
+    finishSubmittedDraft(submittedDraft)
   }
 
   // ── 我的主题(全部按稳定 ID 定位,一次 patch 原子保存)────────────────────
@@ -469,10 +480,11 @@ export const useThemeStore = defineStore('theme', () => {
     const invalid = validateName(name)
     if (invalid) return { ok: false, reason: invalid }
     // 草稿优先;未进编辑时即已应用值(此时参数已在配置里,不再重复写一遍)。
-    const definition = cloneDefinition(draft.value ?? appliedDefinition.value)
+    const submittedDraft = draft.value
+    const definition = cloneDefinition(submittedDraft ?? appliedDefinition.value)
     const theme: SavedTheme = { id: newThemeId(), name: name.trim(), ...definition }
     // 未进入编辑时参数已是已应用值,不再重复写一遍参数。
-    const definitionToCommit = draft.value !== null ? definition : undefined
+    const definitionToCommit = submittedDraft !== null ? definition : undefined
     if (definitionToCommit) selfCommitSignature = signatureOf(definitionToCommit)
     try {
       await writeSettings(listPatch([...savedThemes.value, theme], definitionToCommit))
@@ -480,7 +492,7 @@ export const useThemeStore = defineStore('theme', () => {
       selfCommitSignature = null
       throw error
     }
-    if (draft.value !== null) finishDraft()
+    if (definitionToCommit) finishSubmittedDraft(submittedDraft)
     return { ok: true, theme }
   }
 
@@ -491,12 +503,13 @@ export const useThemeStore = defineStore('theme', () => {
   ): Promise<ThemeSaveResult> {
     const index = savedThemes.value.findIndex((entry) => entry.id === id)
     if (index < 0) return { ok: false, reason: 'notFound' }
-    const definition = cloneDefinition(params ?? draft.value ?? appliedDefinition.value)
+    const submittedDraft = draft.value
+    const definition = cloneDefinition(params ?? submittedDraft ?? appliedDefinition.value)
     const target = savedThemes.value[index]
     const theme: SavedTheme = { ...target, ...definition }
     const next = [...savedThemes.value]
     next[index] = theme
-    const definitionToCommit = draft.value !== null || params !== undefined ? definition : undefined
+    const definitionToCommit = submittedDraft !== null || params !== undefined ? definition : undefined
     if (definitionToCommit) selfCommitSignature = signatureOf(definitionToCommit)
     try {
       await writeSettings(listPatch(next, definitionToCommit))
@@ -504,7 +517,7 @@ export const useThemeStore = defineStore('theme', () => {
       selfCommitSignature = null
       throw error
     }
-    if (draft.value !== null) finishDraft()
+    if (definitionToCommit) finishSubmittedDraft(submittedDraft)
     return { ok: true, theme }
   }
 

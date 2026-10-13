@@ -1,5 +1,5 @@
 // src-tauri/src/ai/worker_client/process.rs
-//! A 组:worker 子进程生命周期(spawn/存活探测/体面弃用/exe 路径解析)。
+//! worker 子进程生命周期：创建、存活探测、退出与可执行文件路径解析。
 
 use super::*;
 
@@ -20,7 +20,7 @@ impl AiWorkerClient {
         }
     }
 
-    /// 当前在载会话快照(T16:provider 回声落库/状态命令「已加载」判定消费);
+    /// 当前在载会话快照，供 provider 回声与状态查询使用；
     /// 无存活实例或无会话为 None。
     pub fn session(&self) -> Option<&SessionDescriptor> {
         self.worker
@@ -34,7 +34,7 @@ impl AiWorkerClient {
         if let Some(w) = self.worker.take() {
             w.shutdown(SHUTDOWN_GRACE);
         }
-        // OCR 会话随进程消亡(失效点①):换代后必须重 init(D-OCR-1)。
+        // OCR 会话随进程消亡，换代后必须重新初始化。
         self.ocr_loaded = None;
     }
 
@@ -55,7 +55,7 @@ impl AiWorkerClient {
 }
 
 /// 解析 ai-worker 可执行文件:环境变量 `PICASA_AI_WORKER_PATH` 覆盖(开发/测试),
-/// 缺省取主程序同目录(workspace 构建与打包分发的共同布局;签名产线随 Part7)。
+/// 缺省取主程序同目录。
 pub fn ai_worker_exe() -> std::result::Result<PathBuf, String> {
     if let Ok(p) = std::env::var("PICASA_AI_WORKER_PATH") {
         let p = PathBuf::from(p);
@@ -82,7 +82,10 @@ fn spawn_ai_worker() -> std::result::Result<Box<dyn EmbedWorker>, String> {
     let spec = WorkerSpec {
         exe_path: ai_worker_exe()?,
         expected_worker_id: "ai-worker".to_string(),
-        required_capabilities: vec![capability::EMBEDDING.to_string()],
+        required_capabilities: vec![
+            capability::EMBEDDING.to_string(),
+            capability::TEXT_ENCODING.to_string(),
+        ],
     };
     let cfg = WorkerConfig {
         handshake_timeout: HANDSHAKE_TIMEOUT,

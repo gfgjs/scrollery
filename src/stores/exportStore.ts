@@ -1,7 +1,7 @@
-// src/stores/exportStore.ts
-// 导出整理成果(方案 A):进度事件订阅 + 快照恢复(同 scanStore 的缩略图生成进度姿态——
+// 导出任务的进度事件订阅与快照恢复；
+// 与缩略图生成任务一样，
 // Channel 随发起它的 webview 一起死,故用 app 级事件 + export_status 快照恢复),
-// 以及供任意入口(选区工具条/右键菜单/相册视图工具栏)统一触发的对话框开关态。
+// 并提供多处入口共用的导出对话框开关状态。
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
@@ -117,10 +117,12 @@ export const useExportStore = defineStore('export', () => {
 
   // 共享注册 Promise(而非布尔标记,同 scanStore 姿态):并发调用都等同一次注册完成。
   let listenerPromise: Promise<unknown> | null = null
+  let progressEventRevision = 0
   function ensureListener(): Promise<unknown> {
-    listenerPromise ??= listen<ExportProgressPayload>(EVENTS.EXPORT_PROGRESS, (e) =>
-      applyProgress(e.payload),
-    ).catch((e) => {
+    listenerPromise ??= listen<ExportProgressPayload>(EVENTS.EXPORT_PROGRESS, (e) => {
+      progressEventRevision++
+      applyProgress(e.payload)
+    }).catch((e) => {
       // 审查 P3:`??=` 会把失败的 Promise 永久缓存——listen 一次失败后,startExport 的
       // `await ensureListener()` 会永远抛错,导出功能整机死锁到重启。失败时清空缓存,
       // 允许下次调用重试。
@@ -133,7 +135,10 @@ export const useExportStore = defineStore('export', () => {
   // 启动/刷新恢复:先订阅事件流,再查后端快照回填——导出仍在跑时进度条立即续上。
   async function restoreExportProgress() {
     await ensureListener()
+    const eventRevision = progressEventRevision
     const snap = await invokeIpc<ExportProgressPayload>(IPC.EXPORT_STATUS).catch(() => null)
+    // 查询期间的新事件已更新当前任务；旧快照可能属于上一任务，不能覆盖新任务或回退进度。
+    if (eventRevision !== progressEventRevision) return
     if (snap && snap.status !== 'idle') applyProgress(snap)
   }
 

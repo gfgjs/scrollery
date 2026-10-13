@@ -112,12 +112,7 @@ pub async fn start_derivation(
             if let Some(filter) = &kind_filter {
                 let kind_strs: Vec<&str> = filter.iter().map(|k| k.as_str()).collect();
                 let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-                let tx = conn.unchecked_transaction()?;
-                if filter.contains(&DerivationKind::VideoCover) {
-                    crate::db::queries::reset_native_video_cover_leases(&tx)?;
-                }
-                let n = reset_derivations_by_kinds(&tx, &kind_strs)?;
-                tx.commit()?;
+                let n = reset_derivations_by_kinds(&conn, &kind_strs)?;
                 info!(
                     "Full re-extract: {} derivation row(s) reset to pending | 全量重做:{} 行退回待处理",
                     n, n

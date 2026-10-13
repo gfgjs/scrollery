@@ -1,11 +1,5 @@
-// src/utils/mediaRoute.ts
-// 打开媒体的统一路由分发（2026-07-10 深审问题2）。此前 FoldersSection 与 MediaGrid 各自
-// 复制「按类型分发 /doc /audio /view」三分支,且都无条件 router.push——查看器是路由页而
-// 侧栏树仍可见可点,在 /view/33 再点树里一张图会把 /view/34 又压一条 history;三个查看器
-// 的关闭都是 router.back(),于是连点 N 张要按 N+1 次 ESC 才能回画廊。
-// 修法:已身处任一查看器路由时改用 replace(查看器换查看器,语义上是「换一张」而非「再进
-// 一层」,与 ContentViewer 翻页 replace 同理);从画廊/集合页等主视图打开仍 push(back 一次
-// 即回来处)。
+// 媒体打开路径按类型分发。查看器内换项使用 replace，避免历史栈层层叠加；
+// 从画廊等主视图打开使用 push，关闭后可回到原视图。
 
 import type { Router } from 'vue-router'
 
@@ -31,8 +25,7 @@ export function isContentViewerRoute(path: string): boolean {
  * 两个带框小按钮叠在一起,一个跳走一个开侧栏(2026-07-16 真机「跟左侧栏的展开/收起按钮放在一起,
  * 容易误导」)。故自持者不再浮动兜底,避免两个开关。
  *
- * 只列 /doc/ 而非「所有有工具栏的视图」:/audio/ 也有工具栏,但它**尚未**自持开关——一并停掉会让
- * 音频页的侧栏开关凭空消失。本谓词描述的是「已自持」这个事实,待 /audio/ 也自持时再加前缀。
+ * 只列 /doc/：音频页虽有工具栏，却依赖 AppShell 的侧栏开关。
  */
 const SELF_HOSTED_SIDEBAR_TOGGLE_PREFIXES = ['/doc/'] as const
 

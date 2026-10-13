@@ -82,6 +82,7 @@
         <input
           ref="nameInput"
           v-model="newName"
+          :disabled="createPending"
           class="collection-card__input"
           :placeholder="t('collections.namePlaceholder')"
           maxlength="40"
@@ -89,6 +90,15 @@
           @keydown.esc="cancelCreate"
           @blur="submitCreate"
         />
+        <button
+          v-if="createFailed"
+          type="button"
+          class="btn btn-secondary collection-card__retry"
+          @pointerdown.prevent
+          @click="submitCreate"
+        >
+          {{ t('common.retry') }}
+        </button>
       </div>
     </div>
 
@@ -171,6 +181,7 @@ import { useExportStore } from '../stores/exportStore'
 import { useExportEntries } from '../composables/useExportEntries'
 import ContextMenu, { type ContextMenuItem } from '../components/common/ContextMenu.vue'
 import type { Collection } from '../types/media'
+import { ipcErrorMessage } from '../utils/ipc'
 
 const store = useCollectionStore()
 const viewStore = useViewStore()
@@ -204,7 +215,7 @@ function openCollection(c: Collection) {
   router.push(`/collections/${c.id}`)
 }
 
-// ── 右键菜单:导出相册(U-2 方案 A ①)── 最小菜单,只这一项,不发明其它命令。
+// 相册右键菜单当前只提供导出操作。
 const ctxMenu = ref({
   visible: false,
   x: 0,
@@ -293,6 +304,8 @@ function cancelRename() {
 
 // ── 新建 ───────────────────────────────────────────────────────────────────
 const creating = ref(false)
+const createPending = ref(false)
+const createFailed = ref(false)
 const newName = ref('')
 const nameInput = ref<HTMLInputElement | null>(null)
 // 防止 blur 与 enter 同时触发导致重复提交。
@@ -301,6 +314,7 @@ let submitted = false
 function startCreate() {
   creating.value = true
   newName.value = ''
+  createFailed.value = false
   submitted = false
   nextTick(() => nameInput.value?.focus())
 }
@@ -309,13 +323,29 @@ async function submitCreate() {
   if (submitted) return
   submitted = true
   const name = newName.value.trim()
-  creating.value = false
-  if (name) await store.create(name)
+  if (!name) {
+    creating.value = false
+    return
+  }
+  // 成功前保留草稿并冻结输入，避免失败后丢失名称或在途重复新建。
+  createPending.value = true
+  createFailed.value = false
+  const id = await store.create(name)
+  createPending.value = false
+  if (id !== null) {
+    creating.value = false
+    return
+  }
+  submitted = false
+  createFailed.value = true
+  nextTick(() => nameInput.value?.focus())
 }
 
 function cancelCreate() {
+  if (createPending.value) return
   submitted = true
   creating.value = false
+  createFailed.value = false
 }
 
 // ── 删除（用户夹，软删除 + 即时 undo，镜像 Persons 隐藏/忽略范式） ────────────────
@@ -327,7 +357,12 @@ async function onDelete(c: Collection) {
     cancelText: t('common.cancel'),
   })
   if (!confirmed) return
-  await store.remove(c.id)
+  try {
+    await store.remove(c.id)
+  } catch (e) {
+    toast.addToast('error', t('selection.deleteFailed', { error: ipcErrorMessage(e) }))
+    return
+  }
   // 软删除可撤销，**无时限**：撤销登记进 historyStore（会话内长存 + Ctrl+Z 可达），toast 只是即时入口。
   // 此前撤销回调寄生在 toast 对象上，5 秒后随 removeToast 一起蒸发——而后端 restore_collection 无时效
   // 校验、全库无 purge，数据本就永久可恢复（真机 round10 #7）。
@@ -348,7 +383,12 @@ async function onDelete(c: Collection) {
 const trashOpen = ref(false)
 
 async function onRestore(c: Collection) {
-  await store.restore(c.id)
+  try {
+    await store.restore(c.id)
+  } catch (e) {
+    toast.addToast('error', ipcErrorMessage(e))
+    return
+  }
   // 不登记 undo:回收站里的恢复是「用户主动来捞」,反悔直接再删一次即可,压栈只会与删除路径的
   // undo 记录混叠(Ctrl+Z 撤销一次「恢复」= 又删掉,语义绕)。
   toast.addToast('success', t('collections.restoredDone', { name: c.name }), 3000)
@@ -564,14 +604,16 @@ onMounted(() => {
 .collection-card:focus-within .collection-card__edit {
   opacity: 1;
 }
-/* 三者须高于卡面内容(z-index:1)与 primary(z-index:0)且自持点击。
+/* 交互控件须高于卡面内容(z-index:1)与 primary(z-index:0)且自持点击；恢复按钮同样需要覆盖点击穿透。
    注:`.collection-card__input` 的 pointer-events:auto 是**必需**的(它仍被上面的 blanket 规则命中、拿到
    pointer-events:none);两个角标已从 blanket 排除, 这里对它们只剩 z-index 有效——保留 pointer-events 作
    防御(万一将来又被纳入 blanket)。此前本条只补了 z-index/pointer-events 却**漏了 position**, 正是 #6 的
    直接来源:补丁救了症状(按钮点不动), 没救根因(定位被覆写)。 */
 .collection-card .collection-card__del,
 .collection-card .collection-card__edit,
-.collection-card .collection-card__input {
+.collection-card .collection-card__input,
+.collection-card .collection-card__restore,
+.collection-card .collection-card__retry {
   z-index: 2;
   pointer-events: auto;
 }

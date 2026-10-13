@@ -498,7 +498,7 @@
 }
 :deep(.media-card__pending-badge) {
   position: absolute;
-  bottom: var(--spacing-2xs); /* 左下角:让出左上给拖拽手柄(与 .media-thumb__avail 对齐) */
+  bottom: var(--thumb-status-bottom, 4px);
   left: var(--spacing-2xs);
   z-index: 12; /* 盖过缩略图徽标 */
   font-size: var(--font-size-2xs);
@@ -510,12 +510,6 @@
   color: var(--color-text-on-error);
   letter-spacing: 0.04em;
   pointer-events: none;
-}
-
-/* 待删态:评分星条上抬一档,避让左下角的「待删除」角标(与 MediaThumb 内 missing/offline 抬升同理;
-   pending 是卡级状态,故在宿主按 .media-card--pending-delete 命中 thumb 内的 rating-slot)。 */
-:deep(.media-card--pending-delete .media-thumb__rating-slot) {
-  bottom: 24px;
 }
 
 /* 极小单元模式：让浏览器跳过离屏单元的渲染。单元有显式行内宽高，

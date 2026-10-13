@@ -23,7 +23,7 @@ const router = createRouter({
       meta: { title: 'sidebar.favorites' },
     },
     {
-      // S2-c 视图路由化:smart-album 各占独立路径(此前 live-photos/recent 连路由壳都没有,靠 store 停在 '/')。
+      // 智能相册各有独立路径，供深链与刷新恢复。
       path: '/live-photos',
       component: GalleryRouteLayer,
       meta: { title: 'sidebar.livePhotos' },
@@ -61,7 +61,7 @@ const router = createRouter({
       meta: { title: 'sidebar.plugins' },
     },
     {
-      // 设置属于页面级信息架构，不再由全局 boolean 伪装成全屏 modal。
+      // 设置使用独立页面路由。
       path: '/settings/:section?',
       component: () => import('../views/SettingsView.vue'),
       meta: { title: 'settings.title' },
@@ -79,9 +79,7 @@ const router = createRouter({
       meta: { title: 'routes.audio' },
     },
     {
-      // 统一查看器（顶栏重构 P4-b, §5 L2）：图/视从 body 覆盖层迁为 shell 内路由。ContentViewer 按
-      // mediaType 渲染,缩放/平移/翻页/信息/exotic/人脸内核复用 useMediaDetail。?path= 为未来 OS
-      // shell 深链(外部文件直达)预留。文档/音频仍走上方专用路由(本期未合并入 /view)。
+      // 图片和视频共用 ContentViewer；文档与音频使用各自的路由。
       path: '/view/:id',
       component: loadViewerComponent,
       meta: { title: 'routes.view' },

@@ -1,14 +1,5 @@
-//! 「在系统文件管理器中显示」（reveal）的**单一实现**（F-015）。
-//!
-//! 此前有两套：`system_commands::show_in_explorer` 手写三平台 `Command::spawn`，
-//! `tree_commands::reveal_tree_entry` 走 `tauri_plugin_opener`。两套的行为并不等价 ——
-//! 手写版的 Linux 分支只 `xdg-open` 父目录，**不选中**目标文件。统一到 opener 后：
-//! Windows `SHOpenFolderAndSelectItems`、macOS `open -R`、Linux D-Bus
-//! `org.freedesktop.FileManager1.ShowItems`（失败回退 XDG portal `OpenDirectory`）——
-//! 三平台都选中，Linux 缺陷随之消失。
-//!
-//! 另一处行为差异值得留意：手写版是 `.spawn()`（发射后不管，打开器起不来也返回 `Ok`），
-//! opener 是同步等结果。故统一后 reveal **可能真的返回错误**，调用方需要能吃到。
+//! 「在系统文件管理器中显示」的共用入口，调用 opener 并将失败映射为稳定错误码。
+//! opener 等待系统打开器的结果，调用方须处理实际返回的错误。
 
 use std::path::PathBuf;
 
@@ -33,7 +24,7 @@ pub(crate) async fn reveal_path(path: PathBuf) -> Result<()> {
 /// message 里，序列化 code 恒为 "PathResolution"，前端分流只能匹配文案）。
 ///
 /// 有意不透传原始错误：Tauri IPC 错误不得泄漏内部路径/原始系统错误（项目硬约束）。
-/// `unsupported_platform` 单列，因为前端要据此永久隐藏该动作（而非提示重试）。
+/// `unsupported_platform` 单列，供前端显示对应的失败提示。
 pub(crate) fn map_reveal_err(e: tauri_plugin_opener::Error) -> AppError {
     match e {
         tauri_plugin_opener::Error::UnsupportedPlatform => AppError::Reveal {

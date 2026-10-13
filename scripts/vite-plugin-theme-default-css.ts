@@ -1,10 +1,9 @@
-// scripts/vite-plugin-theme-default-css.ts
-// 默认主题 CSS 与首帧脚本的交付插件(主题配色重构,方案 §7)。
+// 默认主题 CSS 与首帧脚本的交付插件。
 //
 // 分工:
 //  - transformIndexHtml 注入默认主题 CSS(:root 浅色 / html[data-color-scheme='dark'] 深色)。
 //    这份 CSS 与运行时**同源**:都由 src/themes 的 generateTheme 现算,不手写第二套色值;
-//    首帧缓存缺失时(首次启动、刚恢复默认、外部改动后)由它兜底,不再有六套启动主题分支。
+//    首帧缓存缺失时(首次启动、刚恢复默认、外部改动后)由它兜底。
 //  - 按 /theme-bootstrap.js 交付首帧脚本。脚本源码由 src/themes/bootstrapScript.ts 生成
 //    (内嵌 generate.ts 的变量清单,校验「整份完整」才恢复),故不能在 public/ 手写一份。
 //    dev 走中间件、build 走资产,URL 与 index.html 的引用一致。

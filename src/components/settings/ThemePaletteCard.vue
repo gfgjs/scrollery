@@ -68,7 +68,7 @@
 </template>
 
 <script setup lang="ts">
-// 单套配色卡(方案 §2):真实色板预览 + 三个色块与 HEX + 层次对比度滑条 + 画廊背景。
+// 单套配色卡展示色板、HEX、层次对比度与画廊背景。
 // 只呈现与上抛改动,草稿由 themeStore 持有(浅／深两卡共用同一份草稿)。
 import { useI18n } from 'vue-i18n'
 import UiButton from '../ui/UiButton.vue'

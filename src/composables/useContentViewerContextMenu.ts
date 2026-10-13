@@ -1,6 +1,5 @@
 // src/composables/useContentViewerContextMenu.ts
-// 从 ContentViewer.vue 下沉(超长文件拆分方案 2.1):右键菜单 + 移动/复制对话框。
-// 纯逻辑搬迁,不改变原调用点/参数/时序——见 docs/planning/2026-07-25-超长文件拆分方案/analysis/ContentViewer-vue.md。
+// 查看器右键菜单 + 移动/复制对话框。
 
 import { ref, markRaw } from 'vue'
 import type { ContextMenuItem } from '../components/common/ContextMenu.vue'
@@ -45,7 +44,7 @@ export function useContentViewerContextMenu(options: {
     const item = detail()!
     const id = item.id
 
-    // 收敛(P2-3):共享项(复制图像/资源管理器显示/壁纸-仅图片)从命令注册表按 when 生成,与 MediaGrid
+    // 共享项（复制图像/资源管理器显示/壁纸仅图片）从命令注册表按 when 生成，与 MediaGrid
     // 同源(壁纸-仅图片条件单点定义于 global.ts)。move/copy 是本地 Command(捕获覆盖层单项流:直接把
     // 该项塞进 moveCopyDialog)。
     const ctx = buildCommandContext({ contextTarget: { id, mediaType: item.mediaType } })
@@ -96,7 +95,7 @@ export function useContentViewerContextMenu(options: {
     moveCopyDialog.value.isOpen = false
     const mode = moveCopyDialog.value.mode
 
-    // T6:经 historyStore 走 relocate_media_items / copy_media_items_db(DB 级、可撤销),
+    // 经 historyStore 走 relocate_media_items / copy_media_items_db（DB 级、可撤销），
     // 与画廊 performMediaDrop / MediaGrid 对话框同一路径。history 内部 refresh() 已重载树(实时计数)
     // + 重算网格,故不再手动调整计数 / loadStats / startScan。
     try {

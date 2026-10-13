@@ -63,7 +63,8 @@ export function useVideoFrameCapture(videoEl: Ref<HTMLVideoElement | null>, file
     if (!el || busy.value) return
     const width = el.videoWidth
     const height = el.videoHeight
-    if (!width || !height) return
+    // HAVE_METADATA 已有尺寸但 drawImage 不会绘制，至少 HAVE_CURRENT_DATA 才有可截取帧。
+    if (!width || !height || el.readyState < 2) return
     busy.value = true
     try {
       const canvas = document.createElement('canvas')
@@ -75,6 +76,8 @@ export function useVideoFrameCapture(videoEl: Ref<HTMLVideoElement | null>, file
         return
       }
 
+      // 名称和时间与同步捕获的像素归属同一帧，不能在异步编码后读取已经切换的播放状态。
+      const defaultPath = `${stripExtension(fileName.value)}_${hhmmss(el.currentTime)}.png`
       let blob: Blob | null
       try {
         ctx.drawImage(el, 0, 0, width, height)
@@ -94,7 +97,6 @@ export function useVideoFrameCapture(videoEl: Ref<HTMLVideoElement | null>, file
         return
       }
 
-      const defaultPath = `${stripExtension(fileName.value)}_${hhmmss(el.currentTime)}.png`
       const target = await save({
         defaultPath,
         filters: [{ name: 'PNG', extensions: ['png'] }],

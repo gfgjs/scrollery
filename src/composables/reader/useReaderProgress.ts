@@ -1,11 +1,16 @@
 // src/composables/reader/useReaderProgress.ts
-// 阅读进度去抖保存（结构拆分自 DocumentViewer.vue §S18）。
-// 捕获 (itemId, pos) 配对而非只存 pos(2026-07-10 审查 B12):flush 时 route id 可能已变——
-// 退出阅读器时 id=NaN 会把最后 1.2s 窗内的位置静默丢弃(翻页即退必丢);doc→doc 复用导航时
-// load() 的冲刷会把 A 的 cfi 写进 B 的进度行。写库一律用捕获时刻的 itemId（红线，不可简化）。
+// 阅读进度去抖保存。
+// 配对捕获 itemId 与位置：延迟写入时路由可能已切换，不能将旧文档位置写入新文档。
 import type { Ref } from 'vue'
 import { IPC } from '../../constants/ipc'
 import { invokeIpc } from '../../utils/ipc'
+import { createLatestWriteQueue } from '../../utils/latestWrite'
+
+// 退出后的写入仍可能在途；同一窗口重开阅读器须共用按文档串行的队列，避免旧进度最后落库。
+const writes = createLatestWriteQueue<number, string>(async (itemId, position) => {
+  // 单次失败仍允许队列写入后来位置；旧位置本身不重试。
+  await invokeIpc(IPC.SET_READING_PROGRESS, { itemId, position }).catch(() => {})
+})
 
 export function useReaderProgress(id: Ref<number>) {
   let lastProgress: { itemId: number; pos: string } | null = null
@@ -18,7 +23,8 @@ export function useReaderProgress(id: Ref<number>) {
     }
     if (lastProgress) {
       const { itemId, pos } = lastProgress
-      invokeIpc(IPC.SET_READING_PROGRESS, { itemId, position: pos }).catch(() => {})
+      lastProgress = null
+      writes.push(itemId, pos)
     }
   }
 

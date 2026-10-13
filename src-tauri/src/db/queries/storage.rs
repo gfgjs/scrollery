@@ -66,8 +66,8 @@ pub fn insert_storage_backend(
     Ok(conn.last_insert_rowid())
 }
 
-/// 按 id 删除存储后端；返回其 `cred_ref` 以便调用方清理 keyring。§3.8。
-pub fn delete_storage_backend(conn: &Connection, id: i64) -> Result<Option<String>> {
+/// 删除前读取凭据关联；凭据清理失败时保留原记录供重试。§3.8。
+pub fn storage_backend_cred_ref(conn: &Connection, id: i64) -> Result<Option<String>> {
     let cred_ref: Option<String> = conn
         .query_row(
             "SELECT cred_ref FROM storage_backends WHERE id = ?1",
@@ -76,8 +76,13 @@ pub fn delete_storage_backend(conn: &Connection, id: i64) -> Result<Option<Strin
         )
         .optional()?
         .flatten();
-    conn.execute("DELETE FROM storage_backends WHERE id = ?1", params![id])?;
     Ok(cred_ref)
+}
+
+/// 按 id 删除存储后端；调用方须已成功清理其凭据。§3.8。
+pub fn delete_storage_backend(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM storage_backends WHERE id = ?1", params![id])?;
+    Ok(())
 }
 
 // ── 卷可用性 DAO（SCHEMA_V10；供 Part2 卷探测 probe_volumes / 扫描编排调用）─────────

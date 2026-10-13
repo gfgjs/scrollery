@@ -1,11 +1,10 @@
 // crates/exotic-workers/ai-worker/src/main.rs
-//! AI 推理 Worker 主循环(Part4-T15;合并单 worker:CLIP 嵌入 + 人脸检测/嵌入,
-//! T9.5 VRAM 实测支持合并,正式拍板随 T20)。
+//! AI 推理 Worker 主循环，承接 CLIP 嵌入、人脸检测与嵌入，以及 OCR。
 //!
-//! 契约(承接 psd-worker 样板 + v2 会话族 op):
+//! 契约：
 //!   - **stdout 只走协议帧**;日志只写 stderr。
-//!   - 进程握手快而恒定(Hello→Ready,5s 档):**不承载模型加载**(D3 §2)。模型加载 =
-//!     显式 SessionInit 请求(host 侧对其配 300s 档),SessionReady = 其 Success 应答。
+//!   - 进程握手不承载模型加载；模型通过显式 SessionInit 请求装载，
+//!     SessionReady 由 Success 应答携带，host 按静默限时与总上界监测。
 //!   - host 主导会话生命周期(SessionClose 显式卸载);本端兜底**空闲自杀 timer**:
 //!     收到最后一帧后 300s 无活动 `exit(0)`,防 host 失联留 VRAM 僵尸(D3 §4④——
 //!     读线程 + channel `recv_timeout` 实现,阻塞式 stdin 读无法带超时)。
@@ -41,17 +40,15 @@ const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 空闲自杀阈值:最后一帧后无活动即退出(D3 §4④ 兜底,host 失联不留 VRAM 僵尸)。
 /// 计时仅覆盖「等下一帧」——在途推理(SessionInit 可达分钟级)不在等待态,不会误杀。
 const IDLE_SELF_EXIT: Duration = Duration::from_secs(300);
-/// SessionInit 期间无阶段事件时的心跳节拍(加固批 A-2):宿主静默限时按其数倍设定,
+/// SessionInit 期间无阶段事件时的心跳节拍；宿主静默限时按其数倍设定，
 /// 装载再慢也不会被误杀——只要本进程还活着且装载线程未退。
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// ORT 运行时(dylib+环境)装载的短 watchdog:正常 <1s;超此预算即断定运行时本体
-/// 卡死(死路径/System32 旧版/损坏 DLL),立即回 OrtRuntimeInitTimeout——2026-07-10/11
-/// 夜事故的「无限静默」由此变为秒级可判别错误。
+/// 卡死（死路径/System32 旧版/损坏 DLL）时回 OrtRuntimeInitTimeout。
 const ORT_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 
-// stderr 结构化日志行(日志能力重构线 阶段 3 · W3,D-313/D-314):替换原 `[ai-worker] {msg}`
-// 纯文本 eprintln,统一走 exotic_protocol::WorkerLogLine 单行 JSON——与下方 [`WorkerLogFormat`]
-// 收编的 ai-core 内部 tracing 事件共用同一 schema,host 侧 supervisor 只需一套解析器。
+// stderr 使用 exotic_protocol::WorkerLogLine 单行 JSON；ai-core 内部 tracing 事件
+// 由下方 [`WorkerLogFormat`] 转成同一格式，供 host 侧 supervisor 解析。
 // 定级原则(逐点判断,不一刀切):正常生命周期/握手成功/会话就绪/空闲自杀兜底=info、
 // 非致命异常(worker 继续服务)=warn、致命错误(握手失败/协议损坏/panic,均以非零码退出进程)=error、
 // 高频请求回执=debug。逐点定级清单见
@@ -113,7 +110,7 @@ impl Visit for TracingFieldCollector {
     }
 }
 
-/// 自定义 FormatEvent(D-314):把 ai-core 内部 tracing 事件(装载/降级日志等)格式化为
+/// 自定义 FormatEvent：把 ai-core 内部 tracing 事件（装载/降级日志等）格式化为
 /// [`exotic_protocol::WorkerLogLine`] 形状单行 JSON,收编进与手写 `log_*` 系列相同的 schema——
 /// 此前两种形状(文本 fmt 行 + `[ai-worker] {msg}`)混流,是本次统一的直接动因。
 struct WorkerLogFormat;
@@ -151,7 +148,7 @@ fn main() {
     // tracing 订阅者接 stderr(2026-07-11 加固:此前 ai-core 的全部装载/降级日志被静默
     // 丢弃——SessionInit 卡死时 host 侧 stderr 环形缓冲一片空白,盲调无据)。stdout 是
     // 协议帧通道,日志只允许走 stderr(与 log_* 同通道,supervisor 环形缓冲统一收集)。
-    // event_format 换 WorkerLogFormat(D-314):ai-core 内部日志与手写 log_* 系列同一 schema。
+    // ai-core 内部日志与手写 log_* 系列使用同一 schema。
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -221,6 +218,7 @@ fn main() {
         protocol_version: PROTOCOL_VERSION,
         capabilities: vec![
             capability::EMBEDDING.to_string(),
+            capability::TEXT_ENCODING.to_string(),
             capability::FACE_DETECT_EMBED.to_string(),
             capability::OCR_TEXT.to_string(),
         ],
@@ -236,7 +234,7 @@ fn main() {
 
     // ── 主循环:严格串行,一帧一请求 ─────────────────────────────────────────────────
     let mut sess: Option<SessionState> = None;
-    // OCR 会话独立槽(D-OCR-1):与 CLIP `sess` 各自生命周期,互不干扰(main.rs 头注)。
+    // OCR 与 CLIP 会话各有独立槽，生命周期互不干扰。
     let mut ocr_sess: Option<ocr::OcrSessionState> = None;
     loop {
         let Some(frame) = recv_frame(&rx) else {
@@ -346,7 +344,7 @@ fn recv_frame(rx: &Receiver<FrameResult>) -> Option<Frame> {
     }
 }
 
-/// SessionInit 流式处理(2026-07-11 加固批 A-2):装载跑独立线程,主线程把阶段事件
+/// SessionInit 流式处理：装载跑独立线程，主线程把阶段事件
 /// 转成 Progress 帧、无事件时按 [`HEARTBEAT_INTERVAL`] 发心跳,终态自行写 Success/Failure。
 /// 宿主收到任意帧即重置静默计时——「300s 总限时 vs 单段 600s」的预算倒挂由此消解。
 fn handle_session_init_streaming<W: Write>(
@@ -379,14 +377,8 @@ fn handle_session_init_streaming<W: Write>(
         return;
     };
 
-    // host 主导切换语义(先 Close 再 Init);未 Close 即 Init 按切换处理,旧会话先卸。
-    if let Some(old) = sess.take() {
-        log_info(format!(
-            "SessionInit 前存在旧会话 {} → 先卸载(切换语义)",
-            old.session_id
-        ));
-        drop(old);
-    }
+    // 旧会话交给装载线程核对身份；兼容时只补载角色，切模型时先卸旧池。
+    let previous = sess.take();
 
     /// 装载线程 → 主线程的事件。Done 装箱:SessionState 含整套 Session 池,避免大枚举。
     enum LoadEvent {
@@ -428,8 +420,9 @@ fn handle_session_init_streaming<W: Write>(
             &models_root,
             &ai_cache_dir,
             &image_provider,
+            previous.as_ref().map(|session| &session.identity),
         )
-        .and_then(|resolved| session::load_with_progress(resolved, Some(&progress_cb)));
+        .and_then(|resolved| session::load_with_progress(resolved, previous, Some(&progress_cb)));
         let _ = etx.send(LoadEvent::Done(Box::new(init)));
     });
 
@@ -477,7 +470,7 @@ fn handle_session_init_streaming<W: Write>(
                     embed_dim: state.profile.embed_dim as u32,
                     face_embed_dim: state.face_profile.as_ref().map(|fp| fp.embed_dim as u32),
                     caps: session_caps(&state),
-                    // provider 回声(T16 additive):探测/回退结果只有本端知道,
+                    // provider 回声：探测与回退结果只有 worker 知道，
                     // host 借此写回 ai_provider/ai_gpu_name 配置(状态栏显示)。
                     provider: Some(state.pool.provider.as_str().to_string()),
                     gpu_name: Some(state.pool.gpu_name.clone()),
@@ -544,9 +537,9 @@ fn handle_session_init_streaming<W: Write>(
 
 /// 处理一个非 SessionInit 的 Request → 返回应发送的 Success/Failure 帧。
 /// 会话状态经 `sess` 串行流转;CLIP SessionInit 走 [`handle_session_init_streaming`]。
-/// `ocr_sess` 是与 `sess` 并存的独立槽(D-OCR-1):OcrSessionInit/Close/Batch 三臂
+/// `ocr_sess` 是与 `sess` 并存的独立槽：OcrSessionInit/Close/Batch 三臂
 /// 只读写 `ocr_sess`,CLIP 三臂只读写 `sess`,双槽互不干扰(边界情况10)。OCR 会话装载
-/// 是秒级 CPU 小模型(D-OCR-2),同步处理、不走流式 Progress。
+/// 是 CPU 小模型，同步处理且不走流式 Progress。
 fn handle_request(
     req: RequestBody,
     request_id: u64,
@@ -727,8 +720,14 @@ fn session_expired(request_id: u64) -> Frame {
 
 /// 本会话实际可服务的能力(host 据此派活;与 Ready.capabilities 的「静态支持范围」区分)。
 fn session_caps(state: &SessionState) -> Vec<String> {
-    let mut caps = vec![capability::EMBEDDING.to_string()];
-    if state.face_profile.is_some() {
+    let mut caps = Vec::new();
+    if state.pool.clip_image_ready() {
+        caps.push(capability::EMBEDDING.to_string());
+    }
+    if state.pool.clip_text_session.is_some() && state.tokenizer.is_some() {
+        caps.push(capability::TEXT_ENCODING.to_string());
+    }
+    if state.pool.face_ready() {
         caps.push(capability::FACE_DETECT_EMBED.to_string());
     }
     caps

@@ -335,7 +335,7 @@ export function useChromeRevealListeners(onKeyboardRevealTop?: () => void): void
     // useWindowMode.ts applyFullscreen 的 setResizable(false) 修法,777824d)。排队理论已被
     // F9 探针的 pointerout(relatedTarget=null)物证推翻。此处保留 pointerrawupdate 是因为
     // 它本身仍是真实增益(更密的采样对手抖/高速甩动始终有利),不是因为它曾"解决"过这个 bug。
-    // 可用性:Chromium 系(WebView2/Windows、Android)有;WebKit(mac/iOS)无 → 特性探测后退回
+    // 可用性：Chromium 系(WebView2/Windows)有；WebKit(macOS)无 → 特性探测后退回
     // 纯 pointermove(即当前行为,不更坏)。两条同时挂无妨:applyPointer 幂等(碰到过就出、离开才收)。
     if ('onpointerrawupdate' in window) {
       window.addEventListener('pointerrawupdate', onPointerMove as EventListener, true)

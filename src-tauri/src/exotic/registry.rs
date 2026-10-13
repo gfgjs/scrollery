@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/registry.rs
-//! 冷门格式插件 · 签名 Registry index（v3 Part3 §6.1）。
+//! 冷门格式插件的签名 Registry index。
 //!
 //! Registry 是**远程发行真相**：列出每个插件包的下载地址、大小、SHA-256、`package_sequence`
 //! 与 offering 元数据。文件对 = `index.json` + `index.sig`（release key 签**原始 index bytes**）。
@@ -84,13 +84,13 @@ pub struct RegistryEntry {
     pub package_sha256: String,
     #[serde(default)]
     pub store_url: Option<String>,
-    /// 模型权重 blob 清单(Part4 §3.7.1/T12):独立于插件 zip **分步下载**的大文件。
+    /// 模型权重 blob 清单：独立于插件 zip 分步下载的大文件。
     /// 旧 index 无此字段 → 默认空(向后兼容)。
     #[serde(default)]
     pub model_blobs: Vec<ModelBlob>,
 }
 
-/// 单个模型权重 blob(Part4 §3.7.1/T12)。
+/// 单个模型权重 blob。
 ///
 /// 不进插件 zip → `InstallLimits` 的 zip-bomb 检查(压缩比/总解压量/512MB 总量)对其
 /// **天然不适用**(这正是「大模型分步下载」的动机:ViT-L fp32 ≈1.7GB 无法进 512MB zip,
@@ -237,7 +237,7 @@ fn validate_entry(e: &RegistryEntry) -> Result<(), RegistryError> {
     if e.target.is_empty() || !e.target.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(bad("target 非法"));
     }
-    // model blobs(§3.7.1/T12):独立分步下载的大文件,数据面在此设防(执行面在 fetch)。
+    // 模型 blob 独立分步下载；此处校验清单，下载时再校验传输内容。
     for b in &e.model_blobs {
         if !url_scheme_ok(&b.url) {
             return Err(bad("model_blob url 必须为 HTTPS"));
@@ -363,4 +363,75 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exotic::crypto::test_support::{keyset_json, sign, signing_key, KeySpec};
+
+    const NOW: i64 = 1_790_000_000;
+
+    fn release_keyset(sk: &ring::signature::Ed25519KeyPair) -> VerifyingKeyset {
+        let json = keyset_json(&[KeySpec {
+            key_id: "release-test",
+            purpose: "release",
+            sk,
+            status: "active",
+            not_before: 0,
+            not_after: None,
+        }]);
+        VerifyingKeyset::parse(&json).unwrap()
+    }
+
+    fn good_index(sequence: u64, expires_at: i64) -> String {
+        format!(
+            r#"{{"schema":1,"key_id":"release-test","sequence":{sequence},
+              "generated_at":1700000000,"expires_at":{expires_at},
+              "plugins":[{{
+                "plugin_id":"exotic-image-psd","version":"1.0.0","package_sequence":3,
+                "media_kind":"image","formats":["psd"],"capabilities":["thumbnail"],
+                "sku":"psd-engine-2026","min_host_version":"0.1.0",
+                "target":"x86_64-pc-windows-msvc",
+                "package_url":"https://cdn.example.invalid/psd-1.0.0-win.zip",
+                "package_size":7340032,
+                "package_sha256":"{}",
+                "store_url":"https://store.example.invalid/psd"
+              }}]}}"#,
+            "a".repeat(64)
+        )
+    }
+
+    fn signed(sk: &ring::signature::Ed25519KeyPair, json: &str) -> (Vec<u8>, Vec<u8>) {
+        let bytes = json.as_bytes().to_vec();
+        let sig = sign(sk, &bytes);
+        (bytes, sig)
+    }
+
+    #[test]
+    fn cache_accept_persists_and_blocks_rollback() {
+        let sk = signing_key(9);
+        let ks = release_keyset(&sk);
+        let dir = std::env::temp_dir().join(format!("exotic-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cache = RegistryCache::load(dir.clone());
+        assert_eq!(cache.accepted_sequence(), 0);
+
+        let (b1, s1) = signed(&sk, &good_index(5, NOW + 1000));
+        cache.accept(&b1, &s1, &ks, NOW).unwrap();
+        assert_eq!(cache.accepted_sequence(), 5);
+        assert!(dir.join("index.json").exists());
+
+        // 重新 load → 从磁盘恢复 sequence。
+        let reloaded = RegistryCache::load(dir.clone());
+        assert_eq!(reloaded.accepted_sequence(), 5);
+
+        // 旧 sequence 包被拒，缓存不变。
+        let (b0, s0) = signed(&sk, &good_index(3, NOW + 1000));
+        let mut cache2 = RegistryCache::load(dir.clone());
+        assert!(cache2.accept(&b0, &s0, &ks, NOW).is_err());
+        assert_eq!(cache2.accepted_sequence(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

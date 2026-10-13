@@ -1,5 +1,4 @@
-// src/utils/viewPrefQuery.ts
-// view-preference(分组/组内排序/排序方向/布局)的 URL query 编解码（S2-b2）。纯函数,无 Vue/store 依赖。
+// view-preference(分组/组内排序/排序方向/布局)的 URL query 编解码，无 Vue/store 依赖。
 //
 // 与 filter(galleryQuery.ts)的关键差异 = **持久化语义**:filter 纯内存(缺省即默认,decode 可全量填默认);
 // 而 view-pref 是 uiStore 经 app_config 持久化的偏好。用户裁决「URL 权威、覆盖持久值」→ 语义是:

@@ -1,5 +1,5 @@
 // crates/exotic-workers/psd-worker/src/main.rs
-//! PSD 缩略图 Worker 主循环（v3 Part2 §3.4-3.5）。
+//! PSD 缩略图 Worker 主循环。
 //!
 //! 契约：
 //!   - **stdout 只走协议帧**；任何日志只写 stderr（Host 视 stdout 前导非帧字节为协议损坏）。
@@ -23,11 +23,10 @@ const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 源文件字节上限：读盘前用 metadata 拦截，避免巨文件吃满内存（→ resource_limit）。
 const MAX_SOURCE_FILE_BYTES: u64 = 512 << 20;
 
-// stderr 结构化日志行(日志能力重构线 阶段 3 · W3,D-313/D-314):替换原 `[psd-worker] {msg}`
-// 纯文本 eprintln,统一走 exotic_protocol::WorkerLogLine 单行 JSON——host 侧 supervisor 逐行解析
+// stderr 使用 exotic_protocol::WorkerLogLine 单行 JSON，host 侧 supervisor 逐行解析
 // 转发进主 tracing/JSONL 体系。三档按调用点语义分:正常生命周期(EOF/Shutdown)=info、
 // 非致命异常(单请求解析失败/意外帧,worker 继续服务)=warn、致命错误(握手失败/协议损坏/panic,
-// 均以非零码退出进程)=error。定级清单见 docs/worklogs/2026-07-21-span埋点与worker日志汇入/findings.md。
+// 均以非零码退出进程)=error。
 fn log_info(msg: impl Into<String>) {
     exotic_protocol::emit_stderr_log("info", msg, serde_json::Map::new());
 }

@@ -1,10 +1,10 @@
 export default {
   onboarding: {
     welcome: 'Welcome to Scrollery',
-    subtitle: 'Three quick steps to start managing your photos and videos',
+    subtitle: 'Three quick steps to start managing your assets',
     step1: {
-      title: 'Add a photo folder',
-      desc: 'Pick a folder with your photos or videos and Scrollery will scan it into your library. You can add more anytime from the sidebar.',
+      title: 'Add an asset folder',
+      desc: 'Pick a folder with images, videos, documents, or audio and Scrollery will scan it into your asset library. You can add more anytime from the sidebar.',
       addBtn: 'Choose folder',
       empty: 'No folder added yet — you can also do this later',
       addFailed: 'Failed to add folder: {error}',
@@ -36,12 +36,12 @@ export default {
       welcome: {
         title: 'Welcome',
         intro:
-          'Scrollery is a high-performance asset manager for Windows/macOS/iOS/Android, managing photos, videos, documents, and audio in one place. This guide walks you through the core features; you can reopen it anytime from the Settings page header.',
+          'Scrollery is a high-performance desktop asset manager, managing photos, videos, documents, and audio in one place. This guide walks you through the core features; you can reopen it anytime from the Settings page header.',
         points: [
           'Consistent experience across platforms',
           'GPU-accelerated image pipeline',
           'Local-first — your assets stay on your own disk',
-          'Sidebar switches between Library, Tools, and Management',
+          'Sidebar switches between Asset Library, Tools, and Management',
         ],
       },
       gallery: {
@@ -71,7 +71,7 @@ export default {
         intro: 'Powerful search and filtering help you find assets quickly among huge collections.',
         points: [
           'Semantic search panel (main library view) finds photos by content',
-          'Smart albums: All Photos / Recently Added / Videos / Live Photos, etc.',
+          'Quick filters: All Assets / Recently Added / Videos / Live Photos, etc.',
           'Filter by folder, collection, or person',
           'Filter state syncs to the URL, so deep links and refresh restore it',
         ],
@@ -125,7 +125,7 @@ export default {
         intro: 'Manage licensing and extensions in Features & Plugins.',
         points: [
           'Browse and install plugins from the plugin store',
-          'OCR is included in the one-time official edition license',
+          'Activate OCR individually for free',
           'Plugins run in a background worker and never block the UI',
         ],
       },
@@ -155,7 +155,7 @@ export default {
         intro: "You've now seen Scrollery's core features! Time to start organizing your assets.",
         points: [
           'Reopen this guide anytime via "User Guide" in the Settings page header',
-          'Add more folders from the sidebar to grow your library',
+          'Add more folders from the sidebar to grow your asset library',
           'Check diagnostics and logs in Settings if you run into issues',
           'Enjoy using Scrollery',
         ],
@@ -163,10 +163,10 @@ export default {
     },
   },
   sidebar: {
-    library: 'Library',
+    library: 'Asset Library',
     tools: 'Tools',
     management: 'Management',
-    allPhotos: 'All Photos',
+    allPhotos: 'All Assets',
     recentlyAdded: 'Recently Added',
     favorites: 'Favorites',
     collections: 'Collections',
@@ -192,7 +192,7 @@ export default {
     addFolderFailed: 'Failed to add folder: {error}',
     removeFolderFailed: 'Failed to remove folder: {error}',
     trash: 'Trash',
-    chooseDir: 'Choose Media Folder',
+    chooseDir: 'Choose Asset Folder',
     data: 'Clear',
     clearDb: 'Clear Database',
     clearSettings: 'Clear Settings',
@@ -201,7 +201,7 @@ export default {
     quickScan: 'Quick Scan',
     fullScan: 'Full Scan',
     quickScanHint: 'Quickly check for added or removed files.',
-    fullScanHint: 'Check each file to update the library after editing files in another app.',
+    fullScanHint: 'Check each file to update the asset library after editing files in another app.',
     // Half-finished folder moves (P0-1): where the files are, what still needs finishing, retry by id.
     dirRecovery: {
       title: 'Unfinished moves',
@@ -223,6 +223,7 @@ export default {
         target_unverified: 'Target exists but is not yet proven to belong to this move',
         target_conflict: 'Source and target both exist; needs a manual decision',
         target_unresolved: 'Target state cannot be determined',
+        source_cleanup_required: 'Index updated; the source folder was kept. Confirm the target contents, handle the source folder yourself, then retry',
         source_leftover: 'Index updated, but the old source folder still needs cleanup',
         source_changed: 'The source folder changed; needs a manual decision',
         staging_busy: 'The copy is incomplete; retry to continue',
@@ -254,18 +255,22 @@ export default {
     clearThumbnailsSuccess: 'All thumbnails cleared',
     overlapDetected: 'Folder Overlap Detected',
     overlapParentMsg:
-      'New folder "{path}" contains existing folders: {children}. Merge? (Removes children, keeps parent)',
+      'New folder "{path}" contains existing folders: {children}. Merging places them under the parent while keeping favorites, tags, versions and reading progress. Uncheck to keep separate entries.',
     overlapChildMsg:
       'New folder "{path}" is a child of existing folder "{parents}". It may cause duplicate indexing. Add anyway?',
-    mergeAndReplace: 'Merge (remove children)',
+    mergeAndReplace: 'Merge existing child folders',
+    mergeConflict: 'These folders have overlapping indexes or the target already exists. Your library is unchanged.',
+    mergeVisibilityConflict: 'Visible and hidden folders cannot be merged. Match their visibility settings first. Your library is unchanged.',
+    mergePendingMove: 'These folders have an unfinished move recovery. Complete it before merging. Your library is unchanged.',
+    mergeInvalidPath: 'A folder is unavailable or its actual location is outside the selected parent. Check the paths and retry.',
     addAnyway: 'Add Anyway',
-    // ── R1-7 i18n 清理新增（侧栏文件夹操作 / 工具卡片）──
+    //  侧栏文件夹操作 / 工具卡片
     newBlankFolder: 'New blank folder',
     expandAll: 'Expand all',
     collapseAll: 'Collapse all',
     loadMoreFiles: 'Load more files ({count} loaded)',
     newSubfolder: 'New subfolder',
-    // ── #7 方案A:文件夹迁移后重链接扫描根 ──
+    //  文件夹迁移后重链接根路径
     relinkFolder: 'Folder was moved…',
     relinkTitle: 'Relink folder',
     relinkMessage:
@@ -282,7 +287,7 @@ export default {
     relinkFailed: 'Relink failed: {error}',
     relinkRescanFailed:
       'Relink succeeded, but the follow-up rescan failed to start: {error}. You can rescan this folder manually later.',
-    // ── 文件树显示范围三态(S 线 §3)──
+    //  文件树显示范围三态
     displayScope: 'Show',
     displayScopeWithTreeCategory: 'Show ({summary})',
     scopeRegisteredOnly: 'Media files only',
@@ -311,8 +316,6 @@ export default {
     revealFailed: 'Cannot show this item in the file manager',
     revealUnsupported: 'Showing in the file manager is not supported on this platform',
     unregisteredFileHint: 'Not in library — double-click to show in the file manager',
-    unregisteredFileHintMobile:
-      'Not in library (showing in the file manager is not supported on this platform)',
     unregisteredFileHintPreviewable: 'Not in library — double-click to preview text content',
     previewTruncated: 'File is too large — showing the first 1 MiB only',
     previewFailed: 'Preview failed — the file may have been moved, deleted, or is unreadable',
@@ -342,7 +345,7 @@ export default {
     restartFaceMsg:
       'This will clear all detected faces, named people, and manually confirmed groupings, then re-recognize all images from scratch. Continue?',
     clearThumbnailsFailed: 'Failed to clear thumbnails: {error}',
-    // 等待原因文案(可观测性三修 #3):后端 waitingOn 阻塞源键 → 提示文案。
+    // 等待原因文案：后端 waitingOn 阻塞源键 → 提示文案。
     waitingOnDerivation: 'Waiting for derivation to finish',
     waitingOnScan: 'Waiting for scan to finish',
     waitingOnThumbnail: 'Waiting for thumbnail generation',
@@ -379,12 +382,12 @@ export default {
     filterOptions: 'Filter options',
     exportView: 'Export current view',
     holdEscToExit: 'Hold Esc to exit fullscreen',
-    // ── 自绘标题栏窗口三键（顶栏重构 L1）──
+    //  自绘标题栏窗口控制
     windowMinimize: 'Minimize',
     windowMaximize: 'Maximize',
     windowRestore: 'Restore',
     windowClose: 'Close',
-    // ── R1-7 i18n 清理新增（筛选 / 搜索 / 布局 / 排序 / 撤销重做）──
+    //  筛选 / 搜索 / 布局 / 排序 / 撤销重做
     hideTimeline: 'Hide Timeline',
     showTimeline: 'Show Timeline',
     hideMinimap: 'Hide Minimap',
@@ -448,11 +451,9 @@ export default {
     fmtBadgeNotInstalled: 'Not installed',
     fmtBadgeNotInstalledHint:
       'Provided by a plugin that is not installed — still filterable, but may not preview',
-    fmtBadgeUnlicensed: 'Unlicensed',
+    fmtBadgeUnlicensed: "Not activated",
     fmtBadgeUnlicensedHint:
-      'Plugin installed but not licensed — still filterable, but may not preview',
-    fmtBadgeExpired: 'Expired',
-    fmtBadgeExpiredHint: 'Plugin license expired — still filterable, but may not preview',
+      "This feature is not activated yet. Activate it for free to enable previews.",
     filterByRating: 'Filter by rating (≥N stars)',
     filterByColorLabel: 'Filter by color label',
     filterByDateRange: 'Filter by date range',
@@ -502,10 +503,10 @@ export default {
     scanDone: 'Scan complete, found {count} new items',
     scanError: 'Scan failed: {error}',
     refreshFailed: 'Refresh failed: {error}',
-    // ── R1-7 i18n 清理新增（后台任务指示 / 扫描附属提示）──
+    //  后台任务指示 / 扫描附属提示
     thumbGenBgTitle: 'Generating thumbnails in the background; browsing is unaffected',
     aiAnalyzingTitle: 'AI is analyzing images',
-    // ── 内容页文件信息（2026-07-17 底栏重构）──
+    //  内容页文件信息
     duration: 'Duration',
     moreInfo: 'More info',
     aiProgress: 'AI analysis: {analyzed}/{total}',
@@ -547,7 +548,7 @@ export default {
     location: 'Location',
     livePhotoError: 'Failed to load Live Video',
     volumeOffline: 'Please reconnect device "{label}" and retry',
-    // ── R1-7 i18n 清理新增（详情浮层信息面板 / 缩放 / 不可用态）──
+    //  详情浮层信息面板 / 缩放 / 不可用态
     livePhoto: 'Live Photo',
     immersive: 'Immersive',
     exitImmersive: 'Exit immersive (Esc)',
@@ -556,6 +557,7 @@ export default {
     fileInfo: 'File Info',
     fullPath: 'Full Path',
     rating: 'Rating',
+    starCount: '{count} stars',
     colorLabel: 'Color Label',
     unavailableOfflineTitle: 'Volume Is Offline',
     unavailableOfflineHint: 'Reconnect the disk / USB drive to view it',
@@ -589,14 +591,14 @@ export default {
     captureFrame: 'Capture current frame',
     fullscreen: 'Fullscreen',
     exitFullscreen: 'Exit fullscreen',
-    // 字幕菜单(GE 批)
+    // 字幕菜单
     subtitleOff: 'Subtitles off',
     subtitleTrack: 'Track {n}',
     subtitleExternal: 'External subtitle',
     loadSubtitleFile: 'Load subtitle file…',
     subtitleUnsupported: 'ASS/SSA and embedded MKV subtitles are not supported yet',
     subtitleLoadFailed: 'Failed to load subtitle',
-    // 截帧(GE 批)
+    // 截帧
     captureSaved: 'Frame saved',
     captureFailed: 'Frame capture failed',
     captureTainted: 'This video cannot be captured (cross-origin restriction)',
@@ -623,13 +625,13 @@ export default {
         title: 'Cannot play this video',
         hint: 'The format or codec is unsupported, or the file is corrupted. Try opening it in an external player.',
       },
-      // 视频格式扩展子系统(V7):host 侧判定表已明确归因时的引导文案
+      // 视频格式扩展:host 侧判定表已明确归因时的引导文案
       needsComponent: {
         title: 'Video extension component required',
         hint: 'Playing this format requires downloading the video extension component (FFmpeg, used for container remuxing/transcoding). Download it from Settings, or retry shortly.',
       },
     },
-    // 视频格式扩展子系统(V7,design.md §5.3):播放准备覆盖层文案
+    // 视频格式扩展:播放准备覆盖层文案
     prep: {
       cancel: 'Cancel preparing',
       stagePreparing: 'Preparing playback…',
@@ -655,7 +657,7 @@ export default {
       cancelledRetry: 'Prepare again',
     },
   },
-  // 图片简单编辑(方案 C §7):旋转/翻转/裁剪,另存副本
+  // 图片编辑:旋转/翻转/裁剪,另存副本
   edit: {
     entry: 'Edit',
     premiumName: 'Advanced Image Editing',
@@ -703,7 +705,7 @@ export default {
     targetConflict: 'Too many filename conflicts',
     jobBusy: 'Another file task is running, please try again later',
   },
-  // OCR 文字提取(B′ 路线,2026-07-23,T9):查看器入口按钮 + 结果面板 + 门控引导文案
+  // OCR 文字提取:查看器入口按钮 + 结果面板 + 门控引导文案
   ocr: {
     entry: 'Extract text',
     entryVideo: 'Recognize text in current frame',
@@ -714,11 +716,9 @@ export default {
     close: 'Close',
     empty: 'No text detected',
     failed: 'Copy failed',
-    unlicensed: 'Official edition is not activated. Open Features & Plugins',
-    licenseExpired: 'The official edition license has expired. Activate a valid license',
-    modelMissing: 'OCR model is not downloaded. Go to settings',
+    unlicensed: "Activate OCR for free in Features & Plugins",
   },
-  // 影像增强(降噪/超分子系统 P0 批 5)
+  // 影像增强：降噪与超分
   enhance: {
     entry: 'Enhance photo…',
     dialogTitle: 'Image Enhancement',
@@ -743,12 +743,12 @@ export default {
     startMulti: 'Enhance {n}',
     started: 'Added to the enhancement queue',
     startedMulti: 'Added to the enhancement queue ({n})',
-    gateUnlicensed: 'Official edition is not activated. Open Features & Plugins',
+    gateUnlicensed: "Activate Image Enhancement for free in Features & Plugins",
     gateModelMissing: 'The selected model is not downloaded. Go to settings to download',
     errWorkerMissing: 'The enhancement component is missing. Reinstall the complete Scrollery package.',
     errStatusUnavailable: 'Enhancement status is unavailable. Reopen this page to retry.',
     errInputTooLarge: 'Image exceeds the enhancement size limit',
-    errUnlicensed: 'Image Enhancement license is invalid or expired. Go to the store',
+    errUnlicensed: "Image Enhancement is not activated. Activate it for free in Features & Plugins",
     errInputUnsupported: 'This source is not supported (e.g. RAW / undecodable format)',
     errModelMissing: 'The enhancement model is not downloaded. Go to settings to download',
     errBusy: 'The enhancement service is busy. Please retry later',
@@ -757,7 +757,7 @@ export default {
     errInvalidParams: 'Invalid enhancement parameters',
     errNotImplemented: 'This feature is not yet implemented',
     errUnknown: 'Enhancement error',
-    // 队列进度面板(批 5.5)
+    // 队列进度面板
     queueTitle: 'Enhancement queue',
     queueEmpty: 'No enhancement jobs',
     queueJobLabel: 'Job #{id}',
@@ -778,7 +778,7 @@ export default {
     mint: 'Fresh Mint',
     forest: 'Animal Forest',
   },
-  // 阅读专属主题名(R3;注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
+  // 阅读专属主题名(注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
   readerThemes: {
     paper: 'Paper',
     sepia: 'Sepia',
@@ -814,7 +814,7 @@ export default {
     opacitySummary: '100% is the default appearance.',
     hoverPreviewSummary: 'Videos and live photos loop silently; playback stops when the pointer leaves.',
     autoHideSummary: 'Hide the top and bottom bars in windowed mode; move to an edge to reveal them.',
-    viewerColorSummary: 'Affects desktop viewer display only, without changing original files or edits.',
+    viewerColorSummary: 'Affects viewer display only, without changing original files or edits.',
     minimapSummary: 'Colors appear immediately; thumbnail previews need to load.',
     decodeSummary: 'Displaying originals uses more memory.',
     thumbSizeSummary: 'Larger thumbnails are clearer and use more cache space.',
@@ -976,10 +976,10 @@ export default {
     alignCenter: 'Center',
     alignLeft: 'Left',
     alignRight: 'Right',
-    // ── 查看器渲染色域(2026-07-23 自定义 ICC 与色域切换)────────────────────
+    //  查看器色域与自定义 ICC
     viewerColorTarget: 'Display color space',
     viewerColorTargetDesc:
-      'Render the large-image viewer in the selected color space (desktop only; does not affect the original file or editing). sRGB shows the original image directly with no extra overhead.',
+      'Render the large-image viewer in the selected color space without affecting the original file or editing. sRGB shows the original image directly with no extra overhead.',
     viewerColorSrgb: 'sRGB · Original',
     viewerColorDisplayP3: 'Display P3',
     viewerColorDciP3: 'DCI-P3',
@@ -1028,28 +1028,13 @@ export default {
     videoDeriveFull: 'Full (redo all)',
     videoDeriveStop: 'Stop extraction',
     videoDeriveErrorCount: '{count} failed',
-    // 视频格式扩展子系统(V7):可播产物独立池——实时占用走 VIDEO_CACHE_STATS,失败降级静态上限
+    // 视频格式扩展:可播产物独立池——实时占用走 VIDEO_CACHE_STATS,失败降级静态上限
     videoCachePoolTitle: 'Video transcode cache pool',
     videoCachePoolDesc:
       'Separate from the thumbnail cache pool above; holds remuxed/transcoded playable output for formats like mkv/avi, evicted by most-recently-played. Default budget {size}.',
     videoCachePoolUsage: 'Used {used} / limit {limit} ({files} files)',
     thumbSizeChanged: 'New thumbnails will be generated at {size}px. Existing ones are kept.',
     thumbSizeHint: 'Higher tiers use more disk space',
-    thumbnailPerformanceGroup: 'Thumbnail concurrency and memory (restart required)',
-    thumbFastThreads: 'Fast image threads',
-    thumbFastThreadsDesc: '0 uses the CPU budget; 1–64 sets the thread count. Restart the app to apply.',
-    thumbTailThreads: 'Heavy image and recovery threads',
-    thumbTailThreadsDesc: 'Shared by large images, video covers and recovery; also limited by the pixel working set. Restart to apply.',
-    thumbGpuInflight: 'GPU request concurrency',
-    thumbGpuInflightDesc: 'Total requests admitted to GPU processing. Restart the app to apply.',
-    thumbGpuPerAdapter: 'JPEG hardware concurrency per GPU',
-    thumbGpuPerAdapterDesc: 'VPL concurrency per adapter, also bounded by total GPU concurrency. D2D remains serialized. Restart to apply.',
-    thumbProcessMemoryMb: 'Thumbnail memory per process',
-    thumbProcessMemoryMbDesc: 'Memory limit per thumbnail process, including decoding, encoding and driver overhead. Restart to apply.',
-    thumbTotalMemoryMb: 'Total thumbnail process memory',
-    thumbTotalMemoryMbDesc: 'Combined limit for fast and heavy processes; at least the per-process limit. Restart to apply.',
-    thumbWorksetMb: 'Thumbnail pixel working set',
-    thumbWorksetMbDesc: 'Reserved pixel memory for concurrent decoding. Check this and process memory when increasing threads. Restart to apply.',
     thumbWebpQuality: 'Thumbnail Encoding Quality',
     thumbWebpQualityDesc:
       '1-99 = lossy compression (default 80 — visually near-identical, small files). 100 = lossless (pixel-perfect, roughly 5-10× larger). Existing thumbnails regenerate on demand at the new quality.',
@@ -1067,8 +1052,7 @@ export default {
     clearSettings: 'Clear Settings',
     clearSettingsDesc: 'Reset all application settings to default values.',
     clearSettingsBtn: 'Clear',
-    // 恢复默认设置(2026-09-16 设置集中保存):语义从「清除」改为「整份恢复默认」——
-    // 覆盖外观、布局、播放/阅读偏好与窗口位置;保留资产、阅读进度、任务状态与引导标记。
+    // 恢复外观、布局、播放/阅读偏好与窗口位置；保留资产、阅读进度、任务状态与引导标记。
     resetSettings: 'Restore Default Settings',
     resetSettingsDesc:
       'Restore appearance, layout, playback and reading preferences, and window position to defaults. Assets, reading progress, task state, and the first-launch guide are untouched.',
@@ -1097,30 +1081,17 @@ export default {
     startGenIncremental: 'Incremental (missing only)',
     startGenFullRebuild: 'Full rebuild (regenerate all)',
     stopGen: 'Stop Generation',
-    genStatusRunning: 'Processed: {generated} / {total}',
-    genStatusCompleted: 'Processing finished',
-    thumbPhaseFast: 'Quick processing',
-    thumbPhaseHeavy: 'Large images',
-    thumbPhaseException: 'Finishing problem items',
-    thumbPhaseImageRs: 'Software processing',
-    thumbPhaseVideo: 'Video covers',
+    genStatusRunning: 'Generating: {generated} / {total}',
+    genStatusCompleted: 'Generation completed!',
+    genStatusCancelled: 'Generation cancelled',
+    thumbPhaseImage: 'Image processing',
+    thumbDetailedResults: 'New {newlyGenerated} · Cached {cacheHit} · Direct {direct} · Failed {failed} · Unavailable {temporarilyUnavailable}',
     thumbHardware: {
-      waiting: 'Preparing / waiting', cpu: 'CPU', integrated: 'Integrated GPU + CPU', discrete: 'Discrete GPU + CPU',
-      mixed: 'Discrete / integrated GPUs + CPU', gpuUnknown: 'GPU + CPU (device type unknown)',
-      unknown: 'Some execution details unknown', direct: 'Original images', cache: 'Cached results',
+      waiting: 'Preparing / waiting', cpu: 'CPU', unknown: 'Some execution details unknown', direct: 'Direct source display', cache: 'Cache reuse',
     },
     thumbBackends: {
-      embeddedJpeg: 'Embedded JPEG: CPU decode, resize and encode',
-      imageWic: 'WIC: CPU decode, resize and encode',
-      imageRs: 'image-rs: CPU decode, resize and encode',
-      imageD2d: 'WIC / D2D: CPU decode → GPU resize → CPU encode',
-      imageVpl: 'VPL: GPU decode and resize → CPU encode',
-      videoMf: 'Media Foundation: decode acceleration unknown → CPU encode',
-      videoMfHardwareMft: 'Media Foundation: hardware MFT decode → CPU encode (resize and device type unknown)',
-      unknown: 'Host processing: stage backends unknown',
+      imageWic: 'WIC: CPU decode', imageRs: 'image-rs: CPU decode', unknown: 'Host processing: unknown backend',
     },
-    thumbDetailedResults: 'Generated {newlyGenerated} · Cached {cacheHit} · Originals {direct} · Failed {failed} · Unavailable {temporarilyUnavailable}',
-    genStatusCancelled: 'Generation cancelled',
     genStatusError: 'Generation error',
     aiModels: 'AI Models',
     aiEngineStatus: 'Inference Engine Status',
@@ -1133,19 +1104,32 @@ export default {
     aiForceCpu: 'Force CPU',
     aiHardwareDesc:
       'If the app freezes during loading, force CPU. Reload the engine or test load after changing.',
-    thumbDecodeStrategy: 'Decoding Engine Strategy',
+    thumbDecodeStrategy: 'Thumbnail decoding strategy',
     thumbDecodeDesc:
-      'Choose a thumbnail processing preference. Actual device use depends on the format and system capabilities; direct display reads the original file.',
-    thumbStrategyCpu: 'CPU only',
-    thumbStrategyGpu: 'Prefer GPU (fall back to CPU)',
-    thumbStrategyDirect: 'Display original file',
+      'Automatic prefers the system decoder on Windows; Compatible prefers the portable decoder, with fallback where supported. Other platforms use available decoders. Direct display uses the original file and may use more memory.',
+    thumbStrategyCpu: 'Compatible (Portable decoder first)',
+    thumbStrategyGpu: 'Automatic (Recommended, system decoder first)',
+    thumbStrategyDirect: 'Direct display',
     performancePanel: 'Performance panel',
     performancePanelDesc:
       'Record frame timing, Canvas drawing, and cache metrics in-app with low overhead.',
     performancePanelBtn: 'Open panel',
     galleryRenderMode: 'Gallery render engine (experimental)',
+    experimentalGroup: 'Experimental features',
+    galleryBlendEnabled: 'Gallery image blending',
+    galleryBlendEnabledDesc:
+      'Softly fill gaps with colors from neighboring thumbnail edges. Works only in the Canvas gallery and keeps the existing spacing.',
+    galleryBlendEdgeWidth: 'Edge transition width',
+    galleryBlendEdgeWidthDesc:
+      'Width of the soft transition inside each thumbnail. Set to 0 to fill only the gaps.',
+    galleryBlendBlurRadius: 'Gap blending radius',
+    galleryBlendBlurRadiusDesc:
+      'Softening radius for neighboring edge colors. Higher values blend the colors in the gaps more smoothly.',
+    galleryBlendStrength: 'Blend strength',
+    galleryBlendStrengthDesc:
+      'Opacity of the gap fill and edge transition. Set to 0% to show the original gallery.',
     galleryRenderModeDesc:
-      'Render the gallery grid with DOM or Canvas. Canvas is a prototype; very large libraries or iOS fall back to DOM automatically.',
+      'Render the gallery grid with DOM or Canvas. Canvas draws the viewport.',
     timelineRenderMode: 'Timeline render engine (experimental)',
     timelineRenderModeDesc:
       'Render the right-side timeline with DOM or Canvas. Canvas is a prototype comparison implementation.',
@@ -1245,6 +1229,9 @@ export default {
     aiBatchAdjustedToFixed:
       'Current model is fixed batch={k}, batch size cannot be lower. Adjusted to {k}.',
     unsupportedQuickAction: '(This setting does not support quick actions here)',
+    openRelatedSettings: 'Open related settings',
+    pinAllSettings: 'Pin all settings to Tools',
+    unpinAllSettings: 'Unpin all settings',
     mlTitle: 'Model Library (Download & Switch)',
     mlSource: 'Download Source',
     mlSourceDesc:
@@ -1279,7 +1266,7 @@ export default {
     mlDownloadFailed: 'Download failed: {error}',
     mlSwitchedTo: 'Switched to "{name}"',
     mlSwitchFailed: 'Switch failed: {error}',
-    // 根文件夹显隐(V21,库级排除)
+    // 根文件夹显隐（库级排除）
     rootVisTitle: 'Folder Visibility',
     rootVisIntro:
       "Control whether each scan-root folder is shown. Hiding one removes its media from the gallery, timeline, search, stats and the sidebar folder tree (files aren't deleted); restore any time.",
@@ -1289,7 +1276,7 @@ export default {
     rootVisVisible: 'Visible',
     rootVisHidden: 'Hidden',
     rootVisFailed: 'Operation failed: {code}',
-    // 已知卷面板(T13 离线 UX)
+    // 已知卷面板
     volTitle: 'Known Volumes',
     volIntro:
       'Disks / removable drives the app has registered. Photos on an offline volume are greyed out and auto-recover on reconnect (offline ≠ deleted).',
@@ -1332,11 +1319,16 @@ export default {
     nsAdded: 'Added successfully',
     nsAddFailed: 'Failed to add: {error}',
     nsRemoveFailed: 'Failed to remove: {error}',
-    // ── R1-7 i18n 清理新增（目录/日志/卷操作/AI 引擎状态）──
+    //  目录/日志/卷操作/AI 引擎状态
     openDirFailed: 'Failed to open directory: {error}',
     clearLogsFailed: 'Failed to clear logs: {error}',
     volOpFailedCode: 'Operation failed: {code}',
     aiProviderNotInitialized: 'Not initialized',
+    modelDownloadGuideAi: 'Download the active AI model, then return and start AI analysis again.',
+    modelDownloadGuideFace:
+      'Download the default face model, then return and start face recognition again.',
+    modelDownloadGuideOcr:
+      'Download the active OCR model, then return to the image and extract text again.',
     // 人脸模型库（fm* 前缀，沿用 ml*/vol*/ns* 风格）
     fmTitle: 'Face Models',
     fmIntro:
@@ -1349,10 +1341,10 @@ export default {
     fmFilesReady: '● Files in place',
     fmManualOnly: '○ Manual import only',
     fmNotInstalled: '○ Not installed',
-    // OCR 模型分节(T9 一次写齐,T10 消费)
+    // OCR 模型分节
     ocrTitle: 'OCR Text Extraction Models',
     ocrHint:
-      'Pre-download recognition models; downloading is free, only the recognize command checks a license.',
+      'Download recognition models in advance and activate OCR for free to start recognizing text.',
     ocrTierMobile: 'Standard · ~30MB',
     ocrTierServer: 'High accuracy · ~190MB',
     ocrTierMeta: '{mb}MB',
@@ -1362,10 +1354,10 @@ export default {
     ocrDownloadComplete: 'Download complete',
     ocrDownloadFailed: 'Download failed: {error}',
     ocrManifestUnready: 'Download source not yet available',
-    // 影像增强模型分节(P0 批 5)
+    // 影像增强模型分节
     enhanceTitle: 'Image Enhancement Models',
     enhanceHint:
-      'Pre-download denoise/upscale/de-artifact models; downloading is free, only the enhance command checks a license.',
+      'Download denoise, upscale, and de-artifact models in advance and activate Image Enhancement for free.',
     enhanceManifestUnready: 'Download source for some models is not yet available',
     enhanceModelSizePlaceholder: 'Size TBD',
     enhanceTaskDenoise: 'Denoise',
@@ -1378,15 +1370,15 @@ export default {
   },
   empty: {
     allPhotosTitle: 'Nothing here yet',
-    allPhotosDesc: 'Add a folder with photos to start building your library.',
-    recentlyAdded: 'No recently added photos',
+    allPhotosDesc: 'Add a folder with images, videos, documents, or audio to start building your asset library.',
+    recentlyAdded: 'No recently added assets',
     favoritesTitle: 'No favorites yet',
-    favoritesDesc: 'Click the heart icon on a photo to add it to favorites.',
+    favoritesDesc: 'Click the heart icon on an asset card to add it to favorites.',
     videos: 'No video files',
     livePhotos: 'No Live Photos',
     folder: 'Folder is empty',
     search: 'No results found for "{query}"',
-    filteredTitle: 'No photos match your filters',
+    filteredTitle: 'No assets match your filters',
     filteredDesc: 'Try adjusting or clearing the active filters.',
     computing: 'Computing layout…',
     scrollToTop: 'Scroll to Top',
@@ -1411,7 +1403,7 @@ export default {
     favorited: '{count} items favorited',
     deleted: '{count} items deleted',
     restored: '{count} items restored',
-    // ── R1-7 i18n 清理新增（选择工具条 / 批量操作 toast）──
+    //  选择工具条 / 批量操作 toast
     pendingDelete: 'Pending delete',
     drag: 'Drag',
     invert: 'Invert Selection',
@@ -1431,7 +1423,7 @@ export default {
     rateFailed: 'Batch rating failed: {error}',
     deleteFailed: 'Delete failed: {error}',
   },
-  // 导出整理成果(方案 A):目的文件夹、命名档、冲突策略、manifest 开关与进度文案。
+  // 导出整理成果:目的文件夹、命名档、冲突策略、manifest 开关与进度文案。
   export: {
     dialogTitle: 'Export Selection',
     summaryCount: '{count} items selected',
@@ -1468,51 +1460,38 @@ export default {
     openFolder: 'Open export folder',
     failedToast: 'Export failed',
     cancelledToast: 'Export cancelled',
-    // U-2 方案 A ②:「导出当前视图」入口写入 manifest 的来源名(ExportSource::View.name)。
+    // 「导出当前视图」入口写入 manifest 的来源名(ExportSource::View.name)。
     currentViewName: 'Current view',
   },
-  // Exotic 插件 gate:未授权功能的购买 / 激活引导文案(Part5 T12)。
+  // 功能逐项免费激活与插件资源引导。
   official: {
-    "title": "Scrollery Official",
-    "description": "One purchase and one activation include image editing, OCR, image enhancement, and the PSD engine. Platform and resource requirements still apply.",
-    "retry": "Refresh status",
-    "queryFailed": "Could not load status. Please retry.",
-    "activated": "Official edition activated · Perpetual license",
-    "expired": "License expired. Activate a valid license.",
-    "notActivated": "Official edition not activated",
-    "remove": "Remove local license",
-    "removeWarning": "This disables image editing, OCR, enhancement, and the PSD engine on this device. Plugins, models, and original files stay in place. You can activate again with your license token.",
-    "removeFailed": "Could not remove the license. Please retry.",
-    "buy": "Buy official edition",
-    "notOnSale": "Purchasing is not yet available",
-    "includedLicense": "Included in official edition",
-    "free": "Free",
-    "ocr": "OCR text extraction",
-    "enhance": "Image enhancement",
-    "psd": "PSD image engine",
-    "raw": "RAW image decoding",
-    "video": "Video format extension",
-    "prepareModels": "Prepare models in Settings",
-    "ready": "Ready",
-    "included": "Built in; prepare components as needed",
-    "modelMissing": "Download models to continue",
-    "manifestUnready": "Not ready: release models are not yet available",
-    "workerMissing": "Component missing. Please reinstall the app.",
-    "needsInstall": "Install the plugin below. Installation requires an available release catalog.",
-    "needsActivation": "Activate the official edition to continue",
-    "openFailed": "Could not open the purchase page. Please retry."
+  "title": "Free professional features",
+  "description": "Activate image editing, OCR, image enhancement, and the PSD engine individually for free. No purchase or license key is required. Plugins and models are prepared separately.",
+  "retry": "Refresh status",
+  "queryFailed": "Could not load status. Please retry.",
+  "activated": "Activated for free",
+  "notActivated": "Not activated",
+  "free": "Free to use",
+  "ocr": "OCR text extraction",
+  "enhance": "Image enhancement",
+  "psd": "PSD image engine",
+  "raw": "RAW image decoding",
+  "video": "Video format extension",
+  "prepareModels": "Prepare models in Settings",
+  "ready": "Ready",
+  "included": "Built in; prepare components as needed",
+  "modelMissing": "Download models to continue",
+  "manifestUnready": "Not ready: release models are not yet available",
+  "workerMissing": "Component missing. Please reinstall the app.",
+  "needsInstall": "Install the plugin below. Installation requires an available release catalog.",
+  "needsActivation": "Activate for free to start using this feature",
+  "installPlugin": "Go to plugin installation"
 },
   exotic: {
-    gateChecking: 'Checking entitlement…',
-    gateTitle: 'This feature requires the official edition',
-    gateDescGeneric: 'This feature is included in the official edition. Plugins or models may also need to be prepared.',
-    gateSku: 'Product',
-    gateBuy: 'Get plugin',
-    gateBuyLicense: 'Buy license',
-    gateRenew: 'Get a valid license',
-    gateActivate: 'Already purchased? Activate',
-    gateNoStore: 'Purchasing is not yet available',
-    gateOpenStoreFailed: 'Failed to open the store page: {error}',
+    activateFreeHint: "No purchase, license key, or online verification is needed. Activation is saved on this device.",
+    gateChecking: "Loading activation status…",
+    gateTitle: "Activate this feature for free",
+    gateDescGeneric: "Activate this feature for free. Plugins and models may need to be prepared separately.",
     blockedTitle: 'This feature is currently unavailable',
     blockedUnsupportedPlatform: 'No plugin package is available for the current platform.',
     blockedIncompatibleHost:
@@ -1520,18 +1499,15 @@ export default {
     blockedInvalidInstallation:
       'The plugin installation is corrupted. Please reinstall or repair it.',
     blockedDisabled: 'This plugin or its subsystem has been disabled.',
-    activateTitle: 'Activate official edition',
-    activateDesc: 'Activate the official edition to use {name} and the other included features.',
-    activateDescGeneric: 'Paste your official edition license token to activate all included features.',
-    activateTokenPlaceholder: 'Paste your license token here…',
-    activateSubmit: 'Activate',
+    activateTitle: "Free activation",
+    activateDesc: "Activate {name} for free to enable this feature.",
+    activateSubmit: "Activate for free",
     activating: 'Activating…',
-    activateEmpty: 'Please enter a license token',
-    activateSuccess: 'Activated successfully',
+    activateSuccess: "Activated for free",
     activateFailed: 'Activation failed ({code})',
-    // ── 插件商店(T11)───────────────────────────────────────────────
+    //  插件商店
     storeTitle: 'Features & Plugins',
-    storeSubtitle: 'Manage your official edition license, built-in features, and format plugins.',
+    storeSubtitle: "Activate professional features for free and manage plugins and resources.",
     storeRefresh: 'Refresh catalog',
     storeRefreshing: 'Refreshing…',
     storeRefreshed: 'Updated: {count} plugin(s) available',
@@ -1550,8 +1526,8 @@ export default {
     uninstall: 'Uninstall',
     repair: 'Repair',
     rollback: 'Roll back',
-    activateAction: 'Activate',
-    activated: 'Activated',
+    activateAction: "Activate for free",
+    activated: "Activated for free",
     version: 'Version',
     installedOk: 'Installed',
     uninstalledOk: 'Uninstalled',
@@ -1561,9 +1537,8 @@ export default {
     uninstallTitle: 'Uninstall plugin',
     uninstallMsg:
       'This removes the plugin files (your photos and generated thumbnails are unaffected).',
-    uninstallRemoveLicense: 'Also remove the license (re-activation required next time)',
     procTitle: 'Processing',
-    procBlocked: '{n} item(s) on hold (unlicensed / unsupported)',
+    procBlocked: "{n} item(s) on hold (not activated / not installed / unsupported)",
     procStart: 'Start',
     procPause: 'Pause',
     procStop: 'Stop',
@@ -1580,18 +1555,17 @@ export default {
     procDetailEmpty: 'No records for this filter',
     procDetailCap: 'Showing first {n} items; narrow with a filter',
   },
-  // 插件商店 builtin 条目(D-OCR-5,T9 一次写齐,T10/T11 消费):无安装包,激活即用
+  // 插件商店 builtin 条目:无安装包,激活即用
   store: {
     builtinTitle: 'Built-in Capability Plugins',
     builtinNoInstall: 'No installation needed, ready after activation',
-    // 视频格式扩展子系统(V7,design.md §3.4):FFmpeg 商标/LGPL 许可声明——全链路以进程边界
+    // 视频格式扩展:FFmpeg 商标/LGPL 许可声明——全链路以进程边界
     // 调用 FFmpeg(不静态/动态链接),仍按 LGPL 精神展示声明与源码获取渠道。
     videoExtendedFfmpegNotice:
       'This feature invokes FFmpeg as a separate process (LGPL-licensed, downloaded on demand, not bundled with the installer, not linked into this app). FFmpeg is a trademark of the FFmpeg project.',
     videoExtendedSourceLink: 'Get corresponding source',
   },
-  // ══ R1-7 i18n 清理：以下顶层命名空间为本轮硬编码文案迁移新增 ══
-  // 通用跨功能 UI 词条（多个 feature 共用的动作/状态词，去重收敛于此）
+  // 跨功能通用动作与状态文案。
   performance: {
     title: 'Developer Tools · Performance',
     shortcut: 'Shortcut: Ctrl+Shift+P',
@@ -1647,6 +1621,7 @@ export default {
 
   common: {
     confirm: 'Confirm',
+    retry: 'Retry',
     cancel: 'Cancel',
     typeToConfirm: 'Type "{word}" to confirm',
     ok: 'OK',
@@ -1701,7 +1676,9 @@ export default {
     unnamedPerson: 'Unnamed person',
     unnamed: 'Unnamed',
     subtitle:
-      'People clustered by face recognition. Click to view their photos; double-click a name to rename.',
+      'People clustered by face recognition. Click a portrait to view photos, or a name to rename.',
+    viewPhotos: 'View photos of {name}',
+    rename: 'Rename {name}',
     approveTitle: 'Review face clustering suggestions: confirm or reject unconfirmed faces',
     approveSuggestions: 'Review suggestions ({count})',
     reclusterTitle:
@@ -1776,11 +1753,6 @@ export default {
     rebuildConfirmMsg:
       'This will clear all analyzed vectors for the current model; you will need to run the analysis again (may take a while). Continue?',
     rebuildConfirm: 'Clear & Rebuild',
-    // First run without downloaded models: shown when analysis is rejected (confirm only navigates).
-    modelMissingTitle: 'AI model not downloaded yet',
-    modelMissingMsg:
-      'AI analysis needs the model files first. Go to "Settings → AI → Model Library" to download the active model, then come back here and start again.',
-    modelMissingGo: 'Go to download',
     emptyPrompt: 'Describe the image in natural language in the search box above',
     emptyExamples: 'e.g. "sunset at the beach", "selfie of two people", "cat playing"',
     searching: 'Analyzing…',
@@ -1810,6 +1782,7 @@ export default {
   },
   // 音频播放器
   audio: {
+    playFailed: 'Unable to play audio. Try pressing Play again or open it in an external player.',
     play: 'Play',
     playPause: 'Play / Pause',
     rewind10: 'Rewind 10 seconds',
@@ -1822,6 +1795,37 @@ export default {
   },
   // 文档查看器（阅读 / 编辑 / 版本 / AI 校对 / 替换）
   doc: {
+    leaveEditTitle: 'Save document changes?',
+    leaveEditMessage: 'This document has unsaved changes. Save a new version before leaving; the original file will be kept.',
+    saveVersionAndLeave: 'Save new version and leave',
+    keepEditing: 'Keep editing',
+    finishEditing: 'Finish editing',
+    editorUnsaved: 'Unsaved changes',
+    editorSaved: 'No unsaved changes',
+    editorPosition: 'Ln {line}, Col {column} · {total} lines',
+    documentLinkFailed: 'Cannot open this link. The target must be an accessible TXT or Markdown document registered in the same library root.',
+    documentLinkHeadingMissing: 'Document opened, but the linked heading was not found.',
+    copyCode: 'Copy code',
+    editorGoToLine: 'Go to line',
+    editorLineRange: 'Enter a whole line number from 1 to {total}',
+    editorGo: 'Go',
+    saveAndContinue: 'Save a new version and keep editing',
+    discardEditTitle: 'Discard unsaved changes?',
+    discardEditMessage: 'Unsaved text and the version name will be discarded. Saved versions and the original file will be kept.',
+    discardEditConfirm: 'Discard changes',
+    vditorOutlineSourceMode: 'Switch to instant rendering or WYSIWYG mode to use the outline.',
+    editorSearchPlaceholder: 'Find in document',
+    editorSearchCount: '{current} / {total}',
+    editorSearchPrevious: 'Previous match',
+    editorSearchNext: 'Next match',
+    editorMatchCase: 'Match case',
+    editorReplace: 'Replace',
+    editorReplacement: 'Replace with (empty to delete)',
+    editorReplaceAll: 'Replace all',
+    editorReplaceSourceHint: 'Switch to source mode to replace text.',
+    editorSwitchToSource: 'Switch to source',
+    editorReplaceFailed: 'The editor could not apply this replacement. Your text is unchanged.',
+    editorImagePasteRetry: 'Image not inserted: the document changed or the image could not be read. Please paste it again.',
     pagerMode: 'Paging',
     pagerScroll: 'Continuous scroll',
     pagerWheelSnap: 'Wheel paging',
@@ -1883,6 +1887,7 @@ export default {
     searchPlaceholder: 'Search in book…',
     searching: 'Searching…',
     searchNoResults: 'No matches',
+    searchFailed: 'Search could not be completed. Press Enter to retry.',
     searchHits: '{n} matches',
     bookmarks: 'Bookmarks',
     addBookmark: 'Add current position',
@@ -1906,8 +1911,10 @@ export default {
     readerEngineNative: 'Standard reader',
     readerEngineVditor: 'Vditor',
     readerEngineMarkdownEditor: 'Markdown Editor (experimental)',
-    markdownEditorInMemory:
-      'Experimental editor: changes stay in this window and are not saved yet ({length} characters)',
+    markdownEditorUnsaved: 'Waiting to save ({length} characters)',
+    vditorCachedDraft: 'An older local draft was found. Restoring it will save it to the document.',
+    vditorRestoreDraft: 'Restore and save draft',
+    vditorKeepSource: 'Not now',
     markdownEditorUnavailable:
       'This WebView does not support EditContext. The experimental editor is unavailable.',
     markdownEditorInitFailed: 'The experimental editor failed to initialize: {error}',
@@ -1942,7 +1949,7 @@ export default {
     proofreadDiscard: 'Discard',
     proofreadFailed: 'Proofreading failed: {error}',
     proofreadVersionLabel: 'AI proofread draft',
-    // 用户动作 IPC 失败反馈(审查 P1-16):此前保存/覆盖/配置类写操作失败静默无提示。
+    // 保存、覆盖与配置操作的失败反馈。
     saveVersionFailed: 'Failed to save version: {error}',
     overwriteFailed: 'Failed to overwrite source file: {error}',
     saveConfigFailed: 'Failed to save proofreading config: {error}',
@@ -1975,9 +1982,7 @@ export default {
     view: 'View',
     hgalleryLab: 'Horizontal Gallery Lab',
   },
-  // ── Main-gallery duplicates lens (docs/designs/2026-09-02 §5.1/§6/§9) ──
-  // Status copy and actions follow the §9 state table; single source in
-  // components/media/duplicateLensStatus.ts.
+  // 主画廊重复项状态文案由 duplicateLensStatus.ts 统一判定。
   duplicatesLens: {
     notAnalyzedTitle: 'No exact duplicate results yet',
     notAnalyzedDesc: 'Run an analysis to browse by duplicate group or folder',
@@ -2046,6 +2051,12 @@ export default {
     copyNeedsRescan:
       'Copied {count} files to "{path}", but they are not in the library yet — rescan to add them. {error}',
     copyRescanNow: 'Rescan',
+    copyProgress: 'Copied: {count} files · {size}',
+    copyPublishing: 'Finishing copy…',
+    copyCancelling: 'Cancelling copy…',
+    copyCancelled: 'Copy cancelled',
+    copyCancelFailed: 'Could not cancel copy: {error}',
+    copyBusy: 'A folder copy is already running',
   },
   // 拖拽媒体到文件夹（右键落点菜单）
   dragDrop: {
@@ -2069,7 +2080,7 @@ export default {
     remember: "Remember my choice and don't ask again",
     minimize: 'Minimize to Tray',
     exit: 'Exit App',
-    // IPC 失败反馈(审查 P1-16):此前先关弹窗后 await,退出/托盘失败零提示。
+    // 退出或最小化到托盘失败时保留反馈入口。
     actionFailed: 'Action failed: {error}',
     // 退出前 flush 失败(设置集中保存):在途/待保存设置未能落盘,由用户裁决重试或放弃。
     flushFailed: 'Some settings could not be saved. Retry, or discard the unsaved changes and exit.',
@@ -2099,7 +2110,7 @@ export default {
     newElsewhereTitle: 'Create a folder at any local location',
     newElsewhere: 'New Folder Elsewhere…',
   },
-  // 独立日志窗口(日志能力重构 S4,方案 §5)
+  // 独立日志窗口
   logWindow: {
     tabLive: 'Live',
     tabHistory: 'History',
@@ -2142,7 +2153,7 @@ export default {
     errorAggLast: 'Last',
     errorAggSample: 'Sample',
     errorAggEmpty: 'No logs carry an error.code yet',
-    // span 埋点线 W2:span 耗时 Top N
+    // span 耗时 Top N
     spanAggTitle: 'Span duration (Top 20)',
     columnSpanName: 'span',
     spanAggCount: 'Count',

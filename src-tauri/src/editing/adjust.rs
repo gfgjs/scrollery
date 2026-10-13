@@ -1,13 +1,13 @@
-//! E3 调色(设计 §4.3/§4.4;D-104/D-106/D-107/D-108):亮度/对比度/饱和度三参数。
+//! 亮度、对比度与饱和度调色。
 //!
 //! 公式钉死,与前端 `src/composables/adjustFormula.ts` 双端同源,共享
 //! `src/fixtures/adjustGolden.json` 黄金向量。**有意**作用在 sRGB gamma 编码域而非线性光,
-//! 与 CSS/主流简易编辑器语义对齐——不是疏漏,防未来误「修」:
+//! 与 CSS/简易编辑器语义对齐：
 //! - 亮度 b∈[-100,100]:`k_b = 2^(b/100)`,`v' = v·k_b`(乘法;±100 恰为 ±1EV);
 //! - 对比度 c∈[-100,100]:`k_c = (100+c)/100`,`v' = (v−0.5)·k_c + 0.5`(线性系数;
-//!   **不采用** image crate `imageops::contrast` 的平方映射,两者数学不等价,设计 §1.3 实证);
+//!   不采用 image crate `imageops::contrast` 的平方映射，两者数学不等价);
 //! - 饱和度 s∈[-100,100]:`k_s = (100+s)/100`,W3C Filter Effects saturate 矩阵,
-//!   luma 权重 [0.213, 0.715, 0.072](仅在 sRGB 原色下成立,D-108 保证进公式前已在 sRGB);
+//!   luma 权重 [0.213, 0.715, 0.072]（输入须已在 sRGB）;
 //! - 应用序:亮度 → 对比度 → 饱和度(钉死);每步 clamp [0,1];alpha 通道不动。
 //!
 //! 管线(设计 §4.4「有 adjust」):源 ICC 经 moxcms(relative colorimetric,与 E0 预览同
@@ -15,8 +15,7 @@
 //! 经 CMS 后升 RGB 是色彩转换的固有结果)。无 ICC 按 sRGB 直入且完全保持原变体。CMS 走
 //! 分条(strip)转换:瞬态 f32 缓冲 O(条),整体峰值≈输入+输出两个像素缓冲,与 rotate90
 //! 已实测计量的双缓冲峰形同级,不需要独立 memory_budget 门。
-//! 全零参数在命令层被 [`effective_adjust`] 过滤为 `None`,完全不进入本模块(D-106:
-//! 位深与 ICC 直通行为与 v1 字节级不变)。
+//! 全零参数经 [`effective_adjust`] 过滤为 `None`，跳过调色以保留源位深与 ICC。
 
 use image::DynamicImage;
 use moxcms::{ColorProfile, DataColorSpace, Layout};
@@ -63,7 +62,7 @@ pub fn validate_adjust(ops: &AdjustOps) -> Result<(), AppError> {
     }
 }
 
-/// D-106:全零载荷视同未提供——调用方据此完全跳过调色管线,保住 v1 字节级直通契约。
+/// 全零载荷视同未提供，调用方跳过调色管线以保留字节级直通。
 pub fn effective_adjust(adjust: Option<AdjustOps>) -> Option<AdjustOps> {
     adjust.filter(|ops| !ops.is_neutral())
 }

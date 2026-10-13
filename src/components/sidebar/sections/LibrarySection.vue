@@ -45,7 +45,7 @@
         </button>
       </li>
 
-      <!-- 插件商店（T11）：exotic 格式插件的浏览/安装/激活入口 -->
+      <!-- exotic 格式插件的浏览、安装和激活入口。 -->
       <li>
         <button
           class="nav-item"
@@ -57,7 +57,7 @@
         </button>
       </li>
 
-      <!-- 重复项：进入主画廊重复镜头（browse-only 浏览，方案 §4.3） -->
+      <!-- 重复项入口进入主画廊的只读重复镜头。 -->
       <li>
         <button
           class="nav-item"
@@ -157,7 +157,7 @@ function onPluginsClick() {
 }
 
 function onDuplicatesClick() {
-  // 深链语义直推 URL（2026-09-02 方案 §4.3）：不走 duplicateLensStore.enterLens——它会把当前
+  // 深链语义直推 URL：不走 duplicateLensStore.enterLens，它会把当前
   // fullPath 拍成返回快照，从侧栏（常已在「/」）点击时快照自指；这里只落
   // ?duplicates=groups，由 useGalleryQuerySync 的 route.query watcher 水合镜头 store。
   // 无返回快照 = 深链语义，退出镜头即回普通「/」。已在目标位置时 push 幂等（duplicated nav 直接 resolve）。

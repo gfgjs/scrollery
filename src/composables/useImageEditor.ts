@@ -104,6 +104,7 @@ export function useImageEditor() {
 
   const errorMessage = ref<string | null>(null)
   const savedNeedsIndex = ref<{ pathHint: string; rootId: number } | null>(null)
+  const lastSavedParameters = ref<string | null>(null)
 
   // 源图在「文件 orientation 已应用一次」坐标系里的原始尺寸(EditOverlay 的 <img> onload 回填)。
   const naturalWidth = ref(0)
@@ -137,17 +138,38 @@ export function useImageEditor() {
   const postWidth = computed(() => postFineSize.value.width)
   const postHeight = computed(() => postFineSize.value.height)
 
-  const hasChanges = computed(
-    () =>
-      rotate.value !== 0 ||
+  const saveParameters = computed(() => ({
+    ops: {
+      rotate: rotate.value,
+      flipH: flipH.value,
+      flipV: flipV.value,
+      rotateFine: rotateFine.value,
+      crop: cropToPixelRect(),
+      // 全零时不携带 adjust，后端继续走原有直通路径。
+      adjust: brightness.value === 0 && contrast.value === 0 && saturation.value === 0
+        ? undefined
+        : { brightness: brightness.value, contrast: contrast.value, saturation: saturation.value },
+    },
+    output: {
+      format: format.value,
+      quality: format.value === 'jpeg' ? quality.value : undefined,
+      fileName: undefined,
+    },
+  }))
+
+  const hasChanges = computed(() => {
+    if (lastSavedParameters.value !== null) {
+      return JSON.stringify(saveParameters.value) !== lastSavedParameters.value
+    }
+    return rotate.value !== 0 ||
       flipH.value ||
       flipV.value ||
       rotateFine.value !== 0 ||
       crop.value !== null ||
       brightness.value !== 0 ||
       contrast.value !== 0 ||
-      saturation.value !== 0,
-  )
+      saturation.value !== 0
+  })
 
   function setNaturalSize(w: number, h: number): void {
     naturalWidth.value = w
@@ -170,6 +192,7 @@ export function useImageEditor() {
     quality.value = 92
     errorMessage.value = null
     savedNeedsIndex.value = null
+    lastSavedParameters.value = null
     naturalWidth.value = 0
     naturalHeight.value = 0
     baseViewRotation.value = detail.viewRotation
@@ -294,31 +317,14 @@ export function useImageEditor() {
     status.value = 'saving'
     errorMessage.value = null
     try {
-      // D-106:三滑杆全零时不携带 adjust 字段,后端走 v1 字节级直通路径。
-      const adjust =
-        brightness.value === 0 && contrast.value === 0 && saturation.value === 0
-          ? undefined
-          : {
-              brightness: brightness.value,
-              contrast: contrast.value,
-              saturation: saturation.value,
-            }
+      const parameters = saveParameters.value
+      // 保存返回前状态可能继续变化；仅将这次实际提交的参数标记为已保存。
+      const savedParameters = JSON.stringify(parameters)
       const result = await invokeIpc<EditSaveResult>(IPC.SAVE_EDITED_IMAGE, {
         itemId,
-        ops: {
-          rotate: rotate.value,
-          flipH: flipH.value,
-          flipV: flipV.value,
-          rotateFine: rotateFine.value,
-          crop: cropToPixelRect(),
-          adjust,
-        },
-        output: {
-          format: format.value,
-          quality: format.value === 'jpeg' ? quality.value : undefined,
-          fileName: undefined,
-        },
+        ...parameters,
       })
+      lastSavedParameters.value = savedParameters
       if (result.status === 'savedNeedsIndex') {
         savedNeedsIndex.value = { pathHint: result.pathHint, rootId: result.rootId }
         status.value = 'partial'

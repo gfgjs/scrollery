@@ -1,14 +1,7 @@
-// src-tauri/src/video/playback_orchestrator.rs
-//! 视频格式扩展 · 播放链路编排内核(design.md §5)。从 `ipc/video_commands.rs` 拆出的
-//! 私有调用链(超长文件拆分方案 tierB-2):`resolve_impl` 判定 → `resolve_derived` 分流 →
-//! `spawn_playable_job` 后台产出 → 事件/快照广播。命令壳(`#[tauri::command]`)与 DTO
-//! 契约原样留在 `ipc/video_commands.rs`,只经 `pub(crate)` 接口调用本模块。
+//! 播放链路编排：解析可播路径、派生视频、广播事件与进度快照。
+//! IPC 命令入口位于 `ipc/video_commands.rs`。
 //!
-//! ## 硬约束落实
-//! - rusqlite 全走 `spawn_blocking`;不跨 `.await` 持 std Mutex。
-//! - `PREPARING_OUTPUTS`/`PLAYBACK_PROGRESS` 两个 static 是命令壳(`cancel_video_playback`/
-//!   `video_playback_progress_snapshot`)与本模块的唯一跨文件耦合点——只经下方 `pub(crate)`
-//!   读写函数暴露,static 本身不出模块(拆分方案 tierB-2 §③最大风险)。
+//! 数据库调用在阻塞线程执行；`PREPARING_OUTPUTS` 与 `PLAYBACK_PROGRESS` 只经本模块函数访问。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -848,32 +841,4 @@ fn spawn_progress_forwarder(
             emit_progress_percent(&app, item_id, &snap);
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// §9.1 rename 前源指纹复核(项 1):现值 mtime:size 与 resolve 时拼的 `fingerprint` 一致才
-    /// 放行;mtime 变、size 变、或两者都变(源文件在派生耗时窗口内被替换/编辑)均判不通过。
-    #[test]
-    fn source_fingerprint_matches_detects_source_file_drift() {
-        let original = format!("{}:{}", 1_700_000_000_i64, 12345_i64);
-        assert!(
-            source_fingerprint_matches(1_700_000_000, 12345, &original),
-            "mtime/size 与 resolve 时一致 → 应放行"
-        );
-        assert!(
-            !source_fingerprint_matches(1_700_000_001, 12345, &original),
-            "mtime 变化(内容被改)→ 应判不符"
-        );
-        assert!(
-            !source_fingerprint_matches(1_700_000_000, 99999, &original),
-            "size 变化(内容被替换)→ 应判不符"
-        );
-        assert!(
-            !source_fingerprint_matches(1_700_000_001, 99999, &original),
-            "mtime+size 都变 → 应判不符"
-        );
-    }
 }

@@ -11,7 +11,7 @@
 // `navigator.mediaCapabilities.decodingInfo` 实测——能解就直接当 direct 播原文件,免去一次
 // 不必要的转码等待;探测失败/API 缺失一律保守走引导态。
 
-import { ref, computed, watch, type Ref } from 'vue'
+import { ref, computed, onScopeDispose, watch, type Ref } from 'vue'
 import { useTauriListen } from '../useTauriListen'
 import { invokeIpc, type IpcError } from '../../utils/ipc'
 import { resolveAssetUrl } from '../../utils/assetUrl'
@@ -98,6 +98,9 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
   // needsHevcExt「改用本地转码」→needsConfirm 的粘性标记(V7 项6):记住本次流程是否携带
   // force_transcode,使 needsConfirm 态「继续生成」二次确认时不丢失 forceTranscode 意图。
   const pendingForceTranscode = ref(false)
+  // 一次解析只拥有本轮状态；切项、重试和终态事件都会使在途响应失效。
+  let requestGeneration = 0
+  onScopeDispose(() => requestGeneration++)
 
   function resetState() {
     mode.value = 'idle'
@@ -110,14 +113,14 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
     pendingForceTranscode.value = false
   }
 
-  async function loadProgressSnapshot(id: number) {
+  async function loadProgressSnapshot(id: number, generation: number) {
     try {
       const snap = await invokeIpc<VideoPlaybackProgressSnapshot | null>(
         IPC.VIDEO_PLAYBACK_PROGRESS_SNAPSHOT,
         { itemId: id },
       )
       // 快照只是辅助恢复进度条展示;取回时查看项可能已切换,过期结果丢弃。
-      if (getId() !== id || !snap) return
+      if (generation !== requestGeneration || getId() !== id || !snap) return
       // 仅在仍处于 preparing 且尚无进度时应用(V7 项3):防事件驱动已把 mode/percent 推进到
       // 更新状态后,迟到的快照又把它们回退,或覆盖掉已存在的更新值。
       if (mode.value !== 'preparing' || percent.value !== null) return
@@ -128,8 +131,8 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
     }
   }
 
-  async function applyResolution(id: number, res: VideoPlaybackResolution) {
-    if (getId() !== id) return // 查看项已切换,过期响应丢弃
+  async function applyResolution(id: number, generation: number, res: VideoPlaybackResolution) {
+    if (generation !== requestGeneration || getId() !== id) return
     verdict.value = res.verdict ?? null
     // pendingForceTranscode 清零纪律:先按「非 needsConfirm 分支不残留」的默认假设清零,
     // 仅 needsConfirm 分支按 server 回显重新赋值——避免 force 流放弃/error 重试回到
@@ -147,7 +150,7 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
       case 'preparing':
         mode.value = 'preparing'
         resolvedSrc.value = null
-        await loadProgressSnapshot(id)
+        await loadProgressSnapshot(id, generation)
         break
       case 'needsComponent':
         mode.value = 'needsComponent'
@@ -156,7 +159,7 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
       case 'needsHevcExt': {
         // 前端实测修正(design §5.1):可硬解 → 直接当 direct 播原文件,不必等引导/转码。
         const decodable = res.src ? await probeHevcDecodable() : false
-        if (getId() !== id) return // 探测耗时窗口内查看项可能已切换
+        if (generation !== requestGeneration || getId() !== id) return
         if (decodable && res.src) {
           mode.value = 'direct'
           resolvedSrc.value = resolveAssetUrl(res.src)
@@ -183,14 +186,15 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
   ) {
     const id = getId()
     if (id == null) return
+    const generation = ++requestGeneration
     try {
       const res = await invokeIpc<VideoPlaybackResolution>(
         confirmed ? IPC.CONFIRM_VIDEO_PLAYBACK : IPC.RESOLVE_VIDEO_PLAYBACK,
         confirmed ? { itemId: id, forceTranscode, forceTranscodeConfirmed } : { itemId: id },
       )
-      await applyResolution(id, res)
+      await applyResolution(id, generation, res)
     } catch (e) {
-      if (getId() !== id) return
+      if (generation !== requestGeneration || getId() !== id) return
       mode.value = 'error'
       errorCode.value = (e as IpcError)?.code ?? 'Unknown'
     }
@@ -200,6 +204,14 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
   useTauriListen<VideoPlaybackProgressPayload>(EVENTS.VIDEO_PLAYBACK_PROGRESS, (event) => {
     const payload = event.payload
     if (payload.itemId !== getId()) return // 非当前查看项的进度,忽略
+    // 取消命令不作废已就绪产物；切走再返回后，旧取消广播不能盖住新解析出的可播放源。
+    if (
+      payload.status === 'cancelled'
+      && (mode.value === 'direct' || mode.value === 'derived')
+      && resolvedSrc.value
+    ) return
+    // 后台任务可能先完成、解析 IPC 才返回 preparing；终态必须胜过那份旧响应。
+    if (payload.status !== 'preparing') requestGeneration++
     switch (payload.status) {
       case 'preparing':
         // 终态守卫(V7 项4):mode 已推进到 derived/direct(如已切到缓存命中的直接播放)后,
@@ -266,13 +278,14 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
     // 进入时快照 id(项1):await 期间查看项可能已切换,成功/失败路径都不得砸新项的状态
     // (新项自己的 watch 早已接管解析,本次收尾只该管「本次点击对应的那个 id」)。
     const id = getId()
+    const generation = requestGeneration
     downloadingComponent.value = true
     try {
       await invokeIpc(IPC.DOWNLOAD_VIDEO_COMPONENT)
-      if (getId() !== id) return // 查看项已切换,不替新项重复触发 resolve
+      if (generation !== requestGeneration || getId() !== id) return
       await doResolve(false)
     } catch (e) {
-      if (getId() !== id) return // 查看项已切换,error 不得覆盖新项当前状态
+      if (generation !== requestGeneration || getId() !== id) return
       mode.value = 'error'
       errorCode.value = (e as IpcError)?.code ?? 'Unknown'
     } finally {
@@ -288,10 +301,11 @@ export function useVideoSource(itemId: Ref<number | null> | (() => number | null
   watch(
     getId,
     (id) => {
+      requestGeneration++
       resetState()
       if (id != null) void doResolve(false)
     },
-    { immediate: true },
+    { immediate: true, flush: 'sync' },
   )
 
   return {

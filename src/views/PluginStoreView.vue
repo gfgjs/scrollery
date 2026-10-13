@@ -1,8 +1,8 @@
-<!-- 插件商店（Part5 T11）：浏览签名 Registry 可安装条目 + 安装生命周期 + 处理进度。 -->
+<!-- 插件商店展示可安装条目、安装状态与处理进度。 -->
 <!--
   前后端职责：本视图只调后端命令（列表 / 安装 / 激活 / 进度），
      验签 / 防回滚 / 完整性校验全在后端；命令只传已校验 pluginId，不碰下载坐标，不持验签逻辑。
-  数据/动作经 useExoticStore；激活复用 ExoticActivateDialog。
+  数据/动作经 useExoticStore；激活复用 FeatureActivationDialog。
 -->
 <template>
   <div class="plugin-store">
@@ -126,7 +126,7 @@
       </div>
     </section>
 
-    <!-- 首次加载占位:骨架卡片(S5),替代空转 spinner。 -->
+    <!-- 首次加载显示骨架卡片。 -->
     <div v-if="store.loading.value && rows.length === 0" class="ps-skeleton">
       <div v-for="i in 3" :key="i" class="skeleton-block ps-skeleton__card" />
     </div>
@@ -200,15 +200,15 @@
               >
                 <Wrench :size="14" /> {{ $t('exotic.repair') }}
               </button>
-              <!-- 已授权 → 状态标识；否则显激活入口（激活后即时切换，2026-07-05 内测）。 -->
+              <!-- 已激活 → 状态标识；否则显激活入口（激活后即时切换，2026-07-05 内测）。 -->
               <span
-                v-if="entitlements[row.pluginId] === 'authorized'"
+                v-if="entitlements[row.pluginId]?.activated"
                 class="ps-activated"
               >
                 <CheckCircle2 :size="14" /> {{ $t('exotic.activated') }}
               </span>
               <button
-                v-else
+                v-else-if="entitlements[row.pluginId]?.activationRequired"
                 class="btn btn-ghost btn-sm"
                 @click="activateTarget = row.pluginId"
               >
@@ -225,9 +225,10 @@
     </div>
 
     <!-- 激活对话框：由某行「激活」触发。 -->
-    <ExoticActivateDialog
+    <FeatureActivationDialog
       :open="activateTarget !== null"
-      :feature-name="$t('official.title')"
+      :feature-id="activateTarget ?? ''"
+      :feature-name="rows.find((row) => row.pluginId === activateTarget)?.name ?? activateTarget ?? ''"
       @close="activateTarget = null"
       @activated="onActivated"
     />
@@ -257,18 +258,17 @@ import {
 import { useI18n } from 'vue-i18n'
 
 import OfficialFeaturesPanel from '../components/exotic/OfficialFeaturesPanel.vue'
-import ExoticActivateDialog from '../components/exotic/ExoticActivateDialog.vue'
+import FeatureActivationDialog from '../components/exotic/FeatureActivationDialog.vue'
 import { useExoticStore, mergeStorePlugins, type StorePluginRow } from '../composables/useExoticStore'
 import { resetOcrStatusCache } from '../composables/useOcr'
 import { useToastStore } from '../stores/toastStore'
 import { useConfirm } from '../composables/useConfirm'
 import { IPC, EVENTS } from '../constants/ipc'
 import type {
-  Availability,
   ExoticTaskBucket,
   ExoticTaskDetail,
   ExoticTaskDetailStatus,
-  PluginEntitlement,
+  PluginAvailability,
 } from '../types/exotic'
 import { invokeIpc, type IpcError } from '../utils/ipc'
 
@@ -307,26 +307,32 @@ const procBusy = ref(false)
 const refreshing = ref(false)
 const activateTarget = ref<string | null>(null)
 
-// ── 授权态（2026-07-05 内测：激活后卡片须显「已激活」，而非永远的激活按钮）────────
+// ── 激活状态（2026-07-05 内测：激活后卡片须显「已激活」，而非永远的激活按钮）────────
 // 按已装插件逐个取 entitlement；取失败（含 'no_offering' 预期分支）静默不显徽章、保留激活入口。
-const entitlements = reactive<Record<string, Availability | undefined>>({})
+const entitlements = reactive<Record<string, PluginAvailability | undefined>>({})
 
-async function loadEntitlements() {
+// 已装列表每次重载（挂载 / 安装 / 卸载 / 修复 / 激活后）都换新数组引用 → 重取激活状态。
+watch(() => store.installed.value, async (installed, _previous, onCleanup) => {
+  let active = true
+  // 新快照或离开商店后，旧查询不得把已激活状态恢复成旧按钮。
+  onCleanup(() => { active = false })
+  const installedIds = new Set(installed.map((p) => p.pluginId))
+  for (const pluginId of Object.keys(entitlements)) {
+    if (!installedIds.has(pluginId)) delete entitlements[pluginId]
+  }
   await Promise.all(
-    store.installed.value.map(async (p) => {
+    installed.map(async (p) => {
       try {
-        const e = await invokeIpc<PluginEntitlement>(IPC.GET_PLUGIN_ENTITLEMENT, {
+        const e = await invokeIpc<PluginAvailability>(IPC.GET_PLUGIN_AVAILABILITY, {
           pluginId: p.pluginId,
         })
-        entitlements[p.pluginId] = e.availability
+        if (active) entitlements[p.pluginId] = e
       } catch {
-        entitlements[p.pluginId] = undefined
+        if (active) entitlements[p.pluginId] = undefined
       }
     }),
   )
-}
-// 已装列表每次重载（挂载 / 安装 / 卸载 / 修复 / 激活后）都换新数组引用 → 重取授权态。
-watch(() => store.installed.value, loadEntitlements)
+})
 
 // ── 处理详情（2026-07-05 内测需求：展开查看处理了哪些冷门格式文件）──────────────
 // 桶筛选与摘要四桶对齐；列表活动优先排序（后端定序）；「加载更多」按窗口整取
@@ -337,6 +343,7 @@ const detailsOpen = ref(false)
 const detailBucket = ref<ExoticTaskBucket | null>(null)
 const details = ref<ExoticTaskDetail[]>([])
 const detailsLoading = ref(false)
+let detailsRequest = 0
 
 const bucketDefs = computed(
   (): { key: ExoticTaskBucket | null; label: string; count: number }[] => [
@@ -357,18 +364,21 @@ function statusText(s: ExoticTaskDetailStatus): string {
 }
 
 async function fetchDetails(windowSize?: number) {
+  const request = ++detailsRequest
   const size = windowSize ?? (details.value.length || DETAIL_PAGE)
   detailsLoading.value = true
   try {
-    details.value = await invokeIpc<ExoticTaskDetail[]>(IPC.LIST_EXOTIC_TASK_DETAILS, {
+    const snapshot = await invokeIpc<ExoticTaskDetail[]>(IPC.LIST_EXOTIC_TASK_DETAILS, {
       bucket: detailBucket.value,
       limit: Math.min(Math.max(size, DETAIL_PAGE), DETAIL_CAP),
       offset: 0,
     })
+    // 筛选切换和后台进度刷新会重叠，旧请求只能自行结束，不能覆盖当前详情。
+    if (request === detailsRequest) details.value = snapshot
   } catch {
     // 详情为辅助面板：取失败静默保留旧数据（摘要区仍可用，避免 toast 噪音）。
   } finally {
-    detailsLoading.value = false
+    if (request === detailsRequest) detailsLoading.value = false
   }
 }
 
@@ -429,17 +439,22 @@ onMounted(() => {
     // 失败不弹 toast，由顶部错误横幅展示，避免“空列表无提示”。
     const shouldAutoRefresh =
       store.registry.value.length === 0 || store.registry.value.some((r) => r.registryExpired)
-    if (shouldAutoRefresh && !store.error.value) {
+    if (shouldAutoRefresh && !store.error.value && !refreshing.value) {
+      // 自动与手动刷新共用忙态，避免并发刷新后旧失败覆盖新成功。
+      refreshing.value = true
       try {
         await store.refreshRegistry()
         await store.loadAll()
       } catch (e) {
         store.error.value = e as IpcError
+      } finally {
+        refreshing.value = false
       }
     }
   })()
 })
 onBeforeUnmount(() => {
+  detailsRequest++
   if (statusTimer) clearTimeout(statusTimer)
 })
 
@@ -487,9 +502,9 @@ async function onUninstall(pluginId: string) {
   void run(pluginId, () => store.uninstall(pluginId), 'exotic.uninstalledOk')
 }
 
-// 激活成功 → 刷新已装/进度（授权态变化可能解阻处理）+ 内置能力区（T11）；
-// resetOcrStatusCache 清 useOcr 的 60s 状态缓存，激活后立即反映新授权态。
-useTauriListen(EVENTS.OFFICIAL_LICENSE_CHANGED, () => { onActivated() })
+// 激活成功 → 刷新已装/进度（激活状态变化可能解阻处理）+ 内置能力区（T11）；
+// resetOcrStatusCache 清 useOcr 的 60s 状态缓存，激活后立即反映新激活状态。
+useTauriListen(EVENTS.FEATURE_ACTIVATION_CHANGED, () => { onActivated() })
 
 function onActivated() {
   void store.loadInstalled()

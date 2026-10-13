@@ -22,8 +22,8 @@ use crate::error::{AppError, Result};
 ///
 /// ## 基础谓词是契约不是装饰
 ///
-/// `is_deleted=0 AND companion_of IS NULL` 与正常媒体视图（[`push_where_predicates`](super::query_builder::push_where_predicates)）一致，
-/// 阻止只存在于回收站 / Live-Photo 伴随视频里的格式污染全局 facet。
+/// 活行、非 companion 且非 missing 与正常媒体视图（[`push_where_predicates`](super::query_builder::push_where_predicates)）一致。
+/// 只存在于回收站、伴随视频或缺失历史项的格式不进入 facet；离线格式仍可浏览。
 ///
 /// ⚠ 当前生产库 raw distinct == base distinct == 29 **是数据巧合**（实测：被基础谓词滤掉的只有
 /// 4 行 `is_deleted=1` 的 jpg，而 jpg 在 base 里也存在）—— 不能拿巧合替代契约。
@@ -39,7 +39,7 @@ pub fn list_library_formats(conn: &Connection) -> Result<Vec<String>> {
     let hidden = super::super::scan::hidden_root_ids(conn)?;
     let mut sql = String::from(
         "SELECT DISTINCT file_format FROM media_items
-         WHERE is_deleted = 0 AND companion_of IS NULL",
+         WHERE is_deleted = 0 AND companion_of IS NULL AND availability != 'missing'",
     );
     if !hidden.is_empty() {
         let placeholders: Vec<String> = (0..hidden.len()).map(|i| format!("?{}", i + 1)).collect();

@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/task.rs
-//! 冷门格式插件 · 任务模型（v3 §5.3 / Part1 §1.3）。
+//! 冷门格式插件的任务模型。
 //!
 //! `exotic_tasks` 是「处理真相」：能力级任务、独立重试/失效，**不是** `media_items` 上的状态列。
 //! 状态机：pending → processing →（done | retryable_error | terminal_error）。

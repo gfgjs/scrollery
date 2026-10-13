@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// UiIconButton — 全局 `.btn-icon` 体系的类型化包裹（S1 UI primitive）。
+// 类型化图标按钮，复用全局 `.btn-icon` 样式。
 // `label` 提为**必填 prop**，作为图标按钮的 title 提示源；active 视觉统一映射 `.btn-icon.active`。
 // 样式仍复用已过 contrast 门禁的全局 `.btn-icon` / `.btn-icon.active`。
 // @click / data-* / tabindex 等经 fallthrough 落到根 button；父作用域 scoped 后代选择器亦可命中根元素。

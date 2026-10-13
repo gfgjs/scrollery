@@ -1,4 +1,4 @@
-// Canvas 画廊真机基准驱动器(2026-08-16 缩略图性能线阶段 1):与 canvas-wave-bench.mjs 同源,
+// Canvas 画廊真机基准驱动器：与 canvas-wave-bench.mjs 使用相同指标，
 // 但目标是 **真实 app**(npm run tauri dev + WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=
 // --remote-debugging-port=<port> 拉起),经 WebView2 的 CDP 端点 attach——真实 asset 协议、
 // 真实缩略图文件、真实 WebView2 渲染;dev 前端含 __scrolleryBench 桥(录制/时序采样与

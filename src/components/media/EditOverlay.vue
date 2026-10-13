@@ -42,7 +42,7 @@
           <span class="is-h" style="top: 66.667%"></span>
         </div>
         <CropperSelectionOverlay
-          v-if="editor.crop.value"
+          v-if="editor.crop.value && !isSaving"
           :rect="editor.crop.value"
           :box="displayBox"
           :aspect-ratio="cropAspectRatio"
@@ -51,7 +51,7 @@
       </template>
     </div>
 
-    <div v-if="supported" class="edit-overlay__toolbar">
+    <fieldset v-if="supported" class="edit-overlay__toolbar" :disabled="isSaving">
       <UiIconButton :label="t('edit.rotateCcw')" @click="editor.rotateCcw()">
         <RotateCcw :size="18" />
       </UiIconButton>
@@ -153,10 +153,10 @@
       <UiIconButton :label="t('edit.reset')" @click="onReset">
         <Undo2 :size="18" />
       </UiIconButton>
-    </div>
+    </fieldset>
 
     <div class="edit-overlay__footer">
-      <div v-if="supported" class="edit-overlay__output">
+      <fieldset v-if="supported" class="edit-overlay__output" :disabled="isSaving">
         <label class="edit-overlay__field">
           <span>{{ t('edit.format') }}</span>
           <select v-model="editor.format.value">
@@ -175,7 +175,7 @@
           />
           <span class="edit-overlay__quality-value">{{ editor.quality.value }}</span>
         </label>
-      </div>
+      </fieldset>
 
       <p
         v-if="editor.status.value === 'error' && editor.errorMessage.value"
@@ -352,7 +352,12 @@ const cropToolActive = ref(false)
 function toggleCropTool(): void {
   cropToolActive.value = !cropToolActive.value
   if (cropToolActive.value && !editor.crop.value) {
-    editor.setCropRect({ x: 0.1, y: 0.1, width: 0.8, height: 0.8 })
+    if (editor.cropRatio.value === 'free') {
+      editor.setCropRect({ x: 0.1, y: 0.1, width: 0.8, height: 0.8 })
+    } else {
+      // 几何变换会清空裁剪框，重建时仍需遵守当前选中的比例。
+      editor.setCropRatio(editor.cropRatio.value)
+    }
   }
 }
 
@@ -393,18 +398,14 @@ async function onRescanNow(): Promise<void> {
   try {
     await scan.startScan(rootId)
     toast.addToast('success', t('edit.rescanStarted'))
+    await handleClose()
   } catch (e) {
     toast.addToast('error', e instanceof Error ? e.message : String(e))
   }
-  handleClose()
 }
 
 async function handleClose(): Promise<void> {
   if (editor.status.value === 'saving') return
-  if (editor.status.value === 'partial' || editor.status.value === 'done') {
-    emit('close')
-    return
-  }
   const ok = await requestDiscardEdits(editor)
   if (ok) emit('close')
 }
@@ -476,6 +477,13 @@ defineExpose({ requestClose: handleClose })
   background: rgba(0, 0, 0, 0.75);
   color: #fff;
 }
+/* 保存载荷已经快照，原生禁用整组控件，避免用户继续改动却被成功关闭静默丢弃。 */
+.edit-overlay__toolbar,
+.edit-overlay__output {
+  min-width: 0;
+  margin: 0;
+  border: 0;
+}
 .edit-overlay__sep {
   width: 1px;
   height: 20px;
@@ -531,6 +539,7 @@ defineExpose({ requestClose: handleClose })
   display: flex;
   align-items: center;
   gap: var(--spacing-md, 12px);
+  padding: 0;
 }
 .edit-overlay__field {
   display: flex;

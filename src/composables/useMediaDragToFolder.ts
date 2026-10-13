@@ -1,10 +1,10 @@
 // src/composables/useMediaDragToFolder.ts
-// 画廊媒体拖拽到文件夹树（T18 巨组件拆分：从 MediaGrid 抽出的自包含特性簇）。
+// 画廊媒体拖拽到文件夹树。
 //
 // 设计（保持原行为逐字不变）：
 //  - 浮动幽灵以**命令式**定位（对模板 ref 写 transform / textContent），使 120fps 拖拽绝不触发
 //    巨大虚拟网格的 Vue 重渲染（问题3）；只有悬停目标 dir id 是响应式，且仅在真正变化时写。
-//  - 尾随 click 抑制统一走 selection 的拖拽标志（T5，消 mediaWasDrag 双轨）。
+//  - 尾随 click 抑制使用 selection 的拖拽标志。
 //  - 模式遵循 OS 习惯：左键拖=移动；Shift+左键=复制；右键拖=落点弹「移动/复制」菜单。
 //
 // 幽灵 DOM 与右键菜单容器仍留在 MediaGrid 模板（视图归属），经 deps 注入其 ref/state——
@@ -98,6 +98,7 @@ export function useMediaDragToFolder(deps: MediaDragToFolderDeps) {
   function startMediaDrag(e: PointerEvent, kind: 'left' | 'right') {
     const ids = selection.materializeIds()
     if (ids.length === 0) return
+    const selectionEpoch = selection.selectionEpoch.value
     const startX = e.clientX,
       startY = e.clientY
     let dragging = false
@@ -147,16 +148,16 @@ export function useMediaDragToFolder(deps: MediaDragToFolderDeps) {
         }
         if (cancelled || !dragging || targetDirId == null) return
         if (kind === 'right') {
-          showDropMenu(ev.clientX, ev.clientY, ids, targetDirId)
+          showDropMenu(ev.clientX, ev.clientY, ids, targetDirId, selectionEpoch)
         } else {
-          performMediaDrop(ids, targetDirId, shift ? 'copy' : 'move')
+          performMediaDrop(ids, targetDirId, shift ? 'copy' : 'move', selectionEpoch)
         }
       },
     )
   }
 
   // 右键拖拽落点菜单 —— 让用户选择移动或复制（系统右键拖拽习惯）。
-  function showDropMenu(x: number, y: number, ids: number[], targetDirId: number) {
+  function showDropMenu(x: number, y: number, ids: number[], targetDirId: number, selectionEpoch: number) {
     ctxMenu.value.x = x
     ctxMenu.value.y = y
     ctxMenu.value.items = [
@@ -164,26 +165,31 @@ export function useMediaDragToFolder(deps: MediaDragToFolderDeps) {
         id: 'move_here',
         label: i18n.global.t('dragDrop.moveHere'),
         icon: markRaw(FolderInput),
-        action: () => performMediaDrop(ids, targetDirId, 'move'),
+        action: () => performMediaDrop(ids, targetDirId, 'move', selectionEpoch),
       },
       {
         id: 'copy_here',
         label: i18n.global.t('dragDrop.copyHere'),
         icon: markRaw(Copy),
-        action: () => performMediaDrop(ids, targetDirId, 'copy'),
+        action: () => performMediaDrop(ids, targetDirId, 'copy', selectionEpoch),
       },
     ]
     ctxMenu.value.visible = true
   }
 
-  async function performMediaDrop(ids: number[], targetDirId: number, mode: 'move' | 'copy') {
+  async function performMediaDrop(
+    ids: number[], targetDirId: number, mode: 'move' | 'copy', selectionEpoch: number,
+  ) {
     try {
       const n =
         mode === 'copy'
           ? await history.copyMedia(ids, targetDirId, `复制 ${ids.length} 项`)
           : await history.moveMedia(ids, targetDirId, `移动 ${ids.length} 项`)
       if (n > 0) {
-        if (mode === 'move') selection.clearSelection()
+        // 选区归属从拖拽起手保留到右键菜单及异步回执；旧移动不能清掉后来新选的资产。
+        if (mode === 'move' && selection.selectionEpoch.value === selectionEpoch) {
+          selection.clearSelection()
+        }
         toast.addToast(
           'success',
           mode === 'copy'

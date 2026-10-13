@@ -1,7 +1,4 @@
-//! config.toml 文件监听(A1:本批只实现,不挂载到应用启动流程——挂载是 A2)。
-//!
-//! 用户手改 config.toml 后,应用需要感知变化并热加载;本模块提供该能力的独立实现,
-//! A2 会在启动时调用 `spawn_config_watcher` 并把回调接到 `ConfigManager` 的重载逻辑上。
+//! 监听 config.toml 的外部修改，并通知 `ConfigManager` 重载设置。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,9 +21,7 @@ pub enum WatcherError {
 /// 聚合窗口内的多次触发只回调一次,避免同一次保存重复加载多次。
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// 判断一次文件变更是否是"自己刚写的"(防自触发回环)的纯函数部分:比较当前磁盘内容指纹
-/// 与调用方记录的「最近一次本进程写盘」指纹。拆成纯函数是为了不必真起 watcher/tokio 运行时
-/// 就能单测这条判定逻辑本身(任务范围要求"指纹自写跳过判定纯函数级即可,不必真起 watcher")。
+/// 比较当前内容指纹与本进程最近写盘的指纹，避免监听器响应自身写入。
 ///
 /// `current` 为 `None`(如文件被并发删除导致读取失败)时视为"非自写"(不跳过)——宁可多触发
 /// 一次回调,也不要在读不到内容时武断放弃通知调用方。

@@ -1,12 +1,13 @@
 // src/composables/useFolderTreeSync.ts
-// 树的加载/重载/模式切换/刷新/展开折叠全部生命周期——从 FoldersSection.vue 域 8、9、12、13
-// 迁出(见 docs/planning/2026-07-25-超长文件拆分方案/analysis/FoldersSection-vue.md §2.1)。
+// 树的加载/重载/模式切换/刷新/展开折叠全部生命周期。
 import { computed, watch, onMounted, onBeforeUnmount, type ComputedRef } from 'vue'
 import { invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
-import { IPC } from '../constants/ipc'
+import { IPC, EVENTS } from '../constants/ipc'
+import { useTauriListen } from './useTauriListen'
 import { createFolderTreeSyncQueue } from '../components/sidebar/sections/folderTree.helpers'
 import type { DirNode, TreeCategory } from '../types/media'
+import type { EnrichmentCompletedPayload } from '../types/ipc'
 import type { useFolderTree } from './useFolderTree'
 import type { useScanStore } from '../stores/scanStore'
 import type { useUiStore } from '../stores/uiStore'
@@ -55,9 +56,86 @@ export function useFolderTreeSync(deps: FolderTreeSyncDeps) {
     })
   }
 
+  // ── files:changed 监听(文件监听对账完成)──────────────────────────────────────
+  // 后端 fs_watch 对账后广播 { rootId, directories }(directories 为根相对**父**目录路径)。
+  // 事件可能连发(连续磁盘改动),用「串行合并」队列:一次只跑一个 refreshDirectories,
+  // 期间到达的事件并入下一批,避免并发刷新同一父目录造成整段替换竞争。未加载的父目录由
+  // refreshDirectories 内部直接跳过,故这里不预筛。
+  interface FilesChangedPayload {
+    rootId: number
+    directories: string[]
+  }
+  const filesChangedPending = new Map<number, Set<string>>()
+  let filesChangedDrain: Promise<void> | null = null
+  function enqueueFilesChanged(rootId: number, directories: readonly string[]) {
+    let paths = filesChangedPending.get(rootId)
+    if (!paths) {
+      paths = new Set()
+      filesChangedPending.set(rootId, paths)
+    }
+    for (const dir of directories) paths.add(dir)
+    if (filesChangedDrain) return
+    filesChangedDrain = (async () => {
+      try {
+        while (filesChangedPending.size) {
+          const batch = [...filesChangedPending]
+          filesChangedPending.clear()
+          for (const [id, pendingPaths] of batch) {
+            // 单个根刷新失败不拖垮整批:其余根仍应刷新,失败单独记录。
+            try {
+              await folderTree.refreshDirectories(id, [...pendingPaths])
+            } catch (error) {
+              logger.error('[FoldersSection] files:changed 原位刷新失败', { error, rootId: id })
+            }
+          }
+        }
+      } finally {
+        filesChangedDrain = null
+      }
+    })()
+  }
+  useTauriListen<FilesChangedPayload>(EVENTS.FILES_CHANGED, (event) => {
+    const payload = event.payload
+    if (!payload || typeof payload.rootId !== 'number' || !Array.isArray(payload.directories)) return
+    enqueueFilesChanged(payload.rootId, payload.directories)
+  })
+
+  // 收集某根当前「已加载」的父目录路径:有子行已物化、或本目录文件已加载、或已展开。
+  // 无已加载项时退回根自身(''),保证至少刷新一层。
+  function loadedParentPaths(rootId: number): string[] {
+    const childParents = new Set<string>()
+    for (const node of folderTree.nodes.value) {
+      if (node.parentKey !== null) childParents.add(node.parentKey)
+    }
+    const paths = new Set<string>()
+    for (const node of folderTree.nodes.value) {
+      if (node.rootId !== rootId) continue
+      if (
+        node.parentKey !== null &&
+        !childParents.has(node.nodeKey) &&
+        !node.filesLoaded &&
+        !node.expanded
+      )
+        continue
+      paths.add(node.relPath)
+    }
+    if (paths.size === 0) paths.add('')
+    return [...paths]
+  }
+
+  // 后端补全收尾会执行 live photo 配对(pair_live_photos),改变 companion 归属与该目录
+  // media_count;而 files:changed 在配对**之前**发出,故这里在 enrichment:completed 后按
+  // 最新关系刷新该根已加载父目录——否则磁盘新增 MOV+JPG 被配对后,伴随行与计数会滞留到
+  // 下一次手动刷新或其它事件。走 files:changed 同一队列,避免并发整段替换竞争。
+  useTauriListen<EnrichmentCompletedPayload>(EVENTS.ENRICHMENT_COMPLETED, (event) => {
+    const rootId = event.payload?.rootId
+    if (typeof rootId !== 'number') return
+    enqueueFilesChanged(rootId, loadedParentPaths(rootId))
+  })
+
   // ── 文件夹树：唯一的加载来源 ─────────────────────────────────────────────────
   // 该 watch 是树从扫描根目录加载的唯一入口。它在初始化（immediate）以及每次
-  // scan.scanRoots 被重新赋值（添加/移除/清空）时触发，使增删空都集中处理。扫描后的
+  // 根集合、路径或名称变化（添加/移除/清空）时触发，使增删空都集中处理。扫描后的
   // 计数刷新改由下方的 `folder-stats-changed` 事件驱动。
   //
   // pendingSelectRootId 由 useFolderRootActions 的 addRoot() 经 setPendingSelectRootId 写入
@@ -70,8 +148,10 @@ export function useFolderTreeSync(deps: FolderTreeSyncDeps) {
   watch(
     // 显隐（V21）：树只加载**可见**根；隐藏根从树消失（其媒体也已被后端排除）。切换 isHidden 会
     // 改变 visibleScanRoots 这个 computed 的值 → 本 watch 重触发 → 整树按新可见集重载。
-    () => scan.visibleScanRoots,
-    async (roots) => {
+    // 扫描计数/进度更新不能换掉整树；仅根集合、路径或名称变化重新加载。
+    () => JSON.stringify(scan.visibleScanRoots.map((root) => [root.id, root.path, root.alias])),
+    async () => {
+      const roots = scan.visibleScanRoots
       await folderTree.loadRoots(roots)
       // 初次加载/整树重载可能发生在目标 id 已经写入 store 之后；主动重放当前目标，避免 watcher
       // 因值未变化而不再触发。null 同时会使任何旧在途定位失效。
@@ -99,17 +179,7 @@ export function useFolderTreeSync(deps: FolderTreeSyncDeps) {
 
   // 保留展开态重载（扫描刷新计数后、移动后自动选中时使用）。
   async function reloadTreePreserveExpansion(selectDirId?: number | null) {
-    // 展开态按**路径身份**记录(D-013):FS-only 目录的 id 全是 null,按 id 记会让它们塌成一串
-    // null,重展开时 `find(n => n.id === null)` 又恒命中第一个 FS-only 节点 —— 重载后展开的是
-    // 一堆不相干的目录。
-    // 顺序不变量:expandedKeys 取自拍平的前序 DFS,父必在子之前;loadRoots 后树只剩根行,每次
-    // loadChildren 注入子节点才让下一个更深的键变得可查——故必须**串行按序**走完。
-    const expandedKeys = folderTree.nodes.value.filter((n) => n.expanded).map((n) => n.nodeKey)
-    await folderTree.loadRoots(scan.visibleScanRoots)
-    for (const key of expandedKeys) {
-      const node = folderTree.nodes.value.find((n) => n.nodeKey === key)
-      if (node && !node.expanded) await folderTree.loadChildren(node)
-    }
+    await refreshTree()
     if (selectDirId != null) {
       await folderTree.expandToNode(selectDirId)
       // 入口是实体轴(移动后要选中的 DB 目录 id),展开后换算到结构轴再滚。
@@ -123,7 +193,9 @@ export function useFolderTreeSync(deps: FolderTreeSyncDeps) {
 
   function onFolderStatsChanged(e: Event) {
     const selectDirId = (e as CustomEvent).detail?.selectDirId ?? null
-    reloadTreePreserveExpansion(selectDirId)
+    void reloadTreePreserveExpansion(selectDirId).catch((error) => {
+      logger.error('[FoldersSection] 刷新文件夹统计失败', { error })
+    })
   }
   // §2.3-④:request-add-folder 监听随 addRoot 一起下沉到 useFolderRootActions 自己的
   // onMounted/onBeforeUnmount;本 composable 只保留天然属于「重载生命周期」的 folder-stats-changed。
@@ -149,7 +221,7 @@ export function useFolderTreeSync(deps: FolderTreeSyncDeps) {
   )
 
   // 分类变化在注册库模式下会改变目录骨架：后端要隐藏没有匹配后代的目录，同时保留必要的
-  // 祖先路径；因此整树重载并恢复仍然存在的展开态。两种「所有文件」模式的目录来自文件系统，
+  // 祖先路径；因此原位核对已加载目录。两种「所有文件」模式的目录来自文件系统，
   // 这里只重载已展开目录的文件分页，避免把尚未枚举的磁盘目录误判为空。watch 使用稳定 key，
   // 避免 getter 返回新数组时 deep watch 带来的重复触发；具体 IPC 参数由 useFolderTree 统一注入。
   const treeCategoryKey = deps.getTreeCategoryKey
@@ -161,8 +233,7 @@ export function useFolderTreeSync(deps: FolderTreeSyncDeps) {
     try {
       if (ui.treeDisplayMode === 'registeredOnly') {
         await reloadTreePreserveExpansion()
-        // reloadTreePreserveExpansion 只负责恢复目录结构；分类切换后还要重新取已展开
-        // 目录的文件页，否则节点虽然展开，旧文件行却不会随新分类出现。
+        // 分类切换后重置文件页及游标，只保留当前分类的分页范围。
         await folderTree.reloadFilesForFilter()
       } else {
         await folderTree.reloadFilesForFilter()
@@ -179,18 +250,23 @@ export function useFolderTreeSync(deps: FolderTreeSyncDeps) {
     )
   }
 
-  // 显式刷新:丢掉后端目录快照缓存再整树重载。
+  // 显式刷新:丢掉后端目录快照缓存,再**原位刷新已加载父目录**。
   // 为什么需要它:快照的真相源是**磁盘**,而磁盘可被本应用之外的任何东西改动(用户在资源管理器里
-  // 拖了个文件进来)。没有文件系统监听时,用户主动刷新是唯一的收敛手段(§4.2)。
+  // 拖了个文件进来)。有文件监听时由 files:changed 驱动收敛,这里是用户主动刷新(§4.2)。
+  // 走与 files:changed 同一队列，避免手动刷新和监听并发使其它根的刷新被作废。
   async function refreshTree() {
     try {
       await invokeIpc(IPC.INVALIDATE_TREE_CACHE, { rootId: null })
     } catch (err) {
-      // 缓存失效失败仍继续重载:重载本身有价值(DB 侧数据会刷新),不该因为清缓存失败就整个不做。
+      // 缓存失效失败仍继续刷新:刷新本身有价值(DB 侧数据会刷新),不该因为清缓存失败就整个不做。
       logger.error('[FoldersSection] invalidate tree cache failed', { error: err })
       toast.addToast('error', t('sidebar.refreshTreeFailed'))
     }
-    await reloadTreePreserveExpansion()
+    // 收集「已加载」的父目录:有子行已物化、或本目录文件已加载、或已展开。按根分组后原位刷新。
+    const rootIds = new Set<number>(scan.visibleScanRoots.map((root) => root.id))
+    for (const node of folderTree.nodes.value) rootIds.add(node.rootId)
+    for (const rootId of rootIds) enqueueFilesChanged(rootId, loadedParentPaths(rootId))
+    await filesChangedDrain
   }
 
   // 一键展开全部 / 折叠全部(便于压测虚拟化树)。有任何目录展开时按钮切为「折叠全部」。

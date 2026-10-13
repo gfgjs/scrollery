@@ -1,35 +1,32 @@
 // src-tauri/src/ai/face_pipeline/mod.rs
-//! Background face-recognition pipeline (F3) — worker 派发架构(T16 收束)。
-//! 后台人脸识别流水线:推理恒经 ai-worker 子进程派发。
+//! 后台人脸识别流水线：推理经 ai-worker 子进程派发。
 //!
 //!   Producer → 攒批 → CPU permit → 三级定源(缩略图档位 → face 缓存 640 → 小原图直派)
-//!   → 缺缓存现场预解码(T16-R2 方案 A,镜像 CLIP T18)→ GPU 令牌(D2 顺序)
+//!   → 缺缓存现场预解码 → 单批 Ready 交接 → CPU permit → GPU 令牌
 //!   → FaceDetectEmbed → faces_to_records 映射 → Writer
 //!
 //! 1. Producer:批量查询 face_status=0 的 media_items,标记 Processing,发 FaceTask。
-//! 2. 派发线程:**worker 端只解小图**——缩略图档位(预测短边 ≥ detect_size)或 host 预解码
+//! 2. 准备下一批与当前批推理重叠，交接前释放准备配额。worker 消费缩略图档位
+//!    (实际短边 ≥ detect_size)或 host 预解码
 //!    的 face 缓存(短边 640 WebP,WIC 优先产出,exotic 原图也在覆盖内);仅短边本就 ≤640
 //!    的小原图直派 worker 解码(白名单格式)。预解码失败(双引擎都解不开)标 Error,与
 //!    CLIP T18 现场派生失败同语义。几何按协议回报的**实际解码尺寸**归一化
 //!    (FaceItemResult::Ok.width/height),不用 host 预测尺寸。
 //! 3. Writer:批量收集 FaceResult,成功项先删后插+置 Done(batch_finish_face_items,
-//!    X1 条件写:cache_key 已换的失效项跳过),小批落库(问题2 进度平滑)、大批跑增量
+//!    条件写:源版本/缓存键已换或删除的项跳过),小批落库(问题2 进度平滑)、大批跑增量
 //!    聚类;零脸图也是成功(Done 非 Error)。
 //!
 //! 与 CLIP 分析共用 F5 GPU 分析槽(互斥);让步复用 ai_yield_blockers()。
-//! 进程内推理路径(engine 快照/rayon 预处理/detect+embed 线程)已随 T16 删除,
-//! 历史实现见 git。
-//!
 //! # 解码源:不能复用 CLIP 的 ai_cache
 //! CLIP 的 ai_cache 固定短边 336px,对 YuNet 的 640px 输入太小,会悄悄损害小脸召回率;
 //! face 自持一份 `face_thumbs/`(短边 640,FACE_CACHE_SHORT_EDGE)。
 //! resolve_face_decode_source 先在「常规分档缩略图」与「原图」间选择,原图回退项再由
-//! 派发批升级为 face 缓存(决策核见 face_cache_applies,装配见 dispatch_face_batch)。
+//! 准备批升级为 face 缓存(决策核见 face_cache_applies,装配见 prepare_face_batch)。
 //!
-//! # 模块拆分(tierB-4 简案)
+//! # 模块职责
 //! 四阶段管线按文件切分:`producer`(Producer)/`decode_source`(三级定源)/
 //! `dispatch`(worker 派发)/`writer`(Writer)。`FaceTask`/`FaceResult` 跨阶段共享,
-//! 定义留本文件;编排(`rayon::scope` 派三线程)也留本文件。
+//! 定义留本文件；编排使用 scoped 专用线程，rayon 留给批内派生。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,19 +56,19 @@ struct FaceTask {
     item_id: i64,
     source_path: PathBuf,
     file_format: String,
-    thumb_status: i64,
-    thumb_path: Option<String>,
     width: i64,
     height: i64,
     /// 缩略图/派生缓存键(xxh3(路径+mtime),兼陈旧防护)——face 缓存(方案 A)按此寻址。
     cache_key: i64,
+    source_revision: i64,
 }
 
 /// 从检测+嵌入阶段（或预处理早期失败）发送到写入器的结果。
 struct FaceResult {
     item_id: i64,
-    /// 任务领取时的 `cache_key` 快照(X1 条件写:落库仅当行内当前值仍相等)。
+    /// 任务领取时的缓存键与源版本快照；条件写拒绝源身份已改变的结果。
     cache_key: i64,
+    source_revision: i64,
     /// `Some(rows)` on success — possibly empty (zero-face image, still Done).
     /// `None` on decode/detect/embed failure → Error.
     /// 成功时为 `Some(rows)`——可能为空（零脸图，仍算 Done）。解码/检测/嵌入失败为 `None` → Error。
@@ -122,7 +119,7 @@ pub fn start_face_pipeline(state: Arc<AppState>, generation: u64, token: Cancell
     });
 }
 
-/// Blocking pipeline runner:T16 起恒走 worker 派发(进程内 ort 路径已删)。
+/// 在阻塞线程中运行 worker 派发流水线。
 fn run_face_pipeline_blocking(
     state: &Arc<AppState>,
     token: &CancellationToken,
@@ -189,8 +186,8 @@ fn reconcile_unclustered_faces(state: &Arc<AppState>, profile: &FaceProfile) {
     }
 }
 
-/// worker 派发路径主入口(由 run_face_pipeline_blocking 无条件调用;T16 后为唯一路径)。
-/// Producer/Writer 与进程内共用;中段 = 单派发线程攒批 → FaceDetectEmbed(解码在 worker)。
+/// worker 派发路径主入口，由 `run_face_pipeline_blocking` 调用。
+/// Producer/Writer 独立协调；中段预准备一批，与当前 FaceDetectEmbed 重叠。
 fn run_face_pipeline_worker_blocking(
     state: &Arc<AppState>,
     token: &CancellationToken,
@@ -205,7 +202,7 @@ fn run_face_pipeline_worker_blocking(
     let spec = crate::ai::worker_client::build_session_spec(
         state,
         clip_profile,
-        Some(face_profile.clone()),
+        crate::ai::worker_client::SessionPurpose::Face(&face_profile),
     );
     let profile = Arc::new(face_profile);
 
@@ -250,8 +247,8 @@ fn run_face_pipeline_worker_blocking(
     let state_writer = Arc::clone(state);
     let profile_writer = Arc::clone(&profile);
 
-    rayon::scope(|s| {
-        s.spawn(|_| {
+    std::thread::scope(|s| {
+        s.spawn(|| {
             producer::produce_face_tasks(&state_prod, task_tx, &token_prod);
         });
 
@@ -260,7 +257,7 @@ fn run_face_pipeline_worker_blocking(
         let fatal_ref = &fatal;
         let spec_ref = &spec;
         let profile_disp = Arc::clone(&profile);
-        s.spawn(move |_| {
+        s.spawn(move || {
             if let Err(e) = dispatch::face_dispatch_loop(
                 &state_disp,
                 spec_ref,
@@ -273,7 +270,7 @@ fn run_face_pipeline_worker_blocking(
             }
         });
 
-        s.spawn(move |_| {
+        s.spawn(move || {
             writer::write_face_results(&state_writer, result_rx, &token_writer, &profile_writer);
         });
     });

@@ -2,7 +2,7 @@
 // 批量缩略图请求队列 (§8.3)。收集项目 ID 并以 THUMB_BATCH_SIZE 为批次进行刷新。
 
 import { Channel } from '@tauri-apps/api/core'
-import { generateOperationId, invokeIpc } from '../utils/ipc'
+import { generateOperationId, invokeIpc, parseAppError } from '../utils/ipc'
 import { logger } from '../utils/logger'
 import type { ThumbResult } from '../types/media'
 import { IPC } from '../constants/ipc'
@@ -15,12 +15,8 @@ import { useUiStore } from '../stores/uiStore'
 /// 避免仍在推进的慢盘/大 RAW 批次误触发。
 const STALL_MS = 30000
 
-/// 可重试失败的有界退避(2026-08-16 审查阶段3):整批 IPC 失败、停滞释放或批内缺结果时,
-/// 同一逻辑请求在队列内按 0.5s→1s→2s 最多重试 3 次,而非把拒绝直接抛给调用方——
-/// 调用方(MediaGrid.onRequestThumb)的 catch 只留占位,而 canvas 侧 requestThumbOnce
-/// 对同签名只上抛一次,拒绝后再无重试路径(冷库静默失败格的根因)。上限防后端持续故障时
-/// 的请求风暴;cancelled 是调用方主动放弃,永不重试。后端对在途项 single-flight(ipc.ts
-/// CANCEL 注),停滞重试不会造成同项重复生成。
+// 只对通道停滞或后端明确的过期结果有限退避；重新订阅可取得当前源/配置的结果。
+// Exotic 让路和真实错误没有短周期恢复条件，直接收尾。single-flight 继续防重复生成。
 const THUMB_RETRY_MAX = 3
 const THUMB_RETRY_BASE_MS = 500
 
@@ -32,7 +28,10 @@ function getOptimalThumbTier(rowHeight: number): number {
 }
 
 type Resolver = (result: ThumbResult) => void
-type ViewportThumbResult = ThumbResult & { pending: boolean }
+type ViewportThumbResult = ThumbResult & (
+  | { outcome: 'complete' | 'deferred' | 'retry' }
+  | { outcome: 'failed'; error: { code: string; message: string } }
+)
 
 interface RequestWaiter {
   resolve: Resolver
@@ -133,10 +132,10 @@ export function useRequestQueue() {
     syncStats()
 
     // 停滞看门狗（问题9）：
-    // 若后端 worker 卡在损坏/不支持的文件上，批处理 invoke 永不 resolve、`.finally` 永不
-    // 执行，「处理中 N 项」会永久卡住。装一个「无进展」计时器（每送达一个结果就重置）；
+    // 若后端 worker 卡住或 Channel 失联，「处理中 N 项」会永久卡住。
+    // 装一个「无进展」计时器（每送达一个结果就重置）；
     // 若 STALL_MS 内无任何结果，则释放本批仍在途的 id，使 UI 不依赖后端即可恢复。
-    // `released` 让 {停滞, finally} 中先到者生效，避免迟到的卡死 invoke 冲掉后续新批。
+    // released 保证旧批迟到的受理失败不会冲掉后续新批。
     let released = false
     let stallTimer: ReturnType<typeof setTimeout> | null = null
     let accepted = false
@@ -214,7 +213,9 @@ export function useRequestQueue() {
       // 关键点：按本批次的 slot 收尾，而不是按 id 清全局 Map。
       // 这样同一 id 在旧批次结果返回后重新排队时，新 Promise 不会被旧批次误删或误拒绝。
       pending.delete(slot)
-      if (r.pending) {
+      if (r.outcome === 'failed') {
+        rejectSlot(slot, parseAppError(r.error))
+      } else if (r.outcome === 'retry') {
         retryOrRejectSlot(slot, new ThumbRequestError('incomplete', 'thumb result pending'))
       } else {
         resolveSlot(slot, r)
@@ -235,7 +236,7 @@ export function useRequestQueue() {
     armStall()
 
     // IPC 的成功返回只确认后台已受理；Channel 持续传送最终结果。
-    // 无结果项由后端显式回 pending 并按有限预算重试；通道失联由停滞看门狗重试。
+    // 后端明确区分让路、过期结果与错误；通道失联由停滞看门狗重试。
     void invokeIpc(IPC.BATCH_REQUEST_THUMBNAILS, { itemIds: batchIds, targetSize, requestId, onResult }).then(
       () => {
         accepted = true
@@ -245,7 +246,7 @@ export function useRequestQueue() {
       },
       (err) => {
         logger.error(`[useRequestQueue] batch failed: ${err}`, { batchIds })
-        releaseBatch('batch invoke failed', new ThumbRequestError('incomplete', 'Batch invoke failed'))
+        releaseBatch('batch invoke failed', err)
       },
     )
   }
@@ -296,7 +297,7 @@ export function useRequestQueue() {
       rejectSlot(slot, new ThumbRequestError('cancelled', 'cancelled'))
       syncStats()
     } else {
-      // 撤销本批订阅并立即释放前端名额；后台任务由 DB lease 去重，其他请求方不受影响。
+      // 撤销本批订阅并立即释放前端名额；共享图片服务按执行身份去重，其他订阅不受影响。
       slot.cancelInFlight?.()
     }
   }

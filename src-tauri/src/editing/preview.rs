@@ -1,4 +1,4 @@
-//! E0 编辑预览：orientation 烤入 → ICC 转 sRGB → 长边限制 → 编码 → raw IPC packet。
+//! 编辑预览：orientation 烤入 → ICC 转 sRGB → 长边限制 → 编码 → raw IPC packet。
 
 use fast_image_resize::pixels::PixelType;
 use fast_image_resize::{images::Image as FirImage, FilterType, ResizeAlg, ResizeOptions, Resizer};

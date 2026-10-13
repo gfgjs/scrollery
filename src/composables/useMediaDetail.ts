@@ -1,5 +1,5 @@
 // src/composables/useMediaDetail.ts
-// 媒体详情覆盖层的组件级组合式函数 (§12.3)
+// 媒体详情覆盖层的组件级组合式函数。
 //
 // 重要：在组件 setup 时调用此函数一次，不要在 computed() 内部调用——否则会在每次响应式依赖
 // 变化时重新创建事件监听器，导致 mousemove/mouseup 监听器永久泄漏。
@@ -95,19 +95,20 @@ export function useMediaDetail() {
       return
     }
 
-    // 旋转 90/270:显示足迹宽高对换 → 适应数学用对换后的有效尺寸。
+    // CSS 先按未旋转尺寸 contain，再施加 transform；所有模式必须沿用同一缩放基准。
+    const base_w = Math.min(safeIw, safeCw, safeCh * (safeIw / safeIh))
+    const base_h = Math.min(safeIh, safeCh, safeCw * (safeIh / safeIw))
+    // 旋转只交换已经 contain 的显示足迹，不能按旋转后的原图再计算一次 contain。
     const rotated = rotation.value % 180 !== 0
-    const eiw = rotated ? safeIh : safeIw
-    const eih = rotated ? safeIw : safeIh
-    const base_w = Math.min(eiw, safeCw, safeCh * (eiw / eih))
-    const base_h = Math.min(eih, safeCh, safeCw * (eih / eiw))
+    const footprint_w = rotated ? base_h : base_w
+    const footprint_h = rotated ? base_w : base_h
 
     if (mode === 'original') {
-      scale.value = eiw / base_w
+      scale.value = safeIw / base_w
     } else if (mode === 'fit-width') {
-      scale.value = safeCw / base_w
+      scale.value = safeCw / footprint_w
     } else if (mode === 'fit-height') {
-      scale.value = safeCh / base_h
+      scale.value = safeCh / footprint_h
     }
   }
 

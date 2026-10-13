@@ -1,4 +1,4 @@
-// 内测(internal testing)registry 生成器——Part8 D1 签发端的内测形态(2026-07-05)。
+// 内测 registry 生成器。
 //
 // 与 exotic-dev-registry.mjs 的差异(其余打包/签名逻辑经 lib/exotic-signing.mjs 完全同源):
 //   - worker 用 **release** 构建(target/release/psd-worker.exe),交真人测试的是生产性能形态;
@@ -12,7 +12,7 @@
 // 用法:node scripts/exotic-internal-registry.mjs
 // 前置:cargo build --release -p psd-worker
 // 产出(全部落 <repo>/.internal-signing/):
-//   internal-release.pem / internal-license.pem   Ed25519 私钥(仅本机,勿外传/勿入 CI)
+//   internal-release.pem   Ed25519 私钥(仅本机,勿外传/勿入 CI)
 //   internal-keyset.json                          编译期注入用公钥集(PICASA_EXOTIC_KEYSET_FILE)
 //   registry/{index.json,index.sig,exotic-image-psd.zip}   上传到内测发行源的三件套
 //   seq                                           单调序号(防回滚基线,与 dev 独立)
@@ -26,7 +26,6 @@ import {
   buildPluginZip,
   ensureKey,
   keysetEntry,
-  loadOfficialProduct,
   nextSeq,
   sha256hex,
   signIndex,
@@ -37,23 +36,20 @@ const out = path.join(repo, '.internal-signing');
 const regOut = path.join(out, 'registry');
 fs.mkdirSync(regOut, { recursive: true });
 
-// 授权主体单源:registry 条目 SKU 与 license token 取自同一份官方版配置,
-// 否则商店展示的 SKU 会与实际能验过的 token 不一致(2026-09-22 统一授权)。
-const product = loadOfficialProduct(repo);
 
 const PLUGIN_ID = process.env.EXOTIC_PLUGIN_ID || 'exotic-image-psd';
 const TARGET = process.env.EXOTIC_TARGET || 'x86_64-pc-windows-msvc';
 const MEDIA_KIND = process.env.EXOTIC_MEDIA_KIND || 'image';
 const FORMATS = (process.env.EXOTIC_FORMATS || 'psd').split(',').map((s) => s.trim()).filter(Boolean);
 const CAPABILITIES = (process.env.EXOTIC_CAPABILITIES || 'thumbnail').split(',').map((s) => s.trim()).filter(Boolean);
-const SKU = product.sku;
+// 保留签名 registry 的 schema 1 元数据字段，不参与功能激活。
+const SKU = process.env.EXOTIC_SKU || PLUGIN_ID;
 const MIN_HOST_VERSION = process.env.EXOTIC_MIN_HOST_VERSION || '0.1.0';
 const COMPLIANCE_REVIEW_ID = process.env.EXOTIC_COMPLIANCE_REVIEW_ID || 'internal-2026-07';
 const WORKER_NAME = process.env.EXOTIC_WORKER_NAME || 'psd-worker.exe';
 const WORKER_CRATE = process.env.EXOTIC_WORKER_CRATE || 'psd-worker';
 const WORKER_PATH = process.env.EXOTIC_WORKER_PATH || path.join(repo, 'target', 'release', WORKER_NAME);
 const RELEASE_KEY_ID = process.env.EXOTIC_RELEASE_KEY_ID || 'release-internal-2026-07';
-const LICENSE_KEY_ID = process.env.EXOTIC_LICENSE_KEY_ID || 'license-internal-2026-07';
 // 内测发行源(公开仓 raw 直链;更新 registry = 向该仓 push 新的三件套)。
 const REG_BASE =
   process.env.PICASA_INTERNAL_REGISTRY_BASE ||
@@ -61,7 +57,6 @@ const REG_BASE =
 
 // ── 1. 内测密钥对(存在即复用;与 dev/生产信任根均隔离) ───────────────────────
 const releaseKey = ensureKey(path.join(out, 'internal-release.pem'));
-const licenseKey = ensureKey(path.join(out, 'internal-license.pem'));
 
 // keyset = 仓内占位生产集 + 内测键(超集,保注入态下既有测试断言成立)。
 const placeholder = JSON.parse(
@@ -78,7 +73,6 @@ const keyset = {
   keys: [
     ...placeholder.keys,
     keysetEntry(RELEASE_KEY_ID, 'release', releaseKey),
-    keysetEntry(LICENSE_KEY_ID, 'license', licenseKey),
   ],
 };
 fs.writeFileSync(path.join(out, 'internal-keyset.json'), JSON.stringify(keyset, null, 2));
@@ -159,4 +153,4 @@ console.log(`内测 registry 已生成(seq=${seq}, version=${version}, 有效期
      $env:PICASA_EXOTIC_KEYSET_FILE = '${path.join(out, 'internal-keyset.json')}'
      $env:PICASA_REGISTRY_BASE_DEFAULT = '${REG_BASE}'
      npm run tauri build
-  4) 给测试者签发官方版激活 token:node scripts/exotic-issue-license.mjs`);
+  4) 测试者在功能页逐项点击“免费激活”`);

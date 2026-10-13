@@ -1,6 +1,5 @@
 // src/composables/useFolderTreeIndices.ts
-// 目录节点的双身份索引(D-013:实体轴 id / 结构轴 nodeKey)+ 祖先判定——从 FoldersSection.vue
-// 域 15 迁出(见 docs/planning/2026-07-25-超长文件拆分方案/analysis/FoldersSection-vue.md §2.1)。
+// 目录节点的双身份索引(D-013:实体轴 id / 结构轴 nodeKey)+ 祖先判定。
 // 纯索引 + 一个递归查找函数,无 DOM/生命周期。
 import { computed, type Ref } from 'vue'
 import type { DirNode } from '../types/media'

@@ -1,10 +1,5 @@
-// 画廊轴(时间轴 / minimap)控制簇 + DOM↔Canvas 渲染偏好接线。
-// 自 MediaGrid.vue 结构拆分抽出:**判据、写盘键、触发时机逐字保留**。
-//
-// 🔴 红线(2026-07-24 画廊轴线裁决):
-//  - 轴显隐持久化键恒为 uiStore 的 axisVisible(写盘键 seamless_minimap),改名即丢老用户状态;
-//  - axis_mode 的四道防线(canShowScrubber / activeAxis 回退 / switchAxisMode 自动展开 /
-//    minimapVisible 的 canShowMinimap 门控)不得增删或重排。
+// 画廊时间轴、minimap 与 DOM/Canvas 偏好控制。
+// axisVisible 沿用 seamless_minimap 存储键以保留用户状态；轴模式按数据可用性回退。
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMediaStore } from '../stores/mediaStore'
@@ -23,15 +18,13 @@ export function useGalleryAxisControls() {
     import.meta.env.DEV && localStorage.getItem('scrollery.debug.renderMode') === '1'
   // DOM↔Canvas 渲染引擎偏好(画廊 + 时间轴)提升至 useRenderMode 共享单例,与设置页「实验性」开关
   // 同源——设置改动 live 生效、无需刷新;dev 药丸(showRenderModeDebug 门控)仍可快切。
-  // 存储(设置集中保存,批次B):两项偏好存 config.toml(gallery_render_mode / timeline_render_mode)。
-  // canvas 是原型:galleryRenderMode='canvas' 时若 canvasCapable 不满足(iOS/超大库)仍自动回退 DOM(见 canvasMode)。
+  // 渲染偏好存于 config.toml 的 gallery_render_mode / timeline_render_mode。
   const { galleryRenderMode, timelineRenderMode, setGalleryRenderMode, setTimelineRenderMode } =
     useRenderMode()
   function toggleTimelineRenderMode() {
     setTimelineRenderMode(timelineRenderMode.value === 'dom' ? 'canvas' : 'dom')
   }
-  // Canvas 渲染模式(§9 T4 最简原型,与 DOM 一键切换对比):底层虚拟滚动引擎不变——canvas 只是把
-  // activeRows 换个画法;滚动/选区/命中全复用现有引擎与 handleCardClick。镜像 timelineRenderMode。
+  // 渲染方式切换共用 bucket 滚动与选区状态，仅改变绘制方式。
   function toggleGalleryRenderMode() {
     setGalleryRenderMode(galleryRenderMode.value === 'dom' ? 'canvas' : 'dom')
   }

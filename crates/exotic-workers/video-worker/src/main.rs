@@ -1,5 +1,5 @@
 // crates/exotic-workers/video-worker/src/main.rs
-//! 视频格式扩展 Worker 主循环(视频格式扩展子系统 design.md §2):独立进程,承接
+//! 视频格式扩展 Worker 主循环：独立进程承接
 //! probe/remux/transcode/frames 四能力,底层 spawn 外部 ffmpeg/ffprobe(LGPL-shared)。
 //! 契约照 raw/enhance-worker 样板:
 //!   - **stdout 只走协议帧**;日志只写 stderr(单行 JSON WorkerLogLine)。

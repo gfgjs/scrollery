@@ -50,7 +50,7 @@ pub fn upsert_directory(
         "INSERT INTO directories (root_id, parent_id, rel_path, name, depth, mtime, tree_sort_key)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(root_id, rel_path) DO UPDATE SET
-             name=excluded.name, mtime=excluded.mtime",
+             name=excluded.name, mtime=excluded.mtime, is_missing=0",
     )?
     .execute(params![
         root_id, parent_id, rel_path, name, depth, mtime, tree_key
@@ -151,13 +151,15 @@ fn query_directory_level(
                 String::new(),
                 String::new(),
                 String::new(),
-                "EXISTS(SELECT 1 FROM directories c WHERE c.parent_id = d.id)".to_string(),
+                "EXISTS(SELECT 1 FROM directories c WHERE c.parent_id = d.id AND c.is_missing = 0)"
+                    .to_string(),
             ),
             DirectoryCategoryFilter::DirectoriesOnly => (
                 " AND 0".to_string(),
                 String::new(),
                 String::new(),
-                "EXISTS(SELECT 1 FROM directories c WHERE c.parent_id = d.id)".to_string(),
+                "EXISTS(SELECT 1 FROM directories c WHERE c.parent_id = d.id AND c.is_missing = 0)"
+                    .to_string(),
             ),
             DirectoryCategoryFilter::MediaTypes(types) => {
                 let placeholders = (2..=types.len() + 1)
@@ -181,7 +183,7 @@ fn query_directory_level(
                     SELECT 1
                     FROM directories c
                     JOIN matched matching_child ON matching_child.id = c.id
-                    WHERE c.parent_id = d.id
+                    WHERE c.parent_id = d.id AND c.is_missing = 0
                 )"
                     .to_string(),
                 )
@@ -194,14 +196,16 @@ fn query_directory_level(
     // query functions; user data only enters through `?1` and the media-type placeholders.
     let sql = format!(
         "WITH RECURSIVE sub(id, top) AS (
-             SELECT id, id FROM directories WHERE {seed_clause}
+             SELECT id, id FROM directories WHERE {seed_clause} AND is_missing = 0
              UNION ALL
              SELECT c.id, s.top FROM directories c JOIN sub s ON c.parent_id = s.id
+             WHERE c.is_missing = 0
          ),
          matching(id, top) AS (
              SELECT s.id, s.top
              FROM sub s JOIN media_items m ON m.directory_id = s.id
-             WHERE m.is_deleted = 0 AND m.companion_of IS NULL{media_predicate}
+             WHERE m.is_deleted = 0 AND m.companion_of IS NULL
+               AND m.availability != 'missing'{media_predicate}
          ),
          agg(top, cnt) AS (
              SELECT matching.top, COUNT(*)
@@ -214,7 +218,7 @@ fn query_directory_level(
                 {has_children_expr} AS has_children
          FROM directories d
          LEFT JOIN agg a ON a.top = d.id
-         WHERE {outer_clause}{candidate_predicate}
+         WHERE {outer_clause} AND d.is_missing = 0{candidate_predicate}
          ORDER BY d.name ASC"
     );
 
@@ -328,7 +332,8 @@ pub fn list_directory_files(
     let mut sql = String::from(
         "SELECT id, file_name, media_type, is_favorited
          FROM media_items
-         WHERE directory_id = ?1 AND is_deleted = 0 AND companion_of IS NULL",
+         WHERE directory_id = ?1 AND is_deleted = 0 AND companion_of IS NULL
+           AND availability != 'missing'",
     );
     if let Some(types) = selected_types.as_ref() {
         if types.is_empty() {
@@ -434,6 +439,7 @@ pub fn map_media_entities(
         "SELECT file_name, id, media_type
          FROM media_items
          WHERE directory_id = ?1 AND is_deleted = 0 AND companion_of IS NULL
+           AND availability != 'missing'
            AND file_name IN ({placeholders})"
     );
     let mut stmt = conn.prepare(&sql)?;

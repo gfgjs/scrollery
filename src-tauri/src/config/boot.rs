@@ -1,8 +1,5 @@
 // src-tauri/src/config/boot.rs
-//! 启动期配置装配:`ConfigManager` 构造(含降级)+ 启动期一次性读取的设置键。
-//!
-//! 自 `lib.rs::run()` 的 setup 段 h 迁出(D-450 纯结构移动,行为不变)。
-//!
+//! 启动期配置装配：构造 `ConfigManager` 并读取启动时确定的设置键。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +12,7 @@ pub struct ConfigBoot {
     pub thumb_size: u32,
     pub thumb_skip_max_kb: u64,
     pub thumb_strategy: String,
+    pub gpu_engine: String,
     /// `thumb_cache_dir`;空串已归一为 `None`(= 用内置派生路径)。
     pub custom_cache_dir: Option<String>,
     pub log_level: String,
@@ -25,7 +23,7 @@ pub struct ConfigBoot {
     pub thumb_webp_quality: u8,
 }
 
-/// 配置文件初始化 + 读取持久化配置(setup 段 h)。
+/// 初始化配置文件并读取持久化配置。
 ///
 /// 语法错时的契约(硬约束):**绝不覆盖/重写用户的坏文件**,回退全部键为 schema
 /// 默认值(`ConfigManager::degraded`),错误记入 `last_error` 供 `get_config_status`
@@ -71,6 +69,9 @@ pub fn init(app_data_dir: &Path) -> ConfigBoot {
     let strategy: String = config_manager
         .get("thumb_strategy")
         .unwrap_or_else(|| "cpu".to_string());
+    let gpu_eng: String = config_manager
+        .get("gpu_engine")
+        .unwrap_or_else(|| "wic".to_string());
     let cache_dir: Option<String> = config_manager
         .get("thumb_cache_dir")
         .filter(|s| !s.is_empty());
@@ -97,17 +98,13 @@ pub fn init(app_data_dir: &Path) -> ConfigBoot {
     // 注:thumb_use_pipeline 配置键已退役(2026-07-10 A/B 裁决删方案一,流水线成唯一
     // 实现,7.3s vs 16-20s);旧库残留的该键无读者,无害。
 
-    crate::thumbnail::limits::install(crate::thumbnail::limits::ThumbnailLimits::from_reader(
-        |key| config_manager.get(key),
-    ))
-    .expect("thumbnail limits must be installed before workers start");
-
     ConfigBoot {
         path: config_path,
         manager: config_manager,
         thumb_size: size,
         thumb_skip_max_kb: skip,
         thumb_strategy: strategy,
+        gpu_engine: gpu_eng,
         custom_cache_dir: cache_dir,
         log_level: lvl,
         custom_log_dir: l_dir,

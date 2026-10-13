@@ -27,39 +27,44 @@ const SENTENCE_ENDERS: &[char] = &[
     ')',
 ];
 
-/// 把一章的解码文本切分为段落数组。`reflow=false` 走保守一级;`true` 叠加二级智能重排。
-/// 返回的每段已去首尾空白(缩进交给 CSS);空段被过滤。
-pub fn segment(chapter_text: &str, reflow: bool) -> Vec<String> {
-    // 一级:非空行即段(行首缩进空白由 trim 去除,渲染层再统一施加 text-indent)。
-    let lines: Vec<&str> = chapter_text
-        .split('\n')
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    if !reflow {
-        return lines.into_iter().map(|s| s.to_string()).collect();
-    }
-    reflow_lines(&lines)
+/// 分段文本及一一对应的源行号；行号相对于传入文本、从零起按 LF 计数。
+pub struct SegmentedText {
+    /// 保留既有去空白、过滤空行和可选重排后的段落内容。
+    pub paragraphs: Vec<String>,
+    /// 每段第一条源行；重排黏合多行时保留第一行，避免显示变换影响编辑定位。
+    pub source_lines: Vec<usize>,
 }
 
-/// 二级智能重排:行尾非句末标点 → 与下一行黏合(CJK 无空格连接);句末标点处断段。
-/// 幂等:输出各段(除末段)均以句末标点收尾,再次重排产出相同结果(见测试 `reflow_is_idempotent`)。
-fn reflow_lines(lines: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// 把一章解码文本切为段落及源行号。`reflow=false` 每个非空行一段；`true` 在句末断段。
+/// 去空白与重排在同一流程记录位置，不从已变换的段落反查重复原文。
+pub fn segment(chapter_text: &str, reflow: bool) -> SegmentedText {
+    let mut out = SegmentedText {
+        paragraphs: Vec::new(),
+        source_lines: Vec::new(),
+    };
     let mut buf = String::new();
-    for &line in lines {
-        // CJK 场景无空格连接;若缓冲与新行衔接处两侧都是 ASCII 字母/数字,补一个空格避免粘连英文单词。
+    let mut start_line = 0;
+    for (line_number, raw_line) in chapter_text.split('\n').enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if buf.is_empty() {
+            start_line = line_number;
+        }
+        // 英文硬换行两侧是字母/数字时仍补空格，保持既有重排结果。
         if !buf.is_empty() && needs_space_join(&buf, line) {
             buf.push(' ');
         }
         buf.push_str(line);
-        if ends_sentence(&buf) {
-            out.push(std::mem::take(&mut buf));
+        if !reflow || ends_sentence(&buf) {
+            out.paragraphs.push(std::mem::take(&mut buf));
+            out.source_lines.push(start_line);
         }
     }
     if !buf.is_empty() {
-        out.push(buf);
+        out.paragraphs.push(buf);
+        out.source_lines.push(start_line);
     }
     out
 }

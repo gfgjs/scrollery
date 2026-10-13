@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// UiSelect — 全局 `.select` 下拉的类型化包裹（S1 UI primitive）。
+// 类型化下拉控件，复用全局 `.select` 样式。
 // 结构 = .select-wrap（含 ::after 下拉箭头）> select.select > <slot> 选项。
 // 选项经默认插槽由消费方渲染（保持 i18n / optgroup 灵活性,原语不依赖 i18n keys）。
 // v-model 经 writable computed 走 Vue 规范的 vModelSelect 指令,选项选中/change 读值均由其处理。

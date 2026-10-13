@@ -1,6 +1,6 @@
 [package]
 name = "scrollery"
-version.workspace = true # Part7-T5:版本锚在根 [workspace.package],升版只改根一处
+version.workspace = true # 应用版本由根 workspace 统一定义
 description = "Scrollery — High-performance cross-platform media asset manager"
 authors = ["Scrollery Contributors"]
 license.workspace = true # 第一方许可:AGPL-3.0-only(根 [workspace.package] 单一事实源)
@@ -9,35 +9,29 @@ default-run = "scrollery"
 
 [lib]
 name = "scrollery_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # ── Tauri core ──────────────────────────────────────────────────────────────
-# devtools 不入直接 features(2026-07-10 审查 B16):Tauri v2 debug 构建默认自带 devtools,
-# 直挂等于 release 生产包也编入 inspector(终端用户可检视 IPC 载荷),与 CSP/assetProtocol
-# 加固方向相悖。诊断型生产构建按需 `--features devtools`(经下方同名 feature 接线)。
+# 生产包默认关闭 inspector，诊断构建按需使用 --features devtools。
 tauri          = { version = "2", features = ["protocol-asset", "unstable", "tray-icon"] }
 tauri-plugin-dialog       = "2"
 tauri-plugin-shell        = "2"
-# os:自绘标题栏(WindowChrome)按平台分叉窗口装饰,前端经 @tauri-apps/plugin-os 的 platform()
-# 同步判定 mac/windows(顶栏重构 L0,设计文档 §4.1)。JS 侧对应 os:default capability。
+# 前端通过 platform() 选择平台窗口装饰，权限为 os:default。
 tauri-plugin-os           = "2"
-# opener:**有意只用它的自由函数 reveal_item_in_dir,不注册插件、不授 capability**(S 线 D-001)。
-# 官方 opener:allow-reveal-item-in-dir 无预配置 scope,授给 WebView 即绕过本项目自定义的扫描根
-# 边界;而 reveal_item_in_dir() 是 crate 根导出的普通函数(不需 AppHandle),故可由自有受限 IPC
-# 校验 rootId+relPath 后在 Rust 内部调用 —— JS 侧完全够不着,ACL 面为零。
-# 顺带:该函数在 Android/iOS 返回 Error::UnsupportedPlatform,正好兑现 D-001 的移动端契约。
+# 仅在受限 IPC 校验路径后调用 reveal_item_in_dir，不向 WebView 注册 opener 插件权限。
 tauri-plugin-opener       = "2"
-# updater 属直销(direct)发布面(Part7 §3.5):唯一渠道 = 直销,故为普通依赖;运行期按
-# 「编译进 context 的最终配置是否带 plugins.updater」决定是否注册(lib.rs:133)。
+# 直销更新器仅在最终配置包含 plugins.updater 时注册。
 tauri-plugin-updater      = "2"
 
 # ── Async runtime ────────────────────────────────────────────────────────────
 tokio      = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+# 备份/导出可写探针使用独占匿名文件，句柄关闭后清理，不覆盖或误删用户路径。
+tempfile = "3"
 
 # ── Database ─────────────────────────────────────────────────────────────────
 rusqlite   = { version = "0.31", features = ["bundled", "collation", "functions"] }
@@ -52,30 +46,21 @@ serde_json = "1"
 thiserror  = "1"
 
 # ── 高吞吐哈希（S3.2）────────────────────────────────────────────────────────────
-# 布局/取数缓存的 id → 下标索引是 1M 级整数键 map，SipHash 构建占布局换代耗时大头；
-# FxHash（rustc 同款）对整数键提速数倍。仅用于**内部索引**（键为自产媒体 id，无 HashDoS 面）。
+# FxHash 用于自产媒体 id 的内部索引，减少布局换代时的哈希成本。
 rustc-hash = "2"
 
 # ── 冷门格式插件 IPC 协议（Part2）─────────────────────────────────────────────────
 # 与各 Worker 二进制共享同一份帧编解码/消息/错误码定义（路径依赖，随主程序构建）。
 exotic-protocol = { path = "../crates/exotic-protocol" }
 
-# ── 插件平台契约叶 crate（Part6 §3.9.1a 去环叶 crate）───────────────────────────────
-# plugin-api：EntitlementProvider/LicenseStatus/LicenseError 抽象（零密钥、零门控逻辑）。
-# 未授权回退桩 FreeStubEntitlement 住主机 exotic::license 模块（恒 Unlicensed，无需独立 crate）。
+# 系统凭据服务共用命名常量。
 scrollery-plugin-api = { path = "../crates/scrollery-plugin-api" }
 
-# ── 信任根验签叶 crate（Part6 §3.9.1a 去环 ③a）──────────────────────────────────────
-# VerifyingKeyset + verify_token/evaluate_token/LicensePayload 住此叶 crate，是 registry 与 license
-# 两用途的唯一信任根（验签路径不分叉；默认占位公钥，发布经 PICASA_EXOTIC_KEYSET_FILE 注入）。
-# `crate::exotic::crypto`/`::license` 退化为再导出薄壳，引用路径不变。
-# test_support（测试构造工具）经其 `test-support` feature 暴露 → 见下方 [dev-dependencies]。
+# 插件包与 registry 公钥验签；发布通过 PICASA_EXOTIC_KEYSET_FILE 注入信任根。
 scrollery-exotic-trust = { path = "../crates/scrollery-exotic-trust" }
 
 # ── AI 推理核心(Part4-T15 迁出)────────────────────────────────────────────────────
-# 纯契约面消费(T16 收口):profile/face_profile 注册表、embedding 字节序、face_types
-# 几何、DecodedImage 类型。默认特性关闭 = 不带 inference 面(ort/tokenizers/ndarray
-# 整树不进 host 单包依赖图);推理恒在 ai-worker 子进程(彼处开 inference)。
+# 主进程仅消费模型契约与纯类型，关闭 inference 以免链接 ORT 和 tokenizers。
 scrollery-ai-core = { path = "../crates/scrollery-ai-core", default-features = false }
 
 # ── Hashing ───────────────────────────────────────────────────────────────────
@@ -83,14 +68,12 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # ── Image processing ──────────────────────────────────────────────────────────
 image              = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff"] }
-# 图片编辑 v2：任意角旋转与后续滤波算子。严禁默认 features，避免反向打开
-# image/default、rayon、字体与 FFT 依赖族（D-103/D-110）。
+# 仅需编辑几何算子；关闭默认特性，避免启用字体、FFT 等依赖。
 imageproc          = { version = "0.27", default-features = false }
-# `image 0.25.10` 已传递引入同版本；提升为直接依赖供编辑预览/调色链显式调用 ICC CMS。
+# 编辑预览与调色使用 ICC 色彩转换。
 moxcms             = "0.8.1"
-# 有损 WebP 编码(libwebp 官方绑定)。image crate 0.25 起 WebP 编码器**仅支持无损**,照片类
-# 缩略图无损体积约为有损 q80 的 5~10 倍(连锁放大缓存 LRU 驱逐→404 自愈 churn),故编码主
-# 路径走 libwebp 有损。default-features=false 关掉 img 特性(不需要与 image crate 互转)。
+# 有损缩略图使用 libwebp，避免无损 WebP 过大增加缓存驱逐与自愈。
+# 关闭 img 特性，编码路径无需与 image crate 互转。
 webp               = { version = "0.3", default-features = false }
 fast_image_resize  = "4"
 thumbhash          = "0.1"
@@ -99,39 +82,31 @@ kamadak-exif = "0.5"
 quick-xml    = { version = "0.36", features = ["serialize"] }
 
 # ── Documents（P4，§3.4/§7）─────────────────────────────────────────────────────
-# zip：EPUB 解析（容器即 zip，读 OPF 封面图）。纯 Rust、体积小 → 两变体都含（非「重」依赖）。
-# default-features=false 去掉 bzip2/zstd/aes，仅保留 deflate（epub 内常用存储/deflate）。
+# EPUB 容器读取与备份打包使用 ZIP，仅启用 deflate。
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# similar：文档版本按需 diff（§5.3，类 git 全量快照 + 行级 diff）。纯 Rust、小，两变体都含。
+# 文档版本按需生成行级差异。
 similar = "2"
-# reqwest（rustls）：远程 AI 校对（§5.4），后续亦服务 Ollama / WebDAV。纯 Rust TLS、无 native 捆绑。
-# cookies：ModelScope 等源前置 WAF(如 Aliyun acw_tc 滑块)靠 Set-Cookie 跨跳/跨请求维持会话，
-# 缺 cookie jar 时同一下载内多跳/多文件会被判「非浏览器」返回异常长度内容（2026-07-23 实测，
-# OCR 资产下载 size mismatch 根因）；curl 默认自带同等行为，reqwest 需显式开启对齐。
+# 远程校对、下载与网络存储共用 rustls 客户端。
+# cookie jar 保持下载源的跨跳与跨请求会话，避免 WAF 返回异常内容。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
-# keyring：API Key 等凭据存系统凭据库（§5.4），不落明文 DB。调 OS API，两变体都含。
+# API Key 等凭据存系统凭据库，不落明文数据库。
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
-# lofty：音频封面/标签/歌词提取（P3，§3.6）。纯 Rust、体积小 → 两变体都含（非「重」依赖）。
+# 音频封面、标签与歌词提取。
 lofty = "0.22"
 
 # ── 阅读器文本管线（阅读器完善方案 R1，§5.1/§5.2）────────────────────────────────
 # chardetng：Firefox 的编码启发式检测器（同源 encoding_rs）。纯 Rust、宽松许可（Apache-2.0/MIT）。
 #   仅用于 txt 无 BOM 时的编码猜测（喂前 64KB）；UTF-16 系不测（由 BOM 层 + 零字节启发兜底）。
 chardetng = "0.1"
-# encoding_rs：编码解码引擎（WHATWG 规范）。**已是传递依赖（tauri/html5ever 引入 0.8.35）**，
-#   此处显式化：供编码 seam 按检出/覆盖编码解码为 UTF-8，并做 BOM 剥离 + 替换率统计。
+# 按检测或覆盖编码解码为 UTF-8，并处理 BOM 与替换率。
 encoding_rs = "0.8"
-# regex：txt 分章规则集的正则引擎（rust-lang 官方，线性时间保证）。**已是传递依赖（1.12.4）**，
-#   显式化。注：regex 不支持 lookaround → legado 式 `节(?!课)` 负向断言由本项目自研的
-#   deny_suffix 后过滤等价实现（见 reader/text_index.rs，规则自写不抄 GPL）。
+# txt 分章规则使用正则；不支持的负向断言由 deny_suffix 后过滤实现。
 regex = "1"
-# ferrous-opencc：纯 Rust OpenCC 简繁转换（§5.10）。零 C++ 依赖（对比 opencc-rust 的四平台交叉
-#   编译负债）、14 内置 config 词典编译进库。经 convert_chinese 命令暴露,前端在替换规则之后按章批量调用。
+# 纯 Rust 简繁转换，词典内置；前端在替换规则之后按章调用。
 ferrous-opencc = "0.4"
 
 # ── 网络盘（P5，§3.8）─────────────────────────────────────────────────────────────
-# reqwest_dav：WebDAV 原生客户端（8B）。纯 Rust，依赖既有 reqwest(rustls)；仅 netfs(perf) 编入。
-# 8A（OS 挂载盘/UNC）无需任何 native 依赖；8B 原生 VFS 经 netfs feature 启用。
+# WebDAV 原生客户端由 netfs 特性启用；OS 挂载盘与 UNC 无需该依赖。
 reqwest_dav = { version = "0.1", optional = true }
 
 # ── CPU parallelism ───────────────────────────────────────────────────────────
@@ -139,20 +114,16 @@ rayon = "1"
 
 # ── File system traversal ─────────────────────────────────────────────────────
 walkdir = "2"
-# std::fs::canonicalize 在 Windows 上返回 \\?\ 前缀的 verbatim 路径,explorer.exe 接这种形态
-# 时行为不稳(部分版本报「找不到」)。dunce 只做「能安全去前缀就去」这一件事,已是本仓传递依赖
-# (Cargo.lock 已含 1.0.5,升为直接依赖零新增编译)。open_directory 的路径校验用它(安全审查 #5)。
+# Windows 规范化路径可能带 verbatim 前缀；dunce 在安全时去除前缀，以供系统文件管理器使用。
 dunce = "1"
-# std::fs::copy 不保证保留 mtime(Unix 上尤其不保留,仅 Windows 部分实现「碰巧」保留)。导出
-# (方案 A §2.3)要求复制后显式保留源文件修改时间,跨平台契约不能靠平台巧合。filetime 是
-# alexcrichton 维护的成熟小库(纯 syscall 封装,零传递依赖爆炸),cargo/rustup 等广泛使用。
+# 跨平台复制不保证保留 mtime，导出时需显式恢复源文件修改时间。
 filetime = "0.2"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono", "json"] }
 tracing-appender   = "0.2"
-# panic hook：panic 消息+backtrace 作为最后一条 ERROR 落盘(日志能力重构 S1,LukeMathWalker 维护)。
+# panic 消息与 backtrace 作为 ERROR 日志落盘。
 tracing-panic      = "0.1"
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -163,62 +134,43 @@ crossbeam-channel = "0.5.15"
 libc = "0.2"
 
 # ── AI ────────────────────────────────────────────────────────────────────────
-# T16 收口:host 零 ort/tokenizers/ndarray——推理恒在 ai-worker 子进程(ai-core 是
-# 唯一 ort 载体)。单包构建(tauri build / cargo build -p scrollery)依赖图不含
-# 推理面;workspace 全量构建因 feature 并集会替 ai-worker 编译 inference 面,但
-# host 代码零引用。
-#
-# Half-precision storage for the in-memory embedding cache (C1) — halves resident
-# RAM vs f32 (1M×512 ≈ 1GB instead of 2GB). Already in the dependency tree.
-# 嵌入向量内存缓存的半精度存储(C1)——相比 f32 内存减半(百万×512 ≈ 1GB 而非 2GB)。
+# 嵌入向量缓存使用半精度存储，相比 f32 减半内存占用。
 half      = "2"
-# sha2：模型下载完整性校验（Layer B，对照注册表中各资产的 sha256）。纯 Rust、小。
+# 模型下载内容与注册表的 SHA-256 对照校验。
 sha2 = "0.10"
 # blake3：精确去重摘要（与 content_hash 的扫描变更指纹严格分离）。
 blake3 = "1.5"
 
 # ── 冷门格式插件 · 信任根与验签（Part3 P5/P6）─────────────────────────────────────
-# ring：离线 Ed25519 验签——License token、签名 Registry index、package manifest（v3 D11）。
-#   **复用既有依赖**（reqwest/rustls 已引入 ring，零新增网络成本）。Host **只验签不签名**
-#   （私钥离线/HSM，不入仓，§5.1）；ring 的 Ed25519 verify 遵循 RFC 8032 严格校验（拒非规范签名）。
-#   测试用 `Ed25519KeyPair::from_seed_unchecked` 确定性种子签名 → 不引入 CSPRNG。
+# 离线 Ed25519 验证 License、Registry 与 package manifest；主进程只持公钥。
 ring = "0.17"
-# base64：License token = base64url(payload).base64url(sig)；Registry/manifest 公钥亦 base64。
-#   **已在依赖树**（rustls 等传递引入 0.22），仅提升为直接依赖。
+# License token 使用 base64url(payload).base64url(sig)，公钥也以 base64 表示。
 base64 = "0.22"
 wallpaper = "3.2"
 arboard = "3.6.1"
 trash = "5.2.6"
 
 # ── 配置文件子系统(A1,设置类键唯一真源迁往 <app_data_dir>/config.toml)───────────────
-# toml_edit：带位置信息(span)与注释保留的 TOML 读写——语法错误可报行号列号，`set_value`/
-#   `unset_value` 能在改单键时原样保留其余注释与排版(裸 `toml` crate 只做值语义、序列化会
-#   丢注释，不满足「保留既有注释与排版」的硬约束)。serde feature 供 LoadedConfig 派生使用。
+# TOML 读写保留既有注释与排版，语法错误可按 span 报行列位置。
 toml_edit = { version = "0.25", features = ["serde"] }
-# notify：监听 config.toml 所在目录(按文件名过滤，见 config/watcher.rs 注释——多数编辑器
-#   保存走 tmp+rename，直接盯文件会断 inode)，供用户手改配置后热加载。
+# 监听配置所在目录并按文件名过滤，兼容编辑器的 tmp+rename 保存方式。
 notify = "8"
 
-# ── Windows 原生 API(target 限定,审查 R0-2 / todo C 节跨平台适配)────────────────────
-# `windows` crate 从无条件依赖迁到 cfg(windows) target 限定:非 Windows 目标不再解析/编译它,
-# 是公开树 Linux/macOS `cargo check` 能过的前提(gate 早期 ubuntu 跑实证:唯一硬错误面是
-# wic_engine.rs 的 Win32 符号)。库内所有使用点均已 cfg(windows) 门控:
-#   wic_engine(模块级)/ media_foundation(video/mod.rs 模块级)/ volume_probe(函数级)
-#   / ai/provider DXGI(块级)/ system_commands DWM(块级)。
-# Win32_Media_MediaFoundation:视频解码/取帧/元数据(P2,§3.2);Win32_System_Com_StructuredStorage:
-# PROPVARIANT(PropVariantToInt64);Win32_Storage_FileSystem:卷 GUID + 盘类型(C5 Piece A);
-# Win32_System_ProcessStatus:GetProcessMemoryInfo(方案 C §5 图片编辑内存基准探针
-# `examples/edit_memory_probe.rs` 用,自报 PeakWorkingSetSize,不进正式命令路径)。
-# Win32_UI_WindowsAndMessaging:GetForegroundWindow + GetWindowThreadProcessId(窗口焦点事件
-# 边界的应用前台判定,见 lifecycle.rs;Tauri 焦点事件由 WebView2 合成,不能与 Tao 窗口缓存混用)。
+[target.'cfg(unix)'.dependencies]
+# 暂存清理沿已打开的目录句柄递归，避免检查后路径被替换时跟随到边界外。
+rustix = { version = "1.1.4", features = ["fs"] }
+
+# Windows 原生 API 仅在 cfg(windows) 目标编译，用于图像、媒体、卷与窗口功能。
+# ProcessStatus 同时用于 examples/edit_memory_probe.rs 的内存峰值探针。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["implement", "Win32_Graphics_Imaging", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_DXCore", "Win32_System_LibraryLoader", "Win32_Graphics_Dxgi_Common", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_JobObjects", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = ["implement", "Win32_Graphics_Imaging", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Media_MediaFoundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus",
+    "Win32_System_JobObjects",
+    "Foundation_Numerics", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Dxgi_Common",
+    "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # `#[implement]` 宏(media_foundation.rs 的 IMFSourceReaderCallback 异步回调)展开出 `::windows_core`
 # 绝对路径,需 windows-core 作为直接依赖在 crate 根可见(版本随 windows 0.58 锁到同一 0.58.0)。
 windows-core = "0.58"
-# 窗口材质(毛玻璃,window_material 配置键):DWM 背板 mica/acrylic/blur,见 window_material.rs。
-# Cargo.lock 已锁 0.6.0(tauri 2.11.4 的传递依赖,提升为直接依赖零新增编译);不用 tauri 内置
-# set_effects——它吞错误且列表非 fallback 语义,Win10 的 mica→blur 退化需要拿到 Result(方案 §2.2)。
+# DWM 背板按平台能力回退，需要 Result 判断失败，见 window_material.rs。
 window-vibrancy = "0.6"
 
 [dev-dependencies]
@@ -227,17 +179,11 @@ window-vibrancy = "0.6"
 # 改用 feature 门控）。cargo 对同一 path crate 的 [dependencies]（无 feature）与 [dev-dependencies]
 # （含 feature）做 feature 并集：普通 `cargo build` 不启用 → 测试密钥绝不编入 Release。
 scrollery-exotic-trust = { path = "../crates/scrollery-exotic-trust", features = ["test-support"] }
-# lexicmp:仅作 `utils::natural_sort` 的**对拍基准**(证明自研 natural_cmp 与其非溢出输入逐项
-# 等价、只去掉 ≥20 位数字段的 u64 溢出)。生产 NATURAL_CMP collation 已改用自研实现,不再依赖它;
-# 降为 dev-dep 使发货二进制不含此 crate(其上游溢出 bug surrealdb/lexicmp#1 自 2023-09 未修)。
+# lexicmp 仅作 natural_sort 对拍基准；生产比较器自行处理可能溢出 u64 的长数字段。
 lexicmp = "0.2.0"
-# open_directory 路径校验单测(安全审查 #5)要在真实文件系统上造「存在的目录/文件/不存在的路径」
-# 三态样本 —— std::fs::canonicalize 无法用假路径伪造,必须是磁盘上真实存在的条目。
-tempfile = "3"
-# 图片编辑 v2 P0-CM 对拍参考实现；static 让 Little CMS 从 vendored C 源构建，
-# 不依赖目标机系统库。仅测试/spike 使用，不进入发货二进制。
+# Little CMS 仅作编辑色彩链的测试参考，static 避免依赖目标机系统库。
 lcms2 = { version = "6.1.1", features = ["static"] }
-# 日志内核性能基准(日志能力重构 S1,方案 §3.2/§9.4)：off/过滤态/全开态每事件成本 + 流水线宏基准。
+# 日志关闭、过滤、全开状态与流水线的性能基准。
 criterion = "0.5"
 
 [[bench]]
@@ -245,30 +191,21 @@ name = "logging"
 harness = false
 
 [features]
-native-vpl = [] # Windows x64 worker 链接显式准备的官方 VPL 与本项目薄桥。
-# Lite 为默认变体（极致轻量，零大体积 native 捆绑）。custom-protocol 为 Tauri 生产构建所需。
-# 见 docs/archive/feature_expansion_plan_v1.md §1.4：包体积由编译期决定 → 主开关必须是 Cargo feature。
+# 默认采用 Lite 标记，custom-protocol 用于 Tauri 生产构建。
 default = ["custom-protocol", "lite"]
 custom-protocol = ["tauri/custom-protocol"]
-# devtools:release 诊断开关(debug 构建无需——Tauri v2 默认自带)。此前为空 feature 未接
-# tauri/devtools,形同虚设;接线后 release 默认无 inspector,按需显式开启。
+# Release 诊断构建按需启用 inspector，debug 构建无需此开关。
 devtools = ["tauri/devtools"]
 
-# exotic-dev-fixtures：仅 dev 注入「测试授权」，使无真实 License 时也能在开发期端到端跑通冷门格式
-# 流水线（Part2 §3.5）。**必须**配合 debug 构建（代码用 #[cfg(all(debug_assertions, feature=...))] 双重
-# 门控）；Release 构建即使开启本 feature 也因 debug_assertions=false 而无任何跳过授权的代码路径。
+# 开发测试授权同时受 feature 与 debug_assertions 门控，Release 不启用跳过授权的路径。
 exotic-dev-fixtures = []
 
-# ── 构建变体（§1.4）────────────────────────────────────────────────────────────
-# lite：标记 feature（本身为空），Media Foundation 视频后端因 `#[cfg(windows)]` 两变体都在。
-# perf：经 feature 启用捆绑型原生后端（FFmpeg/pdfium/native-text/netfs，随各阶段落地）。
+# Lite 是构建标记，Perf 启用 netfs 并包含 ffmpeg 标记；Windows 原生媒体后端两者均可用。
 lite = []
 perf = ["ffmpeg", "netfs"]
-# FFmpeg sidecar：覆盖 MF 不支持的容器、批量更快；仅 Perf 打包 externalBin。
-# P2 暂为占位（glue 未实现），先建立 feature 边界，FfmpegBackend 在后续阶段补。
+# ffmpeg 保留为空构建标记；视频插件的 worker 路径不由此特性实现。
 ffmpeg = []
-# netfs：网络盘原生 VFS（P5 8B，§3.8）。启用 reqwest_dav 的 WebDAV 后端 + StorageBackend::WebDav。
-# Lite 不编入（依赖 OS 挂载/UNC，即 8A）；Perf 编入以支持「无需 OS 挂载」的原生连接。
+# netfs 编入 reqwest_dav 与 WebDAV 存储后端；Lite 可访问 OS 挂载盘与 UNC。
 netfs = ["dep:reqwest_dav"]
 
 # ── 合规隔离(Part4-T1 / Part4 §3.10.1)─────────────────────────────────────────
@@ -279,12 +216,6 @@ netfs = ["dep:reqwest_dav"]
 # T15 起转发至 ai-core(SCRFD/ArcFace 代码已随推理核迁出,cfg 门控单一事实源在彼处)。
 face-noncommercial = ["scrollery-ai-core/face-noncommercial"]
 
-# ── 发布渠道(Part7 §3.5)────────────────────────────────────────────────────────
-# 唯一渠道 = 直销(direct):keyring 授权 + 签名 Registry 验签 + HTTPS 下载,这是当前唯一已实现
-# 的授权/分发形态。渠道 feature 维度已整体退役(P16,2026-09-15):channel-msstore/steam 空渠道、
-# lib.rs 互斥门、渠道桩、InstallSource 多值枚举、CI 三渠道依赖树断言同批删除;updater 因此
-# 由 optional dep 转为普通依赖(唯一渠道 = 直销,无常开 feature 需要绑定)。
+# 当前采用直销渠道，授权、Registry 验签与 HTTPS 下载由运行时配置及组件实现。
 
-# ── 构建 profile 已迁至 workspace 根 Cargo.toml ────────────────────────────────
-# cargo 只认 workspace 根的 [profile.*]，member 内声明会被忽略并告警。
-# release（unwind/lto=thin/opt=3/strip）与 lite（尺寸优先）profile 见 ../Cargo.toml。
+# 构建 profile 仅在 workspace 根生效，Release 与 Lite 参数见 ../Cargo.toml。

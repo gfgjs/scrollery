@@ -1,8 +1,6 @@
 // src/composables/reader/useReaderPanels.ts
-// 面板互斥总控（结构拆分自 DocumentViewer.vue §S24）。薄编排工具：不持有状态，只汇总各域已
-// 实例化的 show* ref。**新增面板必须登记于装配处的 flags 数组**（原注释原话，红线）——
-// 漏登记 = 沉浸态残留面板遮挡 + Esc 跳过面板层直接关掉阅读器，而没有任何门会红。
-// showSearch 有意不进 flags 数组：它的关闭需额外清理搜索迭代/高亮，统一走 closeSearch()。
+// 汇总各面板状态；新增面板须登记到 flags，确保沉浸与 Esc 能统一收起。
+// 搜索面板另走 closeSearch()，以清理异步搜索及高亮。
 import { computed, type Ref } from 'vue'
 
 export function useReaderPanels(

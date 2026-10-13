@@ -1,4 +1,4 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "//": "Perf 变体配置覆盖（§1.4.4）。经 `--features perf` 编入原生后端 glue（pdfium load-dynamic、FFmpeg sidecar）。当这些组件落地（P4/P5）后，在此追加 bundle.externalBin（ffmpeg.exe）与 bundle.resources（pdfium.dll）以产出『完整包』；不追加则为『轻量+组件包』（组件离线补装）。当前与默认配置一致。"
+  "//": "配合 --features perf 使用；本文件未覆盖默认 Tauri 配置。Perf 当前编入 netfs，视频插件所需组件由运行时组件系统提供。"
 }

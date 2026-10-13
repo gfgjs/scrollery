@@ -67,9 +67,8 @@ pub async fn load_video_subtitle(
     path: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<SubtitleFile> {
-    // R1-3:先经读池取 item 绝对路径(rusqlite 不得在 async worker 上直接跑)。
-    // GA-fix #6:仓内目前无更轻的「仅取 abs_path」查询——get_media_detail 附带 image_meta/
-    // video_meta 等联查,略重但唯一现成;新增专用轻量查询超出本次修复范围,留作后续。
+    // 经读池取 item 绝对路径，避免在 async worker 上执行 rusqlite。
+    // get_media_detail 同时联查元数据，此处只使用 abs_path。
     let abs_path: String = read_blocking(&state, move |conn| {
         q::get_media_detail(conn, item_id).map(|d| d.abs_path)
     })

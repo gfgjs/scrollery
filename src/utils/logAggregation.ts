@@ -1,7 +1,7 @@
 // src/utils/logAggregation.ts
-// 错误聚合(日志能力重构 S5 P1,方案 §5「按 error.code 分组计数+首末时间+样本展开」)。
+// 错误聚合按 error.code 分组，记录计数、首末时间与样本。
 // 复用 AppError 稳定 code 契约(error.rs Serialize 实现的 attributes['error.code']),比文本模板
-// 挖掘便宜且精确——裸文本 warn/error(无 error.code)不参与聚合,轻量模板启发式非本期范围。
+// 挖掘便宜且精确；无 error.code 的裸文本 warn/error 不参与聚合。
 import type { LogEntry } from '../types/logEntry'
 
 export interface ErrorAggregateRow {

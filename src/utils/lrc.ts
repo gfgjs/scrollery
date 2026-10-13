@@ -1,5 +1,5 @@
 // src/utils/lrc.ts
-// LRC 歌词解析（P3, §3.6）：把带 `[mm:ss.xx]` 时间轴的 LRC 文本解析为按时间排序的行，
+// LRC 歌词解析：把带 `[mm:ss.xx]` 时间轴的 LRC 文本解析为按时间排序的行，
 // 供 AudioPlayer 随播放同步高亮/滚动。无时间轴的纯文本歌词由调用方按普通文本展示。
 
 export interface LrcLine {

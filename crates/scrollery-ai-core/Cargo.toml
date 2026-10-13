@@ -1,10 +1,10 @@
 # crates/scrollery-ai-core/Cargo.toml
-# AI 推理核心(Part4-T15/T16):ort Session 池 + CLIP 编解码 + 人脸检测/嵌入 + 模型契约注册表。
-# T16 收口后本 crate 是 workspace **唯一 ort 载体**:ai-worker 开 inference 消费推理面;
+# AI 推理核心：ORT Session 池、CLIP、人脸、OCR、增强推理与模型契约。
+# ai-worker 启用 inference 消费推理面；
 # src-tauri 关默认特性,只消费纯契约面(profile 注册表/embedding 字节序/face_types/decoded)。
 #
 # ort 特性说明:load-dynamic 激活 ort-sys/disable-linking,download-binaries 实际不运行
-# (见 engine.rs 坑1);升级 ort 只改本文件(「两处同步」义务已随 src-tauri 直依赖拆除解除)。
+# (见 engine.rs)；ORT 版本在本文件管理。
 
 [package]
 name = "scrollery-ai-core"
@@ -18,8 +18,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 tracing = "0.1"
 
-# ── AI 推理(与 src-tauri 同版本同特性,见头部注释;T16 准备:全部 optional,
-#    随 `inference` feature 启停——缺省开,行为零变化)──────────────────────────────
+# ── AI 推理依赖：随 `inference` feature 启停 ──────────────────────────────
 ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "directml", "download-binaries", "copy-dylibs"], optional = true }
 ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
@@ -39,10 +38,10 @@ crossbeam-channel = { version = "0.5.15", optional = true }
 windows = { version = "0.58", features = ["Win32_Graphics_Dxgi"], optional = true }
 
 [features]
-# 缺省 = 全推理面(既有消费方 ai-worker/src-tauri 零变化)。
+# 缺省启用推理面。
 default = ["inference"]
-# 推理面(T16 准备):ort Session 池/CLIP 编解码/人脸检测嵌入/EP 探测。
-# src-tauri 在 T16 删 ort 时改 `default-features = false`,只留纯契约面
+# 推理面：ORT Session 池、CLIP、人脸、OCR、增强与执行提供器探测。
+# src-tauri 使用 `default-features = false`，只消费纯契约面
 # (profile/face_profile 注册表、face_types 几何、embedding 字节序、decoded 类型)。
 inference = [
     "dep:ort",

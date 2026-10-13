@@ -17,7 +17,6 @@
 //! - **对齐**：5 点相似变换 → `arcface_dst` 模板 → 双线性 backward warp。✓ 同关键点逐位一致
 //! - 端到端 cosine ~0.92：残差仅来自检测器输入缩放的亚像素差（letterbox vs OpenCV setInputSize），
 //!   远超识别阈值 0.363，不影响聚类/检索功能。
-//! - SCRFD + ArcFace（非商用轨）尚未对拍，待 F7 接入后用同法验（InsightFace 参考）。
 
 use image::imageops::FilterType;
 use ndarray::Array4;
@@ -695,7 +694,7 @@ fn embed_batch(
 }
 
 /// 对齐 + 嵌入一组人脸，返回各自的 L2 归一化向量（维度 = `profile.embed_dim`）。
-/// N>1 先试批量一次 `run()`（提速）；失败（模型 batch 维固定）回退逐脸，保证不回归。
+/// 模型声明接受当前脸数时才尝试批量；固定单脸模型直接逐脸。
 pub fn embed_faces(
     embed_pool: &SessionPool,
     decoded: &DecodedImage,
@@ -712,7 +711,20 @@ pub fn embed_faces(
         .map(|f| align_face(decoded, f, profile))
         .collect::<Result<_>>()?;
 
-    if aligned.len() > 1 {
+    let can_batch = if aligned.len() > 1 {
+        let guard = embed_pool
+            .get()
+            .ok_or_else(|| AiError::Internal("face embed pool disconnected".into()))?;
+        let batch_axis = guard
+            .inputs()
+            .first()
+            .and_then(|input| input.dtype().tensor_shape())
+            .and_then(|shape| shape.first().copied());
+        embedding_batch_allowed(batch_axis, aligned.len())
+    } else {
+        false
+    };
+    if can_batch {
         match embed_batch(embed_pool, &aligned, size, profile) {
             Ok(v) => return Ok(v),
             Err(e) => {
@@ -729,4 +741,32 @@ pub fn embed_faces(
         out.push(embed_one(embed_pool, rgb, size, profile)?);
     }
     Ok(out)
+}
+
+/// 动态轴沿用批量尝试；固定轴仅接受声明行数，避免每张多人图触发一次已知形状错误。
+fn embedding_batch_allowed(axis: Option<i64>, faces: usize) -> bool {
+    match axis {
+        Some(rows) if rows > 0 => rows as usize == faces,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiple_faces_respect_the_recognition_model_batch_contract() {
+        assert!(
+            !embedding_batch_allowed(Some(1), 2),
+            "固定单脸模型不提交多脸形状"
+        );
+        assert!(
+            !embedding_batch_allowed(Some(4), 3),
+            "不完整的固定批继续逐脸语义"
+        );
+        assert!(embedding_batch_allowed(Some(4), 4));
+        assert!(embedding_batch_allowed(Some(-1), 3));
+        assert!(embedding_batch_allowed(None, 3));
+    }
 }

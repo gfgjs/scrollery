@@ -1,6 +1,5 @@
 // src/utils/color.ts
-// 颜色数学单一归宿（阅读器方案 R3）。此前 isDarkColor（感知亮度）散落在 shikiHighlight，
-// R3 的阅读主题对比度门禁又要 WCAG 相对亮度——两处各写一份解析器易漂移，故抽此共享模块：
+// 共享颜色解析与亮度计算，避免阅读主题和语法高亮使用不同的解析规则：
 //   · parseColorToRgb —— 唯一的 CSS 颜色解析器（#rgb / #rrggbb / rgb() / rgba() / oklch() / color(srgb)）。
 //   · isDarkColor      —— 感知亮度（0.299/0.587/0.114），给 shiki 选明/暗主题（沿用旧行为）。
 //   · relativeLuminance / contrastRatio —— WCAG 2.x 线性化亮度与对比度（阅读主题门禁用）。
@@ -16,7 +15,7 @@ export interface Rgb {
  * 解析 CSS 颜色为 0..255 的 RGB；无法解析（空串 / 具名色 / 非法值）→ null。
  * 支持 `#rgb` / `#rrggbb` / `rgb()` / `rgba()`（含逗号或空格分隔）、`oklch()` 与
  * `color(srgb ...)`——后两者是 getComputedStyle 对主题 color-mix token 的典型序列化形态
- * （主题底色自 2026-09-06 起为 color-mix 浓度表达式,经 DOM 解析后可能以 oklch 形态回读）。
+ * （主题颜色经 DOM 解析后可能以 oklch 形态回读）。
  * **不支持具名色**（如 blue）——具名色需 DOM 解析,纯函数拿不到,返回 null 由调用方按默认处理。
  */
 export function parseColorToRgb(css: string): Rgb | null {

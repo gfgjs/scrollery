@@ -1,14 +1,13 @@
 // src-tauri/src/layout/lens_folder.rs
-//! 重复镜头 folders 模式的纯函数组装（2026-09-02 主画廊重复项浏览方案
-//! §3.3 关联文件夹簇、§7.4 文件夹簇计算、§7.5 文件夹内稳定顺序）。
+//! 重复镜头 folders 模式的关联文件夹簇组装与稳定排序。
 //!
 //! 输入 = 三桶分类行（`list_duplicate_folder_lens_rows`）× 全库 canonical items，
 //! 输出 = 关联文件夹簇序列（簇 → 目录 → 桶 → 行），供布局打包层（compute_layout
 //! 的 Folders 分支）直接消费。簇关系用 Union-Find 的**组节点 star 连接**表达
-//!（同组全部目录并入同一分量，O(k)——§7.4 明令不做 O(k²) pair）。
+//!（同组全部目录并入同一分量，O(k)，避免 O(k²) 两两连接）。
 //!
 //! 全局组序与 groups 模式共用 [`super::lens::cmp_group_order`] 单一事实源，使同一
-//! 重复组在两种模式与跨文件夹块中的「组 N」可追踪（§7.3）。
+//! 重复组在两种模式与跨文件夹块中的「组 N」可追踪。
 
 use std::collections::{HashMap, HashSet};
 

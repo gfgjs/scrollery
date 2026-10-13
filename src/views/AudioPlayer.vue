@@ -36,7 +36,7 @@
           </p>
         </div>
 
-        <!-- 控件：进度条 + 播放/暂停 + 时间 + 音量 -->
+        <!-- 控件：进度条 + 播放/暂停 + 时间 + 音量 + 倍速 -->
         <div class="audio-player__controls">
           <div class="audio-player__seek">
             <span class="audio-player__time">{{ fmt(currentTime) }}</span>
@@ -88,7 +88,11 @@
                 @input="onVolume"
               />
             </div>
+            <VideoRateMenu :rate="prefs.rate" @set-rate="onRate" />
           </div>
+          <p v-if="playbackError" class="audio-player__playback-error" role="alert">
+            {{ playbackError }}
+          </p>
         </div>
 
         <!-- 元数据细节 -->
@@ -140,18 +144,20 @@
       :src="url"
       preload="metadata"
       @timeupdate="onTimeUpdate"
-      @loadedmetadata="onLoadedMeta"
+      @loadedmetadata="onDurationChange"
+      @durationchange="onDurationChange"
       @play="playing = true"
       @pause="playing = false"
       @ended="playing = false"
+      @error="onPlaybackError"
     ></audio>
   </div>
 </template>
 
 <script setup lang="ts">
-// 音频播放器（需求6, §3.6）：路由 /audio/:id。封面 + 控件 + 同步歌词 + 元数据面板。
+// 音频播放器路由 /audio/:id，展示封面、控件、同步歌词和元数据。
 // 标签/歌词由后端 get_audio_detail 懒加载（既有库无需重扫）；封面为后端按需抽取的全分辨率内嵌图。
-import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { convertFileSrc } from '@tauri-apps/api/core'
@@ -179,6 +185,11 @@ import {
 } from '../stores/viewerStore'
 import { resolveViewerKind } from '../utils/viewerKind'
 import type { MediaDetail } from '../types/media'
+import { buildCommandContext } from '../commands/context'
+import { dispatchKeybinding } from '../commands/keybinding'
+import { usePlayerPrefs } from '../composables/player/usePlayerPrefs'
+import { useVideoResume } from '../composables/player/useVideoResume'
+import VideoRateMenu from '../components/media/player/VideoRateMenu.vue'
 
 interface AudioMeta {
   audioCodec?: string | null
@@ -190,6 +201,8 @@ interface AudioMeta {
   genre?: string | null
 }
 interface AudioDetail {
+  id: number
+  playbackPositionMs: number
   fileName: string
   fileFormat: string
   absPath: string
@@ -206,12 +219,33 @@ const id = computed(() => Number(route.params.id))
 
 const detail = ref<AudioDetail | null>(null)
 const error = ref('')
+const playbackError = ref('')
+let playbackAttempt = 0
 
 const audioEl = ref<HTMLAudioElement | null>(null)
 const playing = ref(false)
 const currentTime = ref(0)
 const duration = ref(0)
-const volume = ref(1)
+const { prefs, setPrefs } = usePlayerPrefs()
+const volume = computed(() => prefs.value.muted ? 0 : prefs.value.volume)
+// 详情未返回时不绑定新资产，加载中的暂停事件不能清掉其已有续播位置。
+useVideoResume(
+  audioEl,
+  computed(() => detail.value?.id ?? null),
+  computed(() => detail.value?.playbackPositionMs ?? 0),
+)
+
+function applyPlaybackPrefs() {
+  const el = audioEl.value
+  if (!el) return
+  el.volume = prefs.value.volume
+  el.muted = prefs.value.muted
+  // 换源和重载会按默认倍速复位，必须与即时倍速一同应用。
+  el.defaultPlaybackRate = prefs.value.rate
+  el.playbackRate = prefs.value.rate
+}
+// 设置快照只施加到播放元素；恢复默认或保存失败回滚不应触发反向写入。
+watch([audioEl, () => prefs.value.volume, () => prefs.value.muted, () => prefs.value.rate], applyPlaybackPrefs)
 
 const url = computed(() => (detail.value ? convertFileSrc(detail.value.absPath) : ''))
 const coverUrl = computed(() =>
@@ -241,10 +275,36 @@ function stripExt(name: string): string {
 }
 
 // ── 播放控制 ──────────────────────────────────────────────────────────────────
+function playAudio() {
+  const el = audioEl.value
+  if (!el) return
+  const attempt = ++playbackAttempt
+  // 自动播放和错误重试都先恢复偏好，避免新元素按默认音量和倍速播放。
+  applyPlaybackPrefs()
+  // 资源错误会让 play() 持续拒绝；重新加载才会清除 MediaError 并再次请求当前源。
+  if (el.error) {
+    const position = el.currentTime
+    el.load()
+    // load 会归零；元数据未就绪时写 currentTime 可指定起播位置，保留本次实际进度。
+    if (position > 0) el.currentTime = position
+  }
+  el.play().then(() => {
+    if (attempt === playbackAttempt) playbackError.value = ''
+  }).catch((e: unknown) => {
+    // 换歌/卸载会作废旧播放；被暂停或新资源打断也不应显示解码失败。
+    if (attempt !== playbackAttempt || (e instanceof Error && e.name === 'AbortError')) return
+    onPlaybackError()
+  })
+}
+function onPlaybackError() {
+  if (!detail.value) return
+  playing.value = false
+  playbackError.value = t('audio.playFailed')
+}
 function togglePlay() {
   const el = audioEl.value
   if (!el) return
-  if (el.paused) el.play().catch(() => {})
+  if (el.paused || el.error) playAudio()
   else el.pause()
 }
 function onSeek(e: Event) {
@@ -256,7 +316,7 @@ function seekTo(sec: number) {
   const el = audioEl.value
   if (!el) return
   el.currentTime = sec
-  if (el.paused) el.play().catch(() => {})
+  if (el.paused) playAudio()
 }
 function seekBy(delta: number) {
   const el = audioEl.value
@@ -266,12 +326,23 @@ function seekBy(delta: number) {
 function onVolume(e: Event) {
   const el = audioEl.value
   if (!el) return
-  const v = Number((e.target as HTMLInputElement).value)
+  const v = Math.min(1, Math.max(0, Number((e.target as HTMLInputElement).value)))
   el.volume = v
-  volume.value = v
+  // 与视频控件一致：手动调到正音量即解除静音。
+  if (v > 0) el.muted = false
+  setPrefs({ volume: v, muted: el.muted }, { debounce: true })
 }
 
-function onLoadedMeta() {
+function onRate(rate: number) {
+  const el = audioEl.value
+  if (!el) return
+  el.defaultPlaybackRate = rate
+  el.playbackRate = rate
+  setPrefs({ rate })
+}
+
+// 媒体时长可能在元数据就绪后修正，进度条与快进边界必须同步更新。
+function onDurationChange() {
   const el = audioEl.value
   if (el) duration.value = el.duration || 0
 }
@@ -295,34 +366,49 @@ function scrollActiveIntoView() {
   el.scrollIntoView({ block: 'center', behavior: 'smooth' })
 }
 
-async function load() {
+async function load(
+  reqId: number,
+  _previousId: number | undefined,
+  onCleanup: (cleanup: () => void) => void,
+) {
+  // 按请求生命周期失效，覆盖 A→B→A 和卸载；只比较资产 id 会让首轮迟到结果重新生效。
+  let active = true
+  onCleanup(() => { active = false; playbackAttempt++ })
+  // 新歌尚未就绪时撤销旧资产的命令和可写标量，避免加载失败后仍操作上一首。
+  if (viewerToken !== null) {
+    viewer.clear(viewerToken)
+    viewerToken = null
+  }
   detail.value = null
   fileInfo.value = null
   error.value = ''
+  playbackError.value = ''
   syncedLines.value = []
   activeLine.value = -1
   lineEls.length = 0
   currentTime.value = 0
   duration.value = 0
   // 底栏文件信息:AudioDetail 载荷不含 rating/isFavorited/colorLabel 等库内标量,并行补一次
-  // get_media_detail(同 items 表单行,doc/图视页同源 IPC)。换歌竞态以 id 快照守卫;失败不阻塞
+  // get_media_detail(同 items 表单行,doc/图视页同源 IPC)。与音频详情共用失效守卫;失败不阻塞
   // 播放(fileInfo 留 null,底栏仅少标量段)。
-  const reqId = id.value
   invokeIpc<MediaDetail>(IPC.GET_MEDIA_DETAIL, { id: reqId })
     .then((d) => {
-      if (id.value === reqId) fileInfo.value = toViewerFileInfo(d)
+      if (active) fileInfo.value = toViewerFileInfo(d)
     })
     .catch(() => {})
   try {
-    const d = await invokeIpc<AudioDetail>(IPC.GET_AUDIO_DETAIL, { id: id.value })
+    const d = await invokeIpc<AudioDetail>(IPC.GET_AUDIO_DETAIL, { id: reqId })
+    if (!active) return
     detail.value = d
     if (d.lyricsSynced && d.lyrics) {
       syncedLines.value = parseLrc(d.lyrics)
     }
-    // 等 <audio> 重新绑定 src 后自动尝试播放（静音策略不影响音频）。
+    // 等 <audio> 重新绑定 src 后自动尝试播放。
     await nextTick()
-    audioEl.value?.play().catch(() => {})
+    if (!active) return
+    playAudio()
   } catch (e) {
+    if (!active) return
     error.value = t('audio.openFailed', { error: (e as Error)?.message ?? e })
   }
 }
@@ -336,7 +422,7 @@ async function openExternal() {
   if (detail.value) await shellOpen(detail.value.absPath).catch(() => {})
 }
 
-// ── activeViewer 单源 populate(顶栏重构 P5 余项)─────────────────────────────
+// 同步 activeViewer 状态。
 // 让音频也进 viewerStore, 点亮标题栏上下文工具栏(播放/±10s 命令); ViewerApi 映射到本地播放函数。
 // 与本组件内的播放控件并存(双入口, 承 P5-5「保留局部控件」决策)。populate 后 ContextualToolbar
 // 靠 when=kind 'audio' 渲染音频命令, 其 /audio/ 前缀兜底抑制随 hasActiveViewer 转真自然失效。
@@ -362,14 +448,10 @@ function viewerSnapshot(): Omit<ActiveViewer, 'immersive'> {
     fileInfo: fileInfo.value,
   }
 }
-// detail 加载完成(每首一次)→ 首次 populate、后续换歌 patch。token 时序防御见 viewerStore。
+// 每首详情加载完成后重新发布上下文；换歌起点已按 owner token 撤销旧上下文。
 watch(detail, (d) => {
   if (!d) return
-  if (viewerToken === null) {
-    viewerToken = viewer.populate({ ...viewerSnapshot(), immersive: false })
-  } else {
-    viewer.patch(viewerToken, viewerSnapshot())
-  }
+  viewerToken = viewer.populate({ ...viewerSnapshot(), immersive: false })
 })
 // 标量补齐落地(两种到达顺序都覆盖:先于 populate → snapshot 直接带上;晚于 populate → 此处 patch)。
 watch(fileInfo, (fi) => {
@@ -378,7 +460,23 @@ watch(fileInfo, (fi) => {
 
 watch(id, load, { immediate: true })
 
+function onAudioKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented || event.isComposing || viewer.activeViewer?.api !== viewerApi) return
+  const target = event.target as HTMLElement | null
+  // 输入和滑杆调节交给原控件，避免方向键同时改变播放位置。
+  if (target?.isContentEditable || target?.closest?.(
+    'input, textarea, select, [contenteditable], [role="slider"]',
+  )) return
+  // 按钮保留原生激活键；点击后焦点留在按钮时，其他播放快捷键仍应可用。
+  if ((event.key === ' ' || event.key === 'Enter')
+    && target?.closest?.('button, a[href], [role="button"]')) return
+  if (dispatchKeybinding(event, buildCommandContext())) event.preventDefault()
+}
+
+onMounted(() => document.addEventListener('keydown', onAudioKeydown))
+
 onBeforeUnmount(() => {
+  document.removeEventListener('keydown', onAudioKeydown)
   audioEl.value?.pause()
   // 离开音频页:清 activeViewer 上下文(token 时序防御, 迟到 clear 不误清新查看器)。
   if (viewerToken !== null) viewer.clear(viewerToken)
@@ -391,7 +489,6 @@ onBeforeUnmount(() => {
   inset: 0;
   display: flex;
   flex-direction: column;
-  /* 原 --color-bg-base 为不存在的幽灵 token 且无 fallback——实际渲染透明(S5 修) */
   background: var(--color-bg-primary);
   z-index: 5;
 }
@@ -494,6 +591,11 @@ onBeforeUnmount(() => {
 .audio-player__controls {
   width: min(100%, 460px);
 }
+.audio-player__playback-error {
+  color: var(--color-error);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
 .audio-player__seek {
   display: flex;
   align-items: center;
@@ -540,8 +642,8 @@ onBeforeUnmount(() => {
 .ap-icon--play {
   background: var(--color-accent);
   color: var(--color-text-on-accent);
-  width: var(--control-size-touch);
-  height: var(--control-size-touch);
+  width: var(--control-size-large);
+  height: var(--control-size-large);
 }
 .ap-icon--play:hover {
   background: var(--color-accent-hover);

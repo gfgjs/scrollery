@@ -1,17 +1,11 @@
-// CommandRegistry 贡献点范式的类型契约(设计文档 §3.4 / L3),以现有 ContextMenuItem
-// ({ id, label, icon, action })为原型扩展。一套注册表被多处消费:上下文工具栏(L4)、右键
-// 菜单、未来命令面板、统一 keymap。本文件只定「骨架」类型契约;registry.ts(注册/查询/求值/
-// 执行)与 builtins/*(具体命令)属 Phase 2。
+// 命令类型供注册表、上下文工具栏、右键菜单与快捷键分发共用。
 
 import type { Component } from 'vue'
 import type { MediaType } from '../types/media'
 import type { ActiveViewer } from '../stores/viewerStore'
 
 /**
- * 命令所属分组。**group==='navigation' → 顶栏主图标按钮(点击直达);其余组一律进 ⋯ 溢出菜单**
- * (直接落地需求 2「常用直达、不常用进二级」)。非 navigation 组名用于组织溢出菜单的分区。
- *
- * 承接「开发期不冻结契约」:组集为候选,真机手感调优前不定死。
+ * navigation 组显示为顶栏主按钮；其余组在溢出菜单中分区。
  */
 export type CommandGroup =
   | 'navigation' // 顶栏主图标按钮(直达)
@@ -27,7 +21,7 @@ export type ViewContext = 'grid' | 'viewer'
 
 /**
  * 选区快照 —— 命令 when/isEnabled 谓词读取的最小面。网格多选上下文;查看器内通常单资产。
- * 只暴露谓词所需字段,不泄露 useSelection 内部实现。Phase 2 按实际谓词需要扩(如选中项 id 集)。
+ * 只暴露谓词所需字段，不泄露 useSelection 内部实现。
  */
 export interface SelectionContext {
   /** 已选数量(0 = 无选区)。 */
@@ -49,13 +43,8 @@ export interface ContextTarget {
 }
 
 /**
- * 命令执行/求值上下文 —— when/isEnabled/isActive/run 的**唯一入参**。只穿**可变调用上下文**
- * (view/activeViewer/selection/contextTarget),使命令成为可测纯函数。
- *
- * **环境服务(store)不入 context**:命令 run/when 内直接 `useXxxStore()` 取 pinia 单例(惯用法,
- * 且消费方 computed 内读 store 仍响应式追踪)。此前把 stores 塞进 context 会逼每次 ctx 构造实例化
- * 全部 store(含有 window 副作用的 uiStore),测试即炸——遂改直接访问(2026-07-08 P2 修正)。
- * 查看器类命令经 activeViewer.api 调用具体查看器动作。
+ * 命令执行与求值上下文。store 不放入 context：命令按需读取 store，避免构造上下文时
+ * 实例化无关 store；查看器命令通过 activeViewer.api 调用当前查看器。
  */
 export interface CommandContext {
   view: ViewContext
@@ -66,13 +55,11 @@ export interface CommandContext {
 }
 
 /**
- * 命令贡献点。稳定 id 是自定义/插件持久化的锚(一经发布冻结,命名规范见 §4.4)。
+ * 命令贡献点。稳定 id 是持久化引用的锚。
  * title 支持惰性求值以适配 i18n(locale 切换后须重算,函数形式让渲染层每次拿当前语言串)。
  */
 export interface Command {
-  /** 稳定唯一 id(命名规范 `<域>[.<子域>].<动作>`,子域按需:泛域动作两段如 'viewer.zoomIn' /
-   *  'grid.undo',真属子域才加段如 'viewer.reader.toc' / 'viewer.audio.togglePlay'。§4.4,
-   *  2026-07-10 修订;开发期可重命名,发布后冻结)。 */
+  /** 稳定唯一 id：`<域>[.<子域>].<动作>`；发布后不得重命名。 */
   id: string
   /** 显示标题;函数形式支持 i18n 惰性求值。 */
   title: string | (() => string)
@@ -88,7 +75,7 @@ export interface Command {
   isEnabled?: (ctx: CommandContext) => boolean
   /** 高亮态谓词:如已收藏 / 信息面板已开,用于按钮 active 视觉。 */
   isActive?: (ctx: CommandContext) => boolean
-  /** 快捷键(如 'mod+z');tooltip 显示与实际监听共用此常量(P5-6 键位同源)。组合键以 '+' 连接,
+  /** 快捷键(如 'mod+z');tooltip 显示与实际监听共用此常量。组合键以 '+' 连接,
    *  修饰符规范序 mod→shift→alt(与 eventToCombo 产出一致,乱序不命中)。 */
   keybinding?: string
   /** 隐藏别名键位:分发器同样匹配、但不进 tooltip(如 redo 的 'mod+shift+z' 惯用别名)。 */

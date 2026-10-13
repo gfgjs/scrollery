@@ -1,12 +1,8 @@
 // src-tauri/src/exotic/worker_log.rs
-//! worker stderr 行日志转发（日志能力重构线 阶段 3 · W4，D-310/D-313）。从 `supervisor.rs`
-//! 拆出的纯函数/自包含状态机单元(超长文件拆分方案 tierB-2):不触碰 `WorkerSupervisor` 私有字段。
+//! worker stderr 行日志的扫描、解析与转发。
 //!
-//! stdout 只走协议帧,stderr 一直是自由文本诊断区(§3.4)。此前 stderr 只全量进 64KiB
-//! 环形缓冲(崩溃摘尾诊断);本模块新增**行级**扫描 + 解析 + 转发,把 worker 侧
-//! `exotic_protocol::WorkerLogLine` 单行 JSON(W3)收编进主进程 tracing/JSONL 体系——
-//! 字节级环形缓冲机制原样保留在 `supervisor.rs`(D-313:崩溃路径下行会双写,已接受;
-//! 两套机制**互不合并**,详见 [`super::supervisor::spawn_stderr_drain`] 处的红线注释)。
+//! stdout 只走协议帧，stderr 的单行 JSON 日志转入主进程 tracing/JSONL。
+//! `supervisor.rs` 另保留字节级环形缓冲供崩溃诊断，因此同一行可能出现两次。
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -21,7 +17,7 @@ use super::worker::WorkerSpec;
 const WORKER_LOG_TARGET: &str = "scrollery::worker";
 
 /// 残段累积上限:无换行的字节洪流(损坏/异常 worker 疯狂写 stderr 却不换行)不得无限撑大
-/// 内存——超限即把当前残段整体当一行强制冲出(W4 施工指引)。与 `STDERR_RING_CAP`(留在
+/// 内存——超限即把当前残段整体当一行强制冲出。与 `STDERR_RING_CAP`（留在
 /// `supervisor.rs`)同量级但语义不同:那个是字节环形缓冲上限,这个是行扫描器残段上限,
 /// 互不干扰。
 const LINE_RESIDUAL_CAP: usize = 64 * 1024;
@@ -82,7 +78,7 @@ enum ParsedWorkerLine {
 }
 
 /// 解析一行(调用方已 trim `\r`/跳过空行):先查首字符 `{` 省一次无谓解析尝试,非 JSON
-/// 或反序列化失败均走 `Raw` 兜底(W4 施工指引)。纯函数,不依赖 tracing。
+/// 或反序列化失败均走 `Raw` 兜底。纯函数，不依赖 tracing。
 fn parse_worker_log_line(line: &str) -> ParsedWorkerLine {
     if line.trim_start().starts_with('{') {
         if let Ok(parsed) = serde_json::from_str::<exotic_protocol::WorkerLogLine>(line) {
@@ -135,7 +131,7 @@ fn emit_worker_log_line(worker_kind: &str, line: &exotic_protocol::WorkerLogLine
 
 /// 转发一整行原始 stderr 字节(已由 [`LineScanner`] 切出):trim 尾部 `\r`(CRLF 兜底)、
 /// 跳过空行,能解析出 [`exotic_protocol::WorkerLogLine`] 即结构化转发,否则以 WARN +
-/// `unparsed=true` 转发原文(W4 施工指引「非 JSON 行有兜底」)。
+/// `unparsed=true` 转发原文。
 fn forward_stderr_line(worker_kind: &str, raw_line: &[u8]) {
     let text = String::from_utf8_lossy(raw_line);
     let trimmed = text.strip_suffix('\r').unwrap_or(&text);
@@ -155,11 +151,8 @@ fn forward_stderr_line(worker_kind: &str, raw_line: &[u8]) {
     }
 }
 
-/// 由 [`WorkerSpec::expected_worker_id`] 派生转发日志的 `worker` 字段短名(W4,D-313):
-/// 免新增字段/改调用签名(施工指引「选改动最小路径」)——`expected_worker_id` 本身即两个
-/// worker 的稳定字面标识("ai-worker"/"psd-worker",见 `worker.rs`/`ai/worker_client.rs`)。
-/// 已知两种归一化为短名;未来若有其它 exotic 插件 worker,原样透传其 id(不强行塞进
-/// ai/psd 二选一,转发管线仍能正常工作)。
+/// 从 [`WorkerSpec::expected_worker_id`] 派生日志的 `worker` 字段短名。
+/// ai-worker 与 psd-worker 归一化为短名；其它标识原样返回。
 pub(crate) fn worker_kind_label(spec: &WorkerSpec) -> String {
     match spec.expected_worker_id.as_str() {
         "ai-worker" => "ai".to_string(),

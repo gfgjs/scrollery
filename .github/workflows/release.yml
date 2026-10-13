@@ -1,22 +1,6 @@
-# oss-release —— 公开仓免费版发布流水线(Part7-T17,§3.7.1)。
-#
-# 触发:公开仓 push tag `v*`(正式发布)/ workflow_dispatch(dry-run:全链构建+校验+
-# 工件上传,不创建 release——兼作 C 节「完整安装器打包(WiX MSI/NSIS)验证」的实跑面)。
-# 🔴 本文件经 Copybara 随投影同步进公开仓;`if: github.repository` 守门使其**只在公开仓
-#    执行**(私有仓 tag v* 归 ci.yml 冒烟 + 未来 T16 商业流水线;双轨物理隔离,凭据红线
-#    §3.7.3——本工作流仅用 github.token,无任何签名凭据)。
-#
-# 免费版形态(2026-07-04 T17 施工裁决):
-#   - 构建 = 默认 `tauri build`:release profile + default features(custom-protocol + lite)。
-#     注:根 Cargo.toml **有** `[profile.lite]`(opt-z+LTO+strip)但本工作流**不调用**
-#     它(走 release profile);是否让免费版走体积优化 profile 是开放决策(见 todo H3),非本工作流缺陷。
-#   - 基座 conf 无 updater 配置块 → 运行时不注册 updater、不产 .sig 更新包(§3.6.5①
-#     条件注册;与 §3.7.1「免费版不含 updater 更新包」一致)。
-#   - 无平台签名(SmartScreen 首启提示为已知代价;EV 签免费版提信誉的成本权衡归 Part8)。
-#   - 发布说明 = CHANGELOG.md 对应版本小节(extract-changelog.mjs 提取,缺小节硬失败):
-#     公开仓历史是 squash 同步提交,conventional-commits 自动生成不可用——§3.7.1 的
-#     「自动生成」由「私有侧维护 CHANGELOG → 同步公开 → 提取」替代;git-cliff 类自动化
-#     留 T16 私有流水线(它有完整提交史)。
+# 公开仓免费版发布：v* tag 创建 release，手动触发上传验收工件。
+# 仓库守卫限制公开仓执行；本工作流不使用签名凭据。
+# 发布说明取自 CHANGELOG.md 对应版本小节，缺失时中止发布。
 name: OSS Release
 
 on:
@@ -24,7 +8,7 @@ on:
     tags: [ "v*" ]
   workflow_dispatch: # dry-run:构建与校验全跑,产物上传 artifact,不发布
 
-# 同一 ref 的发布不并发、不互踢(发布这种事宁排队不竞态)。
+# 同一 ref 的发布串行执行，避免产物竞态。
 concurrency:
   group: oss-release-${{ github.ref }}
   cancel-in-progress: false
@@ -39,8 +23,7 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        shell: bash # 与 oss-gate 对齐;注意 GitHub 对显式 bash 注入 -eo pipefail,
-                    # grep 断言须 herestring(见 ci.yml 渠道断言注,2026-07-04 实录)
+        shell: bash # GitHub 显式 bash 使用 -eo pipefail
     steps:
       - uses: actions/checkout@v4
 
@@ -67,8 +50,7 @@ jobs:
 
       - name: NOTICE 归属清单与 SBOM 门
         run: |
-          # 单次调用取代原先的 --check + 生成 + git diff 三连:同一份依赖解析既校验 NOTICE 新鲜度
-          # 又生成 SBOM;校验不过即非零退出且**不写** SBOM,红门不会留下看似成功的 SBOM 工件。
+          # 校验 NOTICE 新鲜度后生成 SBOM；校验失败不写 SBOM。
           node scripts/generate-notice.mjs --check --sbom
 
       # ── 发布硬门三连(任一红即不发布)─────────────────────────────────────────
@@ -85,28 +67,24 @@ jobs:
           cat release-notes.md
 
       # ── 构建(tauri CLI 在 windows runner 自动拉取 NSIS/WiX 工具链)────────────
-      # native worker 的 VPL bridge 依赖固定版本 dispatcher，干净 runner 没有本机预置产物。
-      - name: 准备固定版本 VPL dispatcher
-        run: node scripts/build-vpl-dispatcher.mjs
-
-      # 前端只构建一次:dist 由本步 beforeBuildCommand(prepare:legal + vite build + 四个 worker
-      # 构建)产出,即安装包真正打包的那份;不再另跑一次 npm run build,避免两套产物分叉。
+      # dist 由 beforeBuildCommand 构建，并用于当前安装包。
       - name: tauri build(免费版,含 MSI + NSIS 安装包)
         run: npx tauri build
 
-      # 发布合规扫描针对**最终产物**:扫的就是上面 beforeBuildCommand 产出的、装进安装包的 dist
-      # (原顺序里扫的是独立 npm run build 的 dist,与发布产物不是同一份)。
+      # 扫描上述构建产出的 dist。
       - name: 发布合规扫描(verify-channel-bundle)
         run: node scripts/verify-channel-bundle.mjs
 
       # 发布 SHA 上复跑测试门控(oss-gate 在 sync-staging 验过,此处对 tag SHA 再取证)。
       # 排在构建之后:既保证 dist 已存在(tauri-build 需要 frontendDist 就位),又使测试失败
       # 在此中断——后面的包体断言、产物清单与 gh release 都不会执行,失败不得发布。
+      - name: 全仓测试预算
+        run: npm run check:tests
+
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
-      # 发货闭包断言(F-001 候选落地,2026-08-11):ai-worker sidecar + ORT 四件套必须
-      # 真实落进安装包载荷。7z 在 windows-latest 预装;CI 下安装包存在即硬验,缺失即红。
+      # 核对 worker 与 ORT DLL 实际落入安装包载荷。
       - name: 安装包内容断言(raw/ai/video/enhance worker + ORT DLL)
         run: node scripts/verify-bundle-content.mjs
 

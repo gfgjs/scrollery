@@ -1,8 +1,7 @@
 // 去重分析运行态 store：只承载后端分析任务的「运行态」（状态快照/启停/完成时刻），
 // 供主画廊重复镜头状态条（components/media/useDuplicateLensStatus.ts）消费。
 // 重复内容的浏览/布局不在本 store——镜头状态与 URL 同步见 duplicateLensStore，
-// 成员/文件夹图由后端布局缓存承载（docs/designs/2026-09-02-主画廊重复项浏览方案.md §10.1）。
-// 旧组浏览/清理 IPC（list_duplicate_groups 等）后端暂保留，但前端已无绑定消费方（P4 退场）。
+// 成员/文件夹图由后端布局缓存承载。
 
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -28,7 +27,7 @@ export const useDedupStore = defineStore('dedup', () => {
   /**
    * 最近一次分析完成（status → completed）的本地时间戳（主画廊重复镜头状态条「最近完成于」）。
    * 仅存在于本会话内存：restoreStatus 首次恢复（含应用重启后）时置 null——
-   * 后端快照不带完成时刻,重启后丢失该文案属 MVP 接受范围（方案 §9 状态表）。
+   * 后端快照不带完成时刻，重启后无法恢复该文案。
    */
   const completedAt = ref<number | null>(null)
   /** restoreStatus 是否已在本会话执行过（幂等恢复 + completedAt 仅首次清空的依据）。 */
@@ -76,14 +75,20 @@ export const useDedupStore = defineStore('dedup', () => {
     await ensureListener()
     // 新一轮开始即作废旧完成时刻：完成后事件会重新记录,失败/停止期间不显示陈旧时间。
     completedAt.value = null
-    status.value = await invokeIpc<DedupStatusSnapshot>(IPC.START_DEDUP_ANALYSIS, {
+    const versionBeforeRequest = eventVersion
+    const started = await invokeIpc<DedupStatusSnapshot>(IPC.START_DEDUP_ANALYSIS, {
       reset,
     })
+    // 后台任务可能先于启动响应完成；与恢复读取相同，优先保留在途收到的事件。
+    if (eventVersion === versionBeforeRequest) status.value = started
   }
 
   async function stop() {
     if (!isRunning.value) return
-    status.value = await invokeIpc<DedupStatusSnapshot>(IPC.STOP_DEDUP_ANALYSIS)
+    const versionBeforeRequest = eventVersion
+    const stopped = await invokeIpc<DedupStatusSnapshot>(IPC.STOP_DEDUP_ANALYSIS)
+    // 停止事件已允许重新开始，迟到的旧响应不能覆盖新一轮进度。
+    if (eventVersion === versionBeforeRequest) status.value = stopped
   }
 
   return {

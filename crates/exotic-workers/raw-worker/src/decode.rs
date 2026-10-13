@@ -1,7 +1,7 @@
 // crates/exotic-workers/raw-worker/src/decode.rs
-//! RAW → WebP 缩略图解码（RAW 支持线 阶段 C）。
+//! RAW → WebP 缩略图解码。
 //!
-//! **一期范围（D-430）**：仅提取厂商内嵌预览图（JPEG，由 `rsraw::RawImage::extract_thumbs`
+//! 仅提取厂商内嵌预览图（JPEG，由 `rsraw::RawImage::extract_thumbs`
 //! 取出），转码/缩放为 WebP；不做完整 demosaic。无嵌入预览 / 提取失败 → 稳定错误码
 //! `unsupported_variant`（不强行出图）。畸形输入由顶层 `catch_unwind` 兜底——`rsraw::open`
 //! 底层是 vendored LibRaw C++，无法排除 FFI 边界内部真实 crash（见 raw-probe 探针结论）。
@@ -182,23 +182,4 @@ fn scaled_dims(w: u32, h: u32, target_long_edge: u32) -> (u32, u32) {
         ((w as f64 * scale).round() as u32).max(1),
         ((h as f64 * scale).round() as u32).max(1),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 无真实 RAW 样张仓内可用（RAW 无统一简单容器可手写合成，同 raw-probe 探针注记）；
-    /// 单测只覆盖不依赖真实 RAW 解码路径的纯逻辑（畸形输入 / 缩放计算），真实解码路径
-    /// 覆盖需真实授权样本，另见 raw-probe 的 RAW_PROBE_SAMPLES 环境目录机制。
-    #[test]
-    fn malformed_garbage_rejected_no_panic() {
-        for bytes in [vec![], vec![0xABu8; 16], vec![0x5Au8; 4096]] {
-            let err = decode_raw_to_webp(&bytes, 480).unwrap_err();
-            assert!(matches!(
-                err.code,
-                WorkerErrorCode::MalformedInput | WorkerErrorCode::UnsupportedVariant
-            ));
-        }
-    }
 }

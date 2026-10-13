@@ -1,16 +1,12 @@
 // src-tauri/src/lib.rs
 //! 库入口点 — 模块声明和 Tauri 应用程序构建器。
 //!
-//! D-450:`setup` 闭包已按域拆成各模块的 boot/bootstrap 函数,本文件退化为**编排壳**——
-//! 只留模块声明、feature 守卫、`run()` 的调用链与致命启动错误出口。启动顺序不变量见
-//! `docs/planning/2026-07-25-超长文件拆分方案/analysis/lib-rs.md` §3.1(共 9 条),
-//! 各 boot 函数的文档注释里也复述了与自己相关的那几条——**调整调用顺序前必读**。
+//! `run()` 编排各模块启动、Tauri 事件回调与致命启动错误处理。
 
 pub mod ai;
 pub mod audio;
 pub mod backup;
-/// 配置文件子系统:设置类键唯一真源在 `<app_data_dir>/config.toml`(A1 建模块+单测,A2 接线
-/// 启动/IPC/watcher——见 `config::boot` 与 `config::watcher`、`ipc::config_commands`)。
+/// 配置文件子系统：设置类键存于 `<app_data_dir>/config.toml`。
 pub mod config;
 pub mod db;
 /// 精确内容去重：与常规扫描的 change fingerprint 分离的摘要与逻辑单元身份。
@@ -23,6 +19,7 @@ pub mod enhance;
 pub mod error;
 pub mod exotic;
 pub mod export;
+pub mod feature_activation;
 /// 已注册格式的运行时并集(内置表 ∪ exotic Catalog)与 UI 投影。
 /// 独立成模块因 `utils::format` 不能引 `exotic::catalog`(反向依赖已存在,放一起成环)。
 pub mod formats;
@@ -31,7 +28,6 @@ pub mod layout;
 /// 应用生命周期回调:窗口事件拦截 + `RunEvent`(退出 WAL checkpoint / 后台任务优雅停止)。
 pub mod lifecycle;
 pub mod logging;
-pub mod official;
 pub mod proofread;
 pub mod reader;
 pub mod scanner;
@@ -89,7 +85,6 @@ impl StartupFailure {
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
         // ── 插件 ───────────────────────────────────────────────────────
@@ -104,13 +99,9 @@ pub fn run() {
         // 已装 exotic worker exe)的能力,构成「webview 沦陷 → 改写 worker 二进制 → 本地执行」
         // 升级链。删权限 + 摘插件 + 去依赖,零功能损失。
         .plugin(tauri_plugin_shell::init());
-    // T7/T9(Part7 §3.5):updater 属直销(direct)发布面(dep 为普通依赖,渠道 feature 已退役),
-    // 日后接入第三方渠道时再按渠道重新定门控。更新检查走
-    // Rust 侧 API(app.updater()),**不开放 webview ACL 权限/不引前端包**——现无更新 UI
-    // 消费者,IPC 面越小越好;Part8 做更新 UI 时再定「Rust 驱动+事件通知」或「JS 驱动
-    // +capability」。签名公钥/endpoints 见 tauri.direct-release.conf.json(dev 密钥,
-    // 首发前轮换或转正,.gitignore .release-keys 注有决策链)。
-    // T11/§3.6.5①(Part7):updater 配置块住 direct 发布 overlay,基座 conf 保持天生干净
+    // updater 仅在 direct 发布配置中启用。更新检查由 Rust 侧 API 执行，
+    // 不向 WebView 授予 updater ACL；签名公钥与端点见 tauri.direct-release.conf.json。
+    // updater 配置只存在于 direct 发布 overlay，基座配置无此块
     // (tauri 的 conf 合并只能加/改不能删)。因此按「编译进 context 的最终配置是否携带
     // plugins.updater」决定注册:插件 init 对缺配置是硬失败(Config.pubkey 必填),
     // dev/无 overlay 构建不带块 → 不注册,tauri dev 与普通 build 不受影响;
@@ -188,8 +179,7 @@ pub fn run() {
             {
                 let scope = app.asset_protocol_scope();
                 if let Err(e) = scope.allow_directory(&cache_dir, true) {
-                    // §3.4/§9.2 高敏调用点结构化改造(S2):路径不再插值进 message,
-                    // 脱敏 Layer(未来)只能拦结构化字段,烧进 message 的内容无法事后过滤。
+                    // 路径留在结构化字段，避免将敏感内容烧进无法按字段过滤的 message。
                     tracing::warn!(path = %cache_dir.display(), error = %e, "Failed to allow cache_dir in asset scope");
                 }
                 if let Ok(pool) = db_boot.read_pool.get() {
@@ -230,7 +220,7 @@ pub fn run() {
                 );
             }
 
-            // 启动期 WAL 截断与自愈:**须在 tracing 就绪后、派生管线拉起前**
+            // 启动期 WAL 截断 + 三项自愈:**须在 tracing 就绪后、派生管线拉起前**
             // (§3.1 不变量 4/5),故调用点在此而非 db::boot::init 内。
             db::boot::run_startup_reconciliation(&db_boot.writer, &db_boot.db_path, &cache_dir);
 
@@ -295,6 +285,7 @@ pub fn run() {
                 cfg.thumb_size,
                 cfg.thumb_skip_max_kb,
                 cfg.thumb_strategy,
+                cfg.gpu_engine,
                 cfg.ai_hq_cache,
                 cfg.thumb_webp_quality,
                 exotic_catalog,

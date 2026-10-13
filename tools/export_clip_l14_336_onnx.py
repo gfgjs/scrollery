@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-把 Chinese-CLIP ViT-L/14@336 的 PyTorch 权重导出为 ONNX（优先 fp16，失败回退 fp32）。
+把 Chinese-CLIP ViT-L/14@336 的 PyTorch 权重导出为 ONNX（默认 fp32；启用 fp16 时失败回退 fp32）。
 
 产物（落地到 .models/，文件名匹配 profile `cn-clip-vit-l14-336`）：
   - vit-l-14-336.img.fp16.onnx (+ .extra_file)   图像编码器（回退时为 .img.fp32.onnx）
@@ -11,7 +11,7 @@
     batch 轴 N 为**动态**（区别于 eisneim B/16 钉死为 1），强 GPU 可整批推理。
   - 文本输入名 "text" [1,52] → 输出 "unnorm_text_features" [1,768]（batch 固定 1，查询单条）
 
-几个关键踩坑（按出现顺序）：
+导出时需保留的约束：
   1. 官方 cn_clip.deploy 的 fp16 走 onnxmltools，其同名入口在新版已退化为抛异常的桩
      （convert_large_onnx.bat 的注释记录了这个「依赖地狱」）→ 这里改用 onnxruntime 自带转换器。
   2. torch 2.12 默认 dynamo 导出器不能稳妥处理 (None, text) 占位入参 → dynamo=False 强制旧路径。
@@ -22,14 +22,12 @@
      单个 LayerNormalization 算子，没有可被重融合的原语，规避该崩溃。
   5. torch 旧导出器把 ~1.2GB 的 fp32 图一次性写盘，在 Windows 触发 [Errno 22]（大文件单次写入）
      → 改为导出到内存 BytesIO，再用 onnx 的外部数据保存（按块写盘）。
-  6. fp16 产物必须双重验证：① 用 ORT「默认全套图优化」建会话+推理（App 端就是默认优化）；
+  6. fp16 产物必须双重验证：① 用 ORT「默认全套图优化」建会话+推理；
      ② 与原始 PyTorch(fp32) 输出逐条比对余弦 ≥0.99。**只「能加载」不够**——CLIP 的 BERT
      文本编码器在 fp16 下数值不稳（注意力/softmax/LayerNorm 溢出），会「能加载但算错」：
-     所有文本塌缩成几乎相同向量（实测文本 vs torch 仅 0.2、不同文本互相 0.999）。这与近期
-     commit「文本编码器强制走 CPU（DirectML 静默算错文本模型）」是同一现象。任一验证不过 →
-     该编码器回退 fp32（数值精确、必定可加载，也是本仓库 ViT-L 的既有做法）。
+      所有文本可能塌缩成几乎相同向量。任一验证不过，该编码器回退 fp32。
 
-依赖（全局 Python311 已装齐）：
+依赖：
   torch 2.12 / torchvision 0.27 / cn_clip 1.6 / onnx 1.21 / onnxruntime 1.26 / onnxscript / six
 """
 

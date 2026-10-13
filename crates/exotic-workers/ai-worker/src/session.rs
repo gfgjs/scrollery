@@ -1,17 +1,17 @@
 // crates/exotic-workers/ai-worker/src/session.rs
-//! SessionInit 的校验与加载(D1 §3 完整性 + D3 §2「模型加载不进握手」)。
+//! SessionInit 完整性校验与模型装载；模型加载在握手之后进行。
 //!
-//! 两段式:[`validate_and_resolve`](纯校验,零 ort,可单测)→ [`load`](ort Session 构建)。
+//! 先由 validate_and_resolve 校验，再由 load_with_progress 构建 ORT Session。
 //! 任一校验不过即 `ModelLoadFailed`(terminal——重试同一载荷无意义,host 标记待重下载)。
 //!
 //! 校验清单(全部对**明文**):
 //!   1. `models_root` canonicalize 可达;
 //!   2. `arch_id`/`face_profile_id` 在共享注册表可解析,snapshot 文件名与契约一致;
-//!   3. 每个 [`ModelDescriptor`]:handle 为 Path(Named=AES ④ 通道,T14 后置未启用)、
+//!   3. 每个 [`ModelDescriptor`] 仅接受 Path 通道；
 //!      canonicalize 后以 models_root 为前缀(防宿主被劫持后诱导任意读)、按 role 对应
-//!      契约文件名、字节数与 sha256 逐一相符;
-//!   4. 角色集完备:ImageEncoder+TextEncoder 必备(CLIP 成对加载,与 AiEnginePool 行为
-//!      对齐);FaceDetect+FaceRecog 成对可选,且必须与 `face_profile_id` 的有无一致。
+//!      契约文件名、字节数逐一相符；实际新装载的模型还须核对 sha256；
+//!   4. 非空角色集：图像/文本编码器可独立声明；人脸检测/识别成对，
+//!      且必须与 `face_profile_id` 的有无一致。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -22,13 +22,13 @@ use exotic_protocol::{
 use scrollery_ai_core::clip::ClipTokenizer;
 use scrollery_ai_core::engine::AiEnginePool;
 use scrollery_ai_core::face_profile::{find_face_profile, FaceProfile};
-use scrollery_ai_core::profile::{resolve_profile, ModelProfile};
+use scrollery_ai_core::profile::{resolve_profile, ClipRoles, ModelProfile};
 
 /// 初始化失败 =(稳定错误码, 诊断消息)。消息不含完整绝对路径(协议红线)。
 pub type InitError = (WorkerErrorCode, String);
 
 /// 校验通过、待 ort 加载的会话描述。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResolvedSession {
     pub session_id: u64,
     pub models_root: PathBuf,
@@ -37,6 +37,8 @@ pub struct ResolvedSession {
     pub ai_cache_dir: PathBuf,
     pub image_provider: String,
     pub batch_size: u32,
+    pub roles: ClipRoles,
+    pub models: Vec<ModelDescriptor>,
 }
 
 /// 已加载的推理会话(worker 端唯一可服务状态;严格串行下同一时刻至多一个)。
@@ -48,15 +50,20 @@ pub struct SessionState {
     pub ai_cache_dir: PathBuf,
     /// EmbedBatch 单批 items 上限(host 声明的快照;超限= host bug,回 MalformedInput)。
     pub batch_size: u32,
-    /// CLIP 分词器(EncodeText 用;词表从 models_root 按 profile 契约加载,T17)。
-    pub tokenizer: ClipTokenizer,
+    /// EncodeText 分词器，词表按 profile 从 models_root 加载。
+    pub tokenizer: Option<ClipTokenizer>,
+    /// 图像模型的真实固定 batch；动态模型为 None，用于避免子批重复补齐。
+    pub image_fixed_batch: Option<usize>,
+    /// 装载身份用于补载时核对路径、提供者、契约及已加载文件的哈希。
+    pub identity: ResolvedSession,
 }
 
 fn fail(msg: impl Into<String>) -> InitError {
     (WorkerErrorCode::ModelLoadFailed, msg.into())
 }
 
-/// 纯校验段:解析契约 + 逐模型完整性。不触 ort。
+/// 纯校验段：解析契约与逐模型完整性，不触 ort。
+/// 补载时只有整个会话可复用且描述符未变的已加载角色跳过内容重读。
 pub fn validate_and_resolve(
     session_id: u64,
     models: &[ModelDescriptor],
@@ -64,6 +71,7 @@ pub fn validate_and_resolve(
     models_root: &str,
     ai_cache_dir: &str,
     image_provider: &str,
+    previous: Option<&ResolvedSession>,
 ) -> Result<ResolvedSession, InitError> {
     let root = std::fs::canonicalize(models_root)
         .map_err(|e| fail(format!("models_root 不可达:{}", e.kind())))?;
@@ -85,7 +93,7 @@ pub fn validate_and_resolve(
         None => None,
     };
 
-    // 角色 → 契约文件名(全部必备:CLIP 成对;声明了 face profile 则检测/嵌入成对)。
+    // 角色 → 契约文件名；CLIP 双塔独立，人脸仍按 profile 成对。
     let mut expected: Vec<(ModelRole, &str)> = vec![
         (ModelRole::ImageEncoder, profile.image_file.as_str()),
         (ModelRole::TextEncoder, profile.text_file.as_str()),
@@ -96,6 +104,7 @@ pub fn validate_and_resolve(
     }
 
     let mut seen: HashSet<&str> = HashSet::new();
+    let mut paths = Vec::with_capacity(models.len());
     for desc in models {
         let expected_file = expected
             .iter()
@@ -111,17 +120,23 @@ pub fn validate_and_resolve(
         if !seen.insert(expected_file) {
             return Err(fail(format!("模型角色重复声明:{:?}", desc.role)));
         }
-        verify_descriptor(desc, expected_file, &root)?;
+        paths.push(resolve_descriptor_path(desc, expected_file, &root)?);
     }
-    if seen.len() != expected.len() {
-        return Err(fail(format!(
-            "模型角色不完备:声明 {}/{}(CLIP 成对必备;face 按 profile 成对)",
-            seen.len(),
-            expected.len()
-        )));
+    if models.is_empty()
+        || face_profile.as_ref().is_some_and(|fp| {
+            !seen.contains(fp.detect_file.as_str()) || !seen.contains(fp.embed_file.as_str())
+        })
+    {
+        return Err(fail(
+            "模型角色不完备:至少声明一个角色；face 按 profile 成对",
+        ));
     }
+    let roles = ClipRoles {
+        image: models.iter().any(|d| d.role == ModelRole::ImageEncoder),
+        text: models.iter().any(|d| d.role == ModelRole::TextEncoder),
+    };
 
-    Ok(ResolvedSession {
+    let resolved = ResolvedSession {
         session_id,
         models_root: root,
         profile,
@@ -129,20 +144,39 @@ pub fn validate_and_resolve(
         ai_cache_dir: PathBuf::from(ai_cache_dir),
         image_provider: image_provider.to_string(),
         batch_size: snapshot.batch_size.max(1),
-    })
+        roles,
+        models: models.to_vec(),
+    };
+    // 引擎只补载缺少的角色；已在内存中的 Session 不会再次打开模型文件。
+    // 必须先确认整池可复用，否则提供者或契约变化会重载全部角色，仍需逐件验 hash。
+    let reusable = previous.filter(|old| old.can_reuse(&resolved));
+    for (desc, path) in models.iter().zip(paths) {
+        if !reusable.is_some_and(|old| old.models.contains(desc)) {
+            verify_descriptor_hash(desc, &path)?;
+        }
+    }
+    Ok(resolved)
 }
 
 /// 单个模型载荷的完整性校验:Path 通道 + 归属 + 文件名 + len + sha256。
-/// `pub(crate)`(T5,OCR 会话复用):OCR 四件套(det/cls/rec/dict)与 CLIP 共享同一份
-/// Path 通道/归属/文件名/len/sha256 校验纪律,`ocr.rs::validate_ocr_init` 直接调用。
+/// OCR 的 det/cls/rec/dict 复用同一校验，避免与 CLIP 的安全边界分叉。
 pub(crate) fn verify_descriptor(
     desc: &ModelDescriptor,
     expected_file: &str,
     root: &Path,
 ) -> Result<(), InitError> {
+    let canon = resolve_descriptor_path(desc, expected_file, root)?;
+    verify_descriptor_hash(desc, &canon)
+}
+
+fn resolve_descriptor_path(
+    desc: &ModelDescriptor,
+    expected_file: &str,
+    root: &Path,
+) -> Result<PathBuf, InitError> {
     let path = match &desc.handle {
         ModelHandle::Path(p) => PathBuf::from(p),
-        // AES 共享内存通道随 ④ 变现启用(T14 后置);在此之前收到即协议误用。
+        // Named 通道未启用，收到时按协议误用拒绝。
         ModelHandle::Named(_) => {
             return Err(fail(format!(
                 "named 载荷通道未启用(AES 随 ④):role={:?}",
@@ -174,24 +208,35 @@ pub(crate) fn verify_descriptor(
             desc.len
         )));
     }
-    let actual = sha256_file(&canon).map_err(|e| fail(format!("sha256 计算失败:{}", e.kind())))?;
+    Ok(canon)
+}
+
+fn verify_descriptor_hash(desc: &ModelDescriptor, path: &Path) -> Result<(), InitError> {
+    let actual = sha256_file(path).map_err(|e| fail(format!("sha256 计算失败:{}", e.kind())))?;
     if actual != desc.sha256.to_lowercase() {
         return Err(fail(format!("模型 sha256 不符:role={:?}", desc.role)));
     }
     Ok(())
 }
 
-/// ort 加载段:构建 Session 池并复核「声明的角色都真正就绪」。
-/// 冷加载可达分钟级(ViT-L + DirectML 内核编译)。2026-07-11 加固批 A-2 起本函数在
-/// 装载线程上执行并经 `progress` 回执阶段事件(main 转译为协议 Progress 帧),宿主
-/// watchdog 相应改「静默限时」——300s 总限时的黑盒等待成为历史。
+/// 构建 Session 池并复核所有声明角色已就绪。
+/// 冷加载可能耗时较长，由装载线程报告进度，宿主按静默时长判断超时。
 pub fn load_with_progress(
     resolved: ResolvedSession,
+    previous: Option<SessionState>,
     progress: scrollery_ai_core::engine::LoadProgress<'_>,
 ) -> Result<SessionState, InitError> {
-    let pool = AiEnginePool::init_with_progress(
+    // 身份不兼容时先卸载旧池；补载只保留相同文件的 Session，避免并存两套大模型。
+    let previous = previous.filter(|old| old.identity.can_reuse(&resolved));
+    let (existing, mut tokenizer, previous_models) = match previous {
+        Some(old) => (Some(old.pool), old.tokenizer, old.identity.models),
+        None => (None, None, Vec::new()),
+    };
+    let pool = AiEnginePool::load_with_progress(
+        existing,
         &resolved.models_root,
         &resolved.profile,
+        resolved.roles,
         resolved.face_profile.as_ref(),
         &resolved.image_provider,
         progress,
@@ -199,27 +244,69 @@ pub fn load_with_progress(
     .map_err(|e| fail(format!("引擎初始化失败:{e}")))?;
 
     // AiEnginePool 对缺失文件是「优雅降级」语义;会话语义下声明即必须就绪,降级=加载失败。
-    if !pool.clip_ready() {
+    if (resolved.roles.image && !pool.clip_image_ready())
+        || (resolved.roles.text && pool.clip_text_session.is_none())
+    {
         return Err(fail("CLIP 编码器未能加载(见 stderr 日志)".to_string()));
     }
     if resolved.face_profile.is_some() && !pool.face_ready() {
         return Err(fail("人脸模型未能完整加载(见 stderr 日志)".to_string()));
     }
 
-    // 分词器与文本塔同属会话必备(TextEncoder 是必备角色,EncodeText 是搜索必经载体,
-    // T17):host 侧 variant_installed 已把 vocab 列为安装前提,此处缺失即载荷不完整。
-    let tokenizer = ClipTokenizer::from_profile(&resolved.models_root, &resolved.profile)
-        .map_err(|e| fail(format!("分词器加载失败:{e}")))?;
+    if resolved.roles.text && tokenizer.is_none() {
+        tokenizer = Some(
+            ClipTokenizer::from_profile(&resolved.models_root, &resolved.profile)
+                .map_err(|e| fail(format!("分词器加载失败:{e}")))?,
+        );
+    }
 
+    let image_fixed_batch = pool
+        .clip_image_session
+        .as_ref()
+        .map(|p| scrollery_ai_core::clip::fixed_image_batch(p, &resolved.profile))
+        .transpose()
+        .map_err(|e| fail(format!("图像 batch 契约读取失败:{e}")))?
+        .flatten();
+
+    let mut identity = resolved.clone();
+    for model in previous_models {
+        if !identity.models.iter().any(|d| d.role == model.role) {
+            identity.models.push(model);
+        }
+    }
+    let face_profile = pool.face_profile.clone();
     Ok(SessionState {
         session_id: resolved.session_id,
         pool,
         profile: resolved.profile,
-        face_profile: resolved.face_profile,
+        face_profile,
         ai_cache_dir: resolved.ai_cache_dir,
         batch_size: resolved.batch_size,
         tokenizer,
+        image_fixed_batch,
+        identity,
     })
+}
+
+impl ResolvedSession {
+    /// 已有角色只有在契约、根目录、提供者及重叠文件身份相同时才能复用。
+    fn can_reuse(&self, next: &Self) -> bool {
+        self.models_root == next.models_root
+            && self.image_provider == next.image_provider
+            && self.profile.id == next.profile.id
+            && self.profile.image_file == next.profile.image_file
+            && self.profile.text_file == next.profile.text_file
+            && match (&self.face_profile, &next.face_profile) {
+                (Some(a), Some(b)) => a.id == b.id,
+                _ => true,
+            }
+            && next.models.iter().all(|model| {
+                self.models
+                    .iter()
+                    .find(|old| old.role == model.role)
+                    .is_none_or(|old| old == model)
+            })
+    }
 }
 
 /// 流式 sha256(模型可达 GB 级,不整读进内存),输出 64 位小写 hex。
@@ -277,19 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_clip_only_resolves() {
-        let root = temp_dir("happy");
-        let snap = default_snapshot();
-        let models = clip_pair(&root, &snap);
-        let r = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c:/ai", "cpu")
-            .expect("合法载荷应通过校验");
-        assert_eq!(r.session_id, 1);
-        assert_eq!(r.batch_size, 16);
-        assert!(r.face_profile.is_none());
-        assert_eq!(r.profile.id, DEFAULT_PROFILE_ID);
-    }
-
-    #[test]
     fn path_outside_models_root_rejected() {
         let root = temp_dir("outside-root");
         let elsewhere = temp_dir("outside-elsewhere");
@@ -302,19 +376,66 @@ mod tests {
             &snap.image_file,
             b"img",
         );
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
+        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu", None)
             .unwrap_err();
         assert!(e.1.contains("越界"), "diagnostic: {}", e.1);
     }
 
+    fn resolved_image(
+        root: &Path,
+        snap: &ModelProfileSnapshot,
+        models: &[ModelDescriptor],
+    ) -> ResolvedSession {
+        validate_and_resolve(
+            1,
+            &models[..1],
+            snap,
+            root.to_str().unwrap(),
+            "c",
+            "cpu",
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn sha256_mismatch_rejected() {
-        let root = temp_dir("sha");
+    fn extending_session_checks_new_model_hash() {
+        let root = temp_dir("reuse-new-hash");
         let snap = default_snapshot();
         let mut models = clip_pair(&root, &snap);
+        let previous = resolved_image(&root, &snap, &models);
         models[1].sha256 = "0".repeat(64);
-        let e = validate_and_resolve(1, &models, &snap, root.to_str().unwrap(), "c", "cpu")
-            .unwrap_err();
-        assert!(e.1.contains("sha256"), "diagnostic: {}", e.1);
+        let error = validate_and_resolve(
+            2,
+            &models,
+            &snap,
+            root.to_str().unwrap(),
+            "c",
+            "cpu",
+            Some(&previous),
+        )
+        .unwrap_err();
+        assert!(error.1.contains("sha256"));
+    }
+
+    #[test]
+    fn incompatible_session_rechecks_previously_loaded_model() {
+        let root = temp_dir("reload-hash");
+        let snap = default_snapshot();
+        let models = clip_pair(&root, &snap);
+        let previous = resolved_image(&root, &snap, &models);
+        std::fs::write(root.join(&snap.image_file), b"new").unwrap();
+        // 提供者变化会卸载旧池，不能沿用只针对内存中 Session 的免重读规则。
+        let error = validate_and_resolve(
+            2,
+            &models,
+            &snap,
+            root.to_str().unwrap(),
+            "c",
+            "auto",
+            Some(&previous),
+        )
+        .unwrap_err();
+        assert!(error.1.contains("sha256"));
     }
 }

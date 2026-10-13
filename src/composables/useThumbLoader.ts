@@ -1,8 +1,7 @@
 // src/composables/useThumbLoader.ts
-// 缩略图加载单源（T1 §6.3）：MediaThumb / MediaThumbCompact / MediaGridCanvas 三方共用同一套
-// status 1/3/0 解码 + 懒自愈逻辑，杜绝「两份 loadThumb 漂移」(方案 §11 首号风险)。
+// DOM 缩略图加载器供 MediaThumb / MediaThumbCompact 使用；Canvas 管线复用 buildThumbUrl。
 //
-// 设计要点（保持 MediaThumb 原行为逐字不变）：
+// 加载与自愈约定：
 //  - status 1(已生成 WebP)→ 从缓存目录加载；decode() 拒绝 + img.onerror=404 → 触发一次懒自愈
 //    (regenerate-thumb)，因缓存命中判定只查存在性，被 LRU 驱逐的封面须复位重生成。
 //  - status 3(小文件直显)→ thumbPath 即绝对路径；无 path 时向队列请求解析。
@@ -29,7 +28,7 @@ export interface ThumbLoaderEmit {
 }
 
 /**
- * 由 thumb_status 1/3 构造缩略图 URL（纯函数，单源）。
+ * 由 thumb_status 1/3 构造缩略图 URL；本地路径经 Tauri convertFileSrc 转换。
  * status 1 → `${cacheDir}/thumbnails/${thumbPath}`（生成的 WebP）；
  * status 3 → thumbPath 即原文件绝对路径（小文件直显）；其余 → null。
  * @param cacheBuster 可选 `?t=xxx` 后缀（`?clear=` 强刷时附加）。
@@ -84,6 +83,11 @@ export function useThumbLoader(src: ThumbLoaderSource, emit: ThumbLoaderEmit) {
     // 停稳帧。仅拦「尚未加载」的项——已 decode 出图者不受影响;被推迟者挂标,由下方 watch
     // 在闸门放行时补起。
     if (loadGate.value && !isLoaded.value) {
+      // 新图源虽推迟启动，旧解码仍须作废；否则迟到成功会置已加载，挡住停稳后的补载。
+      if (decodingImg) {
+        decodingImg.src = ''
+        decodingImg = null
+      }
       deferredByGate = true
       return
     }

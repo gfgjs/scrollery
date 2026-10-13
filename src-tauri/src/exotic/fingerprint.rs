@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/fingerprint.rs
-//! 输入指纹（v3 总纲 §5.3 / Part2 §4.3 / 勘误 R5）。
+//! 冷门格式任务的输入指纹。
 //!
 //! 指纹决定「旧 done 是否失效、是否重做」。组成：源 cache_key + 插件 + worker 版本 + 能力 +
 //! 能力 API 版本 + **规范化设置**。源文件变化、Worker 升级、能力 API 或渲染参数变化都使旧 done 失效。

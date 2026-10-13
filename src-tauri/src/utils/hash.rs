@@ -1,9 +1,8 @@
 // src-tauri/src/utils/hash.rs
-//! 哈希实用工具:xxHash3(缓存键)+ SHA-256 hex(完整性校验,R2-6 全仓去重收拢于此)。
+//! 哈希实用工具：xxHash3 缓存键与 SHA-256 hex 完整性校验。
 //!
-//! 来自实施计划的 Q13：
-//! 旧键为 `xxh3_64("{rel_path}/{file_name}|{file_mtime}")`；当前扫描键追加
-//! `|ns={file_mtime_ns}` → 存储为 i64。
+//! 兼容键为 `xxh3_64("{rel_path}/{file_name}|{file_mtime}")`；当前扫描键包含数据库
+//! 目录身份和纳秒 mtime，避免不同扫描根内的同名文件共用缓存，结果存储为 i64。
 //! 当用作文件名时：`format!("{:016x}", cache_key as u64)` 以避免出现负号。
 
 use sha2::{Digest as _, Sha256};
@@ -18,24 +17,33 @@ use xxhash_rust::xxh3::xxh3_64;
 ///
 /// 返回一个 i64（由 u64 重新解释位）。
 pub fn compute_cache_key(rel_path: &str, file_name: &str, file_mtime: i64) -> i64 {
-    compute_cache_key_impl(rel_path, file_name, file_mtime, None)
+    compute_cache_key_impl(None, rel_path, file_name, file_mtime, None)
 }
 
-/// 计算带纳秒 mtime 的媒体项缓存键。
+/// 计算包含目录身份和纳秒 mtime 的媒体项缓存键。
 ///
+/// `directory_id` 在同一数据库内唯一且不依赖盘符，隔离不同扫描根中同名、同时间的文件。
 /// 纳秒值是缓存路径的一部分，避免同秒同大小改写时，迟到的旧 worker 仍能原子替换
 /// 当前 worker 使用的同一最终文件。`0` 表示平台无法提供纳秒精度，仍显式写入版本化
 /// 输入以免与旧三字段键混用。
 pub fn compute_cache_key_with_mtime_ns(
+    directory_id: i64,
     rel_path: &str,
     file_name: &str,
     file_mtime: i64,
     file_mtime_ns: i64,
 ) -> i64 {
-    compute_cache_key_impl(rel_path, file_name, file_mtime, Some(file_mtime_ns))
+    compute_cache_key_impl(
+        Some(directory_id),
+        rel_path,
+        file_name,
+        file_mtime,
+        Some(file_mtime_ns),
+    )
 }
 
 fn compute_cache_key_impl(
+    directory_id: Option<i64>,
     rel_path: &str,
     file_name: &str,
     file_mtime: i64,
@@ -44,7 +52,7 @@ fn compute_cache_key_impl(
     // 构建稳定的输入序列。当 rel_path 为空时使用前导 "/"，
     // 使得格式始终为 "{rel_path}/{file_name}|{mtime}"。
     // 扫描热路径(百万文件)优先在 512 字节栈缓冲内完成拼接,避免逐文件 format!/Vec 分配;
-    // 超长路径回退 Vec,字节序列与旧 format! 实现逐字节相同(测试锁定)。
+    // 超长路径回退 Vec；目录身份使用定长字节前缀，不增加逐文件字符串分配。
     const STACK_BUF: usize = 512;
     let mut mtime_buf = [0u8; 20];
     let remaining = {
@@ -68,6 +76,8 @@ fn compute_cache_key_impl(
         None
     };
     const NS_MARKER: &[u8] = b"|ns=";
+    const DIRECTORY_MARKER: &[u8] = b"directory-v1\0";
+    let directory_bytes = directory_id.map(i64::to_le_bytes);
     let rel = rel_path.as_bytes();
     let name = file_name.as_bytes();
     let total_len = if rel.is_empty() {
@@ -80,9 +90,16 @@ fn compute_cache_key_impl(
             + mtime_len
             + mtime_ns_len.map_or(0, |len| NS_MARKER.len() + len)
     };
+    let total_len = total_len + directory_bytes.map_or(0, |_| DIRECTORY_MARKER.len() + 8);
     let mut stack = [0u8; STACK_BUF];
     if total_len <= STACK_BUF {
         let mut n = 0;
+        if let Some(directory_bytes) = directory_bytes {
+            stack[..DIRECTORY_MARKER.len()].copy_from_slice(DIRECTORY_MARKER);
+            n += DIRECTORY_MARKER.len();
+            stack[n..n + directory_bytes.len()].copy_from_slice(&directory_bytes);
+            n += directory_bytes.len();
+        }
         if !rel.is_empty() {
             stack[n..n + rel.len()].copy_from_slice(rel);
             n += rel.len();
@@ -104,6 +121,10 @@ fn compute_cache_key_impl(
         xxh3_64(&stack[..n]) as i64
     } else {
         let mut bytes = Vec::with_capacity(total_len);
+        if let Some(directory_bytes) = directory_bytes {
+            bytes.extend_from_slice(DIRECTORY_MARKER);
+            bytes.extend_from_slice(&directory_bytes);
+        }
         if !rel.is_empty() {
             bytes.extend_from_slice(rel);
         }
@@ -152,57 +173,62 @@ pub fn sha256_hex_of_file(path: &Path) -> std::io::Result<String> {
     Ok(to_hex_lower(&hasher.finalize()))
 }
 
-/// 内容指纹全文阈值:≤ 此值全文 hash(无漏检);> 此值走「头/中/尾 3×256KB + 长度」抽样。
+/// 内容指纹全文阈值：超出后不读内容，直接交由扫描保守判定源变更。
 pub const CONTENT_HASH_FULL_LIMIT: u64 = 64 * 1024 * 1024;
-const SAMPLE_CHUNK: usize = 256 * 1024;
 
-/// 媒体内容指纹(Part2 §3.3.2「可疑变更」二次确认)。带算法前缀,算法演进时旧基线可被
-/// 识别为「非本算法」→ 按 NULL 兜底保守失效,而非静默错比:
-/// - ≤64MB:`sha256:<hex>`(全文,无漏检);
-/// - 大于 64MB:`sha256s:<hex>`(抽样 = 头 256KB ‖ 中 256KB ‖ 尾 256KB ‖ 文件长度 LE 字节)。
-///   已知漏检边界(设计已接受):采样窗外字节变化且总长不变会漏判——元数据编辑通常改头部,
-///   落采样窗,覆盖主用例。同一文件的形态只取决于 size,而比较仅发生在 size 相同时 → 新旧
-///   指纹必然同形态,不会全文 vs 抽样错比。
+/// 媒体可疑变更的完整内容指纹，格式为 `sha256:<hex>`。
 ///
-/// 注:设计定 BLAKE3,离线 cargo 缓存缺该 crate → 以在树 sha2 实现(语义等价,性能取舍;
-/// 联网预取后可换,前缀机制保证换算法安全)。
-pub fn content_fingerprint(path: &Path, file_size: i64) -> std::io::Result<String> {
-    content_fingerprint_with_limit(path, file_size, CONTENT_HASH_FULL_LIMIT)
+/// 大于 64 MiB 返回 `None` 且不打开文件：抽样无法证明内容未变，扫描本就须保守失效，
+/// 继续计算抽样摘要不会改变判定。旧抽样基线由定案时清除。
+pub fn content_fingerprint(path: &Path, file_size: i64) -> std::io::Result<Option<String>> {
+    if file_size.max(0) as u64 > CONTENT_HASH_FULL_LIMIT {
+        return Ok(None);
+    }
+    Ok(Some(format!("sha256:{}", sha256_hex_of_file(path)?)))
 }
 
-/// 阈值参数化版本(测试用小阈值构造抽样路径,不必生成 64MB 文件)。
-pub fn content_fingerprint_with_limit(
-    path: &Path,
-    file_size: i64,
-    full_limit: u64,
-) -> std::io::Result<String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let len = file_size.max(0) as u64;
-    if len <= full_limit {
-        return Ok(format!("sha256:{}", sha256_hex_of_file(path)?));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_cache_namespace_covers_stack_and_long_paths() {
+        let expected = |directory_id: i64, rel: &str| {
+            let mut bytes = b"directory-v1\0".to_vec();
+            bytes.extend_from_slice(&directory_id.to_le_bytes());
+            bytes.extend_from_slice(
+                format!("{rel}/same.bmp|1700000000|ns=1700000000123456700").as_bytes(),
+            );
+            xxh3_64(&bytes) as i64
+        };
+        let first = compute_cache_key_with_mtime_ns(
+            1,
+            "photos",
+            "same.bmp",
+            1_700_000_000,
+            1_700_000_000_123_456_700,
+        );
+        let second = compute_cache_key_with_mtime_ns(
+            2,
+            "photos",
+            "same.bmp",
+            1_700_000_000,
+            1_700_000_000_123_456_700,
+        );
+        assert_eq!(first, expected(1, "photos"));
+        assert_eq!(second, expected(2, "photos"));
+        assert_ne!(first, second, "相同相对路径和时间必须按目录身份隔离");
+        let long_path = "层级/".repeat(80);
+        assert_eq!(
+            compute_cache_key_with_mtime_ns(
+                2,
+                &long_path,
+                "same.bmp",
+                1_700_000_000,
+                1_700_000_000_123_456_700
+            ),
+            expected(2, &long_path),
+            "超出栈缓冲的路径保持相同字节契约"
+        );
     }
-    let mut f = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; SAMPLE_CHUNK];
-    // 头/中/尾三段(saturating:极小文件时三窗重叠也确定性一致,不会下溢 panic)。
-    let offsets = [
-        0u64,
-        (len / 2).saturating_sub(SAMPLE_CHUNK as u64 / 2),
-        len.saturating_sub(SAMPLE_CHUNK as u64),
-    ];
-    for off in offsets {
-        f.seek(SeekFrom::Start(off))?;
-        let mut read_total = 0;
-        while read_total < SAMPLE_CHUNK {
-            let n = f.read(&mut buf[read_total..])?;
-            if n == 0 {
-                break; // EOF:窗越界部分自然截断
-            }
-            read_total += n;
-        }
-        hasher.update(&buf[..read_total]);
-    }
-    // 长度入摘要:同采样内容、不同总长的文件不得同指纹。
-    hasher.update(len.to_le_bytes());
-    Ok(format!("sha256s:{}", to_hex_lower(&hasher.finalize())))
 }

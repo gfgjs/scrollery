@@ -37,12 +37,14 @@ version = "0.1.0"
 dependencies = [
  "exotic-protocol",
  "image",
+ "libc",
  "ndarray 0.16.1",
  "scrollery-ai-core",
  "serde_json",
  "sha2",
  "tracing",
  "tracing-subscriber",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -3312,6 +3314,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "native-thumbnail-worker"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "fast_image_resize",
+ "image",
+ "kamadak-exif",
+ "moxcms",
+ "scrollery-ai-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "thumbhash",
+ "tracing",
+ "webp",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5125,6 +5147,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "rustc-hash",
+ "rustix",
  "scrollery-ai-core",
  "scrollery-exotic-trust",
  "scrollery-plugin-api",
@@ -5182,7 +5205,6 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ring",
- "scrollery-plugin-api",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -5192,9 +5214,6 @@ dependencies = [
 [[package]]
 name = "scrollery-plugin-api"
 version = "0.1.0"
-dependencies = [
- "thiserror 1.0.69",
-]
 
 [[package]]
 name = "security-framework"

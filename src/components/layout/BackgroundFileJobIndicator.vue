@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// A/B 共用的轻量文件任务指示器:放 AppStatusBar 右区,展示唯一 export/backup job 的进度与取消。
+// A/B 共用的轻量文件任务指示器:放 AppStatusBar 右区，展示文件任务的进度与取消。
 // export 有确定 processed/total；backup 只有粗粒度 running → terminal，故显示不确定 spinner。
 // 自动备份失败不弹 toast 打断用户，而是在这里保留可点击状态，入口直达设置页重试/换目录。
 
@@ -11,6 +11,7 @@ import { useRouter } from 'vue-router'
 import { useExportStore } from '../../stores/exportStore'
 import { useBackupStore } from '../../stores/backupStore'
 import { useFileJobStore } from '../../stores/fileJobStore'
+import { useHistoryStore } from '../../stores/historyStore'
 import { useToastStore } from '../../stores/toastStore'
 import { invokeIpc } from '../../utils/ipc'
 import { IPC } from '../../constants/ipc'
@@ -23,6 +24,7 @@ const router = useRouter()
 const exportStore = useExportStore()
 const backupStore = useBackupStore()
 const fileJobs = useFileJobStore()
+const history = useHistoryStore()
 const toast = useToastStore()
 const backupFailureDismissed = ref(false)
 
@@ -135,8 +137,26 @@ function openBackupSettings() {
 </script>
 
 <template>
+  <span v-if="history.copyProgress" class="statusbar__file-job" :title="history.copyProgress.name">
+    <span class="spinner" />
+    {{ history.copyProgress.publishing
+      ? t('history.copyPublishing')
+      : history.copyProgress.cancelling
+        ? t('history.copyCancelling')
+        : t('history.copyProgress', { count: history.copyProgress.copiedFiles, size: formatFileSize(history.copyProgress.copiedBytes) }) }}
+    <button
+      type="button"
+      class="statusbar__file-job-cancel"
+      :title="t('common.cancel')"
+      :aria-label="t('common.cancel')"
+      :disabled="history.copyProgress.generation === null || history.copyProgress.publishing || history.copyProgress.cancelling"
+      @click="history.cancelDirectoryCopy"
+    >
+      <X :size="12" />
+    </button>
+  </span>
   <span
-    v-if="visible"
+    v-else-if="visible"
     class="statusbar__file-job"
     :title="
       fileJobs.activeJob?.type === 'export'
@@ -216,6 +236,10 @@ function openBackupSettings() {
 .statusbar__file-job-cancel:hover {
   background: var(--color-bg-hover);
   color: var(--color-text-primary);
+}
+.statusbar__file-job-cancel:disabled {
+  cursor: default;
+  opacity: 0.4;
 }
 
 .statusbar__file-job--failed {

@@ -1,14 +1,12 @@
 //! 缩略图域 DAO:pending 调度/封面对账/淘汰复位/exotic 路由信息/结果回写
 //! (T 线拆分自 queries.rs,SQL 与行为不变;写边界防降级测试与实现同迁)。
 
-use rusqlite::{params, params_from_iter, Connection};
-use std::collections::HashMap;
+use rusqlite::{params, Connection};
 
 // 「exotic 接管门控」谓词由 exotic 域持有(P0 增补裁决);format! 内联捕获须裸名,故 use 引入。
 use super::exotic::NOT_BLOCKED_BY_EXOTIC;
 // 「隐藏根排除」谓词由 scan 域持有(V21);缩略图 pending 三查询共用,跳过隐藏根的媒体。
 use super::scan::EXCLUDE_HIDDEN_ROOTS;
-use crate::db::models::ThumbResult;
 use crate::error::{AppError, Result};
 use crate::exotic::task::ExoticTaskStatus;
 
@@ -24,8 +22,8 @@ const EXCLUDE_FRONTEND_DOC_THUMB: &str =
     "AND NOT (media_type='document' AND file_format IN ('pdf','svg'))";
 
 /// 图像调度器还必须排除 **video / audio**:它们的封面由派生流水线(video_cover / audio_cover)
-/// 产出并回填 thumb_status,主 generator 的 `decode_media_step` 对非图像一律判 UNSUPPORTED_TYPE →
-/// 回写 `thumb_status=2`(灰卡)。封面派生尚未完成时(thumb_status=0)若被本调度器领走标 2,会
+/// 产出并回填 thumb_status,不属于图片执行服务的领活范围。封面派生尚未完成时
+/// (thumb_status=0)若被本调度器领走并按图片失败标 2,会
 /// **抢先冲掉**其真实封面路径、且派生行仍 done 永不重做 —— 与 pdf/svg 被排除同源同理(那是前端
 /// DocThumbRenderer 独占,这是派生流水线独占)。
 /// (2026-07-13 定位:全量生成的 dispatcher 缺此排除,把 2414 视频 + 31 音频误标 status=2 灰卡;
@@ -71,48 +69,6 @@ pub fn count_pending_thumb_items(conn: &Connection) -> Result<i64> {
         .map_err(AppError::from)
 }
 
-/// 一次读取视口待回项的当前结果快照；不存在的 ID 不出现在返回映射中。
-pub fn thumbnail_results_for_ids(
-    conn: &Connection,
-    item_ids: &[i64],
-) -> Result<HashMap<i64, ThumbResult>> {
-    if item_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let placeholders = vec!["?"; item_ids.len()].join(",");
-    let sql = format!(
-        "SELECT id, thumb_status, thumb_path, thumbhash, source_revision, cache_key
-         FROM media_items WHERE id IN ({placeholders})"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(item_ids), |row| {
-        Ok(ThumbResult {
-            item_id: row.get(0)?,
-            thumb_status: row.get(1)?,
-            thumb_path: row.get(2)?,
-            thumbhash: row.get(3)?,
-            source_revision: row.get(4)?,
-            cache_key: row.get(5)?,
-        })
-    })?;
-    let mut results = HashMap::with_capacity(item_ids.len());
-    for row in rows {
-        let result = row?;
-        results.insert(result.item_id, result);
-    }
-    Ok(results)
-}
-
-/// 配置改变时把直显项退回待处理，保留源文件与既有占位数据。
-pub fn reset_direct_thumbnail_rows_for_config(conn: &Connection) -> Result<usize> {
-    conn.execute(
-        "UPDATE media_items SET thumb_status = 0, thumb_path = NULL
-         WHERE thumb_status = 3 AND is_deleted = 0",
-        [],
-    )
-    .map_err(AppError::from)
-}
-
 /// 启动期自愈 P1-4 封面缩略图竞写残留：对「封面派生已完成（`status=2` 且 `payload_path` 非空）」
 /// 但 `media_items` 分叉（`thumb_status<>1` 或 `thumb_path IS NULL`）的项，从**权威**派生产物
 /// 重新回填 `thumb_status=1 / thumb_path`。冲突源于图像调度器与专门流水线（DocThumbRenderer /
@@ -132,11 +88,6 @@ pub fn reconcile_cover_thumbs(conn: &Connection) -> Result<usize> {
                  SELECT dv.payload_path FROM media_derivations dv
                  WHERE dv.item_id = media_items.id
                    AND dv.kind IN ('video_cover','audio_cover','doc_thumb')
-                   AND dv.output_fingerprint = ''
-                   AND NOT (dv.kind='video_cover' AND EXISTS (
-                       SELECT 1 FROM media_derivations next
-                       WHERE next.item_id=dv.item_id AND next.kind='video_cover'
-                         AND next.output_fingerprint!=''))
                    AND dv.status = 2 AND dv.payload_path IS NOT NULL
                  LIMIT 1)
          WHERE is_deleted = 0
@@ -145,11 +96,6 @@ pub fn reconcile_cover_thumbs(conn: &Connection) -> Result<usize> {
                  SELECT 1 FROM media_derivations dv
                  WHERE dv.item_id = media_items.id
                    AND dv.kind IN ('video_cover','audio_cover','doc_thumb')
-                   AND dv.output_fingerprint = ''
-                   AND NOT (dv.kind='video_cover' AND EXISTS (
-                       SELECT 1 FROM media_derivations next
-                       WHERE next.item_id=dv.item_id AND next.kind='video_cover'
-                         AND next.output_fingerprint!=''))
                    AND dv.status = 2 AND dv.payload_path IS NOT NULL)",
         [],
     )?;
@@ -240,11 +186,11 @@ pub fn reset_cover_thumb_for_regen_if_current(
     Ok(affected)
 }
 
-/// LRU 驱逐即时复位(深审 defer ⑥,事件驱动):按**被驱逐文件的 DB 相对路径**精确复位
-/// 受影响项。`media_items.thumb_path` 与驱逐路径同构(`{size}/{xx}/{hex}.webp`),按路径
-/// 匹配天然避免「同 key 另一档位文件被驱逐」误伤现行缩略图(按 cache_key 复位则会)。
+/// LRU 驱逐即时复位：按被驱逐文件的 DB 相对路径精确复位展示引用并删除匹配 artifact。
+/// display 路径相对 thumbnails，AI 路径相对缓存根（含 ai_thumbs/）；其它尺寸/指纹保留。
 /// 封面派生行**先于** media_items 复位(media_items 更新后 thumb_path 置 NULL,子查询将
 /// 失配)。返回复位的 item id 集,调用方据此 patch 常驻 items 缓存并广播刷新。
+/// 普通图片含软删行一并清除展示引用，避免恢复时继续引用已驱逐产物。
 /// 调用方须持写连接、在 `spawn_blocking` 内执行。幂等(路径已不匹配则改 0 行)。
 pub fn reset_thumbs_by_evicted_paths(conn: &Connection, paths: &[String]) -> Result<Vec<i64>> {
     if paths.is_empty() {
@@ -264,8 +210,10 @@ pub fn reset_thumbs_by_evicted_paths(conn: &Connection, paths: &[String]) -> Res
         );
         tx.execute(&deriv_sql, rusqlite::params_from_iter(chunk.iter()))?;
         let items_sql = format!(
-            "UPDATE media_items SET thumb_status = 0, thumb_path = NULL
-             WHERE thumb_status = 1 AND is_deleted = 0 AND thumb_path IN ({ph})
+            "UPDATE media_items SET thumb_status = 0, thumb_path = NULL, thumbhash = NULL
+             WHERE thumb_path IN ({ph})
+               AND ((thumb_status = 1 AND is_deleted = 0)
+                    OR (media_type = 'image' AND thumb_status IN (1,3)))
              RETURNING id"
         );
         let mut stmt = tx.prepare(&items_sql)?;
@@ -276,18 +224,149 @@ pub fn reset_thumbs_by_evicted_paths(conn: &Connection, paths: &[String]) -> Res
             ids.push(r?);
         }
         drop(stmt);
+        tx.execute(
+            &format!("DELETE FROM image_artifacts WHERE path IN ({ph})"),
+            rusqlite::params_from_iter(chunk.iter()),
+        )?;
     }
     tx.commit()?;
     Ok(ids)
+}
+
+/// 配置变更只撤销当前展示引用，保留所有已提交的历史图片产物变体。
+///
+/// `reset_images` 对应图片策略或缓存目录变化，`reset_covers` 对应封面尺寸/质量变化。
+/// 调用方须在生命周期写区持写连接执行；事务同时复位封面引用与其派生行。
+pub fn reset_thumbnail_config_references(
+    conn: &Connection,
+    reset_images: bool,
+    reset_covers: bool,
+) -> Result<(usize, usize)> {
+    let tx = conn.unchecked_transaction()?;
+    let mut items = 0;
+    let mut covers = 0;
+    if reset_images {
+        // 隐藏或软删图片也要撤销旧配置引用，避免再次可见时复活旧展示。
+        // exotic 封面由独立流水线持有，不能因普通图片策略变更而丢失。
+        items += tx.execute(
+            "UPDATE media_items SET thumb_status=0, thumb_path=NULL, thumbhash=NULL
+             WHERE media_type='image'
+               AND (thumb_status<>0 OR thumb_path IS NOT NULL OR thumbhash IS NOT NULL)
+               AND NOT EXISTS (
+                   SELECT 1 FROM exotic_catalog_formats ec, json_each(ec.capabilities_json) capability
+                   WHERE ec.format=media_items.file_format AND capability.value='thumbnail')
+               AND NOT EXISTS (
+                   SELECT 1 FROM exotic_tasks et
+                   WHERE et.item_id=media_items.id AND et.capability='thumbnail')",
+            [],
+        )?;
+    }
+    if reset_covers {
+        items += tx.execute(
+            "UPDATE media_items SET thumb_status=0, thumb_path=NULL, thumbhash=NULL
+             WHERE media_type<>'image' AND thumb_status=1 AND is_deleted=0",
+            [],
+        )?;
+        covers = tx.execute(
+            "UPDATE media_derivations SET status=0, payload_path=NULL
+             WHERE status=2 AND kind IN ('video_cover','audio_cover','doc_thumb')
+               AND item_id IN (
+                   SELECT id FROM media_items WHERE media_type<>'image' AND is_deleted=0)",
+            [],
+        )?;
+    }
+    tx.commit()?;
+    Ok((items, covers))
+}
+
+#[cfg(test)]
+mod reset_by_evicted_paths_tests {
+    //! ⑥ 事件驱动复位:按路径精确匹配 + 封面派生行同步复位 + 分块边界。
+    use super::*;
+
+    fn seeded() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
+             -- 1=被驱逐的视频封面;2=同类但路径未被驱逐;3=被驱逐的普通图像;4=软删的匹配路径
+             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, thumb_status, thumb_path, is_deleted) VALUES
+                 (1, 10, 'a.mp4', 1, 1, 'mp4', 'video', 0, 0, 100, 11, 1, '480/aa/evicted1.webp', 0),
+                 (2, 10, 'b.mp4', 1, 1, 'mp4', 'video', 0, 0, 200, 12, 1, '480/bb/alive.webp',    0),
+                 (3, 10, 'c.jpg', 1, 1, 'jpg', 'image', 0, 0, 300, 13, 1, '480/cc/evicted2.webp', 0),
+                 (4, 10, 'd.mp4', 1, 1, 'mp4', 'video', 0, 0, 400, 14, 1, '480/dd/evicted3.webp', 1);
+             INSERT INTO media_derivations (item_id, kind, status, payload_path) VALUES
+                 (1, 'video_cover', 2, '480/aa/evicted1.webp'),
+                 (1, 'ai_thumb',    2, 'ai/aa.webp'),
+                 (2, 'video_cover', 2, '480/bb/alive.webp');",
+        )
+        .unwrap();
+        c
+    }
+
+    fn thumb_of(c: &Connection, id: i64) -> (i64, Option<String>) {
+        c.query_row(
+            "SELECT thumb_status, thumb_path FROM media_items WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn deriv_status(c: &Connection, id: i64, kind: &str) -> i64 {
+        c.query_row(
+            "SELECT status FROM media_derivations WHERE item_id=?1 AND kind=?2",
+            params![id, kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn seed_artifacts(c: &Connection) {
+        c.execute_batch(
+            "UPDATE media_items SET thumbhash=x'07' WHERE id=3;
+             INSERT INTO image_artifacts(item_id,source_revision,cache_key,kind,fingerprint,status,path) VALUES
+                 (3,1,13,'display','policy:480',1,'480/cc/evicted2.webp'),
+                 (3,1,13,'display','policy:960',1,'960/cc/large.webp'),
+                 (3,1,13,'display','old-policy:480',1,'480/cc/old.webp'),
+                 (3,1,13,'ai','ai:336',1,'ai_thumbs/v2/336/cc/ai.webp');",
+        )
+        .unwrap();
+    }
+
+    fn artifact_count(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM image_artifacts", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn artifact_delete_failure_rolls_back_media_and_cover_resets() {
+        let c = seeded();
+        seed_artifacts(&c);
+        c.execute_batch(
+            "CREATE TRIGGER fail_delete BEFORE DELETE ON image_artifacts
+             BEGIN SELECT RAISE(ABORT,'forced'); END;",
+        )
+        .unwrap();
+        assert!(reset_thumbs_by_evicted_paths(
+            &c,
+            &["480/aa/evicted1.webp".into(), "480/cc/evicted2.webp".into()]
+        )
+        .is_err());
+        assert_eq!(artifact_count(&c), 4);
+        assert_eq!(thumb_of(&c, 1), (1, Some("480/aa/evicted1.webp".into())));
+        assert_eq!(thumb_of(&c, 3), (1, Some("480/cc/evicted2.webp".into())));
+        assert_eq!(deriv_status(&c, 1, "video_cover"), 2);
+    }
 }
 
 /// 启动期自愈 ②（与 `reconcile_cover_thumbs` 反向互补）：修复 **LRU 缓存驱逐残留**。
 ///
 /// 病理：`enforce_cache_limit`（LRU 按 mtime 删 `thumbnails/` 文件）删封面时**不改**
 /// `media_items.thumb_status`，而 `route_thumbnail` 对 `thumb_status=1` 直接短路（不 stat 文件、
-/// 不重生成）→ 被驱逐的封面缩略图永久 404（视频封面尤甚：整批旧档 cohort 被驱逐）。主 generator
-/// 的 `decode_media_step` 本有「缺文件 CACHE_MISS → 重生成」能力，但封面类根本走不到它（router
-/// 短路 + 派生行仍 done 不会重排）。
+/// 不重生成）→ 被驱逐的封面缩略图永久 404（视频封面尤甚：整批旧档 cohort 被驱逐）。
+/// 封面类走 router 短路,派生行仍 done,不会因文件缺失自动重排。
 ///
 /// 修法：扫「有封面派生（done）且 `media_items` 声称已生成（`thumb_status=1`）」的项，逐一 stat
 /// `thumb_path`；文件缺失的交 `reset_cover_thumbs_for_regen` 复位（media_items + 派生行一并退回
@@ -400,7 +479,8 @@ pub fn exotic_thumbnail_route_info_for_items(
             row.get::<_, Option<String>>(3)?,
         ))
     })?;
-    for (item_id, status, fp, wv) in rows.flatten() {
+    for row in rows {
+        let (item_id, status, fp, wv) = row?;
         if let Some(st) = ExoticTaskStatus::from_i64(status) {
             map.insert(
                 item_id,
@@ -497,4 +577,62 @@ pub fn update_thumb_result(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod update_thumb_result_tests {
+    //! 写边界防降级:失败写(status=2)不得覆盖已有产物行(1/3),成功写恒无条件。
+    use super::*;
+
+    fn seeded() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
+             -- 1=已生成封面(status=1),2=直显(status=3),3=待生成(status=0),4=已失败(status=2)
+             INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, thumb_status, thumb_path) VALUES
+                 (1, 10, 'a.mp4', 1, 1, 'mp4', 'video',    0, 0, 100, 11, 1, '480/aa/cover.webp'),
+                 (2, 10, 'b.jpg', 1, 1, 'jpg', 'image',    0, 0, 200, 12, 3, '/r/b.jpg'),
+                 (3, 10, 'c.jpg', 1, 1, 'jpg', 'image',    0, 0, 300, 13, 0, NULL),
+                 (4, 10, 'd.txt', 1, 1, 'txt', 'document', 0, 0, 400, 14, 2, NULL);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn thumb_of(c: &Connection, id: i64) -> (i64, Option<String>) {
+        c.query_row(
+            "SELECT thumb_status, thumb_path FROM media_items WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn guarded_failure_preserves_success_and_rejects_stale_source() {
+        let c = seeded();
+
+        // 当前已有成功产物：失败结果即使快照匹配，也必须保留产物并返回 0。
+        assert_eq!(
+            update_thumb_result_if_current(&c, 1, 1, 11, 2, None, None).unwrap(),
+            0,
+            "失败写不得降级已有成功产物"
+        );
+        assert_eq!(thumb_of(&c, 1), (1, Some("480/aa/cover.webp".into())));
+
+        // 模拟 scanner 在同一 database epoch 内推进源代次；旧 worker 的失败回写也必须丢弃。
+        c.execute(
+            "UPDATE media_items SET source_revision=2, thumb_status=0, thumb_path=NULL WHERE id=3",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            update_thumb_result_if_current(&c, 3, 1, 13, 2, None, None).unwrap(),
+            0,
+            "旧 worker 的失败结果不得标记新源"
+        );
+        assert_eq!(thumb_of(&c, 3), (0, None));
+    }
 }

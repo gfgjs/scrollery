@@ -1,5 +1,5 @@
 // crates/exotic-protocol/src/stderr_log.rs
-//! Worker stderr 行日志协议(日志能力重构线 阶段 3 · W3,D-313/D-314)。
+//! Worker stderr 行日志协议。
 //!
 //! **不属帧协议**:stdout 才是唯一的帧通道(magic/版本/长度上限校验),stderr 一直是自由文本
 //! 诊断区。本模块只是把这片自由文本的形状定成单行 JSON,供 supervisor 侧统一解析转发进主

@@ -130,32 +130,111 @@ pub async fn add_backend(
     .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
 }
 
-/// 移除存储后端（§3.8）：删除行并清理其 keyring 凭据。
+/// 移除存储后端（§3.8）：清理凭据成功后删除行，失败保留关联供重试。
 #[tauri::command]
 pub async fn remove_backend(id: i64, state: State<'_, Arc<AppState>>) -> Result<()> {
     // R1-3：DB 写 + keyring 清理整段离开 tokio worker。
     let s = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let cred_ref = {
-            let conn = s.db_writer.lock().unwrap_or_else(|e| e.into_inner());
-            q::delete_storage_backend(&conn, id)?
-        };
-        if let Some(account) = cred_ref {
-            // 清理凭据；NoEntry 视为成功（幂等）。
-            if let Ok(entry) = keyring_entry(&account) {
-                match entry.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => {}
-                    Err(e) => {
-                        return Err(AppError::internal(
-                            "删除凭据失败 | credential delete failed",
-                            e,
-                        ))
-                    }
-                }
+    tokio::task::spawn_blocking(move || remove_backend_with_entry(&s.db_writer, id, keyring_entry))
+        .await
+        .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+}
+
+// 凭据操作位于两段短 DB 锁之间；失败时必须保留关联供同一操作重试。
+fn remove_backend_with_entry(
+    writer: &std::sync::Mutex<rusqlite::Connection>,
+    id: i64,
+    entry_for: impl FnOnce(&str) -> Result<keyring::Entry>,
+) -> Result<()> {
+    let cred_ref = {
+        let conn = writer.lock().unwrap_or_else(|e| e.into_inner());
+        q::storage_backend_cred_ref(&conn, id)?
+    };
+    if let Some(account) = cred_ref {
+        // 清理凭据；NoEntry 视为成功（幂等）。
+        match entry_for(&account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => {
+                return Err(AppError::internal(
+                    "删除凭据失败 | credential delete failed",
+                    e,
+                ))
             }
         }
-        Ok(())
-    })
-    .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
+    }
+    let conn = writer.lock().unwrap_or_else(|e| e.into_inner());
+    q::delete_storage_backend(&conn, id)
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    fn writer() -> std::sync::Mutex<rusqlite::Connection> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE storage_backends (id INTEGER PRIMARY KEY, cred_ref TEXT);
+            INSERT INTO storage_backends VALUES (1, 'storage_backend_1');",
+        )
+        .unwrap();
+        std::sync::Mutex::new(conn)
+    }
+
+    fn remaining(writer: &std::sync::Mutex<rusqlite::Connection>) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        writer
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cred_ref FROM storage_backends WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn entry() -> keyring::Entry {
+        keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default()))
+    }
+
+    #[test]
+    fn entry_failure_keeps_backend_reference() {
+        let writer = writer();
+        let result =
+            remove_backend_with_entry(&writer, 1, |_| Err(AppError::System("unavailable".into())));
+        assert!(result.is_err());
+        assert_eq!(remaining(&writer).as_deref(), Some("storage_backend_1"));
+    }
+
+    #[test]
+    fn delete_failure_keeps_reference_and_allows_retry() {
+        let writer = writer();
+        let failed = entry();
+        failed.set_password("test-password").unwrap();
+        failed
+            .get_credential()
+            .downcast_ref::<keyring::mock::MockCredential>()
+            .unwrap()
+            .set_error(keyring::Error::PlatformFailure(Box::new(
+                std::io::Error::other("private credential"),
+            )));
+        assert!(remove_backend_with_entry(&writer, 1, |_| Ok(failed)).is_err());
+        assert_eq!(remaining(&writer).as_deref(), Some("storage_backend_1"));
+        let retry = entry();
+        retry.set_password("test-password").unwrap();
+        remove_backend_with_entry(&writer, 1, |account| {
+            assert_eq!(account, "storage_backend_1");
+            Ok(retry)
+        })
+        .unwrap();
+        assert_eq!(remaining(&writer), None);
+    }
+
+    #[test]
+    fn missing_credential_allows_backend_removal() {
+        let writer = writer();
+        remove_backend_with_entry(&writer, 1, |_| Ok(entry())).unwrap();
+        assert_eq!(remaining(&writer), None);
+    }
 }

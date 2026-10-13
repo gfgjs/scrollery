@@ -1,9 +1,6 @@
 <script setup lang="ts">
-// UiPopover（S1 原语）：全库锚定弹层的唯一定位实现。
-// 此前各弹层各自手写 getBoundingClientRect + 手算 top/left,水平钳制/垂直 flip 各处漏配不一;
-// 定位数学委托 @floating-ui/vue(Popper 继任者),本原语只持有项目契约:Teleport 逃逸祖先
-// overflow 裁切 + 焦点陷阱 + backdrop/Esc dismiss。
-// 与 UiDialog 的差异:锚定定位(非居中)、非 modal、dismiss 走 backdrop+Esc(而非遮罩)。
+// 全库锚定弹层使用 @floating-ui/vue 定位；Teleport 避开祖先 overflow 裁切。
+// 焦点陷阱和 backdrop/Esc 负责关闭交互；与居中的模态对话框分开处理。
 // 全库无 .popover 全局基座类,本原语自带定位外壳与默认 float 表面;已有 slot 可继续自持尺寸/内边距。
 import { computed, ref } from 'vue'
 import { useFloating, autoUpdate, offset, flip, shift, type Placement } from '@floating-ui/vue'
@@ -14,7 +11,7 @@ const props = withDefaults(
     open: boolean // 开阖(v-if 存在性切换，驱动焦点陷阱 + autoUpdate 生命周期)
     anchor: HTMLElement | null // 定位锚点=触发元素的根 DOM(UiIconButton 经 defineExpose({el}) 提供)
     placement?: Placement // 放置方位，默认 'bottom-start'
-    offsetPx?: number // 与锚点主轴间距，默认 6(沿用旧 positionMenu 的 rect.bottom + 6)
+    offsetPx?: number // 与锚点主轴间距，默认 6px
     trapFocus?: boolean // 是否启用焦点陷阱，默认 true(open 期圈焦点、关闭归还锚点)
   }>(),
   { placement: 'bottom-start', offsetPx: 6, trapFocus: true },
@@ -29,11 +26,8 @@ const floatingEl = ref<HTMLElement | null>(null)
 
 // @floating-ui 引擎:strategy 'fixed' 使 top/left 相对视口(与 Teleport-to-body + autoUpdate 契合)。
 // middleware 顺序:offset(主轴间距) → flip(放不下则翻面) → shift(沿轴滑动留在视口内,padding 为视口留边)。
-// shift 一举替代旧 positionMenu 的手写水平钳制,并修掉 date 弹层漏钳制的越界 bug。
-// whileElementsMounted: autoUpdate 仅在两元素都挂载时(客户端)运行,使滚动/resize/尺寸变化自动重定位,
-// 替代旧「resize 即关闭再重开」的降级处理。
-// transform:false → 用 top/left 定位,把 transform 让给入场动画的位移(否则两者互相覆盖,
-// 旧版 translateY(-4px) 从未真正生效);并配合 isPositioned 就位前隐藏,消除首帧左上角闪现再跳到锚点的观感。
+// autoUpdate 在锚点与弹层都挂载时运行，跟随滚动和尺寸变化重定位。
+// top/left 负责定位，transform 留给入场动画；isPositioned 避免首帧跳位。
 const { floatingStyles, placement, isPositioned } = useFloating(anchorRef, floatingEl, {
   placement: computed(() => props.placement),
   strategy: 'fixed',

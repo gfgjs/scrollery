@@ -1,6 +1,6 @@
 // src/composables/useGridFlipReflow.ts
-// 网格删除/移除后的平滑重排动画(FLIP + 淡出),从 MediaGrid 抽出的自包含 DOM 工具
-// (T18 轨道 B:仅依赖段容器 getter,与 selection/mediaStore/对话框等全解耦)。
+// 网格删除/移除后的平滑重排动画（FLIP + 淡出）。
+// 仅依赖段容器 getter，与 selection/mediaStore/对话框解耦。
 //
 // 为什么需要 FLIP:justify 布局在后端算,前端无法本地增量重排,删除一项后整张布局重算,
 // 若不处理幸存格子会从旧位置瞬跳到新位置。FLIP(First-Last-Invert-Play):重算前快照各格

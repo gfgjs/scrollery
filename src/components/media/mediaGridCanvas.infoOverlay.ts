@@ -1,15 +1,21 @@
-// 信息浮窗(对齐 DOM .media-thumb__info-overlay:底部渐变 + 徽章行 + 信息行)组装 + 逐帧缓存,
-// 从 MediaGridCanvas.vue 下沉(方案 2.2 ③)。工厂封装 infoGen/infoLineCache 两个命令式状态,
-// 宿主在 <script setup> 顶层只调用一次 createInfoOverlayCache(),数据/设置换代时调 invalidate()
-// (对应原 infoGen++ + infoLineCache.clear())。
+// 信息浮窗(对齐 DOM .media-thumb__info-overlay:底部渐变 + 徽章行 + 信息行)组装 + 逐帧缓存。
+// 工厂封装 infoGen/infoLineCache 两个命令式状态,宿主在 <script setup> 顶层只调用一次
+// createInfoOverlayCache(),数据/设置换代时调 invalidate()。
 import type { LayoutRowItem, MediaMeta } from '../../types/layout'
 import { formatFileSize } from '../../utils/format'
 import { buildThumbInfoLines, typeBadgeOf } from './mediaGrid.helpers'
 import { truncateToWidth } from './mediaGridCanvas.helpers'
 import type { Palette } from './mediaGridCanvas.palette'
 import type { DemoInfoFormatter } from '../../utils/demoAlias'
+import {
+  thumbInfoLineLimit,
+  THUMB_INFO_LINE_HEIGHT,
+  THUMB_INFO_BADGE_HEIGHT,
+  THUMB_INFO_FADE_HEIGHT,
+  type ThumbBottomLayout,
+} from './thumbBottomLayout'
 
-/** drawInfoOverlay 每次调用显式接收的上下文(替代原闭包读取 props/palette)。 */
+/** drawInfoOverlay 每次调用显式接收的上下文(props/palette 等经参数传入)。 */
 export interface InfoOverlayCtx {
   palette: Palette
   viewportMeta: Map<number, MediaMeta>
@@ -17,6 +23,7 @@ export interface InfoOverlayCtx {
   showThumbInfo: boolean
   /** 演示打码的信息浮窗文案替换(宿主注入;关闭时为 null → 走真实文案)。 */
   demoInfo: DemoInfoFormatter | null
+  bottom: ThumbBottomLayout
 }
 
 // showInfo 关闭时的空文本块:模块级复用,避免逐帧新建对象。
@@ -67,15 +74,14 @@ export function createInfoOverlayCache() {
     // 文本块先取(同一 id 逐帧命中缓存):信息行 + 演示化的文件大小角标文本。
     const bundle = showInfo ? infoBundleFor(ctx, item, w - 12, ctxArgs) : NO_DEMO_TEXT
     // 徽章收集(条件逐字对齐 DOM 模板 v-if):ORIG/THUMB/大小/类型按设置,相似度/LIVE 常显。
-    // 类型角标的判定不在此逐字重写,走 helpers.typeBadgeOf 与 DOM 共享单源。
+    // 类型角标判定走 helpers.typeBadgeOf 与 DOM 共享单源,不在此重写条件。
     const badges: Array<{ text: string; px: number; mark?: string }> = []
     if (sim == null && loaded && showInfo && els.includes('status')) {
       if (item.thumbStatus === 3) badges.push({ text: 'ORIG', px: 11 })
-      else if (item.thumbStatus === 1)
-        badges.push({ text: 'THUMB', px: 11 })
+      else if (item.thumbStatus === 1) badges.push({ text: 'THUMB', px: 11 })
     }
     if (sim == null && item.fileSize && showInfo && els.includes('size')) {
-      // 演示打码:文件大小示例化(存在性判定仍用真实 fileSize,不新增原来没有的角标)。
+      // 演示打码:文件大小示例化(存在性判定仍用真实 fileSize,不新增原本没有的角标)。
       badges.push({ text: bundle.demoSize ?? formatFileSize(item.fileSize), px: 11 })
     }
     if (sim != null) badges.push({ text: `${Math.round(sim * 100)}%`, px: 11 })
@@ -87,13 +93,20 @@ export function createInfoOverlayCache() {
         badges.push({ text: 'DOC', px: 11, mark: palette.badgeMarkDocument })
       else if (kind === 'raw') badges.push({ text: 'RAW', px: 11 })
     }
-    const lines = bundle.lines
+    const { infoBottom } = ctxArgs.bottom
+    const hasBadges =
+      badges.length > 0 && h >= infoBottom + THUMB_INFO_FADE_HEIGHT + THUMB_INFO_BADGE_HEIGHT
+    const lines = bundle.lines.slice(0, thumbInfoLineLimit(h, infoBottom, hasBadges))
+    if (!hasBadges) badges.length = 0
     if (badges.length === 0 && lines.length === 0) return
 
     // 底部渐变(to top: 0.85 → 70% 处 0.5 → 顶透明;padding-top 24 即渐隐区)
-    const lineH = 12
-    const badgesH = badges.length > 0 ? 16 : 0
-    const overlayH = Math.min(h, 24 + badgesH + lines.length * lineH + 6)
+    const lineH = THUMB_INFO_LINE_HEIGHT
+    const badgesH = hasBadges ? THUMB_INFO_BADGE_HEIGHT : 0
+    const overlayH = Math.min(
+      h,
+      THUMB_INFO_FADE_HEIGHT + badgesH + lines.length * lineH + infoBottom,
+    )
     const oy = y + h - overlayH
     const grad = ctx.createLinearGradient(0, oy, 0, y + h)
     grad.addColorStop(0, 'rgba(0, 0, 0, 0)')
@@ -102,19 +115,22 @@ export function createInfoOverlayCache() {
     ctx.fillStyle = grad
     ctx.fillRect(x, oy, w, overlayH)
 
-    const linesTop = y + h - 6 - lines.length * lineH
-    // 徽章行(左起单行排布,溢出截断队尾;DOM 为 flex-wrap,canvas 单行在常规格宽下等价)
+    const linesTop = y + h - infoBottom - lines.length * lineH
+    // 两路都保留单行徽章，超宽部分在内容区裁剪，不改变文件名的纵向位置。
     if (badges.length > 0) {
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(x + 6, linesTop - 16, Math.max(0, w - 12), 16)
+      ctx.clip()
       let bx = x + 6
       const by = linesTop - 16
       for (const b of badges) {
-      ctx.font = `600 ${b.px}px system-ui, -apple-system, sans-serif`
+        ctx.font = `600 ${b.px}px system-ui, -apple-system, sans-serif`
         ctx.textAlign = 'left'
         ctx.textBaseline = 'middle'
         const tw = ctx.measureText(b.text).width
         const markSpace = b.mark ? 9 : 0
         const bw = tw + 10 + markSpace
-        if (bx + bw > x + w - 6) break
         ctx.beginPath()
         ctx.roundRect(bx, by, bw, 16, palette.radiusXs)
         ctx.fillStyle = palette.badgeScrim
@@ -129,6 +145,7 @@ export function createInfoOverlayCache() {
         ctx.fillText(b.text, bx + 5 + markSpace, by + 8)
         bx += bw + 4
       }
+      ctx.restore()
     }
     // 信息行(mono 10px 白字 + 文字投影)
     if (lines.length > 0) {

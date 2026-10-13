@@ -2,7 +2,7 @@
 //!
 //! 七命令：`enhance_status`（门控+模型态查询）/ `download_enhance_model`（复用
 //! `download_assets`）/ `delete_enhance_model` / `enhance_preview`（单 tile 前后对比）/
-//! `enhance_start`（付费门控 + 入队 + 后台驱动）/ `enhance_cancel` / `get_enhance_queue`。
+//! `enhance_start`（激活检查 + 入队 + 后台驱动）/ `enhance_cancel` / `get_enhance_queue`。
 //!
 //! 自有命令通过 AppManifest/permissions/capabilities 显式授权。
 //!
@@ -37,8 +37,8 @@ fn ensure_enhance_ready(state: &AppState, params: &EnhanceParams) -> Result<()> 
             message: "未选择任何增强任务".into(),
         });
     }
-    let authorized =
-        state.exotic_host().resolve_format("enhance").availability == Availability::Authorized;
+    let activated =
+        state.exotic_host().resolve_format("enhance").availability == Availability::Ready;
     let worker_ready = enhance_worker_ready();
     let models_dir = crate::ai::runtime_config::models_dir(state);
     for step in &params.steps {
@@ -49,7 +49,7 @@ fn ensure_enhance_ready(state: &AppState, params: &EnhanceParams) -> Result<()> 
             });
         }
         readiness(
-            authorized,
+            activated,
             worker_ready,
             enhance_manifest_ready(&step.model_id),
             enhance_model_installed(&models_dir, &step.model_id),
@@ -72,7 +72,7 @@ pub struct EnhanceModelDto {
     /// 该档下载清单是否已钉定 URL、字节数与 sha256。
     pub manifest_ready: bool,
     pub readiness: EnhanceReadiness,
-    /// 保留先下后购，但组件或发行清单缺失时禁止下载。
+    /// 保留提前准备模型，但组件或发行清单缺失时禁止下载。
     pub can_download: bool,
 }
 
@@ -80,7 +80,6 @@ pub struct EnhanceModelDto {
 #[serde(rename_all = "camelCase")]
 pub struct EnhanceStatusDto {
     pub availability: Availability,
-    pub store_url: Option<String>,
     pub worker_ready: bool,
     /// 增强协议尚无提供器回声，当前为 None；不得填入其他 worker 的提供器。
     pub provider: Option<String>,
@@ -94,11 +93,14 @@ pub struct EnhanceStatusDto {
 pub async fn enhance_status(state: State<'_, Arc<AppState>>) -> Result<EnhanceStatusDto> {
     let state = Arc::clone(&state);
     tokio::task::spawn_blocking(move || -> Result<EnhanceStatusDto> {
-        crate::official::entitlement(state.entitlement_provider().as_ref())?;
+        {
+            let conn = state.db_read_pool.get().map_err(AppError::from)?;
+            crate::feature_activation::status(&conn, "exotic-enhance")?;
+        }
         let resolution = state.exotic_host().resolve_format("enhance");
         let models_dir = crate::ai::runtime_config::models_dir(&state);
         let worker_ready = enhance_worker_ready();
-        let authorized = resolution.availability == Availability::Authorized;
+        let activated = resolution.availability == Availability::Ready;
         let models = enhance_profiles()
             .into_iter()
             .map(|p| {
@@ -107,7 +109,7 @@ pub async fn enhance_status(state: State<'_, Arc<AppState>>) -> Result<EnhanceSt
                 EnhanceModelDto {
                     installed,
                     manifest_ready,
-                    readiness: readiness(authorized, worker_ready, manifest_ready, installed),
+                    readiness: readiness(activated, worker_ready, manifest_ready, installed),
                     can_download: worker_ready && manifest_ready,
                     task: serde_json::to_value(p.task)
                         .ok()
@@ -122,7 +124,6 @@ pub async fn enhance_status(state: State<'_, Arc<AppState>>) -> Result<EnhanceSt
         let provider = None;
         Ok(EnhanceStatusDto {
             availability: resolution.availability,
-            store_url: resolution.store_url,
             worker_ready,
             provider,
             models,
@@ -133,7 +134,7 @@ pub async fn enhance_status(state: State<'_, Arc<AppState>>) -> Result<EnhanceSt
 }
 
 /// 下载某增强模型档位（照 `download_ocr_models` 姿态；复用 `download_assets`，P0 批 4 #11）。
-/// **不过授权门**（先下后购，同 OCR download 命令裁决）：只落模型字节，不触发增强。
+/// **无需激活**：只落模型字节，不触发增强。
 #[tauri::command]
 pub async fn download_enhance_model(
     model_id: String,
@@ -213,7 +214,7 @@ pub async fn delete_enhance_model(model_id: String, state: State<'_, Arc<AppStat
     .map_err(join_err)?
 }
 
-/// 前后对比预览（design.md §F）：付费门控 → 参数校验 → 裁中心（或 `point` 归一化点位为
+/// 前后对比预览（design.md §F）：激活检查 → 参数校验 → 裁中心（或 `point` 归一化点位为
 /// 中心）512² 单 tile 跑一次增强 → 返回 before/after 固定名文件路径（前端 convertFileSrc
 /// 消费）。worker 正忙（job 执行中）→ `enhance_busy`；不入队列、不 claim、不 ingest。
 ///
@@ -226,7 +227,7 @@ pub async fn enhance_preview(
     state: State<'_, Arc<AppState>>,
 ) -> Result<PreviewPaths> {
     let state = Arc::clone(&state);
-    // 付费门控（后端真门，同 enhance_start）。
+    // 激活检查（后端真门，同 enhance_start）。
     {
         let gate = Arc::clone(&state);
         let gate_params = params.clone();
@@ -244,7 +245,7 @@ pub async fn enhance_preview(
     .map_err(join_err)?
 }
 
-/// 发起增强（多选入队，顺序执行）：付费门控 → 参数校验 → 入队 → 后台驱动，返回 job_id。
+/// 发起增强（多选入队，顺序执行）：激活检查 → 参数校验 → 入队 → 后台驱动，返回 job_id。
 #[tauri::command]
 pub async fn enhance_start(
     app: tauri::AppHandle,
@@ -253,7 +254,7 @@ pub async fn enhance_start(
     state: State<'_, Arc<AppState>>,
 ) -> Result<u64> {
     let state = Arc::clone(&state);
-    // 付费门控（后端真门：绕过前端直接 invoke 亦拦）。
+    // 激活检查（后端真门：绕过前端直接 invoke 亦拦）。
     {
         let state_gate = Arc::clone(&state);
         let gate_params = params.clone();

@@ -1,76 +1,9 @@
-// crates/scrollery-ai-core/src/engine.rs
-//! AI 推理引擎池 — 封装用于 CLIP 模型的 ort Session。
+//! ONNX Runtime 会话池与模型装载。
 //!
-//! # 踩坑记录（2026-06-03）
-//!
-//! ## 坑1：ort crate 的 `load-dynamic` 与 `download-binaries` 互斥
-//! `load-dynamic` feature 会激活 `ort-sys/disable-linking`，
-//! 导致 build.rs 提前返回，`download-binaries` **完全不运行**。
-//! **后果**：即使在 Cargo.toml 同时写了两个 feature，DLL 也不会自动下载。
-//! **应对**：必须手动管理 DLL，并通过 ORT_DYLIB_PATH 指定路径。
-//!
-//! ## 坑2：ORT DLL 版本必须 ≥ 1.19（ONNX IR v10 要求）
-//! Chinese-CLIP ViT-B/16 模型用 PyTorch 2.11 导出，ONNX IR version = 10。
-//! ORT 1.17（旧版/WebView2 System32 自带版本）不支持 IR v10，
-//! 会在 CreateSession 时报 "model IR version is higher than supported" 错误，
-//! 或在某些路径下**直接无限卡死不报错**。
-//!
-//! ## 坑3：ORT 版本与 FP16 外部数据格式兼容性
-//! - ORT 1.21：无法加载 eisneim/cn-clip_vit-b-16 的 FP16 外部数据格式
-//!   （`.onnx` + `.extra_file`），在 `disabled` 和 `Level1` 图优化下均**无限卡死**。
-//!   Node.js ORT 1.26 在相同模型 421ms 内快速失败并报 `GetIndexFromName` 错误。
-//! - ORT 1.26：正常加载，Level1 优化下 ~200ms。
-//!
-//! **应对**：从 `onnxruntime-node@1.26.0` 的 `bin/napi-v6/win32/x64/` 中复制 DLL。
-//!
-//! ## 坑4：FP16 模型在 disabled 图优化下的类型错误
-//! `GraphOptimizationLevel::Disable` 下加载 FP16 模型会报：
-//! "Type (tensor(float)) of output arg (InsertedPrecisionFreeCast_...) does not match
-//! expected type (tensor(float16))"
-//! **原因**：FP16 模型内部有 ORT 插入的 PrecisionFreeCast 节点，这些节点依赖
-//! Level1+ 的 SimplifiedLayerNormFusion 优化才能正确处理类型。
-//! **应对**：必须使用 `Level1`（Basic）或更高级别，**不能用 Disable**。
-//!
-//! ## 坑5：单体 fp32 ONNX 格式（330MB）在 CPU 上极慢
-//! ORT 加载单体格式时必须一次性反序列化整个 Protobuf，
-//! 即使 `GraphOptimizationLevel::Disable`，330MB 文件也需要 >5 分钟。
-//! **应对**：使用外部数据格式（`.onnx` header + `.extra_file` 权重），
-//! ORT 通过内存映射按需读取权重，Session 创建只需解析小 header 文件。
-//!
-//! ## 坑6：CPU 路径不能用 Level3 图优化
-//! Level3（ORT_ENABLE_ALL）对 330MB ViT-B/16 图执行完整图融合和布局变换，
-//! 首次加载可能需要 5–10 分钟（无缓存）。
-//! **应对**：CPU 路径使用 Level1（Basic）= 常量折叠 + 死节点消除，
-//! Session 创建时间为秒级，推理性能影响极小。
-//!
-//! ## 坑7：新旧模型的张量 I/O 接口完全不同
-//! - 旧模型（cn-clip-vit-b16-*.onnx）:
-//!   图像: `pixel_values: f32[1,3,224,224]` → `image_features: f32[1,512]`（已L2归一化）
-//!   文本: `input_ids + attention_mask + token_type_ids: i64[1,52]` → `text_features`
-//! - 新模型（eisneim/cn-clip_vit-b-16）:
-//!   图像: `image: f32[1,3,224,224]` → `unnorm_image_features: f32[1,512]`（未归一化！）
-//!   文本: `text: i64[1,52]`（仅 token IDs）→ `unnorm_text_features: f32[1,512]`
-//!
-//! **应对**：推理后必须手动 L2 归一化；文本编码器不再需要 attention_mask/token_type_ids。
-//!
-//! ## 坑8（致命）：vocab.txt 与模型不匹配 → 准确率降为随机
-//! `eisneim/cn-clip_vit-b-16` 仓库附带的 vocab.txt 是**英文 CLIP 的 BPE 词表**
-//! （~5594 tokens），而非 Chinese-CLIP 需要的 **bert-base-chinese 词表**
-//! （21128 tokens）。误用导致所有中文字符被编码为 [UNK]，
-//! 任何查询产生完全相同的嵌入向量（cosine=1.0），搜索准确率降至随机水平。
-//! **应对**：从模型原始作者 `OFA-Sys/chinese-clip-vit-base-patch16` 获取 vocab.txt；
-//! 加载后校验 vocab_size ≥ 10000，否则立即报错。
-//! **详细记录**：见 `clip.rs` 模块头部的踩坑记录。
-//!
-//! ## 坑9（致命）：DirectML 静默算错文本编码器 → 语义搜索结果错乱
-//! `eisneim/cn-clip_vit-b-16` 的 **文本** 编码器是 BERT，输入为 int64 token ids，含
-//! embedding `Gather` 等算子。在 **DirectML** 上这些算子会被**静默算错**（不报错、不回退），
-//! 产出被污染的查询向量；图像（ViT）侧不受影响。症状：同一组（DirectML 生成且正确的）图像
-//! 向量下，DirectML 文本排序与 CPU 排序毫无重合——“白色的猫”返回纸箱/快递、“黄色的猫”返回
-//! 大量纯黑图，而 CPU 下均正确。重构前的旧三输入文本模型不触发此问题。
-//! **应对**：**文本编码器固定走 CPU**（见 `init()`）。它很小、每次查询只跑一次，CPU 延迟
-//! （~200ms）可忽略；图像编码器仍走 GPU 以保证批量分析速度。
-//! **排查关键**：若“图像向量正确（CPU 复算结果正确）但 app 搜索错乱”，优先怀疑查询向量（文本侧 EP）。
+//! 动态库必须显式解析并通过 preflight，避免隐式搜索命中过旧运行时。
+//! FP16 外部权重使用 Basic 图优化；禁用优化会产生类型错误，高级优化可能长时间阻塞装载。
+//! 图像塔可使用 GPU；BERT 文本塔固定 CPU，避开 DirectML 的 int64 Gather 静默错误。
+//! 张量 I/O、归一化与词表校验由模型契约和 clip 模块负责。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,11 +16,11 @@ use tracing::{info, warn};
 use crate::clip::ClipTokenizer;
 use crate::error::Result;
 use crate::face_profile::FaceProfile;
-use crate::profile::ModelProfile;
+use crate::profile::{ClipRoles, ModelProfile};
 use crate::provider::AiProvider;
 
 /// 线程安全的 ONNX Runtime Session 池。
-/// 用于解决 ort rc.12 中 Session::run 需要 &mut self 导致的串行瓶颈:session 经 channel 借出/归还,而非共享。
+/// Session::run 需要可变借用，因此通过 channel 借出独立 Session，避免共享锁串行化。
 #[derive(Clone)]
 pub struct SessionPool {
     rx: Receiver<Session>,
@@ -104,8 +37,7 @@ impl SessionPool {
         let _ = self.tx.send(session);
     }
 
-    /// 当前池中可用（未借出）的 session 数。流水线启动瞬间无人借出 → 等于池实际容量
-    /// （可能因部分加载失败而小于请求值）。人脸据此决定 detect/embed 并发 worker 数（问题6c）。
+    /// 未借出的 Session 数；启动时用于确定人脸推理并发数，可能小于请求容量。
     pub fn available(&self) -> usize {
         self.rx.len()
     }
@@ -164,22 +96,11 @@ impl std::fmt::Debug for SessionPool {
     }
 }
 
-/// 会话加载超时时间。
-///
-/// FP16 外部数据格式（eisneim/cn-clip_vit-b-16）在 ORT 1.26 + CPU + Level1 下
-/// 加载仅需 ~200ms；设 600s 超时是为了应对极端情况（NAS/慢速 HDD）或
-/// DirectML shader 编译（DirectML 卡死是无限期的，600s 内会被捕获）。
-/// 2026-07-11 加固批 A 起,这只是**单段后备上界**:宿主侧改静默限时(心跳在途即不杀),
-/// dylib 级卡死已被 [`preflight_ort_runtime`] 的短 watchdog 前置拦截。
+/// 单段装载的后备超时，覆盖慢速磁盘与 GPU 内核编译。
+/// 宿主按进度与心跳判断静默超时；动态库初始化另有 preflight 短 watchdog。
 const SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-// ── ORT 运行时 preflight(2026-07-11 加固批 A-1:死路径快败)──────────────────
-//
-// 病灶背景:ort `load-dynamic` 的懒加载在首个 Session::builder 时才解析动态库——
-// env `ORT_DYLIB_PATH` 指向不存在文件、或裸名回退命中 System32 的 1.17 旧版时,
-// 装载线程**无限阻塞而非快败**(0 CPU 零日志,2026-07-10/11 夜事故的直接杀伤机制)。
-// 对策:worker 侧**自解析**路径(拒绝隐式 DLL 搜索回退)+ `ort::init_from` 急切装载
-// + 短 watchdog,把「无限静默」变成秒级可判别错误。
+// ORT 运行时预检
 
 /// ORT 运行时 preflight 失败(三态映射协议错误码:unavailable→OrtDylibUnavailable,
 /// timeout→OrtRuntimeInitTimeout,failed→同 timeout 归运行时本体病灶)。
@@ -199,16 +120,13 @@ pub enum OrtPreflightError {
 /// 平台动态库文件名(与 ort setup_api 的裸名默认一致)。
 #[cfg(target_os = "windows")]
 const ORT_DYLIB_NAME: &str = "onnxruntime.dll";
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 const ORT_DYLIB_NAME: &str = "libonnxruntime.so";
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "macos")]
 const ORT_DYLIB_NAME: &str = "libonnxruntime.dylib";
 
-/// 解析 ort 将使用的动态库路径。规则与 ort 懒加载一致但**收紧**:
-/// ① env `ORT_DYLIB_PATH` 非空 → 该路径必须真实存在(死路径即错,不静默回退);
-/// ② 未设 env → exe 同目录的 [`ORT_DYLIB_NAME`] 必须存在——**刻意拒绝**裸名交给
-///    系统 DLL 搜索链的回退(会命中 System32 的 WebView2 遗留 1.17,无限阻塞,坑2)。
-/// 返回 (绝对路径, 来源描述)。
+/// 解析动态库路径及其来源：非空 ORT_DYLIB_PATH 必须指向现有文件，
+/// 未设置时仅检查可执行文件同目录，避免系统搜索链命中过旧运行时。
 pub fn resolve_ort_dylib() -> std::result::Result<(PathBuf, &'static str), OrtPreflightError> {
     match std::env::var("ORT_DYLIB_PATH") {
         Ok(v) if !v.is_empty() => {
@@ -241,11 +159,8 @@ pub fn resolve_ort_dylib() -> std::result::Result<(PathBuf, &'static str), OrtPr
     }
 }
 
-/// 一次性急切装载 ORT 运行时(进程级缓存,重复调用直接返回首次结果)。
-/// 成功后 ort 全局库句柄已就位,后续 `Session::builder` 不再走 env 懒解析;
-/// 失败则调用方应把错误映射为协议级错误码立即回报,**不要**再让加载路径去撞无限阻塞。
-/// watchdog 超时的装载线程会泄漏(ort 装载不可中断)——进程级一次、可接受,与
-/// `load_session_pool` 超时泄漏同性质。
+/// 急切装载 ORT，进程内缓存首次结果；失败时由调用方映射协议错误。
+/// 装载不可中断，watchdog 超时后线程仍可能存活，交由 worker 退出回收。
 pub fn preflight_ort_runtime(timeout: Duration) -> std::result::Result<String, OrtPreflightError> {
     static RESULT: std::sync::OnceLock<std::result::Result<String, OrtPreflightError>> =
         std::sync::OnceLock::new();
@@ -322,21 +237,13 @@ fn emit(progress: LoadProgress<'_>, event: &str) {
 }
 
 impl AiEnginePool {
-    /// 从给定的模型目录初始化引擎池。
-    pub fn init(
+    /// 按角色装载模型，并保留调用方已核实身份兼容的现有 Session。
+    /// 阶段回调供 worker 发进度和心跳；未请求的角色不会访问模型文件。
+    pub fn load_with_progress(
+        existing: Option<Self>,
         models_dir: &Path,
         profile: &ModelProfile,
-        face_profile: Option<&FaceProfile>,
-        provider_override: &str,
-    ) -> Result<Self> {
-        Self::init_with_progress(models_dir, profile, face_profile, provider_override, None)
-    }
-
-    /// 同 [`Self::init`],但带装载阶段进度回调(2026-07-11 加固批 A-2:
-    /// worker 借此把「卡在哪段」实时回执给宿主,替代黑盒 300s 总限时)。
-    pub fn init_with_progress(
-        models_dir: &Path,
-        profile: &ModelProfile,
+        roles: ClipRoles,
         face_profile: Option<&FaceProfile>,
         provider_override: &str,
         progress: LoadProgress<'_>,
@@ -355,130 +262,119 @@ impl AiEnginePool {
             provider_info.gpu_name = String::new();
         }
 
-        let pool_size = match provider_info.provider {
-            // CPU 路径：流水线是单推理线程的，所以给单个 Session 分配全核心，将池子大小限制为 2
+        let mut pool = existing.unwrap_or_else(|| Self {
+            provider: provider_info.provider,
+            gpu_name: provider_info.gpu_name,
+            profile: profile.clone(),
+            clip_image_session: None,
+            clip_text_session: None,
+            clip_tokenizer: None,
+            face_detect_session: None,
+            face_embed_session: None,
+            face_profile: None,
+        });
+
+        let pool_size = match pool.provider {
+            // CPU 单次推理使用全部核心，限制池容量以控制资源占用。
             AiProvider::Cpu => 2,
-            _ => 1, // GPU:DirectML/CUDA 驱动自行处理内部并发,多 session 会导致严重的 DX12 锁争用
+            _ => 1, // GPU 使用单 Session，避免多实例争用驱动资源。
         };
 
-        // 人脸专用 pool 尺寸（问题6c 提速）：独立于 CLIP 的 `pool_size`，不影响 CLIP。
-        // ⚠️ GPU 也给 2，试图让人脸 detect/embed 多 session 并发吃满 GPU——这与上面「GPU 多 session
-        // 致严重 DX12 锁争用」的结论相悖，是计划明知风险、要求用户实测的尝试。人脸是轻量纯 CNN
-        // （112/640 输入），争用代价可能低于 CLIP 大 ViT；若实测变慢/不稳，把此处改回 1 即可。
-        let face_pool_size = match provider_info.provider {
+        // 人脸独立使用两个 Session，允许检测与嵌入并发；GPU 下仍需关注资源争用。
+        let face_pool_size = match pool.provider {
             AiProvider::Cpu => 2,
             _ => 2,
         };
 
         // ── 步骤 2：加载 CLIP 模型 ──────────────────────────────────────
-        // 图像编码器：用探测到的最优 provider。ViT 在 DirectML/CUDA 上结果正确且快得多
-        // —— 已用库内向量产出准确搜索结果验证。
-        let mut clip_image_session = load_session_pool(
-            &image_path,
-            &provider_info.provider,
-            "CLIP image encoder | CLIP 图像编码器",
-            pool_size,
-            "clip_image_load",
-            progress,
-        );
-
-        // 【坑9·致命·2026-06-17】eisneim cn-clip 的 BERT 文本编码器含 int64 的 embedding
-        // Gather 等算子，**DirectML 会静默算错**（不报错、不回退），产出被污染的查询向量，使
-        // 语义搜索结果完全错乱。实测：同一组（DirectML 生成且正确的）图像向量下，app 的
-        // DirectML 文本排序与 CPU 排序毫无重合——“白色的猫”在 DirectML 下返回纸箱/快递，
-        // 在 CPU 下正确返回白猫；“黄色的猫”在 DirectML 下返回大量纯黑图。重构前的旧文本模型
-        // （input_ids/attention_mask/token_type_ids 三输入）不触发此问题。
-        // 文本模型很小、每次查询只跑一次，CPU 延迟（~200ms）可忽略，故固定 CPU 保证正确性。
-        // 图像编码器不受影响（ViT 在 DirectML 上结果正确）。
-        let clip_text_session = load_session_pool(
-            &text_path,
-            &AiProvider::Cpu,
-            "CLIP text encoder (CPU forced) | CLIP 文本编码器 (强制 CPU)",
-            2,
-            "clip_text_load",
-            progress,
-        );
-
-        // 图像编码器 GPU 加载失败则回退 CPU（文本已是 CPU）。
-        if clip_image_session.is_none() && provider_info.provider != AiProvider::Cpu {
-            tracing::warn!("GPU image encoder failed to load, falling back to CPU | 图像编码器 GPU 加载失败，回退 CPU...");
-            provider_info.provider = AiProvider::Cpu;
-            provider_info.gpu_name = String::new();
-            clip_image_session = load_session_pool(
+        // 图像编码器使用探测到的提供者，GPU 加载失败时再回退 CPU。
+        if roles.image && pool.clip_image_session.is_none() {
+            pool.clip_image_session = load_session_pool(
                 &image_path,
+                &pool.provider,
+                "CLIP image encoder | CLIP 图像编码器",
+                pool_size,
+                "clip_image_load",
+                progress,
+            );
+
+            // 已有 GPU 人脸池时保留提供者回声；仅新图像塔回退 CPU。
+            if pool.clip_image_session.is_none() && pool.provider != AiProvider::Cpu {
+                tracing::warn!("图像编码器 GPU 加载失败，回退 CPU");
+                if !pool.face_ready() {
+                    pool.provider = AiProvider::Cpu;
+                    pool.gpu_name.clear();
+                }
+                pool.clip_image_session = load_session_pool(
+                    &image_path,
+                    &AiProvider::Cpu,
+                    "CLIP image encoder (CPU) | CLIP 图像编码器 (CPU)",
+                    2,
+                    "clip_image_cpu_fallback",
+                    progress,
+                );
+            }
+            emit(progress, "contract_check:begin");
+            if let Some(session) = &pool.clip_image_session {
+                if let Some(guard) = session.get() {
+                    crate::clip::verify_image_tower_contract(&guard, profile)?;
+                }
+            }
+        }
+        // BERT 的 int64 Gather 在 DirectML 上曾静默算错，文本塔固定 CPU 保证查询向量正确。
+        if roles.text && pool.clip_text_session.is_none() {
+            pool.clip_text_session = load_session_pool(
+                &text_path,
                 &AiProvider::Cpu,
-                "CLIP image encoder (CPU) | CLIP 图像编码器 (CPU)",
+                "CLIP text encoder (CPU forced) | CLIP 文本编码器 (强制 CPU)",
                 2,
-                "clip_image_cpu_fallback",
+                "clip_text_load",
                 progress,
             );
         }
 
-        // 装载期契约自检(2026-07-10 审查 K1):错配模型文件(手动导入/改名错放)在激活时
-        // 即拒,给出指向明确的错误;否则要等运行期形状断言,且旧版本会静默产出错切向量。
-        emit(progress, "contract_check:begin");
-        if let Some(pool) = &clip_image_session {
-            if let Some(guard) = pool.get() {
-                crate::clip::verify_image_tower_contract(&guard, profile)?;
-            }
-        }
-
         info!(
             "AI provider ready: {} ({}) | AI 提供者就绪: {} ({})",
-            provider_info.provider.label(),
-            provider_info.gpu_name,
-            provider_info.provider.label(),
-            provider_info.gpu_name
+            pool.provider.label(),
+            pool.gpu_name,
+            pool.provider.label(),
+            pool.gpu_name
         );
 
         // ── 步骤 3：加载人脸模型（可选；文件缺失则优雅降级，不阻断 CLIP）──
-        // 人脸为纯 CNN（YuNet/SCRFD/SFace/ArcFace），跟随图像侧探测到的 provider。不同于 CLIP 文本塔
-        // （BERT int64 在 DirectML 静默算错，坑9），CNN 在 GPU 上一般正确，留待 F8 对拍参考实现验正。
-        // 检测+嵌入须同时就绪方为人脸可用（仅有检测而无嵌入无意义），任一缺失则整体降级为 None。
-        let (face_detect_session, face_embed_session, loaded_face_profile) = match face_profile {
-            Some(fp) => {
-                let det = load_session_pool(
-                    &models_dir.join(&fp.detect_file),
-                    &provider_info.provider,
-                    "Face detector | 人脸检测器",
-                    face_pool_size,
-                    "face_detect_load",
-                    progress,
-                );
-                let emb = load_session_pool(
-                    &models_dir.join(&fp.embed_file),
-                    &provider_info.provider,
-                    "Face embedder | 人脸嵌入器",
-                    face_pool_size,
-                    "face_embed_load",
-                    progress,
-                );
-                if det.is_some() && emb.is_some() {
-                    info!("Face models ready: {} | 人脸模型就绪: {}", fp.id, fp.id);
-                    (det, emb, Some(fp.clone()))
-                } else {
-                    warn!(
+        // 人脸 CNN 跟随图像侧提供者；检测与嵌入须同时就绪，否则整组不启用。
+        if let Some(fp) = face_profile.filter(|_| !pool.face_ready()) {
+            let det = load_session_pool(
+                &models_dir.join(&fp.detect_file),
+                &pool.provider,
+                "Face detector | 人脸检测器",
+                face_pool_size,
+                "face_detect_load",
+                progress,
+            );
+            let emb = load_session_pool(
+                &models_dir.join(&fp.embed_file),
+                &pool.provider,
+                "Face embedder | 人脸嵌入器",
+                face_pool_size,
+                "face_embed_load",
+                progress,
+            );
+            if det.is_some() && emb.is_some() {
+                info!("Face models ready: {} | 人脸模型就绪: {}", fp.id, fp.id);
+                pool.face_detect_session = det;
+                pool.face_embed_session = emb;
+                pool.face_profile = Some(fp.clone());
+            } else {
+                warn!(
                         "Face models not fully loaded (detector={}, embedder={}), face feature disabled | 人脸模型未完整加载，人脸功能禁用",
                         det.is_some(),
                         emb.is_some()
                     );
-                    (None, None, None)
-                }
             }
-            None => (None, None, None),
-        };
+        }
 
-        Ok(Self {
-            provider: provider_info.provider,
-            gpu_name: provider_info.gpu_name,
-            profile: profile.clone(),
-            clip_image_session,
-            clip_text_session,
-            clip_tokenizer: None, // loaded lazily from models_dir in ai_commands
-            face_detect_session,
-            face_embed_session,
-            face_profile: loaded_face_profile,
-        })
+        Ok(pool)
     }
 
     /// 返回 `true` 如果 CLIP 图像编码器已加载。
@@ -497,11 +393,8 @@ impl AiEnginePool {
     }
 }
 
-/// 影像增强会话池装载(P0 批 3:enhance-worker 复用既有 `build_session`/EP 骨架,
-/// design.md §A/§E「复用既有 ort engine/provider/session 骨架」)。单模型单 session
-/// (增强严格串行、一次一请求,无并发压力);`provider` 由调用方 [`detect_best_provider`]
-/// 探测后传入。缺文件/超时/装载失败均返回 `None`(语义同 [`load_session_pool`]),
-/// 调用方据此回 `ModelLoadFailed`。
+/// 装载影像增强的单 Session 池；增强请求串行，提供者由调用方探测。
+/// 缺文件、超时或装载失败返回 None，调用方据此报告 ModelLoadFailed。
 pub fn load_enhance_session_pool(
     model_path: &Path,
     provider: &AiProvider,
@@ -518,11 +411,9 @@ pub fn load_enhance_session_pool(
     )
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-// ── 辅助函数 ──────────────────────────────────────────────────────────────────
+// 辅助函数
 
-// `pub(crate)`:OCR 模块(ocr::mod::OcrEngine::init)复用它的池装载+超时+进度姿态,
-// 以 CPU EP、pool_size=1 加载 det/cls/rec 三 session(D-OCR-2)。
+// OCR 复用池装载、超时与进度处理，以 CPU 和单 Session 分别加载 det/cls/rec。
 pub(crate) fn load_session_pool(
     model_path: &PathBuf,
     provider: &AiProvider,
@@ -668,7 +559,7 @@ fn build_session(model_path: &PathBuf, provider: &AiProvider) -> ort::Result<Ses
                 .with_execution_providers([ort::ep::CUDA::default().build()])?;
             b.commit_from_file(model_path)
         }
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(target_os = "macos")]
         AiProvider::CoreML => {
             let mut b = Session::builder()?
                 .with_intra_threads(1)?
@@ -684,9 +575,7 @@ fn build_session(model_path: &PathBuf, provider: &AiProvider) -> ort::Result<Ses
             b.commit_from_file(model_path)
         }
         _ => {
-            // CPU 路径 — 因为扫描流水线的外层 `run_inference_tasks` 只有 1 个线程在请求 Session，
-            // 所以我们必须给该 Session 赋予全部的核心资源（with_intra_threads(cores)），
-            // 否则会造成全量扫描时 CPU 使用率极低（退化成单核执行）的问题。
+            // 外层仅一个推理线程，Session 使用全部核心，避免全量分析退化为单核。
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);

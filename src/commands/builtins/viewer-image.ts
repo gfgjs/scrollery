@@ -1,9 +1,5 @@
-// 图/视查看器专属命令(顶栏重构 P5-2)。ContentViewer 经 defineExpose + viewerStore.populate 暴露
-// ViewerApi,本册命令经 ctx.activeViewer.api 调用具体动作;when 谓词按 activeViewer.kind 过滤
-// (image/video——ContentViewer 承载二者)。navigation 只保留返回、跨项导航与沉浸；缩放、旋转、
-// 信息属内容区连续操作，归入 view 组且以 ContentViewer 底部控制条作为唯一可见主入口。
-// keybinding 为元数据(供 P5-6 键位同源:tooltip 与实际监听共用同一常量);当前实际按键仍由
-// ContentViewer.onKeydown 处理,P5-6 收敛为注册表分发后此元数据成为唯一来源。
+// 图片查看器命令通过 activeViewer.api 执行；按键由 useContentViewerKeyboard 分发。
+// navigation 组放跨项导航，缩放、旋转和信息操作归入 view 组。
 
 import { markRaw } from 'vue'
 import {

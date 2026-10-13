@@ -1,47 +1,14 @@
 // src-tauri/src/ai/search_control.rs
-//! 语义搜索控制面(P1-3):请求身份代次、常驻缓存快照与提交线性化。
+//! 语义搜索控制面：约束请求代次、模型身份、缓存快照与结果提交。
 //!
-//! 生产路径(ai_commands::semantic_search_cmd)的时序是:profile → ai-worker 编码文本 →
-//! 打分 → 整表覆写 ai_search_results。这条路径上有两处共享态此前没有被身份约束:
+//! `begin_request` 登记单调代次和模型身份；`snapshot_for` 在同一读锁内取得
+//! 身份与不可变向量缓存，评分在锁外执行。缓存失效与装载共用代次校验，
+//! 防止查询向量与另一模型的向量空间混用。
 //!
-//! 1. **常驻缓存**:装载只认 model_name,且「确保装载」与「取读打分」分两次取锁,两步之间
-//!    换模型/失效会让查询向量对上另一模型的向量空间——同维静默算错,异维按缓存维度索引
-//!    panic(前端只收到笼统 JoinError)。
-//! 2. **共享结果表**:ai_search_results 整表单写、谁后提交谁赢。用户清空搜索或切换模型后,
-//!    一条迟到的旧请求仍会把旧结果写回去;前端 latest-only 令牌只护展示态,护不住共享表。
-//!
-//! 本模块把这两件事收进一个控制面对象(每个 AppState 一份):
-//!
-//! - **入口登记**:[`SearchControl::begin_request`] 分配单调代次并记下模型身份,返回
-//!   [`SearchTicket`]。装载与打分都只认这张票的模型身份,杜绝「用 A 的查询向量打 B 的
-//!   向量空间」。代次分配与登记同临界区(代次大的必是后登记的),模型身份也在闸门内现读,
-//!   见 [`SearchControl::begin_request_resolved`]。
-//! - **不可变快照**:[`SearchControl::snapshot_for`] 在同一读锁内整体取用「身份 + 数据」
-//!   快照(`Arc<EmbeddingCache>`),评分在锁外进行——失效不再需要等评分跑完,评分也不再
-//!   可能被中途换掉的缓存串味。装载的「代次校验 + 安装」与失效的「代次 +1 + 清槽」共用
-//!   同一把缓存锁,装载期间发生的失效(分析落库/清空/切模型)必被判出并丢弃重读;有界重试
-//!   仍连续失效时**不驻留**(宁可不省这次全量读,也不让陈旧数据占住常驻位)。
-//! - **线性化提交**:[`SearchControl::commit`] 在闸门内完成「检验仍是最新请求」与「调用方
-//!   写库」,两步之间不存在 TOCTOU:旧请求要么在写库前被拒,要么它当时就是最新请求。
-//! - **两段式清空**:[`SearchControl::begin_clear`] 在**入口**当场吊销在途请求并领取清空代次,
-//!   [`SearchControl::clear_if_current`] 在工作段擦库,但只在期间没有更新的登记时。清空的
-//!   意图(别再用旧结果了)不该排在磁盘动作后面,而磁盘动作也不该擦掉一个比它更新的请求刚写
-//!   的行:清空 IPC 先到、工作线程因调度晚跑时,期间新登记的搜索已是「最新」,晚到的擦除须退化。
-//!   提交/清空/切模型共用同一闸门,清空后旧提交不可能复活结果表。
-//!
-//! 破坏性重置(重启分析 / 重建嵌入)与切模型沿用同一姿态:吊销点紧贴破坏性状态变更本身
-//! (重置嵌入、写入新模型配置)之后——变更之前登记的请求一律作废,之后登记的按新状态跑;
-//! 擦库仍走 [`SearchControl::clear_if_current`] 的代次守卫,因此不存在「清理 worker 晚跑,
-//! 把期间新搜索结果擦掉」的次序。
-//!
-//! 消费侧协议(前端 aiStore):[`SearchCommit::Superseded`] **不是**错误——`null` 应答不动
-//! matchCount、不报搜索错误、不触发旧布局刷新;spinner 仍由**本地令牌持有者**在 finally
-//! 收尾(后端侧吊销——重启/重建/切模型——不会给前端发新令牌,不在此收尾就会永远转)。
-//! 空查询本地先递增令牌并清 loading/matchCount,再发后端清空命令。
-//!
-//! 锁序约定:控制面闸门(`gate`)→ `db_writer`。提交/清空闭包在闸门内取 `db_writer`,
-//! 反序(先持 `db_writer` 再进闸门)会造成死锁,接线方须遵守;闸门内的闭包也不得回调
-//! 本控制面的登记/清空方法(`std::sync::Mutex` 非重入)。
+//! `commit` 在闸门内检验最新请求并写入共享结果表；`begin_clear` 先吊销在途请求，
+//! `clear_if_current` 仅清除仍属当前代次的结果，避免迟到的搜索或清空覆盖新结果。
+//! 重启分析、重建嵌入与切换模型也在破坏性变更后吊销旧请求。
+//! 锁序为 `gate` → `db_writer`；闸门内的回调不得再进入本控制面，否则会死锁。
 
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -569,87 +536,42 @@ mod tests {
         assert_eq!(control.committed().unwrap().seq, ticket_b.seq());
     }
 
-    /// 清空后旧提交:清空吊销在途请求,迟到的旧提交不得复活结果表;之后新请求照常。
+    /// 切模型:作废常驻缓存 + 吊销在途旧模型请求;新模型请求不得复用旧模型快照。
     #[test]
-    fn clear_revokes_in_flight_request_and_late_commit_cannot_resurrect() {
+    fn model_switch_drops_cache_and_rejects_old_model_request() {
         let control = SearchControl::new();
         let table = FakeTable::default();
 
-        let seeded = control.begin_request("m1");
-        assert_eq!(
-            run_search(
-                &control,
-                &seeded,
-                &[1.0, 0.0],
-                10,
-                DIM,
-                |model, dim| Ok(rows(model, dim, &[(1, &[1.0, 0.0])])),
-                table.writer(1),
-            )
-            .unwrap(),
-            SearchCommit::Committed(1)
-        );
-
-        // 用户又发了一次查询(在途),随后清空搜索。
-        let in_flight = control.begin_request("m1");
-        let _snapshot = control
-            .snapshot_for(&in_flight, DIM, |model, dim| {
-                Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
-            })
-            .unwrap();
-        control.clear(table.wipe()).unwrap();
-        assert!(table.content().is_empty(), "清空须擦除结果表");
-        assert!(control.committed().is_none(), "清空后不得留结果集身份");
-        assert!(control.latest().is_none(), "清空须吊销在途请求");
-
-        let outcome = control.commit(&in_flight, table.direct(9)).unwrap();
-        assert_eq!(outcome, SearchCommit::Superseded);
-        assert!(table.content().is_empty(), "清空后不得被迟到提交复活");
-
-        // 清空后新登记的请求正常走完。
-        control.invalidate_cache();
-        let fresh = control.begin_request("m1");
-        assert_eq!(
-            run_search(
-                &control,
-                &fresh,
-                &[1.0, 0.0],
-                10,
-                DIM,
-                |model, dim| Ok(rows(model, dim, &[(5, &[1.0, 0.0])])),
-                table.writer(10),
-            )
-            .unwrap(),
-            SearchCommit::Committed(1)
-        );
-        assert_eq!(table.content()[0].0, 5);
-        assert_eq!(control.committed().unwrap().seq, fresh.seq());
-    }
-
-    /// 同维不同模型:身份判定必须按 (模型, 维度) 整体比较——
-    /// 只比模型名会让 m2 的查询向量打在 m1 的向量空间上(静默算错)。
-    #[test]
-    fn snapshot_never_crosses_model_identity_at_equal_dim() {
-        let control = SearchControl::new();
-
-        let m1 = control.begin_request("m1");
+        let warm = control.begin_request("m1");
         control
-            .snapshot_for(&m1, DIM, |model, dim| {
+            .snapshot_for(&warm, DIM, |model, dim| {
                 Ok(rows(model, dim, &[(1, &[1.0, 0.0])]))
             })
             .unwrap();
+        assert_eq!(control.resident_identity(), Some(("m1".to_string(), DIM)));
+
+        let in_flight = control.begin_request("m1");
+        control.model_switched(table.wipe()).unwrap();
+        assert!(
+            control.resident_identity().is_none(),
+            "切模型须作废常驻缓存"
+        );
+        assert_eq!(
+            control.commit(&in_flight, table.direct(9)).unwrap(),
+            SearchCommit::Superseded,
+            "旧模型在途请求不得提交"
+        );
 
         let loads = AtomicUsize::new(0);
-        let m2 = control.begin_request("m2");
+        let ticket = control.begin_request("m2");
         let snapshot = control
-            .snapshot_for(&m2, DIM, |model, dim| {
+            .snapshot_for(&ticket, DIM, |model, dim| {
                 loads.fetch_add(1, AtomicOrdering::SeqCst);
-                Ok(rows(model, dim, &[(2, &[0.0, 1.0])]))
+                Ok(rows(model, dim, &[(7, &[0.0, 1.0])]))
             })
             .unwrap();
-        assert_eq!(loads.load(AtomicOrdering::SeqCst), 1, "换模型须重新装载");
+        assert_eq!(loads.load(AtomicOrdering::SeqCst), 1, "新模型须自行装载");
         assert_eq!(snapshot.model_name, "m2");
-        assert_eq!(snapshot.ids, vec![2]);
-        assert_eq!(score_top_k(&snapshot, &[0.0, 1.0], 1).unwrap()[0].0, 2);
+        assert_eq!(snapshot.ids, vec![7]);
     }
 }

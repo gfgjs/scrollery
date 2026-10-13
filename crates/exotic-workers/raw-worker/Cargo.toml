@@ -1,6 +1,6 @@
 # crates/exotic-workers/raw-worker/Cargo.toml
-# RAW 缩略图 Worker（RAW 支持线 阶段 C）。长驻子进程：stdin 收协议帧、stdout 回协议帧、stderr 写日志。
-# 一期仅提取厂商嵌入预览（JPEG）+ 缩放/转码，**不做完整 demosaic**（D-430）。
+# RAW 缩略图 Worker：stdin/stdout 传协议帧，stderr 写日志。
+# 仅提取厂商嵌入预览（JPEG）并缩放/转码，不做完整 demosaic。
 #
 # 🔴 rsraw 的 build.rs（经 rsraw-sys，vendored LibRaw C++）在 MSVC 下 panic!("MSVC is not supported")，
 #    故本 crate 只能用 --target x86_64-pc-windows-gnu 编译，绝不可能在默认 msvc 工具链下编译。

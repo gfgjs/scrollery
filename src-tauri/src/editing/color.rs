@@ -1,6 +1,6 @@
 //! 图片编辑色彩管理公共入口。
 //!
-//! 预览与后续调色保存都必须先把带 ICC 的源像素转换到 sRGB；无 ICC 时按业界惯例假定
+//! 预览与调色保存都必须先把带 ICC 的源像素转换到 sRGB；无 ICC 时假定
 //! 已是 sRGB。生产实现只用纯 Rust `moxcms`，`lcms2` 仅在测试中作参考对拍。
 
 use image::{DynamicImage, RgbaImage};
@@ -18,9 +18,7 @@ pub(super) fn cms_error() -> AppError {
     }
 }
 
-/// 与 `editing::adjust` 共用:预览与保存链必须同 intent(relative colorimetric,P0-CM 裁决)。
-/// `pub(crate)`(而非 `pub(super)`):B 线(2026-07-23)查看器色域渲染的 ICC 导入变换探针
-/// (`ipc::viewer_color_commands`)复用同一 intent,不重复定义一份可能漂移的常量。
+/// 预览、保存和查看器 ICC 转换共用 relative colorimetric intent，避免不同入口口径漂移。
 pub(crate) fn options() -> TransformOptions {
     TransformOptions {
         rendering_intent: RenderingIntent::RelativeColorimetric,
@@ -28,12 +26,11 @@ pub(crate) fn options() -> TransformOptions {
     }
 }
 
-/// 把任意 `DynamicImage` 投影到 `target` 色域编码的 RGBA8(B 线,2026-07-23 泛化自原
-/// `to_srgb_rgba8`)。**无 ICC 源时的分支差异**(计划 §0③/边界情况1):`target` 恰为 sRGB
+/// 把任意 `DynamicImage` 投影到 `target` 色域编码的 RGBA8。无 ICC 源时，`target` 恰为 sRGB
 /// (编辑链 `to_srgb_rgba8` 的唯一调用姿态)时原样返回、不经 CMS 数值管线——既有契约
-/// (D-413)锁的是「不经变换的原始字节相等」,sRGB→sRGB 恒等变换在离散 8-bit LUT 下不保证
+/// 需保证「不经变换的原始字节相等」；sRGB→sRGB 恒等变换在离散 8-bit LUT 下不保证
 /// 逐字节相等,故该分支由 `to_srgb_rgba8` 自身短路处理,不进入本函数;本函数被直接以
-/// 非 sRGB target 调用时(查看器渲染,D-411),无 ICC 源假定源已是 sRGB 仍须转换。
+/// 非 sRGB target 调用时，无 ICC 源假定源已是 sRGB 仍须转换。
 ///
 /// 16-bit / f32 源先在原位深完成 CMS，再量化为预览所需的 8-bit；全分辨率保存链会复用
 /// 同一 profile 解析和 intent，但保持源位深。

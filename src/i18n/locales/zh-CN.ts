@@ -1,10 +1,10 @@
 export default {
   onboarding: {
     welcome: '欢迎使用 Scrollery',
-    subtitle: '只需三步，开始管理你的照片与视频',
+    subtitle: '只需三步，开始管理你的资产',
     step1: {
-      title: '添加照片目录',
-      desc: '选择一个包含照片或视频的文件夹，Scrollery 会自动扫描并建立图库。之后可随时在侧栏添加更多。',
+      title: '添加资产文件夹',
+      desc: '选择一个包含图片、视频、文档或音频的文件夹，Scrollery 会自动扫描并建立资产库。之后可随时在侧栏添加更多。',
       addBtn: '选择文件夹',
       empty: '尚未添加目录——你也可以稍后再加',
       addFailed: '添加文件夹失败：{error}',
@@ -36,12 +36,12 @@ export default {
       welcome: {
         title: '欢迎',
         intro:
-          'Scrollery 是面向 Windows/macOS/iOS/Android 的高性能资产管理器，统一管理照片、视频、文档与音频。本引导带你走一遍核心功能；随时可在「设置」页头部重新打开。',
+          'Scrollery 是一款高性能桌面资产管理器，统一管理照片、视频、文档与音频。本引导带你走一遍核心功能；随时可在「设置」页头部重新打开。',
         points: [
           '跨平台一致体验',
           'GPU 加速的图像管线',
           '本地优先，资产留在你的磁盘',
-          '左侧栏切换图库、工具与管理',
+          '左侧栏切换资产库、工具与管理',
         ],
       },
       gallery: {
@@ -70,7 +70,7 @@ export default {
         intro: '强大的搜索与筛选帮你在海量资产中快速定位。',
         points: [
           '语义搜索面板（主库视图）按内容找图',
-          '智能相册：所有照片/最近添加/视频/实况等',
+          '快捷筛选：全部资产/最近添加/视频/实况照片等',
           '按文件夹、收藏夹、人物筛选',
           '筛选状态同步到 URL，可深链/刷新恢复',
         ],
@@ -115,10 +115,10 @@ export default {
       },
       plugins: {
         title: '插件',
-        intro: '在功能与插件页面管理授权和扩展能力。',
+        intro: '在功能与插件页面免费激活功能并管理扩展能力。',
         points: [
           '插件商店浏览与安装',
-          'OCR 文字识别包含在官方版一次性授权中',
+          'OCR 文字识别可单独免费激活',
           '插件在后台 worker 运行，不阻塞界面',
         ],
       },
@@ -148,7 +148,7 @@ export default {
         intro: '你已了解 Scrollery 的核心功能！开始整理你的资产吧。',
         points: [
           '随时点设置页头部「使用引导」重看本手册',
-          '侧栏添加更多目录扩充图库',
+          '侧栏添加更多目录扩充资产库',
           '遇到问题在设置中查看诊断与日志',
           '祝使用愉快',
         ],
@@ -156,10 +156,10 @@ export default {
     },
   },
   sidebar: {
-    library: '图库',
+    library: '资产库',
     tools: '工具',
     management: '管理',
-    allPhotos: '所有照片',
+    allPhotos: '全部资产',
     recentlyAdded: '最近添加',
     favorites: '个人收藏',
     collections: '收藏夹',
@@ -184,7 +184,7 @@ export default {
     addFolderFailed: '添加文件夹失败: {error}',
     removeFolderFailed: '移除文件夹失败: {error}',
     trash: '回收站',
-    chooseDir: '选择媒体文件夹',
+    chooseDir: '选择资产文件夹',
     data: '清除',
     clearDb: '清除数据库',
     clearSettings: '清除设置',
@@ -193,7 +193,7 @@ export default {
     quickScan: '快速扫描',
     fullScan: '完整扫描',
     quickScanHint: '快速检查新增或移除的文件。',
-    fullScanHint: '逐个检查文件，适合在其他软件中编辑过文件后更新图库。',
+    fullScanHint: '逐个检查文件，适合在其他软件中编辑过文件后更新资产库。',
     // 目录移动半完成（P0-1）：文件真实位置 + 仍需收尾的原因 + 按日志 id 的重试入口。
     dirRecovery: {
       title: '未完成的移动',
@@ -215,6 +215,7 @@ export default {
         target_unverified: '目标存在，但尚未确认属于本次移动',
         target_conflict: '源与目标同时存在，需人工确认',
         target_unresolved: '目标状态无法判定',
+        source_cleanup_required: '索引已更新，源目录已保留；请确认目标内容后再手动处理源目录，然后重试',
         source_leftover: '索引已更新，源目录残留待清理',
         source_changed: '源目录内容已变化，需人工确认',
         staging_busy: '搬运动作未完成，重试即可继续',
@@ -244,18 +245,22 @@ export default {
     clearThumbnailsSuccess: '所有缩略图已清除',
     overlapDetected: '检测到文件夹重叠',
     overlapParentMsg:
-      '新文件夹「{path}」包含已添加的文件夹：{children}。是否合并？（删除子文件夹，仅保留父文件夹）',
+      '新文件夹「{path}」包含已添加的文件夹：{children}。合并后由父文件夹统一管理，保留收藏、标签、版本和阅读进度。取消勾选可保留各自入口。',
     overlapChildMsg:
       '新文件夹「{path}」是已添加文件夹「{parents}」的子文件夹，可能存在重复索引。是否仍然添加？',
-    mergeAndReplace: '合并（删除子文件夹）',
+    mergeAndReplace: '合并已添加的子文件夹',
+    mergeConflict: '这些文件夹存在重复索引或目标已添加，无法自动合并。原库保持不变。',
+    mergeVisibilityConflict: '显示与隐藏的文件夹不能合并。请先统一显隐设置，原库保持不变。',
+    mergePendingMove: '这些文件夹仍有未完成的移动恢复，请处理后再合并。原库保持不变。',
+    mergeInvalidPath: '无法访问要合并的文件夹，或其实际位置不在所选父文件夹内。请检查路径后重试。',
     addAnyway: '仍然添加',
-    // ── R1-7 i18n 清理新增（侧栏文件夹操作 / 工具卡片）──
+    //  侧栏文件夹操作 / 工具卡片
     newBlankFolder: '新建空白文件夹',
     expandAll: '展开全部',
     collapseAll: '折叠全部',
     loadMoreFiles: '加载更多文件（已加载 {count}）',
     newSubfolder: '新建子文件夹',
-    // ── #7 方案A：文件夹迁移后重链接根路径 ──
+    //  文件夹迁移后重链接根路径
     relinkFolder: '文件夹已迁移…',
     relinkTitle: '重链接文件夹',
     relinkMessage:
@@ -270,7 +275,7 @@ export default {
       '所选位置里的文件与原文件夹对不上（抽样核对仅 {matched}/{sampled} 一致），已取消。请确认选的是迁移后的同一个文件夹。',
     relinkFailed: '重链接失败：{error}',
     relinkRescanFailed: '重链接已完成，但兜底重扫启动失败：{error}。可稍后手动重新扫描该文件夹。',
-    // ── 文件树显示范围三态（S 线 §3）──
+    //  文件树显示范围三态
     displayScope: '显示内容',
     displayScopeWithTreeCategory: '显示内容（{summary}）',
     scopeRegisteredOnly: '仅媒体文件',
@@ -299,7 +304,6 @@ export default {
     revealFailed: '无法在文件管理器中显示该项',
     revealUnsupported: '当前平台不支持在文件管理器中显示',
     unregisteredFileHint: '未入库——双击在文件管理器中显示',
-    unregisteredFileHintMobile: '未入库(此平台不支持在文件管理器中显示)',
     unregisteredFileHintPreviewable: '未入库——双击预览文本内容',
     previewTruncated: '文件过大，仅显示前 1 MiB',
     previewFailed: '预览失败——文件可能已被移动、删除或无法读取',
@@ -327,7 +331,7 @@ export default {
     restartFaceMsg:
       '将清空所有已识别人脸、已命名人物和手动确认的归类，并从头重新识别全部图片。确定继续？',
     clearThumbnailsFailed: '清除缩略图失败: {error}',
-    // 等待原因文案（可观测性三修 #3）：后端 waitingOn 阻塞源键 → 中文提示。
+    // 等待原因文案：后端 waitingOn 阻塞源键 → 中文提示。
     waitingOnDerivation: '等待派生任务完成',
     waitingOnScan: '等待扫描完成',
     waitingOnThumbnail: '等待缩略图生成',
@@ -363,12 +367,12 @@ export default {
     filterOptions: '筛选选项',
     exportView: '导出当前视图',
     holdEscToExit: '按住 Esc 退出全屏',
-    // ── 自绘标题栏窗口三键（顶栏重构 L1）──
+    //  自绘标题栏窗口控制
     windowMinimize: '最小化',
     windowMaximize: '最大化',
     windowRestore: '向下还原',
     windowClose: '关闭',
-    // ── R1-7 i18n 清理新增（筛选 / 搜索 / 布局 / 排序 / 撤销重做）──
+    //  筛选 / 搜索 / 布局 / 排序 / 撤销重做
     hideTimeline: '隐藏时间轴',
     showTimeline: '显示时间轴',
     hideMinimap: '隐藏 minimap 轴',
@@ -433,10 +437,8 @@ export default {
     // availability badge：只标「需要用户动作」的态；能用是常态，不标。
     fmtBadgeNotInstalled: '未安装',
     fmtBadgeNotInstalledHint: '该格式由插件提供，尚未安装 —— 仍可筛选，但可能无法预览',
-    fmtBadgeUnlicensed: '未授权',
-    fmtBadgeUnlicensedHint: '插件已安装但未授权 —— 仍可筛选，但可能无法预览',
-    fmtBadgeExpired: '已过期',
-    fmtBadgeExpiredHint: '插件授权已过期 —— 仍可筛选，但可能无法预览',
+    fmtBadgeUnlicensed: "未激活",
+    fmtBadgeUnlicensedHint: "该功能尚未免费激活，仍可筛选，但可能无法预览",
     filterByRating: '按评分筛选（≥N 星）',
     filterByColorLabel: '按颜色标签筛选',
     filterByDateRange: '按日期范围筛选',
@@ -486,10 +488,10 @@ export default {
     scanDone: '扫描完成，发现 {count} 个新项目',
     scanError: '扫描失败: {error}',
     refreshFailed: '刷新失败: {error}',
-    // ── R1-7 i18n 清理新增（后台任务指示 / 扫描附属提示）──
+    //  后台任务指示 / 扫描附属提示
     thumbGenBgTitle: '正在后台生成缩略图，不影响正常浏览',
     aiAnalyzingTitle: 'AI 正在分析图片',
-    // ── 内容页文件信息（2026-07-17 底栏重构）──
+    //  内容页文件信息
     duration: '时长',
     moreInfo: '更多信息',
     aiProgress: 'AI 分析: {analyzed}/{total}',
@@ -530,7 +532,7 @@ export default {
     location: '位置',
     livePhotoError: '无法加载 Live 视频',
     volumeOffline: '请插入设备「{label}」后重试',
-    // ── R1-7 i18n 清理新增（详情浮层信息面板 / 缩放 / 不可用态）──
+    //  详情浮层信息面板 / 缩放 / 不可用态
     livePhoto: 'Live 照片',
     immersive: '沉浸模式',
     exitImmersive: '退出沉浸（Esc）',
@@ -539,6 +541,7 @@ export default {
     fileInfo: '文件信息',
     fullPath: '完整路径',
     rating: '评分',
+    starCount: '{count} 星',
     colorLabel: '颜色标签',
     unavailableOfflineTitle: '所在卷已离线',
     unavailableOfflineHint: '重新连接该磁盘 / U 盘后即可查看',
@@ -570,14 +573,14 @@ export default {
     captureFrame: '截取当前帧',
     fullscreen: '全屏',
     exitFullscreen: '退出全屏',
-    // 字幕菜单(GE 批)
+    // 字幕菜单
     subtitleOff: '关闭字幕',
     subtitleTrack: '轨道 {n}',
     subtitleExternal: '外挂字幕',
     loadSubtitleFile: '加载字幕文件…',
     subtitleUnsupported: 'ASS/SSA 与 MKV 内嵌字幕暂不支持',
     subtitleLoadFailed: '字幕加载失败',
-    // 截帧(GE 批)
+    // 截帧
     captureSaved: '已保存截帧',
     captureFailed: '截帧失败',
     captureTainted: '此视频不允许截帧(跨源限制)',
@@ -604,13 +607,13 @@ export default {
         title: '无法播放此视频',
         hint: '视频格式或编码不被支持,或文件已损坏。可尝试用外部播放器打开。',
       },
-      // 视频格式扩展子系统(V7):host 侧判定表已明确归因时的引导文案
+      // 视频格式扩展:host 侧判定表已明确归因时的引导文案
       needsComponent: {
         title: '需要视频扩展组件',
         hint: '播放该格式需要下载视频扩展组件(FFmpeg,用于容器改封/转码)。前往设置或稍后重试即可下载。',
       },
     },
-    // 视频格式扩展子系统(V7,design.md §5.3):播放准备覆盖层文案
+    // 视频格式扩展:播放准备覆盖层文案
     prep: {
       cancel: '取消准备',
       stagePreparing: '正在准备播放…',
@@ -636,7 +639,7 @@ export default {
       cancelledRetry: '重新准备',
     },
   },
-  // 图片简单编辑(方案 C §7):旋转/翻转/裁剪,另存副本
+  // 图片编辑:旋转/翻转/裁剪,另存副本
   edit: {
     entry: '编辑',
     premiumName: '图片编辑高级功能',
@@ -681,7 +684,7 @@ export default {
     targetConflict: '同名文件冲突次数过多',
     jobBusy: '已有文件任务在运行,请稍后再试',
   },
-  // OCR 文字提取(B′ 路线,2026-07-23,T9):查看器入口按钮 + 结果面板 + 门控引导文案
+  // OCR 文字提取:查看器入口按钮 + 结果面板 + 门控引导文案
   ocr: {
     entry: '提取文字',
     entryVideo: '识别当前帧文字',
@@ -692,11 +695,9 @@ export default {
     close: '关闭',
     empty: '未识别到文字',
     failed: '复制失败',
-    unlicensed: '官方版尚未激活，前往功能与插件',
-    licenseExpired: '官方版授权已过期，请重新激活',
-    modelMissing: 'OCR 模型未下载,前往设置',
+    unlicensed: "请先免费激活 OCR 文字提取，前往功能与插件",
   },
-  // 影像增强(降噪/超分子系统 P0 批 5)
+  // 影像增强：降噪与超分
   enhance: {
     entry: '增强照片…',
     dialogTitle: '影像增强',
@@ -721,12 +722,12 @@ export default {
     startMulti: '增强 {n} 张',
     started: '已加入增强队列',
     startedMulti: '已加入增强队列({n} 张)',
-    gateUnlicensed: '官方版尚未激活，前往功能与插件',
+    gateUnlicensed: "请先免费激活影像增强，前往功能与插件",
     gateModelMissing: '所选模型尚未下载,前往设置下载',
     errWorkerMissing: '增强组件缺失，请重新安装完整的 Scrollery 安装包。',
     errStatusUnavailable: '增强状态尚未取得，请重新打开此页面重试。',
     errInputTooLarge: '图像超出增强尺寸上限',
-    errUnlicensed: '影像增强授权无效或已过期,前往商店',
+    errUnlicensed: "影像增强尚未免费激活，前往功能与插件",
     errInputUnsupported: '该源文件不支持增强(如 RAW / 不可解码格式)',
     errModelMissing: '增强模型尚未下载,请前往设置页下载',
     errBusy: '增强任务繁忙,请稍后重试',
@@ -735,7 +736,7 @@ export default {
     errInvalidParams: '增强参数非法',
     errNotImplemented: '该功能尚未实现',
     errUnknown: '增强处理出错',
-    // 队列进度面板(批 5.5)
+    // 队列进度面板
     queueTitle: '增强队列',
     queueEmpty: '暂无增强任务',
     queueJobLabel: '任务 #{id}',
@@ -756,7 +757,7 @@ export default {
     mint: '清新薄荷',
     forest: '动物森林',
   },
-  // 阅读专属主题名(R3;注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
+  // 阅读专属主题名(注册表 nameKey = readerThemes.<id>;与 app 主题不同命名空间)
   readerThemes: {
     paper: '纸白',
     sepia: '羊皮纸',
@@ -792,7 +793,7 @@ export default {
     opacitySummary: '100% 为默认观感。',
     hoverPreviewSummary: '视频与动态照片 · 静音循环，移开即停。',
     autoHideSummary: '窗口模式下隐藏顶栏与底栏，移至边缘时显示。',
-    viewerColorSummary: '仅影响桌面查看器显示，原文件与编辑不变。',
+    viewerColorSummary: '仅影响查看器显示，原文件与编辑不变。',
     minimapSummary: '色块即时显示，缩略图需加载预览。',
     decodeSummary: '源文件直显会使用更多内存。',
     thumbSizeSummary: '较大尺寸更清晰，也会增加缓存占用。',
@@ -944,10 +945,10 @@ export default {
     alignCenter: '居中',
     alignLeft: '靠左',
     alignRight: '靠右',
-    // ── 查看器渲染色域(2026-07-23 自定义 ICC 与色域切换)────────────────────
+    //  查看器色域与自定义 ICC
     viewerColorTarget: '显示色域',
     viewerColorTargetDesc:
-      '大图查看器按所选色域渲染显示(仅桌面端;不影响原图文件与编辑)。sRGB 直显原图无额外开销。',
+      '大图查看器按所选色域渲染显示，不影响原图文件与编辑。sRGB 直显原图无额外开销。',
     viewerColorSrgb: 'sRGB · 直显原图',
     viewerColorDisplayP3: 'Display P3',
     viewerColorDciP3: 'DCI-P3',
@@ -990,7 +991,7 @@ export default {
       '手动提取视频封面与关键帧：增量提取只补缺失项，全量提取重做全部；勾选上方「提取关键帧」才会连带关键帧，否则只提取封面。',
     videoDeriveIncremental: '增量提取（只补缺失）',
     videoDeriveFull: '全量提取（重做全部）',
-    // 视频格式扩展子系统(V7):可播产物独立池——实时占用走 VIDEO_CACHE_STATS,失败降级静态上限
+    // 视频格式扩展:可播产物独立池——实时占用走 VIDEO_CACHE_STATS,失败降级静态上限
     videoCachePoolTitle: '视频转码缓存池',
     videoCachePoolDesc:
       '独立于上方缩略图缓存池，用于存放 mkv/avi 等格式改封/转码后的可播放产物，按最近播放时间自动清理。默认上限 {size}。',
@@ -999,21 +1000,6 @@ export default {
     videoDeriveErrorCount: '{count} 项失败',
     thumbSizeChanged: '新缩略图将以 {size}px 生成，已有缩略图保留',
     thumbSizeHint: '更高档位缩略图占用更多磁盘空间',
-    thumbnailPerformanceGroup: '缩略图并发与内存（重启生效）',
-    thumbFastThreads: '快速图片线程数',
-    thumbFastThreadsDesc: '0 按 CPU 自动分配；1–64 手动指定。修改后重启应用生效。',
-    thumbTailThreads: '重型图片与补救线程数',
-    thumbTailThreadsDesc: '大图、视频封面和失败补救共用，仍受像素工作集限制。修改后重启应用生效。',
-    thumbGpuInflight: 'GPU 总并发',
-    thumbGpuInflightDesc: '宿主允许同时进入 GPU 路径的请求数。修改后重启应用生效。',
-    thumbGpuPerAdapter: '单显卡 JPEG 硬解并发',
-    thumbGpuPerAdapterDesc: 'VPL 每张显卡的并发上限，同时受 GPU 总并发限制；D2D 共享上下文仍串行。修改后重启生效。',
-    thumbProcessMemoryMb: '缩略图单进程内存上限',
-    thumbProcessMemoryMbDesc: '每个缩略图处理进程的内存上限，包含解码、编码和驱动开销。修改后重启生效。',
-    thumbTotalMemoryMb: '缩略图进程总内存上限',
-    thumbTotalMemoryMbDesc: '快速与重型进程合计上限；实际值至少等于单进程上限。修改后重启生效。',
-    thumbWorksetMb: '缩略图像素工作集额度',
-    thumbWorksetMbDesc: '限制同时解码的像素内存预留。提高线程数时也需检查此额度和进程内存上限。修改后重启生效。',
     thumbWebpQuality: '缩略图编码质量',
     thumbWebpQualityDesc:
       '1-99 为有损压缩(默认 80,肉眼几乎无差且体积小);填 100 为无损(逐像素保真,体积约为有损的 5-10 倍)。修改后已生成的缩略图会按需以新质量重新生成。',
@@ -1030,8 +1016,7 @@ export default {
     clearSettings: '清除设置',
     clearSettingsDesc: '重置所有应用设置为默认值',
     clearSettingsBtn: '清除',
-    // 恢复默认设置(2026-09-16 设置集中保存):语义从「清除」改为「整份恢复默认」——
-    // 覆盖外观、布局、播放/阅读偏好与窗口位置;保留资产、阅读进度、任务状态与引导标记。
+    // 恢复外观、布局、播放/阅读偏好与窗口位置；保留资产、阅读进度、任务状态与引导标记。
     resetSettings: '恢复默认设置',
     resetSettingsDesc:
       '把外观、布局、播放与阅读偏好、窗口位置恢复为默认值。不会删除资产、阅读进度、任务状态，也不会再次触发首次使用引导。',
@@ -1058,30 +1043,17 @@ export default {
     startGenIncremental: '增量生成（只补缺失）',
     startGenFullRebuild: '全量重建（重新生成全部）',
     stopGen: '停止生成',
-    genStatusRunning: '已处理: {generated} / {total}',
-    genStatusCompleted: '本轮处理结束',
-    thumbPhaseFast: '快速处理',
-    thumbPhaseHeavy: '大图片',
-    thumbPhaseException: '异常项收尾',
-    thumbPhaseImageRs: '软件处理',
-    thumbPhaseVideo: '视频封面',
+    genStatusRunning: '正在生成: {generated} / {total}',
+    genStatusCompleted: '生成完成！',
+    genStatusCancelled: '生成已取消',
+    thumbPhaseImage: '图片处理',
+    thumbDetailedResults: '新生成 {newlyGenerated} · 缓存复用 {cacheHit} · 原图直显 {direct} · 失败 {failed} · 暂不可用 {temporarilyUnavailable}',
     thumbHardware: {
-      waiting: '准备 / 等待处理', cpu: 'CPU', integrated: '核显＋CPU', discrete: '独显＋CPU',
-      mixed: '独显 / 核显混合＋CPU', gpuUnknown: 'GPU＋CPU（设备类型未知）',
-      unknown: '部分执行信息未知', direct: '原图直显', cache: '缓存复用',
+      waiting: '准备 / 等待处理', cpu: 'CPU', unknown: '部分执行信息未知', direct: '原图直显', cache: '缓存复用',
     },
     thumbBackends: {
-      embeddedJpeg: '内嵌 JPEG：CPU 解码、缩放与编码',
-      imageWic: 'WIC：CPU 解码、缩放与编码',
-      imageRs: 'image-rs：CPU 解码、缩放与编码',
-      imageD2d: 'WIC / D2D：CPU 解码 → GPU 缩放 → CPU 编码',
-      imageVpl: 'VPL：GPU 解码与缩放 → CPU 编码',
-      videoMf: 'Media Foundation：解码加速未知 → CPU 编码',
-      videoMfHardwareMft: 'Media Foundation：硬件 MFT 解码 → CPU 编码（缩放与设备类型未知）',
-      unknown: '宿主处理：阶段后端未知',
+      imageWic: 'WIC：CPU 解码', imageRs: 'image-rs：CPU 解码', unknown: '宿主处理：后端未知',
     },
-    thumbDetailedResults: '新生成 {newlyGenerated} · 缓存复用 {cacheHit} · 原图直显 {direct} · 失败 {failed} · 暂不可用 {temporarilyUnavailable}',
-    genStatusCancelled: '生成已取消',
     genStatusError: '生成发生错误',
     aiModels: 'AI 模型配置',
     aiEngineStatus: '当前推理引擎状态',
@@ -1094,17 +1066,28 @@ export default {
     aiForceCpu: '强制使用 CPU',
     aiHardwareDesc:
       '如果选择自动且加载模型时软件卡死，请强制选择 CPU。切换后需点击上方“测试加载”或重载引擎。',
-    thumbDecodeStrategy: '解码引擎策略',
-    thumbDecodeDesc: '选择缩略图处理偏好。实际设备由格式和系统能力决定；源文件直显会增加原图读取。',
-    thumbStrategyCpu: '仅 CPU',
-    thumbStrategyGpu: '优先使用 GPU（不可用时回退 CPU）',
-    thumbStrategyDirect: '源文件直显',
+    thumbDecodeStrategy: '缩略图解码策略',
+    thumbDecodeDesc: '自动在 Windows 优先使用系统原生解码；兼容优先使用通用解码，格式支持时可回退。其它平台使用可用解码器。直接显示使用原文件，可能占用更多内存。',
+    thumbStrategyCpu: '兼容（通用解码优先）',
+    thumbStrategyGpu: '自动（推荐，系统原生优先）',
+    thumbStrategyDirect: '直接显示',
     performancePanel: '性能面板',
     performancePanelDesc: '在应用内低开销记录帧时间、Canvas 绘制与缓存指标。',
     performancePanelBtn: '打开面板',
     galleryRenderMode: '画廊渲染引擎（实验）',
+    experimentalGroup: '实验性功能',
+    galleryBlendEnabled: '画廊图片融合',
+    galleryBlendEnabledDesc:
+      '用相邻缩略图的边缘颜色柔和填充间隙。仅在 Canvas 画廊中生效，保持现有间距。',
+    galleryBlendEdgeWidth: '图缘过渡宽度',
+    galleryBlendEdgeWidthDesc: '缩略图内侧参与柔和过渡的宽度；0 表示只填充间隙。',
+    galleryBlendBlurRadius: '缝隙混合半径',
+    galleryBlendBlurRadiusDesc:
+      '相邻边缘颜色的柔化范围；数值越大，缝隙内的颜色混合越柔和。',
+    galleryBlendStrength: '融合强度',
+    galleryBlendStrengthDesc: '控制缝隙填充和图缘过渡的覆盖强度；0% 显示原始画廊。',
     galleryRenderModeDesc:
-      '画廊网格用 DOM 还是 Canvas 渲染。Canvas 为原型实现，超大图库或 iOS 会自动回退 DOM。',
+      '选择画廊网格的渲染方式。Canvas 按视口绘制。',
     timelineRenderMode: '时间轴渲染引擎（实验）',
     timelineRenderModeDesc: '右侧时间轴用 DOM 还是 Canvas 渲染。Canvas 为原型对照实现。',
     renderModeDom: 'DOM',
@@ -1198,6 +1181,9 @@ export default {
     aiBatchFixedMin: '固定 batch 模型，最小 {k}',
     aiBatchAdjustedToFixed: '当前模型为固定 batch={k}，批大小不能更小，已调整为 {k}',
     unsupportedQuickAction: '（该项在此暂不支持快速操作）',
+    openRelatedSettings: '打开相关设置',
+    pinAllSettings: '全部固定到工具',
+    unpinAllSettings: '取消全部设置固定',
     mlTitle: '模型库（下载与切换）',
     mlSource: '下载源',
     mlSourceDesc: '下载/重新下载与获取在线列表时优先使用所选源，失败会自动回退到另一个源。',
@@ -1231,7 +1217,7 @@ export default {
     mlDownloadFailed: '下载失败: {error}',
     mlSwitchedTo: '已切换到「{name}」',
     mlSwitchFailed: '切换失败: {error}',
-    // 根文件夹显隐（V21，库级排除）
+    // 根文件夹显隐（库级排除）
     rootVisTitle: '文件夹显隐',
     rootVisIntro:
       '控制每个扫描根文件夹是否显示。隐藏后该文件夹的媒体会从画廊、时间轴、搜索、统计与侧栏文件树中全部移除（不删除文件），随时可恢复。',
@@ -1241,7 +1227,7 @@ export default {
     rootVisVisible: '显示中',
     rootVisHidden: '已隐藏',
     rootVisFailed: '操作失败：{code}',
-    // 已知卷面板（T13 离线 UX）
+    // 已知卷面板
     volTitle: '已知卷',
     volIntro: '应用登记过的磁盘 / 移动盘。离线卷上的照片会灰显，重连后自动恢复（离线≠删除）。',
     volLoading: '加载中…',
@@ -1283,11 +1269,14 @@ export default {
     nsAdded: '已添加',
     nsAddFailed: '添加失败: {error}',
     nsRemoveFailed: '移除失败: {error}',
-    // ── R1-7 i18n 清理新增（目录/日志/卷操作/AI 引擎状态）──
+    //  目录/日志/卷操作/AI 引擎状态
     openDirFailed: '无法打开目录: {error}',
     clearLogsFailed: '清除日志失败: {error}',
     volOpFailedCode: '操作失败: {code}',
     aiProviderNotInitialized: '未初始化',
+    modelDownloadGuideAi: '请下载当前使用的 AI 模型，完成后返回并再次开始 AI 分析。',
+    modelDownloadGuideFace: '请下载默认人脸模型，完成后返回并再次开始人脸识别。',
+    modelDownloadGuideOcr: '请下载当前使用的 OCR 模型，完成后返回图片并再次提取文字。',
     // 人脸模型库（fm* 前缀，沿用 ml*/vol*/ns* 风格）
     fmTitle: '人脸模型',
     fmIntro:
@@ -1300,9 +1289,9 @@ export default {
     fmFilesReady: '● 文件已就位',
     fmManualOnly: '○ 仅手动导入',
     fmNotInstalled: '○ 未安装',
-    // OCR 模型分节(T9 一次写齐,T10 消费)
+    // OCR 模型分节
     ocrTitle: 'OCR 文字提取模型',
-    ocrHint: '预下载识别模型;下载免费,识别命令才验授权。',
+    ocrHint: '可提前下载识别模型，免费激活 OCR 后即可识别。',
     ocrTierMobile: '标准 · 约 30MB',
     ocrTierServer: '高精度 · 约 190MB',
     ocrTierMeta: '{mb}MB',
@@ -1312,9 +1301,9 @@ export default {
     ocrDownloadComplete: '下载完成',
     ocrDownloadFailed: '下载失败:{error}',
     ocrManifestUnready: '下载源尚未上线',
-    // 影像增强模型分节(P0 批 5)
+    // 影像增强模型分节
     enhanceTitle: '影像增强模型',
-    enhanceHint: '预下载降噪/超分/去伪影模型;下载免费,增强命令才验授权。',
+    enhanceHint: '可提前下载降噪、超分和去伪影模型，免费激活影像增强后即可使用。',
     enhanceManifestUnready: '部分模型的下载源尚未上线',
     enhanceModelSizePlaceholder: '体量待定',
     enhanceTaskDenoise: '降噪',
@@ -1327,15 +1316,15 @@ export default {
   },
   empty: {
     allPhotosTitle: '这里空空如也',
-    allPhotosDesc: '添加一个存有照片的文件夹,开始建立你的资料库。',
-    recentlyAdded: '暂无最近添加的照片',
-    favoritesTitle: '还没有收藏任何照片',
-    favoritesDesc: '点击照片右下角的心形图标即可收藏。',
+    allPhotosDesc: '添加一个包含图片、视频、文档或音频的文件夹，开始建立你的资产库。',
+    recentlyAdded: '暂无最近添加的资产',
+    favoritesTitle: '还没有收藏任何资产',
+    favoritesDesc: '点击资产卡片上的心形图标即可收藏。',
     videos: '暂无视频文件',
     livePhotos: '暂无实况照片',
     folder: '文件夹是空的',
     search: '没有找到匹配 "{query}" 的内容',
-    filteredTitle: '没有符合筛选条件的照片',
+    filteredTitle: '没有符合筛选条件的资产',
     filteredDesc: '试试调整或清除当前的筛选条件。',
     computing: '正在计算布局…',
     scrollToTop: '回到顶部',
@@ -1360,7 +1349,7 @@ export default {
     favorited: '已收藏 {count} 项',
     deleted: '已删除 {count} 项',
     restored: '已恢复 {count} 项',
-    // ── R1-7 i18n 清理新增（选择工具条 / 批量操作 toast）──
+    //  选择工具条 / 批量操作 toast
     pendingDelete: '待删除',
     drag: '拖动',
     invert: '反选',
@@ -1380,7 +1369,7 @@ export default {
     rateFailed: '批量评分失败: {error}',
     deleteFailed: '删除失败: {error}',
   },
-  // 导出整理成果（方案 A）：目的文件夹、命名档、冲突策略、manifest 开关与进度文案。
+  // 导出整理成果：目的文件夹、命名档、冲突策略、manifest 开关与进度文案。
   export: {
     dialogTitle: '导出整理成果',
     summaryCount: '已选 {count} 项',
@@ -1413,68 +1402,52 @@ export default {
     openFolder: '打开导出目录',
     failedToast: '导出失败',
     cancelledToast: '已取消导出',
-    // U-2 方案 A ②:「导出当前视图」入口写入 manifest 的来源名(ExportSource::View.name)。
+    // 「导出当前视图」入口写入 manifest 的来源名(ExportSource::View.name)。
     currentViewName: '当前视图',
   },
-  // Exotic 插件 gate：未授权功能的购买 / 激活引导文案（Part5 T12）。
+  // 功能逐项免费激活与插件资源引导。
   official: {
-    "title": "Scrollery 官方版",
-    "description": "一次购买、一次激活，包含图片编辑、文字提取、影像增强和 PSD 引擎。各项功能仍需满足平台和资源条件。",
-    "retry": "刷新状态",
-    "queryFailed": "状态获取失败，请重试。",
-    "activated": "官方版已激活 · 永久授权",
-    "expired": "授权已过期，请重新激活有效授权",
-    "notActivated": "官方版尚未激活",
-    "remove": "移除本机授权",
-    "removeWarning": "这会停用本机的图片编辑、OCR、影像增强和 PSD 引擎。插件、模型及原文件均保留，可用授权码重新激活。",
-    "removeFailed": "移除授权失败，请重试。",
-    "buy": "购买官方版",
-    "notOnSale": "暂未开放购买",
-    "includedLicense": "官方版包含",
-    "free": "免费",
-    "ocr": "OCR 文字提取",
-    "enhance": "影像增强",
-    "psd": "PSD 图像引擎",
-    "raw": "RAW 图像解码",
-    "video": "视频格式扩展",
-    "prepareModels": "前往设置准备模型",
-    "ready": "已就绪",
-    "included": "内建能力，按需准备组件",
-    "modelMissing": "需要下载模型",
-    "manifestUnready": "尚未就绪：发行模型暂未提供",
-    "workerMissing": "组件缺失，请重新安装应用",
-    "needsInstall": "需要安装插件；在下方管理插件，发行目录未就绪时暂不可安装",
-    "needsActivation": "需要激活官方版",
-    "openFailed": "无法打开购买页面，请重试。"
+  "title": "免费专业功能",
+  "description": "图片编辑、文字提取、影像增强和 PSD 引擎均可逐项免费激活，无需购买或注册码。插件安装和模型准备单独进行。",
+  "retry": "刷新状态",
+  "queryFailed": "状态获取失败，请重试。",
+  "activated": "已免费激活",
+  "notActivated": "尚未激活",
+  "free": "免费使用",
+  "ocr": "OCR 文字提取",
+  "enhance": "影像增强",
+  "psd": "PSD 图像引擎",
+  "raw": "RAW 图像解码",
+  "video": "视频格式扩展",
+  "prepareModels": "前往设置准备模型",
+  "ready": "已就绪",
+  "included": "内建能力，按需准备组件",
+  "modelMissing": "需要下载模型",
+  "manifestUnready": "尚未就绪：发行模型暂未提供",
+  "workerMissing": "组件缺失，请重新安装应用",
+  "needsInstall": "需要安装插件；在下方管理插件，发行目录未就绪时暂不可安装",
+  "needsActivation": "免费激活后即可使用",
+  "installPlugin": "前往安装插件"
 },
   exotic: {
-    gateChecking: '正在检查授权…',
-    gateTitle: '此功能需要官方版授权',
-    gateDescGeneric: '该功能包含在官方版中。激活后还需准备对应的插件或模型。',
-    gateSku: '产品编号',
-    gateBuy: '获取插件',
-    gateBuyLicense: '购买授权',
-    gateRenew: '获取有效授权',
-    gateActivate: '已购买？点此激活',
-    gateNoStore: '暂未开放购买',
-    gateOpenStoreFailed: '打开购买页面失败: {error}',
+    activateFreeHint: "无需购买、注册码或联网验证。激活状态会保存在本机。",
+    gateChecking: "正在读取激活状态…",
+    gateTitle: "免费激活此功能",
+    gateDescGeneric: "此功能可免费激活。插件和模型需另行准备。",
     blockedTitle: '此功能当前不可用',
     blockedUnsupportedPlatform: '当前平台没有对应的插件包。',
     blockedIncompatibleHost: '插件需要更新版本的 Scrollery，请升级后重试。',
     blockedInvalidInstallation: '插件安装已损坏，请重新安装或修复。',
     blockedDisabled: '该插件或其所属子系统已被禁用。',
-    activateTitle: '激活官方版',
-    activateDesc: '激活 Scrollery 官方版即可使用「{name}」及其他所含功能。',
-    activateDescGeneric: '粘贴官方版授权码，一次激活全部所含功能。',
-    activateTokenPlaceholder: '在此粘贴授权码…',
-    activateSubmit: '激活',
+    activateTitle: "免费激活",
+    activateDesc: "免费激活「{name}」，开启这项功能。",
+    activateSubmit: "免费激活",
     activating: '激活中…',
-    activateEmpty: '请输入授权码',
-    activateSuccess: '激活成功',
+    activateSuccess: "免费激活成功",
     activateFailed: '激活失败（{code}）',
-    // ── 插件商店（T11）───────────────────────────────────────────────
+    //  插件商店
     storeTitle: '功能与插件',
-    storeSubtitle: '管理官方版授权、内建功能与格式插件。',
+    storeSubtitle: "逐项免费激活专业功能，管理插件和运行资源。",
     storeRefresh: '刷新目录',
     storeRefreshing: '刷新中…',
     storeRefreshed: '已更新：可安装 {count} 个插件',
@@ -1493,8 +1466,8 @@ export default {
     uninstall: '卸载',
     repair: '修复',
     rollback: '回滚',
-    activateAction: '激活',
-    activated: '已激活',
+    activateAction: "免费激活",
+    activated: "已免费激活",
     version: '版本',
     installedOk: '安装完成',
     uninstalledOk: '已卸载',
@@ -1503,9 +1476,8 @@ export default {
     opFailed: '操作失败（{code}）',
     uninstallTitle: '卸载插件',
     uninstallMsg: '将移除该插件的安装文件（不影响你的照片与已生成的缩略图）。',
-    uninstallRemoveLicense: '同时移除授权（下次需重新激活）',
     procTitle: '处理进度',
-    procBlocked: '{n} 项因未授权 / 不支持而暂缓',
+    procBlocked: "{n} 项因未激活 / 未安装 / 不支持而暂缓",
     procStart: '开始',
     procPause: '暂停',
     procStop: '停止',
@@ -1522,18 +1494,17 @@ export default {
     procDetailEmpty: '当前筛选无记录',
     procDetailCap: '仅显示前 {n} 条，可用筛选缩小范围',
   },
-  // 插件商店 builtin 条目(D-OCR-5,T9 一次写齐,T10/T11 消费):无安装包,激活即用
+  // 插件商店 builtin 条目:无安装包,激活即用
   store: {
     builtinTitle: '内置能力插件',
     builtinNoInstall: '无需安装，激活即用',
-    // 视频格式扩展子系统(V7,design.md §3.4):FFmpeg 商标/LGPL 许可声明——全链路以进程边界
+    // 视频格式扩展:FFmpeg 商标/LGPL 许可声明——全链路以进程边界
     // 调用 FFmpeg（不静态/动态链接），仍按 LGPL 精神展示声明与源码获取渠道。
     videoExtendedFfmpegNotice:
       '本功能通过独立进程调用 FFmpeg（LGPL 许可，按需下载，不随安装包捆绑，不链接进本应用）。FFmpeg 为 FFmpeg 项目的商标。',
     videoExtendedSourceLink: '获取对应源码',
   },
-  // ══ R1-7 i18n 清理：以下顶层命名空间为本轮硬编码文案迁移新增 ══
-  // 通用跨功能 UI 词条（多个 feature 共用的动作/状态词，去重收敛于此）
+  // 跨功能通用动作与状态文案。
   performance: {
     title: '开发者工具 · 性能',
     shortcut: '快捷键：Ctrl+Shift+P',
@@ -1588,6 +1559,7 @@ export default {
 
   common: {
     confirm: '确认',
+    retry: '重试',
     cancel: '取消',
     typeToConfirm: '请输入「{word}」以确认',
     ok: '确定',
@@ -1618,8 +1590,7 @@ export default {
   contextMenu: {
     copyImage: '复制图片',
     showInExplorer: '在文件夹中显示',
-    // reveal 统一到 opener 后会真的返回失败(最常见:文件已被本应用之外的操作删除/移动),
-    // 旧的 spawn 实现发射后不管、永远「成功」,所以此前无需此文案。
+    // 文件被外部移动或删除时，reveal 可能失败。
     showInExplorerFailed: '无法在文件夹中显示——文件可能已被移动或删除',
     revealUnsupported: '当前平台不支持在文件夹中显示',
     setWallpaper: '设为壁纸',
@@ -1643,7 +1614,9 @@ export default {
     backTo: '返回人物 · {name}',
     unnamedPerson: '未命名人物',
     unnamed: '未命名',
-    subtitle: '人脸识别聚类出的人物。点击查看其照片，双击名字可命名。',
+    subtitle: '人脸识别聚类出的人物。点击头像查看照片，点击名字可命名。',
+    viewPhotos: '查看 {name} 的照片',
+    rename: '命名 {name}',
     approveTitle: '审批人脸聚类建议：确认/拒绝未确认的脸',
     approveSuggestions: '审批建议 ({count})',
     reclusterTitle: '重新聚类：合并碎片化的未命名人物（已确认的脸和已命名人物不受影响）',
@@ -1716,11 +1689,6 @@ export default {
     rebuildConfirmMsg:
       '将清空当前模型的全部已分析向量，之后需重新运行分析（可能耗时较长）。确定继续？',
     rebuildConfirm: '清空并重建',
-    // 首次使用未下载模型：分析被拒绝时弹此确认框（确认只导航到模型库，不代下载）。
-    modelMissingTitle: 'AI 模型尚未下载',
-    modelMissingMsg:
-      'AI 分析需要先下载模型文件。请前往「设置 → AI → 模型库」下载当前激活的模型，下载完成后回到此处再次开始。',
-    modelMissingGo: '前往下载',
     emptyPrompt: '在上方搜索框中用自然语言描述图片',
     emptyExamples: '例：「海边日落」「两人自拍」「猫咪玩耍」',
     searching: '语义分析中…',
@@ -1751,6 +1719,7 @@ export default {
   },
   // 音频播放器
   audio: {
+    playFailed: '无法播放音频。请点击播放重试，或使用外部播放器打开。',
     play: '播放',
     playPause: '播放/暂停',
     rewind10: '后退 10 秒',
@@ -1763,6 +1732,37 @@ export default {
   },
   // 文档查看器（阅读 / 编辑 / 版本 / AI 校对 / 替换）
   doc: {
+    leaveEditTitle: '保存文档修改？',
+    leaveEditMessage: '此文档有未保存的修改。保存为新版本后再离开，原始文件会保留。',
+    saveVersionAndLeave: '保存为新版本并离开',
+    keepEditing: '继续编辑',
+    finishEditing: '结束编辑',
+    editorUnsaved: '有未保存的修改',
+    editorSaved: '没有未保存的修改',
+    editorPosition: '第 {line} 行，第 {column} 列 · 共 {total} 行',
+    documentLinkFailed: '无法打开链接：目标须为同一内容库中已收录的 TXT 或 Markdown 文档，且文件可访问。',
+    documentLinkHeadingMissing: '文档已打开，但未找到链接指定的标题。',
+    copyCode: '复制代码',
+    editorGoToLine: '跳转到行',
+    editorLineRange: '请输入 1 到 {total} 之间的整数行号',
+    editorGo: '跳转',
+    saveAndContinue: '保存为新版本并继续编辑',
+    discardEditTitle: '放弃未保存的修改？',
+    discardEditMessage: '本次尚未保存的文字和版本名称将被丢弃，已保存的版本与原文件不受影响。',
+    discardEditConfirm: '放弃修改',
+    vditorOutlineSourceMode: '请切换到即时渲染或所见即所得模式以使用目录。',
+    editorSearchPlaceholder: '查找文档内容',
+    editorSearchCount: '{current} / {total}',
+    editorSearchPrevious: '上一个匹配',
+    editorSearchNext: '下一个匹配',
+    editorMatchCase: '区分大小写',
+    editorReplace: '替换',
+    editorReplacement: '替换为（留空可删除）',
+    editorReplaceAll: '全部替换',
+    editorReplaceSourceHint: '替换需要在源码模式下进行。',
+    editorSwitchToSource: '切换到源码',
+    editorReplaceFailed: '当前编辑器无法完成替换，内容未修改。',
+    editorImagePasteRetry: '图片未插入：文档已变化或读取失败，请重新粘贴。',
     pagerMode: '翻页',
     pagerScroll: '连续滚动',
     pagerWheelSnap: '滚轮翻页',
@@ -1822,6 +1822,7 @@ export default {
     searchPlaceholder: '搜索书内文字…',
     searching: '搜索中…',
     searchNoResults: '无匹配结果',
+    searchFailed: '搜索未完成，请按回车重试。',
     searchHits: '共 {n} 处',
     bookmarks: '书签',
     addBookmark: '添加当前位置',
@@ -1845,7 +1846,10 @@ export default {
     readerEngineNative: '标准阅读器',
     readerEngineVditor: 'Vditor',
     readerEngineMarkdownEditor: 'Markdown Editor（实验）',
-    markdownEditorInMemory: '实验编辑器：内容只保存在当前窗口，尚未接入保存（{length} 字符）',
+    markdownEditorUnsaved: '等待保存（{length} 字符）',
+    vditorCachedDraft: '发现旧本地草稿，恢复后将自动保存到文档。',
+    vditorRestoreDraft: '恢复并保存草稿',
+    vditorKeepSource: '暂不恢复',
     markdownEditorUnavailable: '当前 WebView 不支持 EditContext，实验编辑器暂不可用。',
     markdownEditorInitFailed: '实验编辑器初始化失败：{error}',
     switchToVditor: '切换到 Vditor',
@@ -1877,7 +1881,7 @@ export default {
     proofreadDiscard: '放弃',
     proofreadFailed: '校对失败: {error}',
     proofreadVersionLabel: 'AI 校对稿',
-    // 用户动作 IPC 失败反馈(审查 P1-16):此前保存/覆盖/配置类写操作失败静默无提示。
+    // 保存、覆盖与配置操作的失败反馈。
     saveVersionFailed: '保存版本失败: {error}',
     overwriteFailed: '覆盖源文件失败: {error}',
     saveConfigFailed: '保存校对配置失败: {error}',
@@ -1910,8 +1914,7 @@ export default {
     view: '查看',
     hgalleryLab: '横向画廊实验室',
   },
-  // ── 主画廊重复镜头(docs/designs/2026-09-02-主画廊重复项浏览方案.md §5.1/§6/§9)──
-  // 状态文案与动作按 §9 状态表;判定单源见 components/media/duplicateLensStatus.ts。
+  // 主画廊重复项状态文案由 duplicateLensStatus.ts 统一判定。
   duplicatesLens: {
     notAnalyzedTitle: '尚未建立精确重复结果',
     notAnalyzedDesc: '完成分析后可按重复组或文件夹浏览',
@@ -1979,6 +1982,12 @@ export default {
     copyNeedsRescan:
       '「{path}」已复制 {count} 个文件，但尚未完成入库，重新扫描后才会出现在图库。{error}',
     copyRescanNow: '重新扫描',
+    copyProgress: '已复制 {count} 个文件 · {size}',
+    copyPublishing: '正在完成复制…',
+    copyCancelling: '正在取消复制…',
+    copyCancelled: '已取消复制',
+    copyCancelFailed: '取消复制失败：{error}',
+    copyBusy: '已有目录正在复制',
   },
   // 拖拽媒体到文件夹（右键落点菜单）
   dragDrop: {
@@ -2002,7 +2011,7 @@ export default {
     remember: '记住我的选择，不再提示',
     minimize: '最小化到托盘',
     exit: '退出应用',
-    // IPC 失败反馈(审查 P1-16):此前先关弹窗后 await,退出/托盘失败零提示。
+    // 退出或最小化到托盘失败时保留反馈入口。
     actionFailed: '操作失败: {error}',
     // 退出前 flush 失败(设置集中保存):在途/待保存设置未能落盘,由用户裁决重试或放弃。
     flushFailed: '部分设置尚未保存成功。可重试,或放弃未保存的修改并退出。',
@@ -2032,7 +2041,7 @@ export default {
     newElsewhereTitle: '选择任意本地位置新建文件夹',
     newElsewhere: '在其他位置新建…',
   },
-  // 独立日志窗口(日志能力重构 S4,方案 §5)
+  // 独立日志窗口
   logWindow: {
     tabLive: '实时',
     tabHistory: '历史',
@@ -2075,7 +2084,7 @@ export default {
     errorAggLast: '最近',
     errorAggSample: '样本',
     errorAggEmpty: '暂无带 error.code 的日志',
-    // span 埋点线 W2:span 耗时 Top N
+    // span 耗时 Top N
     spanAggTitle: 'span 耗时 Top 20',
     columnSpanName: 'span',
     spanAggCount: '次数',

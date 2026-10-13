@@ -1,6 +1,5 @@
 <template>
-  <!-- 外壳(Teleport/遮罩/标题栏/关闭键/焦点陷阱/Escape/点遮罩关闭)已收敛进 UiDialog 原语;
-       迁移顺带修掉此前漏用 Teleport 的隐患——原位渲染时 z-index 可被祖先 overflow/transform 层叠上下文裁剪。 -->
+  <!-- UiDialog 负责 Teleport、焦点与关闭交互，避免被祖先层叠上下文裁剪。 -->
   <UiDialog
     :open="ui.showCloseConfirmDialog"
     :title="t('closeConfirm.title')"
@@ -10,7 +9,7 @@
     <p id="close-confirm-message" class="dialog-message">{{ t('closeConfirm.message') }}</p>
 
     <!-- flush 失败(设置未保存成功)时的裁决区:后端拒绝了退出,这里给出重试与明确放弃两个出口,
-         不把未保存说成已保存,也不让弹窗卡死(方案 §5.4/§7「保存失败可重试或明确放弃」)。 -->
+         提供重试与明确放弃两个出口，避免误报保存成功或卡住弹窗。 -->
     <p v-if="flushFailed" class="dialog-message flush-failed" role="alert">
       {{ t('closeConfirm.flushFailed') }}
     </p>
@@ -93,7 +92,7 @@ async function minimizeToTray() {
 }
 
 /**
- * 退出:先把前端在途设置落盘,再请求后端退出。
+ * 退出：先保存设置，再由统一退出入口等待当前文档保存，最后请求后端退出。
  *
  * 后端 exit_app 现在也会等一次 flush(它要与窗口几何的待保存值一起收口),因此这里的前置 flush
  * 是**同一套协议的前端一侧**,不是重复劳动:写盘失败时后端会以 settings_flush_failed 拒绝退出,
@@ -115,7 +114,7 @@ async function exitApp() {
   }
   try {
     // 成功即退出进程,后一行不可达;失败则弹窗保持打开并提示(P1-16)。
-    await invokeIpc(IPC.EXIT_APP)
+    await ui.exitAppAfterSaving()
     ui.showCloseConfirmDialog = false
   } catch (e) {
     if (isFlushFailure(e)) {
@@ -138,7 +137,7 @@ async function retryExit() {
 async function exitAnyway() {
   busy.value = true
   try {
-    await invokeIpc(IPC.EXIT_APP, { force: true })
+    await ui.exitAppAfterSaving(true)
     ui.showCloseConfirmDialog = false
   } catch (e) {
     toast.addToast('error', t('closeConfirm.actionFailed', { error: ipcErrorMessage(e) }))

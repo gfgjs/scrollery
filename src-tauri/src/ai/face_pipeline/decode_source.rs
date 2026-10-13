@@ -1,16 +1,18 @@
 // src-tauri/src/ai/face_pipeline/decode_source.rs
-//! 解码源三级定源(T16-R2 方案 A):在「常规分档缩略图」「host 预解码 face 缓存」
+//! 解码源选择：在「常规分档缩略图」「host 预解码 face 缓存」
 //! 「原图直派」之间选择,及检测/嵌入结果向 DB 行的映射。
 
 use std::path::PathBuf;
 
 use crate::ai::clip::embedding_to_bytes;
 use crate::ai::face::DetectedFace;
-use crate::db::queries::NewFace;
-use crate::state::AppState;
+use crate::db::queries::{FaceDisplayArtifact, NewFace};
 use crate::thumbnail::cache::FACE_CACHE_SHORT_EDGE;
 
 use super::FaceTask;
+
+#[path = "../../../../crates/shared/authorized_file.rs"]
+mod authorized_file;
 
 /// 已解析的解码源：解码哪个文件、按什么格式。
 pub(super) struct FaceDecodeSource {
@@ -19,7 +21,7 @@ pub(super) struct FaceDecodeSource {
     pub(super) kind: FaceSourceKind,
 }
 
-/// 解码源三级构成(T16-R2 方案 A):诊断计数随批输出;原图直派常态应只剩短边 ≤640 的小图,
+/// 解码源三级构成：诊断计数随批输出；原图直派通常只剩短边 ≤640 的小图，
 /// 若原图源占比高且单项耗时大,优先怀疑防呆回退或预解码异常。
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum FaceSourceKind {
@@ -33,20 +35,19 @@ pub(super) enum FaceSourceKind {
 
 /// worker 端可解码的源格式白名单(ai-worker 用纯 `image` crate 解码,无 WIC/exotic 引擎;
 /// 与 ai-worker Cargo.toml 的 image features 对齐)。缩略图档位与 face 缓存源恒为 webp(可解);
-/// 白名单外(heic/raw/psd 等)的原图回退项恒走 host 预解码的 face 缓存(方案 A,WIC 引擎可解
-/// heic 等)——原「exotic 原图跳过」的过渡缺口就此收敛;仅 detect_size 超缓存尺寸的未来模型
-/// 防呆分支仍会跳过(见 dispatch_face_batch 阶段1)。
+/// 白名单外（heic/raw/psd 等）的原图回退项走 host 预解码的 face 缓存；
+/// 若 detect_size 超过缓存尺寸且 worker 无法解码源格式，则跳过该项。
 pub(super) const WORKER_DECODABLE_FORMATS: &[&str] =
     &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff"];
 
 /// 选择短边仍满足 `detect_size`（640）的最廉价解码源。
 ///
-/// 故意不与 `pipeline.rs` 的 `resolve_decode_source` 共用（原因见模块头：那个函数优先级 1 的
-/// AI 缓存捷径固定短边 336px，对 YuNet 的 640px 输入而言太小）。此版本只在「常规分档缩略图」
-/// 与「原图」之间选择——不涉及 AI 缓存。
+/// 在同源、同策略的已提交显示产物中选择最小合格输入，不涉及 CLIP 的 336px 缓存。
 pub(super) fn resolve_face_decode_source(
     task: &FaceTask,
-    state: &AppState,
+    cache_dir: &std::path::Path,
+    policy: &str,
+    artifacts: &[FaceDisplayArtifact],
     detect_size: u32,
 ) -> FaceDecodeSource {
     let original = FaceDecodeSource {
@@ -55,50 +56,73 @@ pub(super) fn resolve_face_decode_source(
         kind: FaceSourceKind::Original,
     };
 
-    if task.thumb_status != 1 || task.width <= 0 || task.height <= 0 {
+    if task.width <= 0 || task.height <= 0 {
         return original;
     }
-    let Some(rel) = task.thumb_path.as_deref() else {
-        return original;
-    };
-
-    // 从相对路径 "{档位}/{前缀}/{hex}.webp" 解析档位（长边）。
-    let Some(tier) = rel.split('/').next().and_then(|s| s.parse::<u32>().ok()) else {
-        return original;
-    };
-
-    // Thumbnail is LongEdge(tier) but never upscaled → long edge = min(tier, max(W,H)).
-    // Predict short edge WITHOUT touching disk; use the thumbnail only if it's ≥ detect_size.
-    // 缩略图按长边=tier 缩放但绝不放大 → 长边 = min(tier, max(W,H))；不读盘预测短边，
-    // 仅当 ≥ detect_size 时采用。
     let (w, h) = (task.width as u32, task.height as u32);
     let (long, short) = (w.max(h), w.min(h));
-    let thumb_short = if long <= tier {
-        short
-    } else {
-        (short as f32 * tier as f32 / long as f32).round() as u32
-    };
-    if thumb_short < detect_size {
-        return original;
-    }
-
-    let cache_dir = state
-        .thumb_config
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .cache_dir
-        .clone();
-    let thumb_full = cache_dir.join("thumbnails").join(rel);
-    if thumb_full.exists() {
-        // 缩略图生成时已转正——用"webp"格式使 WIC 的旋转分支（仅 jpg/heic）不触发，避免二次转向。
-        FaceDecodeSource {
-            path: thumb_full,
-            format: "webp".to_string(),
-            kind: FaceSourceKind::Thumb,
+    let prefix = format!("{policy}:");
+    let hex = format!("{:016x}", task.cache_key as u64);
+    let mut best: Option<(u64, PathBuf)> = None;
+    for a in artifacts {
+        if a.item_id != task.item_id
+            || a.cache_key != task.cache_key
+            || a.source_revision != task.source_revision
+        {
+            continue;
         }
-    } else {
-        original
+        let Some(tier) = a
+            .fingerprint
+            .strip_prefix(&prefix)
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let predicted_short = if long <= tier {
+            short
+        } else {
+            (short as f64 * tier as f64 / long as f64).round() as u32
+        };
+        if predicted_short < detect_size {
+            continue;
+        }
+        let expected = format!(
+            "{}/{}/r{}-{}/{}.webp",
+            tier,
+            &hex[..2],
+            task.source_revision,
+            policy,
+            hex
+        );
+        if a.path != expected {
+            continue;
+        }
+        // 宿主和 worker 都从授权句柄读取，禁止路径穿越和检查后链接替换。
+        let Ok(file) = authorized_file::open_relative(cache_dir, &format!("thumbnails/{}", a.path))
+        else {
+            continue;
+        };
+        let reader = image::ImageReader::with_format(
+            std::io::BufReader::new(file),
+            image::ImageFormat::WebP,
+        );
+        let Ok((actual_w, actual_h)) = reader.into_dimensions() else {
+            continue;
+        };
+        if actual_w.min(actual_h) < detect_size {
+            continue;
+        }
+        let pixels = u64::from(actual_w) * u64::from(actual_h);
+        if best.as_ref().is_none_or(|(size, _)| pixels < *size) {
+            best = Some((pixels, cache_dir.join("thumbnails").join(&a.path)));
+        }
     }
+    best.map(|(_, path)| FaceDecodeSource {
+        path,
+        format: "webp".into(),
+        kind: FaceSourceKind::Thumb,
+    })
+    .unwrap_or(original)
 }
 
 /// 原图回退项是否应升级走 face 缓存(方案 A 决策核,纯函数可单测)。

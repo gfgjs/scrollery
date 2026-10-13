@@ -1,5 +1,5 @@
 <template>
-  <!-- 首启向导（Part5 T17, §3.8）：3 步 onboarding —— 加扫描目录 / 选主题 / 选语言。外壳迁 UiDialog。
+  <!-- 首启向导：添加扫描目录、选择主题和语言，使用 UiDialog 外壳。
        刻意不支持点遮罩 / Escape 关闭（close-on-overlay/esc=false + show-close=false）：首启须显式「完成」或
        「跳过」，避免误触留下空图库且 flag 未写。自定义头部（副标题 + 步骤点）走 #header 插槽整体覆盖默认标题行。 -->
   <UiDialog
@@ -250,7 +250,7 @@ async function complete() {
   height: 8px;
   border-radius: 50%;
   background: var(--color-border);
-  /* 圆点→胶囊形变刻意补间 width(S1 机械批:属性显式列举) */
+  /* 圆点到胶囊的过渡需补间 width。 */
   transition:
     width var(--transition-fast),
     border-radius var(--transition-fast),

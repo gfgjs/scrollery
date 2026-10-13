@@ -1,5 +1,5 @@
 // src/composables/useHVirtualScroll.ts
-// H-Lab 横向虚拟滚动(x 轴可视窗口;docs/designs/2026-07-02-horizontal-gallery-lab.md §2-3)。
+// H-Lab 横向虚拟滚动（x 轴可视窗口）。
 //
 // 与生产 gallery 虚拟滚动的关系:同款「rAF 节流 + 取数边界框去重 + fetchId 竞态守卫」模式
 // (那套已被实战验证),但**独立实现且刻意不移植坐标压缩**(SAFE_MAX 平移模式)——实验库
@@ -32,7 +32,7 @@ interface UseHVirtualScrollOptions {
 
 // 滚轮动画器:定时长线性重定标(五轮手测收敛的终态模型)。
 //
-// 为何自研(六轮演进,全史见 plan §2-3①):原生 scrollBy/scrollTo smooth 是 ease-in-out 曲线、
+// 自行控制滚动：原生 scrollBy/scrollTo smooth 使用 ease-in-out 曲线，
 // 每次重定标都从零速起步,且无缓动控制 API——快速启动的缓入迟滞在原生路线上无解。四条体验
 // 约束:不阶跃、慢滚不脉动、连滚不丢量、启动即跟手,线性段是唯一同时满足的曲线——
 // 输入即满速(跟手),又不带其速度尖峰(慢滚不脉动)。

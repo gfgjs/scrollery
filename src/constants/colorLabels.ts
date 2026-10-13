@@ -1,4 +1,4 @@
-// 颜色标签调色板（Part5 T16）。
+// 颜色标签调色板。
 // 后端 schema 仅存 0-7 档位（0=未标，见 schema.rs:582），**颜色映射在前端**——改色只需动此表，
 // 改名在 i18n 词典（name 存 i18n 键），均不触后端。采用 Lightroom / Adobe Bridge / macOS Finder
 // 一脉相承的标准 7 色作默认（单一事实源，全 UI 经 colorLabelHex / COLOR_LABELS 取色）。

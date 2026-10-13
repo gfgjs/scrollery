@@ -1,5 +1,4 @@
-// src/themes/presets.ts
-// 内置预设(方案 §4.1/§6):默认种子来自 presets/*.json,预设只是完整参数的快捷填入。
+// 内置预设：默认种子来自 presets/*.json，预设用于填入完整参数。
 //
 // 权威默认种子只写一份 —— presets/default-light.json / default-dark.json;本文件 import 它们
 // 供前端使用,Rust schema 以 include_str! 引用同一对文件作结构默认值,禁止另写一份 HEX 默认。

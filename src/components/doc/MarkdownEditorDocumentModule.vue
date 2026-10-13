@@ -17,28 +17,30 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRoute } from 'vue-router'
+import { onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router'
 import {
   EditorController,
   EditorModel,
   EditorView,
+  OffsetRange,
   Selection,
   StringEdit,
   StringValue,
 } from '@vscode/markdown-editor'
 import { runOnChange } from '@vscode/observables'
-import { IPC } from '../../constants/ipc'
-import { invokeIpc, ipcErrorMessage } from '../../utils/ipc'
+import { ipcErrorMessage } from '../../utils/ipc'
+import { hasEditContext } from '../../utils/markdownEditorCapability'
 import { useToastStore } from '../../stores/toastStore'
+import { useMarkdownAutoSave } from '../../composables/reader/useMarkdownAutoSave'
 import '@vscode/markdown-editor/editor.css'
 import '@vscode/markdown-editor/themes/default.css'
 
 const props = defineProps<{
+  itemId: number
   value: string
 }>()
 
 const { t } = useI18n()
-const route = useRoute()
 const toast = useToastStore()
 
 const emit = defineEmits<{
@@ -48,26 +50,26 @@ const emit = defineEmits<{
 const host = ref<HTMLElement | null>(null)
 const sourceLength = ref(props.value.length)
 const unavailableMessage = ref('')
-const saveState = ref<'saved' | 'dirty' | 'saving' | 'error'>('saved')
-const saveError = ref('')
-const historySources: string[] = [props.value]
-let historyIndex = 0
-let latestSource = props.value
-let lastSavedSource = props.value
-let autoSaveTimer: ReturnType<typeof setTimeout> | null = null
-let pendingSaveSource: string | null = null
-let saveInFlight: Promise<void> | null = null
-let disposed = false
+const autoSave = useMarkdownAutoSave({ itemId: props.itemId, initialSource: props.value })
+const { saveState, saveError, saveNow } = autoSave
+defineExpose({ saveNow })
+interface HistoryEntry {
+  source: string
+  beforeSelection: Selection | undefined
+  afterSelection: Selection | undefined
+}
 
-const AUTO_SAVE_DELAY_MS = 1000
+const historyEntries: HistoryEntry[] = []
+let historyIndex = 0
+let pendingSelectionEntry: HistoryEntry | null = null
 
 const saveStatusText = computed(() => {
   if (saveState.value === 'saving') return t('edit.saving')
   if (saveState.value === 'dirty') {
-    return t('doc.markdownEditorInMemory', { length: sourceLength.value })
+    return t('doc.markdownEditorUnsaved', { length: sourceLength.value })
   }
   if (saveState.value === 'error') {
-    return t('doc.overwriteFailed', { error: saveError.value })
+    return t('doc.overwriteFailed', { error: ipcErrorMessage(saveError.value) })
   }
   return t('edit.savedNeedsIndexTitle')
 })
@@ -76,142 +78,57 @@ let model: EditorModel | null = null
 let view: EditorView | null = null
 let controller: EditorController | null = null
 let sourceSubscription: { dispose(): void } | null = null
+let selectionSubscription: { dispose(): void } | null = null
 
-function hasEditContext(): boolean {
-  const globals = globalThis as typeof globalThis & {
-    EditContext?: unknown
-  }
-  return typeof globals.EditContext === 'function'
-}
+watch(saveError, (error) => {
+  if (error !== null) toast.addToast('error', t('doc.overwriteFailed', { error: ipcErrorMessage(error) }))
+})
 
-function cancelAutoSave(): void {
-  if (autoSaveTimer === null) return
-  clearTimeout(autoSaveTimer)
-  autoSaveTimer = null
-}
-
-function currentItemId(): number | null {
-  // 平行编辑器不改父组件接口，直接复用当前 /doc/:id 路由作为保存目标。
-  const rawId = route.params.id
-  const idValue = Array.isArray(rawId) ? rawId[0] : rawId
-  const itemId = Number(idValue)
-  return Number.isSafeInteger(itemId) && itemId > 0 ? itemId : null
-}
-
-async function saveSource(source: string): Promise<void> {
-  const itemId = currentItemId()
-  if (itemId === null) throw new Error('Invalid document id')
-
-  await invokeIpc<number>(IPC.SAVE_VERSION, {
-    itemId,
-    content: source,
-    label: null,
-    parentId: null,
-    target: 'overwrite',
-    source: 'user',
-  })
-
-  if (disposed || latestSource !== source) return
-  lastSavedSource = source
-  saveError.value = ''
-  saveState.value = 'saved'
-}
-
-function flushSave(): void {
-  if (disposed || saveInFlight || pendingSaveSource === null) return
-
-  const source = pendingSaveSource
-  pendingSaveSource = null
-  if (source === lastSavedSource) {
-    saveState.value = 'saved'
-    if (pendingSaveSource !== null) flushSave()
-    return
-  }
-
-  saveError.value = ''
-  saveState.value = 'saving'
-  saveInFlight = saveSource(source)
-    .catch((error: unknown) => {
-      if (disposed || latestSource !== source) return
-      saveError.value = ipcErrorMessage(error)
-      saveState.value = 'error'
-      toast.addToast('error', t('doc.overwriteFailed', { error: saveError.value }))
-    })
-    .finally(() => {
-      saveInFlight = null
-      if (!disposed && pendingSaveSource !== null) flushSave()
-    })
-}
-
-function scheduleAutoSave(source: string): void {
-  latestSource = source
-  if (source === lastSavedSource) {
-    pendingSaveSource = null
-    cancelAutoSave()
-    saveError.value = ''
-    saveState.value = 'saved'
-    return
-  }
-
-  pendingSaveSource = source
-  saveError.value = ''
-  saveState.value = 'dirty'
-  cancelAutoSave()
-  autoSaveTimer = setTimeout(() => {
-    autoSaveTimer = null
-    flushSave()
-  }, AUTO_SAVE_DELAY_MS)
-}
-
-function saveNow(): void {
-  cancelAutoSave()
-  pendingSaveSource = latestSource
-  if (latestSource === lastSavedSource) {
-    pendingSaveSource = null
-    saveState.value = 'saved'
-    return
-  }
-  saveError.value = ''
-  saveState.value = 'dirty'
-  flushSave()
-}
+// 同一文档切换阅读引擎也会卸载编辑器，必须与离开文档一样等最新稿落盘。
+onBeforeRouteLeave(() => saveNow())
+onBeforeRouteUpdate(() => saveNow())
 
 function resetHistory(source: string): void {
-  historySources.splice(0, historySources.length, source)
+  const selection = Selection.collapsed(0)
+  historyEntries.splice(0, historyEntries.length, {
+    source,
+    beforeSelection: selection,
+    afterSelection: selection,
+  })
   historyIndex = 0
+  pendingSelectionEntry = null
 }
 
 function recordSource(source: string): void {
-  if (historySources[historyIndex] === source) return
+  if (historyEntries[historyIndex]?.source === source) return
 
-  historySources.splice(historyIndex + 1)
-  historySources.push(source)
-  historyIndex = historySources.length - 1
+  // EditorModel 先同步发布源码变化，再发布该次编辑后的选区。
+  const selection = model?.selection.get()
+  const entry = { source, beforeSelection: selection, afterSelection: selection }
+  historyEntries.splice(historyIndex + 1)
+  historyEntries.push(entry)
+  historyIndex = historyEntries.length - 1
+  pendingSelectionEntry = entry
 }
 
-function restoreHistoryEntry(index: number): void {
-  if (!model || index < 0 || index >= historySources.length) return
+function restoreHistoryEntry(index: number, selection: Selection | undefined): void {
+  if (!model || index < 0 || index >= historyEntries.length) return
 
-  const source = historySources[index]
-  const currentSelection = model.selection.get()
-  const currentOffset = currentSelection?.active ?? source.length
-
+  pendingSelectionEntry = null
   historyIndex = index
-  model.sourceText.set(new StringValue(source), undefined, undefined)
-  model.selection.set(
-    Selection.collapsed(Math.min(currentOffset, source.length)),
-    undefined,
-    undefined,
-  )
+  model.sourceText.set(new StringValue(historyEntries[index].source), undefined, undefined)
+  model.selection.set(selection, undefined, undefined)
 }
 
 function undo(): void {
-  if (historyIndex > 0) restoreHistoryEntry(historyIndex - 1)
+  if (historyIndex > 0) {
+    restoreHistoryEntry(historyIndex - 1, historyEntries[historyIndex].beforeSelection)
+  }
 }
 
 function redo(): void {
-  if (historyIndex + 1 < historySources.length) {
-    restoreHistoryEntry(historyIndex + 1)
+  if (historyIndex + 1 < historyEntries.length) {
+    restoreHistoryEntry(historyIndex + 1, historyEntries[historyIndex + 1].afterSelection)
   }
 }
 
@@ -232,7 +149,7 @@ function currentLine(source: string, offset: number): {
   }
 }
 
-function listContinuation(source: string, selection: Selection): string | undefined {
+function listEnterEdit(source: string, selection: Selection): StringEdit | undefined {
   if (!selection.isCollapsed || model?.activeBlock.get()?.kind === 'codeBlock') {
     return undefined
   }
@@ -244,10 +161,11 @@ function listContinuation(source: string, selection: Selection): string | undefi
   )
   if (!match || !lineBeforeCursor.startsWith(match[0])) return undefined
 
-  const contentBeforeCursor = lineBeforeCursor.slice(match[0].length)
   const newline = source.includes('\r\n') ? '\r\n' : '\n'
-  if (contentBeforeCursor.trim().length === 0) {
-    return newline
+  if (line.text.slice(match[0].length).trim().length === 0) {
+    // 空项按 Enter 退出列表；保留原有行尾，让后续正文与新段落保持分隔。
+    const end = line.start + line.text.length
+    return StringEdit.replace(new OffsetRange(line.start, end), newline)
   }
 
   const marker = match[2]
@@ -255,7 +173,7 @@ function listContinuation(source: string, selection: Selection): string | undefi
     ? `${Number.parseInt(marker, 10) + 1}${marker.endsWith('.') ? '.' : ')'}`
     : marker
   const taskPrefix = match[4] === undefined ? '' : '[ ] '
-  return `${newline}${match[1]}${nextMarker}${match[3]}${taskPrefix}`
+  return StringEdit.replace(selection.range, `${newline}${match[1]}${nextMarker}${match[3]}${taskPrefix}`)
 }
 
 function insertEnter(): void {
@@ -266,12 +184,12 @@ function insertEnter(): void {
 
   const source = model.sourceText.get().value
   const newline = source.includes('\r\n') ? '\r\n' : '\n'
-  const continuation = listContinuation(source, selection)
-  const text = continuation ?? (
+  const listEdit = listEnterEdit(source, selection)
+  const text = (
     model.activeBlock.get()?.kind === 'codeBlock' ? newline : `${newline}${newline}`
   )
 
-  model.applyEditForSelection(StringEdit.replace(selection.range, text))
+  model.applyEditForSelection(listEdit ?? StringEdit.replace(selection.range, text))
 }
 
 function handleKeyDown(event: KeyboardEvent): void {
@@ -281,7 +199,7 @@ function handleKeyDown(event: KeyboardEvent): void {
     if (key === 's') {
       event.preventDefault()
       event.stopImmediatePropagation()
-      saveNow()
+      void saveNow()
       return
     }
     if (key === 'z') {
@@ -315,11 +233,11 @@ function handleKeyDown(event: KeyboardEvent): void {
 }
 
 function disposeEditor(): void {
-  disposed = true
-  cancelAutoSave()
-  pendingSaveSource = null
+  autoSave.dispose()
   sourceSubscription?.dispose()
   sourceSubscription = null
+  selectionSubscription?.dispose()
+  selectionSubscription = null
   view?.element.removeEventListener('keydown', handleKeyDown, true)
   controller?.dispose()
   controller = null
@@ -329,11 +247,7 @@ function disposeEditor(): void {
 }
 
 onMounted(() => {
-  disposed = false
-  latestSource = props.value
-  lastSavedSource = props.value
-  saveState.value = 'saved'
-  saveError.value = ''
+  autoSave.resetSource(props.value)
   resetHistory(props.value)
 
   if (!host.value) return
@@ -357,10 +271,15 @@ onMounted(() => {
 
     sourceSubscription = runOnChange(model.sourceText, (source) => {
       recordSource(source.value)
-      latestSource = source.value
       sourceLength.value = source.value.length
       emit('change', source.value)
-      scheduleAutoSave(source.value)
+      autoSave.updateSource(source.value)
+    })
+    selectionSubscription = runOnChange(model.selection, (selection) => {
+      if (!pendingSelectionEntry) return
+      // 只记录紧随源码变更的选区；之后普通光标移动不能改写重做位置。
+      pendingSelectionEntry.afterSelection = selection
+      pendingSelectionEntry = null
     })
   } catch (error) {
     disposeEditor()
@@ -374,12 +293,7 @@ watch(
   () => props.value,
   (value) => {
     if (model?.sourceText.get().value === value) return
-    cancelAutoSave()
-    pendingSaveSource = null
-    latestSource = value
-    lastSavedSource = value
-    saveState.value = 'saved'
-    saveError.value = ''
+    autoSave.resetSource(value)
     resetHistory(value)
     if (!model) {
       sourceLength.value = value.length

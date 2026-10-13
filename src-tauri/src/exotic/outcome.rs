@@ -8,7 +8,7 @@
 
 use exotic_protocol::{FaceDet, FailureBody, SuccessBody, WorkerErrorCode};
 
-/// op 无关的原始请求结果(T15,D3 §4①)。`Success` **未经任何 op 特定校验**——
+/// 与 op 无关的原始请求结果。`Success` 尚未经 op 特定校验——
 /// thumbnail 的 WebP 复核在 [`super::worker::WorkerConn::run_thumbnail`],embed/face 批的
 /// 维度×数量一致性在 [`super::validate::validate_embed_batch_output`]/
 /// [`super::validate::validate_face_batch_output`],由调用方按 op 分派。
@@ -24,6 +24,8 @@ pub enum RawOutcome {
     Failure(FailureBody),
     /// 超时(Supervisor 应 kill)。
     TimedOut,
+    /// 宿主主动取消在途请求(Supervisor 应 kill,不计 worker 故障)。
+    Cancelled,
     /// 连接断开 / Worker 退出。
     Disconnected,
     /// 协议违例(错序 / 损坏帧 / 意外帧类型)。
@@ -45,6 +47,8 @@ pub enum TaskOutcome {
     Failure(FailureBody),
     /// 超时（Supervisor 应 kill）。
     TimedOut,
+    /// 宿主主动取消，任务由流水线结束清理退回待处理。
+    Cancelled,
     /// 连接断开 / Worker 退出（Supervisor 应 wait 回收）。
     Disconnected,
     /// 协议违例或输出非法（错序 / 错 id / 非法 WebP / 尺寸不符）→ terminal invalid_worker_output。

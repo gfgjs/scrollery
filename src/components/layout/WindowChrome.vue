@@ -1,20 +1,13 @@
 <template>
-  <!-- 自绘标题栏(顶栏重构 L1)。承载「标题栏 = 工具栏容器」的物理层:整条为拖拽区。
-       拖拽机制(2026-07-14 改)不再用 data-tauri-drag-region(它只作用于命中元素本身、按钮不在拖拽面上,
-       且 mousedown 即拖无阈值→无法区分点击/拖动),改由 useWindowDrag 在本根上委托监听:按下越阈值才移窗,
-       未越阈值即松手 → 按钮/控件照常响应点击。整行任意处(含按钮)可拖,原生表单控件(行高滑块/搜索框/
-       下拉)与窗口三键(data-no-window-drag)排除。双击裸露标题面最大化/还原由 useWindowDrag 复刻。
-       平台分叉:mac 用系统红绿灯(不渲染三键),非 mac 自绘三键。 -->
+  <!-- 自绘标题栏由 useWindowDrag 委托处理拖窗；交互项越过阈值才拖动，表单控件与窗口三键排除。
+       mac 使用系统窗口按钮，其他平台显示自绘三键。 -->
   <div ref="rootRef" class="window-chrome theme-shell-surface" :class="{ 'is-mac': isMac }">
-    <!-- 内容区:P1 为空(仅拖拽);P3 换 ContextualToolbar。mac 左侧 padding 避让红绿灯。
-         data-window-drag-surface:内容区本体(槽位内容之间的空隙/padding)是「纯空隙拖拽面」——命中它
-         本体即 pointerdown 即时移窗(VSCode 级,useWindowDrag 路径 B);槽内后代按钮/可点 div 靠 matches
-         判定天然落进阈值路径,不受影响(见 useWindowDrag 顶注)。 -->
+    <!-- 内容区空隙可立即拖窗；子项使用拖动阈值。mac 左侧留出系统窗口按钮空间。 -->
     <div class="window-chrome__content" data-window-drag-surface>
       <slot />
     </div>
 
-    <!-- 非 mac:自绘窗口三键(靠右)。mac 分支不渲染(保系统红绿灯,需求 8)。
+    <!-- 非 mac 平台显示自绘窗口三键，mac 保留系统窗口按钮。
          data-no-window-drag:三键区仅点击不参与移窗拖拽(用户裁决,合原生标题栏惯例)。 -->
     <div v-if="!isMac" ref="controlsRef" class="window-chrome__controls" data-no-window-drag>
       <button
@@ -62,18 +55,16 @@ import { isMaximized, toggleMaximize } from '../../composables/useWindowMode'
 const { t } = useI18n()
 const appWindow = getAppWindow()
 
-// 最大化态(驱动最大化键图标 方块↔还原)不再由本组件自持:窗口三态的唯一所有者是 useWindowMode
-// (2026-07-16)。此前这里是个局部 ref + 自己的 DOM resize 监听,与 uiStore.isFullscreen 互不知情
-// ——「既全屏又最大化」于是可表示,真机四症状由此而来。OS 回同步现统一在 useWindowMode(initWindowMode)。
+// useWindowMode 是窗口三态的唯一来源，并负责与系统窗口状态同步。
 const controlsRef = ref<HTMLElement | null>(null)
 
-// 标题栏根:承载「整行按住拖动移窗」的委托监听(替代 data-tauri-drag-region,见 template 顶注)。
+// 标题栏根承载整行拖窗的委托监听。
 // 全屏态自动惰性——闸在 useWindowDrag 内直读 useWindowMode.canDragWindow,本组件无需传参。
 const rootRef = ref<HTMLElement | null>(null)
 useWindowDrag(rootRef)
 
 // 窗口操作失败不可静默:frameless 下三键是唯一关闭/最小化入口,权限回归时「点了没反应」
-// 必须留诊断信号(2026-07-10 深审 LOW-3)。
+// 必须留诊断信号。
 function warnWindowOp(op: string) {
   return (err: unknown) => logger.warn(`[WindowChrome] ${op} failed`, { error: err })
 }

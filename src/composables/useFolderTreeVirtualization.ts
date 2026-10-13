@@ -1,6 +1,5 @@
 // src/composables/useFolderTreeVirtualization.ts
-// 文件树虚拟化(方案 B,共享滚动,T1-a/T1-b)——从 FoldersSection.vue 域 3/4 迁出(见
-// docs/planning/2026-07-25-超长文件拆分方案/analysis/FoldersSection-vue.md §2.1)。
+// 文件树虚拟化(共享滚动)。
 // 行窗口化、行高实测、粘性区块堆叠占位、粘性目录头链、结构轴滚动定位;是 KeyboardNav /
 // AutoLoadMore / DragDrop 三个 composable 共同依赖的基础设施层,应尽早稳定接口。
 //

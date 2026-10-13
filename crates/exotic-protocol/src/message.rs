@@ -1,5 +1,5 @@
 // crates/exotic-protocol/src/message.rs
-//! 协议消息体（v3 Part2 §3.3）。两端共享同一份定义，JSON 只放控制字段；缩略图等二进制走同帧 blob。
+//! Host 与 Worker 共用的协议消息体；JSON 只放控制字段，二进制走同帧 blob。
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ pub struct ReadyBody {
     pub max_blob_len: u32,
 }
 
-/// Host→Worker 处理请求（Request 帧）。按 `op` 分流；首发只有 thumbnail。
+/// Host→Worker 处理请求（Request 帧），按 `op` 分流。
 ///
 /// `target_long_edge` 必须是**吸附后档位**（R5）——与指纹里的 `target_tier` 一致，
 /// 否则同档不同请求 size 会算出不同指纹、反复重做。
@@ -44,13 +44,11 @@ pub enum RequestBody {
         source_path: String,
         input_fingerprint: String,
     },
-    /// 模型加载 = 显式会话请求(v2;Part4 D3 §2:不进进程握手、不加帧类型;
-    /// 其 300s 超时由 host 侧 per-op timeout 表配置)。响应 = Success 帧 +
-    /// `SuccessBody.session`(SessionReady 不是新帧)。
+    /// 模型加载使用显式会话请求，不占用进程握手；响应为 Success 帧的 `session` 字段。
     SessionInit {
         /// host 侧单调分配;SessionClose/诊断日志引用。
         session_id: u64,
-        /// 多角色模型载荷(Part6 §3.2.1a:合并单 ai-worker 一次声明 CLIP 图/文 +
+        /// 多角色模型载荷：ai-worker 一次声明 CLIP 图/文与
         /// YuNet + SFace;worker 按 role 取各自 handle)。
         models: Vec<ModelDescriptor>,
         model_profile: ModelProfileSnapshot,
@@ -58,15 +56,14 @@ pub enum RequestBody {
         /// 前缀,越界回 `ModelLoadFailed`(D1 §3,防宿主被劫持后诱导任意读)。
         models_root: String,
         /// 受限缓存根:worker 只读 `{ai_cache_dir}/{key[..2]}/{key}.webp`,拒越界
-        /// (Part6 §3.2.1a ②,补「worker 只收 cache_keys、不知缓存根」缺口)。
+        /// 防止缓存键被用于读取授权根之外的文件。
         ai_cache_dir: String,
-        /// 图像塔 EP:"directml"|"cpu";文本塔由 worker 内硬编码 CPU(Part4 §8.6)。
+        /// 图像塔 EP："directml"|"cpu"；文本塔由 worker 固定为 CPU。
         image_provider: String,
     },
     /// 显式卸载会话(host 主导生命周期:空闲计时到期/切换模型前;D3 §4)。
     SessionClose { session_id: u64 },
-    /// CLIP 批量嵌入,一 Request = 一批(§8.1 决策1/方案B:传 cache_keys 而非
-    /// tensor,blob≈0 无 MAX_BLOB 压力)。响应 = Success 帧 + `SuccessBody.embed`,
+    /// CLIP 批量嵌入，一 Request 对应一批缓存键。响应为 Success 帧的 `embed` 字段，
     /// 嵌入本体在同帧 blob(布局见 [`EmbedBatchSuccess`])。
     EmbedBatch { items: Vec<EmbedItem> },
     /// 人脸检测+嵌入批(与 EmbedBatch 同构逐项化;几何走 JSON、嵌入走 blob)。
@@ -76,17 +73,14 @@ pub enum RequestBody {
         /// 取值随 host 侧 face profile(YuNet 0.9 / SCRFD 0.5)。
         det_score_thresh: f32,
     },
-    /// CLIP 文本编码(v2 additive,T17):语义搜索查询向量。T16 删主进程 ort+tokenizers
-    /// 后,文本塔只存在于 worker(其 EP 恒 CPU,Part4 §8.6),故此 op 是搜索链路的必经
-    /// 载体——T10 三源合并时漏列,T15 发现缺口、T17 补齐(additive,不动 PROTOCOL_VERSION)。
+    /// CLIP 文本编码，供语义搜索获取查询向量；文本塔在 worker 中以 CPU 执行。
     /// 响应 = Success 帧 + `SuccessBody.text_embed`,向量本体在同帧 blob(按 texts 顺序连续,
     /// 每项 `embed_dim × f32(LE)`)。**全批原子**:文本编码无逐项 IO 失败模式(不读盘、
     /// tokenizer 接受任意字符串),任一失败即整批 Failure,不做逐项 Ok/Err。
     /// 不新增 capability:文本塔与 CLIP 图像塔同属 `embedding` 会话,凡会话就绪即可服务。
     EncodeText { texts: Vec<String> },
-    /// OCR 会话装载(v2 additive):独立于 CLIP 会话(D-OCR-1),worker 双槽并存。
+    /// OCR 会话装载：独立于 CLIP 会话，worker 双槽并存。
     /// 响应 = Success + SuccessBody.ocr_session。
-    /// v2 additive:不动 PROTOCOL_VERSION;旧 worker 收到新 op 会 JSON 解析失败回 internal_error(main.rs 兜底),两端同仓同步分发,无实际混版窗口。
     OcrSessionInit {
         session_id: u64,
         /// 角色 OcrDet/OcrCls/OcrRec/OcrDict 四件套,逐件 len+sha256(同 D1 §3)。
@@ -97,11 +91,10 @@ pub enum RequestBody {
     },
     /// OcrSessionClose 兼容性同 OcrSessionInit。
     OcrSessionClose { session_id: u64 },
-    /// OCR 批(交互一次一图为主,批口面向未来)。响应 = Success + SuccessBody.ocr,blob 恒空(D-OCR-4)。
-    /// v2 additive:不动 PROTOCOL_VERSION;旧 worker 收到新 op 会 JSON 解析失败回 internal_error(main.rs 兜底),两端同仓同步分发,无实际混版窗口。
+    /// OCR 批处理。响应为 Success 的 `ocr` 字段，blob 为空。
     OcrBatch { items: Vec<OcrItem> },
     /// 影像增强会话装载(v2 additive,降噪/超分子系统 design.md §G):独立于 CLIP/OCR
-    /// 会话(D-OCR-1 同型 worker 独立 worker 进程),models 逐件走 validate_and_resolve
+    /// 会话运行在独立 worker 进程，models 逐件执行 validate_and_resolve
     /// 前缀/字节数/sha256 校验(与 SessionInit 同款)。响应 = Success 帧(无专属就绪体,
     /// 增强会话就绪即可直接派 EnhanceRun)。
     EnhanceSessionInit {
@@ -266,14 +259,11 @@ impl RequestBody {
     }
 }
 
-/// 模型载荷句柄(Part4 D1 两级通道;v2 一次定型,避免二次破坏性升版)。
+/// 模型载荷句柄。
 ///
-/// - `Path`:明文权重(P2 首期全部模型)——models 目录内文件的**绝对路径**,worker
+/// - `Path`：models 目录内明文权重的绝对路径，worker
 ///   `commit_from_file` 直接加载;须先做 models_root 归属校验(见 SessionInit 字段注)。
-/// - `Named`:AES 加密权重(④ 变现后)——主进程解密后写具名共享内存,worker 按名
-///   map 后 `commit_from_memory`;名称格式 `pn-{8B hex}-{16B CSPRNG hex}`(D1 §4)。
-/// - 刻意不设 `Fd`/`Win32Handle` 变体:匿名句柄跨 exec 进程无效(Part4 §3.7.3),
-///   具名方案三平台闭合;除非实测具名开销不可接受才另启(D1 裁决②)。
+/// - `Named`：协议字段已定义，当前 worker 校验会拒绝该句柄。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ModelHandle {
@@ -281,7 +271,7 @@ pub enum ModelHandle {
     Named(String),
 }
 
-/// 模型角色(Part6 §3.2.1a):一个 session 载多模型,worker 按角色寻址。
+/// 模型角色：一个 session 可载多个模型，worker 按角色寻址。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {
@@ -293,9 +283,7 @@ pub enum ModelRole {
     OcrCls,
     OcrRec,
     OcrDict,
-    /// 影像增强模型(降噪/超分子系统 design.md §G):单角色,一次会话可装载多个
-    /// 同角色档位(降噪/去伪影/超分各选一,或同任务多档),worker 侧模型间的
-    /// 二次寻址细节归 P0 批 2(推理模块)实现。
+    /// 影像增强模型：单角色可装载多个档位，worker 按 `model_id` 二次寻址。
     Enhance,
 }
 
@@ -318,7 +306,7 @@ pub struct ModelDescriptor {
     pub model_id: Option<String>,
 }
 
-/// 模型 profile 快照(Part4 §8.6 / Part6 §8.3):worker 侧预/后处理按 `arch_id` 从
+/// 模型 profile 快照：worker 侧预/后处理按 `arch_id` 从
 /// 其内建注册表取几何/归一化/tokenizer 等参数,host 不逐字段下发。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelProfileSnapshot {
@@ -329,16 +317,18 @@ pub struct ModelProfileSnapshot {
     /// CLIP 图像批容量(静态 batch;EmbedBatch 单批 items 数不得超过)。
     pub batch_size: u32,
     /// 人脸 profile id(= `faces.model_name`);None = 本 session 不载人脸角色。
-    /// (T10 补充:合并 session 需同时声明 CLIP 与人脸两套 profile,§3.2.1a 原稿仅 CLIP 形。)
     pub face_profile_id: Option<String>,
 }
 
-/// EmbedBatch 单项(Part6 §3.2.1a 逐项化:每项独立 fingerprint,陈旧/错位防护到项)。
+/// EmbedBatch 单项；每项独立 fingerprint，避免陈旧或错位结果落库。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbedItem {
     pub item_id: i64,
     /// ai_cache 键;worker 拼 `{ai_cache_dir}/{key[..2]}/{key}.webp` 读图自解码。
     pub cache_key: String,
+    /// 已提交 AI 产物相对 session ai_cache_dir 的 v2 路径；None 沿用旧 cache_key 路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
     pub fingerprint: String,
 }
 
@@ -348,13 +338,15 @@ pub struct EmbedItem {
 pub struct FaceItem {
     pub item_id: i64,
     pub cache_key: Option<String>,
+    /// 相对宿主缓存根的已验证显示/人脸产物；worker 从授权句柄读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
     pub source_path: Option<String>,
     pub fingerprint: String,
 }
 
 /// OcrBatch 单项:语义同 [`FaceItem`]——`cache_key`/`source_path` 至少给一。
-/// OCR 一期忽略 `cache_key`(ai 缓存 ≤640 级分辨率不足以识字),host 恒传
-/// `source_path`;`cache_key` 字段面向未来批量场景保留。
+/// OCR 使用原图 `source_path`；worker 不读取 `cache_key`，因为 AI 缓存图分辨率不足以识字。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OcrItem {
     pub item_id: i64,
@@ -392,6 +384,8 @@ pub mod capability {
     pub const THUMBNAIL: &str = "thumbnail";
     pub const METADATA: &str = "metadata";
     pub const EMBEDDING: &str = "embedding";
+    /// 文本编码就绪；用于按需会话，不参与通用资产插件调度。
+    pub const TEXT_ENCODING: &str = "text_encoding";
     pub const FACE_DETECT_EMBED: &str = "face_detect_embed";
     /// 注:worker 能力通告用;OCR builtin 路径不进 exotic 任务化(D-OCR-7),catalog::Capability 无对应变体,豁免本 mod 头注的一一对应承诺。
     pub const OCR_TEXT: &str = "ocr_text";
@@ -469,8 +463,7 @@ pub struct SessionReadyBody {
     pub face_embed_dim: Option<u32>,
     /// 本会话实际可服务的能力(如 ["embedding","face_detect_embed"]),host 据此派活。
     pub caps: Vec<String>,
-    /// 实际选用的执行提供器回声(如 "directml"/"cpu";T16 additive:host 删进程内引擎后
-    /// provider 探测只发生在 worker 侧,host 借此写回 `ai_provider` 配置供状态栏显示)。
+    /// 实际选用的执行提供器回声（如 "directml"/"cpu"）；host 写回状态配置。
     /// serde(default) 容旧 worker 帧;None = 旧帧/未回报,host 保留既有配置值。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -510,8 +503,8 @@ pub struct TextEmbedSuccess {
 /// fingerprint,不符即丢弃该项(陈旧/错位防护);逐项 Err 不连坐整批。
 ///
 /// 嵌入本体不进 JSON——128 项 × 768d 的 JSON 文本会撞 MAX_JSON_LEN(1MiB),且违反
-/// 「JSON 只放控制字段、二进制走同帧 blob」天条(T10 对 §3.2.1a `Ok{embedding}` 的
-/// 修正)。blob 布局:按 `results` 中 **Ok 项的顺序**连续排布,每项 `embed_dim ×
+/// 「JSON 只放控制字段、二进制走同帧 blob」约束。blob 按 `results` 中 **Ok 项的顺序**
+/// 连续排布，每项 `embed_dim ×
 /// f32(LE)`;host 校验 `blob.len() == ok_count × embed_dim × 4`。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbedBatchSuccess {

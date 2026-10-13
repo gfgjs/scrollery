@@ -1,5 +1,5 @@
 // src/utils/shikiHighlight.ts
-// md 代码块语法高亮（阅读器方案 R4，§7-R4「md 插件位（shiki 懒载）」）。
+// Markdown 代码块语法高亮，按需加载 shiki。
 //
 // 关键约束（用户 2026-07-07 定方向）：**必须用 JS 正则引擎**（createJavaScriptRegexEngine），
 // 不用 shiki 默认的 WASM（oniguruma）引擎——WASM 需 CSP `wasm-unsafe-eval`，而生产 CSP 已硬化

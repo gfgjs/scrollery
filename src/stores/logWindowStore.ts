@@ -1,5 +1,4 @@
-// src/stores/logWindowStore.ts
-// 独立日志窗口的状态(日志能力重构 S4,方案 §5/§9.4 S4):实时流(环形缓冲 + 过滤)+
+// 独立日志窗口的状态：实时流(环形缓冲 + 过滤)与
 // 历史(按日 JSONL 分页)。只在日志窗口(main.ts 按 window label 分流出的独立挂载路径)
 // 内实例化——主窗口从不 use 本 store,不产生额外订阅/内存开销。
 
@@ -12,7 +11,7 @@ import { readSetting, writeSettings } from './settingsPersistence'
 import { parseSettingJson } from '../composables/settingsValues'
 import { LOG_LEVELS, type LogEntry, type LogLevelFilter } from '../types/logEntry'
 
-/** 环形缓冲上限的默认值/可调区间(方案 §5 MVP「默认 10k 行,设置可调 5k-20k」)。
+/** 环形缓冲上限的默认值与可调区间(默认 10k 行，可调 5k-20k)。
  * 这是**前端**本地保留行数——后端安全阀见 logging.rs::RING_BUFFER_CAPACITY(20k,不可调)。 */
 export const RENDER_CAP_DEFAULT = 10_000
 export const RENDER_CAP_MIN = 5_000

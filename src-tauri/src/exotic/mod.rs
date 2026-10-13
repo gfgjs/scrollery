@@ -1,12 +1,8 @@
 // src-tauri/src/exotic/mod.rs
-//! 冷门格式插件子系统（v3 总纲）。
+//! 冷门格式插件子系统。
 //!
-//! 三份真相（v3 §5.1）分模块：
-//!   - [`catalog`]：能力真相（某格式有无产品、属哪类、提供哪些能力、哪些平台）。
-//!   - 安装真相 / 授权真相：Part3 落地；Part1 用只读桩（无安装记录即 `AvailableUninstalled`）。
-//!   - [`task`]：处理真相（能力级任务状态机）。
-//!
-//! 本卷（Part1）**不**启动 Worker、不下载、不验签。
+//! 能力目录、安装记录、免费激活记录和处理任务各自独立。
+//! 宿主合并这些事实决定是否可运行；激活不替代安装、平台和完整性检查。
 
 pub mod catalog;
 pub mod coordinator;
@@ -15,7 +11,6 @@ pub mod fetch;
 pub mod fingerprint;
 pub mod install;
 pub mod installer;
-pub mod license;
 pub mod limiter;
 pub mod outcome;
 pub mod package;
@@ -35,10 +30,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::db::connection::DbPool;
+use crate::feature_activation::{self, ActivationSource};
 pub use catalog::{Capability, CatalogOffering, CatalogSnapshot, CatalogStore, MediaKind};
 pub use crypto::VerifyingKeyset;
-use license::FreeStubEntitlement;
-pub use license::{EntitlementProvider, LicenseStatus};
 pub use task::{ExoticTaskRow, ExoticTaskStatus};
 
 /// Host 语义版本（min_host_version 兼容门控用）。
@@ -49,14 +43,12 @@ const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Availability {
-    /// 有产品、未安装 → 显示购买占位。
+    /// 插件尚未安装。
     AvailableUninstalled,
-    /// 已安装、未授权 → 显示激活。
-    InstalledUnlicensed,
-    /// 已授权、可运行。
-    Authorized,
-    /// License 过期。
-    LicenseExpired,
+    /// 尚未免费激活。
+    Inactive,
+    /// 激活与安装等条件齐备，可运行。
+    Ready,
     /// 当前平台无对应包。
     UnsupportedPlatform,
     /// Host 版本不满足 min_host_version。
@@ -81,13 +73,14 @@ pub struct FormatResolution {
     pub display_name: String,
     pub capabilities: Vec<Capability>,
     pub availability: Availability,
-    pub store_url: Option<String>,
+    pub activation_required: bool,
+    pub activated: bool,
     pub installed_version: Option<String>,
-    /// builtin offering(D-OCR-5):无安装包,直接验 license;前端据此免走「购买/安装」文案。
+    /// builtin offering(D-OCR-5):无安装包,读取本地激活状态;前端据此区分插件安装与内置组件准备。
     pub builtin: bool,
 }
 
-/// 已安装插件信息（安装真相投影；前端市场用）。Part1 安装表为空，命令返回空列表。
+/// 已安装插件信息（安装真相投影，供前端市场使用）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledExoticPlugin {
@@ -100,8 +93,8 @@ pub struct InstalledExoticPlugin {
 }
 
 /// 安装真相完整行（**内部**用；含 `manifest_hash`，不对前端序列化）。
-/// Part3 安装/升级写入；resolve_format 据 `install_state` 区分 Authorized/InstalledUnlicensed/
-/// InvalidInstallation；Supervisor 启动前据 `manifest_hash` 复核安装完整性（Part2 §3.6 接真实校验）。
+/// 安装/升级写入；`resolve_format` 根据 `install_state` 区分可用状态。
+/// Worker 启动前依据 `manifest_hash` 复核安装完整性。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPluginRecord {
     pub plugin_id: String,
@@ -186,14 +179,12 @@ impl InstalledSource for EmptyInstalledSource {
     }
 }
 
-/// 组合三份真相的 Host（v3 §2.1 / Part3 §5）。
-/// **不创造能力**，只把 catalog（能力真相）+ installed（安装真相）+ licenses（授权真相）
-/// 折叠成 [`FormatResolution`]。Release 主路径用真实 DB + keyring；无全局跳过授权开关。
+/// 组合能力、安装与逐项免费激活状态。
 pub struct ExoticHost {
     catalog: Arc<CatalogStore>,
     installed: Arc<dyn InstalledSource>,
-    licenses: Arc<dyn EntitlementProvider>,
-    /// **仅** dev fixture / 测试注入：把某 plugin_id 直接视为已授权（绕过真实 installed+license）。
+    activations: Arc<dyn ActivationSource>,
+    /// **仅** dev fixture / 测试注入：把某 plugin_id 直接视为已激活（绕过真实 installed+activation）。
     ///
     /// 防御纵深（§5.4，安全评审 medium 加固）：字段本身用 `#[cfg]` 门控——Release 构建
     /// （非 debug 或无 `exotic-dev-fixtures`）下该字段**编译期不存在**，连同 `availability_of`
@@ -202,35 +193,34 @@ pub struct ExoticHost {
     authorized_fixture: Option<String>,
 }
 
-/// 某插件的授权判定 DTO（前端 gate / 购买引导，Part6 §3.8）。camelCase 序列化对齐前端。
+/// 插件可用状态；激活记录与安装、平台检查分开显示。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PluginEntitlement {
+pub struct PluginAvailability {
     pub plugin_id: String,
-    /// 折叠后的可用态（平台 / 版本 / 安装 / 授权门控结果）。
     pub availability: Availability,
-    /// 授权来源渠道（`"direct"` = keyring 直销 / `"free"` = fail-closed 回退桩），
-    /// 取自 [`EntitlementProvider::source_tag`]。
-    pub source_tag: String,
-    /// 付费插件的 sku（免费 / 无 sku 插件为 None）。
-    pub sku: Option<String>,
-    /// 购买 / 商店链接（未授权时的购买引导用）。
-    pub store_url: Option<String>,
+    pub activation_required: bool,
+    pub activated: bool,
 }
 
-/// 组合根 · 授权 provider 装配点（Part6 §3.9 **唯一 swap 点**）。
-///
-/// 当前唯一渠道 = 直销(direct),即下方 keyring 装配(空渠道 msstore/steam 已删,P16 2026-09-15)。
-///
-/// direct = keyring 直销验签([`license::KeyringLicenseStore`]) + 信任根公钥集
-/// ([`trusted_keyset`]——registry 与 license 共用同一集,验签路径不分叉)。
-/// 随仓 keyset 只含占位公钥(私钥已弃);使用正式或自建签发链时，经
-/// `PICASA_EXOTIC_KEYSET_FILE` 编译期注入对应公钥。
-/// 信任根解析失败即 fail-closed 降级 [`FreeStubEntitlement`](授权一律拒绝,绝不放行)。
-/// 🔒 dev/test 旁路(仅 debug 构建编入,SEC-02 姿态,同 `EXOTIC_PSD_WORKER_PATH`):
-/// `PICASA_EXOTIC_DEV_KEYSET=<path>` 指向本地 keyset JSON 时**整组替换**——配合
-/// `scripts/exotic-dev-registry.mjs` 生成的 dev 签名链,开发期端到端测试插件商店
-/// (拉取/验签/安装/启动前完整性复核)。Release 构建该分支不存在,恒为内置集。
+struct NoActivations;
+impl ActivationSource for NoActivations {
+    fn is_activated(&self, _feature_id: &str) -> crate::error::Result<bool> {
+        Ok(false)
+    }
+}
+
+struct DbActivationSource {
+    pool: DbPool,
+}
+impl ActivationSource for DbActivationSource {
+    fn is_activated(&self, feature_id: &str) -> crate::error::Result<bool> {
+        let conn = self.pool.get().map_err(crate::error::AppError::from)?;
+        Ok(feature_activation::status(&conn, feature_id)?.activated)
+    }
+}
+
+/// 插件 registry 与发行包验签使用的信任根，独立于免费激活。
 pub(crate) fn trusted_keyset() -> Result<VerifyingKeyset, crypto::CryptoError> {
     #[cfg(debug_assertions)]
     if let Ok(p) = std::env::var("PICASA_EXOTIC_DEV_KEYSET") {
@@ -244,24 +234,14 @@ pub(crate) fn trusted_keyset() -> Result<VerifyingKeyset, crypto::CryptoError> {
     VerifyingKeyset::builtin()
 }
 
-pub fn default_entitlement_provider() -> Arc<dyn EntitlementProvider> {
-    match trusted_keyset() {
-        Ok(ks) => Arc::new(license::KeyringLicenseStore::new(Arc::new(ks))),
-        Err(e) => {
-            tracing::error!("内置信任根公钥集解析失败，exotic 授权一律拒绝 | {e}");
-            Arc::new(FreeStubEntitlement)
-        }
-    }
-}
-
 impl ExoticHost {
-    /// 只读桩 Host：无安装、无授权（前端 list 命令在无真实数据源时回退用；多数解析为
+    /// 只读桩 Host：无安装、未激活（前端 list 命令在无真实数据源时回退用；多数解析为
     /// `AvailableUninstalled`）。Release 主路径请用 [`ExoticHost::for_runtime`]。
     pub fn new(catalog: Arc<CatalogStore>) -> Self {
         ExoticHost {
             catalog,
             installed: Arc::new(EmptyInstalledSource),
-            licenses: Arc::new(FreeStubEntitlement),
+            activations: Arc::new(NoActivations),
             #[cfg(any(test, all(debug_assertions, feature = "exotic-dev-fixtures")))]
             authorized_fixture: None,
         }
@@ -271,18 +251,18 @@ impl ExoticHost {
     pub fn with_sources(
         catalog: Arc<CatalogStore>,
         installed: Arc<dyn InstalledSource>,
-        licenses: Arc<dyn EntitlementProvider>,
+        activations: Arc<dyn ActivationSource>,
     ) -> Self {
         ExoticHost {
             catalog,
             installed,
-            licenses,
+            activations,
             #[cfg(any(test, all(debug_assertions, feature = "exotic-dev-fixtures")))]
             authorized_fixture: None,
         }
     }
 
-    /// 测试 fixture：把某插件标为已授权（仅单测/集成；不经任何 Release 代码路径）。
+    /// 测试 fixture：把某插件标为已激活（仅单测/集成；不经任何 Release 代码路径）。
     #[cfg(test)]
     pub fn with_authorized_fixture(catalog: Arc<CatalogStore>, plugin_id: &str) -> Self {
         let mut h = ExoticHost::new(catalog);
@@ -290,22 +270,12 @@ impl ExoticHost {
         h
     }
 
-    /// 构造运行期 Host：安装真相 ← 只读连接池；授权真相由**组合根注入**（§3.9 去环）。
-    /// dev 构建额外注入 fixture（Release 无此路径）。
-    ///
-    /// 【Part6 §3.9.1a ①】`licenses` 由调用方（组合根 `State::exotic_host` → [`default_entitlement_provider`]）
-    /// 注入，本函数不再内建 keyring provider——使 provider 装配收敛到单点 swap 函数，且 `for_runtime`
-    /// 对具体授权渠道保持无知（与 [`ExoticHost::with_sources`] 同哲学）。
-    pub fn for_runtime(
-        catalog: Arc<CatalogStore>,
-        pool: DbPool,
-        licenses: Arc<dyn EntitlementProvider>,
-    ) -> Self {
-        let installed: Arc<dyn InstalledSource> = Arc::new(DbInstalledSource { pool });
+    /// 安装和免费激活均从当前本地数据库读取，激活后现有宿主立即生效。
+    pub fn for_runtime(catalog: Arc<CatalogStore>, pool: DbPool) -> Self {
         ExoticHost {
             catalog,
-            installed,
-            licenses,
+            installed: Arc::new(DbInstalledSource { pool: pool.clone() }),
+            activations: Arc::new(DbActivationSource { pool }),
             #[cfg(any(test, all(debug_assertions, feature = "exotic-dev-fixtures")))]
             authorized_fixture: dev_authorized_fixture(),
         }
@@ -323,14 +293,24 @@ impl ExoticHost {
                 display_name: format.to_string(),
                 capabilities: Vec::new(),
                 availability: Availability::NoOffering,
-                store_url: None,
+                activation_required: false,
+                activated: false,
                 installed_version: None,
                 builtin: false,
             };
         };
         let installed = self.installed.get(&off.plugin_id);
         let installed_version = installed.as_ref().map(|r| r.version.clone());
-        let availability = self.availability_of(off, installed.as_ref());
+        let activation_required = feature_activation::requires_activation(&off.plugin_id);
+        let activated = activation_required
+            && self
+                .activations
+                .is_activated(&off.plugin_id)
+                .unwrap_or_else(|error| {
+                    tracing::warn!("读取免费激活状态失败: {error}");
+                    false
+                });
+        let availability = self.availability_of(off, installed.as_ref(), activated);
         FormatResolution {
             format: format.to_string(),
             media_kind: off.media_kind,
@@ -338,22 +318,20 @@ impl ExoticHost {
             display_name: off.display_name.clone(),
             capabilities: off.capabilities.clone(),
             availability,
-            store_url: if crate::official::includes(&off.plugin_id) {
-                crate::official::store_url()
-            } else {
-                None
-            },
+            activation_required,
+            activated,
             installed_version,
             builtin: off.builtin,
         }
     }
 
     /// 折叠某 offering 的可用态。门控顺序（即防御纵深）：
-    /// 平台 → Host 版本 → (dev fixture) → 安装状态 → 授权状态。
+    /// 平台 → Host 版本 → (dev fixture) → 安装状态 → 激活状态。
     fn availability_of(
         &self,
         off: &CatalogOffering,
         installed: Option<&InstalledPluginRecord>,
+        activated: bool,
     ) -> Availability {
         if !off.supports_platform(current_target_triple()) {
             return Availability::UnsupportedPlatform;
@@ -361,57 +339,30 @@ impl ExoticHost {
         if !host_meets_min(&off.min_host_version, HOST_VERSION) {
             return Availability::IncompatibleHost;
         }
-        // dev/test fixture：平台/版本已过即授权。Release 构建该分支**编译期消除**（§5.4 防御纵深）。
+        // dev/test fixture：平台/版本已过即视为可运行。Release 构建该分支**编译期消除**（§5.4 防御纵深）。
         #[cfg(any(test, all(debug_assertions, feature = "exotic-dev-fixtures")))]
         if self.authorized_fixture.as_deref() == Some(off.plugin_id.as_str()) {
-            return Availability::Authorized;
+            return Availability::Ready;
         }
-        // builtin offering(D-OCR-5):无安装包,跳过安装态门,直接验 license。
-        if off.builtin {
-            // free 档(D-427 一期免费 RAW):显式判 license_tier=="free" 才放行,
-            // 付费能力只有固定套装权益可验权，不能因配置缺 SKU 放行。
-            if off.license_tier == "free" {
-                return Availability::Authorized;
-            }
-            if !crate::official::includes(&off.plugin_id) {
-                return Availability::InstalledUnlicensed;
-            }
-            return match crate::official::status(self.licenses.as_ref(), now_secs()) {
-                LicenseStatus::Authorized => Availability::Authorized,
-                LicenseStatus::Expired => Availability::LicenseExpired,
-                // 有意与 package 流(KeyringUnavailable→InstalledUnlicensed)分叉:builtin 无安装态可退,
-                // 统一投射为可购态(fail-closed,不误授权);keyring 瞬时故障恢复后下次查询自愈。
-                LicenseStatus::Unlicensed | LicenseStatus::KeyringUnavailable => {
-                    Availability::AvailableUninstalled
-                }
+        if !off.builtin {
+            let Some(rec) = installed else {
+                return Availability::AvailableUninstalled;
             };
-        }
-        let Some(rec) = installed else {
-            return Availability::AvailableUninstalled;
-        };
-        match rec.install_state.as_str() {
-            install_state::BROKEN => return Availability::InvalidInstallation,
-            install_state::DISABLED => return Availability::Disabled,
-            _ => {}
-        }
-        if off.license_tier == "free" {
-            return Availability::Authorized;
-        }
-        if !crate::official::includes(&off.plugin_id) {
-            return Availability::InstalledUnlicensed;
-        }
-        match crate::official::status(self.licenses.as_ref(), now_secs()) {
-            LicenseStatus::Authorized => Availability::Authorized,
-            LicenseStatus::Expired => Availability::LicenseExpired,
-            // 无 token / 不匹配 / keyring 不可用 → 已装未授权（不可证明授权即按未授权，fail-closed）。
-            LicenseStatus::Unlicensed | LicenseStatus::KeyringUnavailable => {
-                Availability::InstalledUnlicensed
+            match rec.install_state.as_str() {
+                install_state::BROKEN => return Availability::InvalidInstallation,
+                install_state::DISABLED => return Availability::Disabled,
+                _ => {}
             }
+        }
+        if feature_activation::requires_activation(&off.plugin_id) && !activated {
+            Availability::Inactive
+        } else {
+            Availability::Ready
         }
     }
 
     /// 列出 Catalog 中全部格式的解析结果（前端 `list_exotic_format_resolutions` 用）。
-    /// 即使未安装 PSD 也会出现 `AvailableUninstalled`（首次离线也显示购买占位）。
+    /// 即使未安装 PSD 也会出现 `AvailableUninstalled`（首次离线也显示安装占位）。
     pub fn list_resolutions(&self) -> Vec<FormatResolution> {
         let snap = self.catalog.snapshot();
         snap.iter_formats()
@@ -421,8 +372,8 @@ impl ExoticHost {
 
     /// 某 (plugin, capability) 当前是否**可领取处理**（Scheduler/Coordinator 门控用，v3 §5.3）。
     ///
-    /// runnable ⟺ 有 offering、平台兼容、Host 版本兼容、已安装且授权（或 dev fixture）、声明了该能力。
-    /// 未安装/未授权/平台不支持/禁用/损坏都返回 false——这些状态**不**写任务状态，由本门控拦在领取前。
+    /// runnable ⟺ 有 offering、平台兼容、Host 版本兼容、已安装且激活（或 dev fixture）、声明了该能力。
+    /// 未安装/未激活/平台不支持/禁用/损坏都返回 false——这些状态**不**写任务状态，由本门控拦在领取前。
     pub fn is_task_runnable(&self, plugin_id: &str, capability: Capability) -> bool {
         let snap = self.catalog.snapshot();
         // 找到该插件的任一 format，按其可用态判定（同一插件多 format 共享 offering）。
@@ -432,34 +383,26 @@ impl ExoticHost {
         if !off.claims_capability(capability) {
             return false;
         }
-        matches!(
-            self.resolve_format(fmt).availability,
-            Availability::Authorized
-        )
+        matches!(self.resolve_format(fmt).availability, Availability::Ready)
     }
 
-    /// 某插件的授权判定（前端 gate / 购买引导用，Part6 §3.8）：折叠其任一 format 的可用态，
-    /// 附 [`EntitlementProvider`] 的来源渠道 + 该插件 sku + 购买链接。判定全在后端，前端不持验签逻辑。
-    /// catalog 无此插件 → `None`（命令层转 `no_offering` 错误）。
-    pub fn entitlement_of(&self, plugin_id: &str) -> Option<PluginEntitlement> {
+    /// 查询单项插件的激活与资源可用状态。
+    pub fn availability_of_plugin(&self, plugin_id: &str) -> Option<PluginAvailability> {
         let snap = self.catalog.snapshot();
-        // 同一插件多 format 共享 offering，取任一即可（与 is_task_runnable 同法）。
-        let (fmt, off) = snap
+        let (fmt, _) = snap
             .iter_formats()
-            .find(|(_, o)| o.plugin_id == plugin_id)?;
+            .find(|(_, off)| off.plugin_id == plugin_id)?;
         let res = self.resolve_format(fmt);
-        Some(PluginEntitlement {
-            plugin_id: plugin_id.to_string(),
+        Some(PluginAvailability {
+            plugin_id: plugin_id.to_owned(),
             availability: res.availability,
-            source_tag: self.licenses.source_tag().to_string(),
-            sku: (off.license_tier != "free" && crate::official::includes(plugin_id))
-                .then(|| crate::official::product().sku.clone()),
-            store_url: res.store_url,
+            activation_required: res.activation_required,
+            activated: res.activated,
         })
     }
 }
 
-/// dev fixture 授权插件（仅 debug + `exotic-dev-fixtures`；Release 恒 None，§5.4）。
+/// dev fixture 可用插件（仅 debug + `exotic-dev-fixtures`；Release 恒 None，§5.4）。
 /// 函数本身按字段同条件门控——Release 不编入，避免「字段被消除后函数变死代码」告警。
 #[cfg(any(test, all(debug_assertions, feature = "exotic-dev-fixtures")))]
 fn dev_authorized_fixture() -> Option<String> {
@@ -470,19 +413,6 @@ fn dev_authorized_fixture() -> Option<String> {
     #[cfg(not(all(debug_assertions, feature = "exotic-dev-fixtures")))]
     {
         None
-    }
-}
-
-/// 当前 unix 秒（License 时间窗判定用）。时钟早于 UNIX_EPOCH（VM/容器时钟异常）时返回 0：
-/// fail-closed（now=0 < 内置 not_before → 一律未授权，绝不误授权），但单独告警以便运维定位
-/// 「激活失败实为系统时钟异常而非 token 问题」（安全评审 low）。不输出任何 token 材料。
-fn now_secs() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs() as i64,
-        Err(_) => {
-            tracing::warn!("系统时钟早于 UNIX_EPOCH，exotic 授权按 fail-closed 处理（now=0）");
-            0
-        }
     }
 }
 

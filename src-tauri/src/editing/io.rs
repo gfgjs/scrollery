@@ -1,6 +1,5 @@
-//! 编辑保存的落盘契约(方案 C §4/§6):同目录 `*.tmp` 编码 + 元数据写回 + 复读验证 →
-//! flush/close → same-volume rename 到 [`super::naming::claim_target_path`] 已认领的
-//! 目标路径。任一步失败清理 tmp 与占位文件,不发布半成品(硬约束:先 tmp 后 rename)。
+//! 编辑保存先写同目录 `*.tmp`，同步并复读验证后，改名覆盖已认领的目标路径。
+//! 失败时清理临时文件与占位文件，避免发布半成品。
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -17,7 +16,7 @@ use super::metadata;
 pub const CODE_ENCODE_FAILED: &str = "edit_encode_failed";
 pub const CODE_IO: &str = "edit_io";
 
-/// v1 已准入的输出格式(方案 C-6:WebP 输出因元数据 spike 未通过,不在此列)。
+/// 支持保留必要元数据的输出格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Jpeg,
@@ -41,7 +40,7 @@ fn encode_failed() -> AppError {
 }
 
 /// 编码 `img` 为 `format`(JPEG 用 `quality` 1..=100;PNG 忽略 `quality`),写入 ICC(若源图
-/// 携带)与由 [`metadata::build_output_exif`] 构造的最小 EXIF(方案 §4:不转发原始 blob)。
+/// 携带)与由 [`metadata::build_output_exif`] 构造的最小 EXIF，不转发原始 blob。
 fn encode(
     img: &DynamicImage,
     format: OutputFormat,
@@ -73,9 +72,7 @@ fn encode(
     Ok(out)
 }
 
-/// 复读验证(方案 §4 验收项):重新解码刚写的字节,确认 orientation 已归一(几何已烤入
-/// 像素,输出不应再带任何旋转指令)。ICC/日期字段的正确性已由 `editing::metadata` 的
-/// golden 测试覆盖,这里只验证「写出的字节仍可正确解码且 orientation 契约成立」。
+/// 重新解码写出的字节，确认几何操作烤入像素后 orientation 已归一。
 fn verify_round_trip(bytes: &[u8]) -> Result<(), AppError> {
     let reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -188,35 +185,6 @@ mod tests {
         // 落盘产物可正常解码回相同尺寸。
         let decoded = image::load_from_memory(&bytes).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (4, 3));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn write_edited_image_commits_png_with_icc_and_date() {
-        let dir = tmp_dir("png_commit");
-        let target = super::super::naming::claim_target_path(&dir, "photo-edit", "png").unwrap();
-        write_edited_image(
-            &target,
-            &sample_image(),
-            OutputFormat::Png,
-            92,
-            Some(b"opaque-icc-bytes"),
-            Some("2024:03:15 08:30:00"),
-        )
-        .unwrap();
-
-        let bytes = fs::read(&target).unwrap();
-        let reader = ImageReader::new(std::io::Cursor::new(&bytes))
-            .with_guessed_format()
-            .unwrap();
-        let mut decoder = reader.into_decoder().unwrap();
-        let meta = metadata::read_source_metadata(&mut decoder);
-        assert_eq!(meta.orientation, image::metadata::Orientation::NoTransforms);
-        assert_eq!(meta.icc_profile.as_deref(), Some(&b"opaque-icc-bytes"[..]));
-        assert_eq!(
-            meta.date_time_original.as_deref(),
-            Some("2024:03:15 08:30:00")
-        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

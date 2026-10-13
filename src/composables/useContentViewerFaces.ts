@@ -1,7 +1,6 @@
 // src/composables/useContentViewerFaces.ts
-// 从 ContentViewer.vue 下沉(超长文件拆分方案 2.1):人脸框状态与投影计算。
-// 纯逻辑搬迁,不改变原调用点/参数/时序——见 docs/planning/2026-07-25-超长文件拆分方案/analysis/ContentViewer-vue.md。
-// 红线(风险章节):faceToken 并发丢弃判定须逐字保留,不得简化为取消/AbortController 等替代实现。
+// 人脸框状态与投影计算。
+// faceToken 丢弃切图后迟到的请求结果，避免旧图人脸框覆盖新图。
 
 import { computed, ref, watch, nextTick, type Ref } from 'vue'
 import type { FaceBox } from '../types/person'
@@ -20,27 +19,25 @@ export function useContentViewerFaces(options: {
 }) {
   const { viewerRef, currentImageElement, transform, personStore } = options
 
-  // ── 人脸框(F6)─── 把检测到的人脸叠加到图上。bbox 是相对图像自身像素的归一化 [0,1],故投影到
+  // bbox 是相对图像自身像素的归一化 [0,1],故投影到
   // 图像的**内容矩形**(object-fit:contain 会留黑边),用 getBoundingClientRect 实时测量——它已含
   // 缩放/平移 transform,所以框会自动跟随缩放与拖拽。
   const faces = ref<FaceBox[]>([])
-  // 人脸蓝框显隐开关(问题5)。默认显示;全局查看偏好,存中央设置(config.toml),重置随快照回默认。
+  // 全局人脸框显隐偏好存中央设置，重置时随快照恢复默认。
   const showFaces = computed(() => readSettingBool(SHOW_FACES_KEY, true))
   function toggleFaces() {
     // 写盘失败由中央服务统一提示;此处 catch 只为收掉 promise。
     writeSettings({ [SHOW_FACES_KEY]: String(!showFaces.value) }).catch(() => {})
   }
-  // Image content rect in viewer-local coords {x,y,w,h}; null when not measurable.
   // 图像内容矩形(viewer 局部坐标 {x,y,w,h});不可测时为 null。
   const faceContentRect = ref<{ x: number; y: number; w: number; h: number } | null>(null)
   let faceRaf: number | null = null
-  // in-flight token(2026-07-06 审查 P1-10):方向键快速翻图时多个 getFacesForItem 并发在途,
-  // 无 token 则「后落地者赢」——慢的旧图应答会把新图的人脸集覆盖(bbox 投影到新图坐标系位置全错)。
+  // 并发翻图请求以代次区分，只允许当前图片的结果落地。
   let faceToken = 0
 
   async function loadFacesFor(item: { id: number; mediaType: string } | null) {
     const my = ++faceToken
-    // 切图先清空:新图渲染期间不残留旧图的框(image→image 切换原先不清,旧框错位可见)。
+    // 切图先清空，避免新图渲染期间残留旧图人脸框。
     faces.value = []
     if (!item || item.mediaType !== 'image') {
       return
@@ -79,7 +76,6 @@ export function useContentViewerFaces(options: {
     }
   }
 
-  // rAF-throttled recompute (transform changes fire rapidly while dragging).
   // rAF 节流重算(拖拽时 transform 高频变化)。
   function scheduleFaceRecompute() {
     if (faceRaf != null) return

@@ -1,7 +1,6 @@
 <script setup lang="ts">
-// 独立日志窗口内容(日志能力重构 S4/S5,方案 §5/§9.4)。main.ts 按 window label==='logs'
-// 直接把本组件挂为应用根(跳过 App.vue 的 AppShell/路由整套,方案 §5「主体是独立日志窗口」)。
-// S5 新增「分析」第三标签(P1 错误聚合/preset/诊断可见 + P2 直方图/诊断包导出)+ 双窗格上下文。
+// main.ts 在 logs 窗口直接挂载本组件，不经过 App.vue 的 shell 与路由。
+// 提供实时、历史和分析标签，以及日志上下文与诊断导出。
 import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useLogWindowStore, RENDER_CAP_MIN, RENDER_CAP_MAX } from '../stores/logWindowStore'
@@ -101,12 +100,12 @@ const visibleEntries = computed(() =>
 )
 
 // 分析面板的错误聚合:基于当前已加载(实时+历史)的全部条目,不受级别/target/文本过滤影响——
-// 用户即便把级别过滤只留 info,仍希望看到"这段时间内到底出了多少错"(方案 §5 P1)。
+// 即使级别过滤只留 info，聚合仍统计已加载的错误。
 const errorAggregation = computed(() =>
   aggregateErrorEntries(store.liveEntries.concat(store.historyEntries)),
 )
 
-// span 耗时 Top N(span 埋点线 W2,方案 docs/worklogs/2026-07-21-span埋点与worker日志汇入):
+// span 耗时 Top N：
 // 同 errorAggregation 姿态——基于当前已加载的全部(实时+历史)条目,不受级别/target/文本过滤影响。
 const spanAggregation = computed(() =>
   aggregateSpanDurations(store.liveEntries.concat(store.historyEntries)),

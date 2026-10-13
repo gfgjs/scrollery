@@ -3,27 +3,23 @@
 // 覆盖的不只是 happy path:在途 A + 新 patch B、防抖失败回滚、跨窗口 reset 丢弃旧 pending、
 // 重置失败/重复点击去重、flush 错误上报、权威快照不吞未确认预览。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { createPinia, setActivePinia } from 'pinia'
+import { nextTick } from 'vue'
+import { useConfigStore } from './configStore'
+import { getThumbCacheDir, setThumbCacheDir } from '../utils/thumbCacheDir'
 
 vi.mock('../utils/ipc', () => ({ invokeIpc: vi.fn() }))
 vi.mock('../utils/appEvents', () => ({ listenAppEvent: vi.fn(() => Promise.resolve(() => {})) }))
 vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  setLoggerEnabled: vi.fn(),
 }))
 
 import { invokeIpc } from '../utils/ipc'
 import { listenAppEvent } from '../utils/appEvents'
 import { IPC } from '../constants/ipc'
 import type { SettingsChange, SettingsSnapshot } from '../types/config'
-import {
-  flushSettings,
-  initializeSettings,
-  installSettingsBridge,
-  readSetting,
-  resetSettings,
-  resetSettingsModuleStateForTests,
-  settingsReady,
-  writeSettings,
-} from './settingsPersistence'
+import { flushSettings, initializeSettings, installSettingsBridge, readSetting, resetSettings, resetSettingsModuleStateForTests, writeSettings } from './settingsPersistence'
 
 function snapshot(values: Record<string, string>, revision: number, generation = 0): SettingsSnapshot {
   return { values, revision, generation }
@@ -81,98 +77,101 @@ describe('settingsPersistence', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
-  describe('就绪门控', () => {
-    it('快照到达前读取落 undefined、写入被拒(不把占位值当用户修改写回)', async () => {
-      expect(settingsReady.value).toBe(false);
-      expect(readSetting('player_volume')).toBeUndefined();
-
-      await writeSettings({ player_volume: '0.5' });
-
-      expect(invokeIpc).not.toHaveBeenCalled();
-      expect(settingsReady.value).toBe(false);
-    });
-
-    it('初始快照不覆盖已通过事件到达的更新快照(按 revision 守卫)', async () => {
-      const getHandler = captureEventHandler();
-      installSettingsBridge();
-      expect(getHandler).toBeTypeOf('function');
-      // 事件先到:更新 revision 的快照已落地。
-      getHandler()({
-        payload: {
-          snapshot: snapshot({ demo_privacy: 'true' }, 9),
-          keys: [],
-          restart_required: [],
-          apply_failed: [],
-        },
-      });
-      expect(readSetting('demo_privacy')).toBe('true');
-
-      // 随后到达的初始快照更旧:不得把它装回来。
-      vi.mocked(invokeIpc).mockResolvedValueOnce({
-        settings: snapshot({ demo_privacy: 'false' }, 3),
-        state: { firstLaunch: null, guideSeen: null },
-      });
-      await initializeSettings();
-      expect(readSetting('demo_privacy')).toBe('true');
-    });
+  it.each(['not_ready', 'resetting', 'cancelled'] as const)('目录保存 %s 不执行成功续体或改共享缓存', async (reason) => {
+    setActivePinia(createPinia());
+    vi.stubGlobal('document', { documentElement: { style: { setProperty: vi.fn() }, classList: { add: vi.fn(), remove: vi.fn() } } });
+    const handler = captureEventHandler();
+    const config = useConfigStore();
+    if (reason !== 'not_ready') await boot({ thumb_cache_dir: 'old' });
+    let release!: (value: SettingsChange) => void;
+    vi.mocked(invokeIpc).mockImplementation(() => new Promise(resolve => { release = resolve; }));
+    const resetting = reason === 'resetting' ? resetSettings() : null;
+    setThumbCacheDir('old');
+    const success = vi.fn(() => setThumbCacheDir('new'));
+    const saving = config.saveConfig('thumb_cache_dir', 'new').then(success);
+    const rejected = expect(saving).rejects.toMatchObject({ reason });
+    if (reason === 'cancelled') {
+      handler()({ payload: { ...change({ thumb_cache_dir: 'old' }, 2), snapshot: snapshot({ thumb_cache_dir: 'old' }, 2, 1) } });
+      release(change({ thumb_cache_dir: 'new' }, 1));
+    }
+    await rejected;
+    expect(success).not.toHaveBeenCalled();
+    expect(await getThumbCacheDir()).toBe('old');
+    if (resetting) { release(change({ thumb_cache_dir: 'old' }, 2)); await resetting; }
   });
 
-  describe('提交与落盘', () => {
-    it('即时写入立即预览,失败后回滚到确认值', async () => {
-      await boot({ player_volume: '1' });
-      vi.mocked(invokeIpc).mockRejectedValueOnce(new Error('write failed'));
+  it('DOM 由中央预览更新，拒绝不改显示且落盘失败回退', async () => {
+    setActivePinia(createPinia());
+    const setProperty = vi.fn();
+    vi.stubGlobal('document', { documentElement: { style: { setProperty }, classList: { add: vi.fn(), remove: vi.fn() } } });
+    const config = useConfigStore();
+    await expect(config.setUiFontSize(24)).rejects.toMatchObject({ reason: 'not_ready' });
+    await nextTick();
+    expect(setProperty).not.toHaveBeenCalled();
+    await boot({ ui_font_size: '13' });
+    let fail!: (error: Error) => void;
+    vi.mocked(invokeIpc).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+    const saving = config.setUiFontSize(24);
+    await nextTick();
+    expect(config.uiFontSize).toBe(24);
+    expect(setProperty).toHaveBeenCalled();
+    setProperty.mockClear();
+    const rejected = expect(saving).rejects.toThrow('disk');
+    fail(new Error('disk'));
+    await rejected;
+    await nextTick();
+    expect(config.uiFontSize).toBe(13);
+    expect(setProperty).toHaveBeenCalled();
+  });
 
-      const promise = writeSettings({ player_volume: '0.4' });
-      // 即时预览:同步可见(不等后端回执)。
-      expect(readSetting('player_volume')).toBe('0.4');
-
-      await expect(promise).rejects.toThrow('write failed');
-      // 失败回滚到最后确认值。
-      expect(readSetting('player_volume')).toBe('1');
+  it('画廊融合配置保存后响应式生效，写入失败回退且重置恢复默认', async () => {
+    setActivePinia(createPinia());
+    vi.stubGlobal('document', { documentElement: { style: { setProperty: vi.fn() }, classList: { add: vi.fn(), remove: vi.fn() } } });
+    const config = useConfigStore();
+    const defaults = {
+      gallery_blend_enabled: 'false',
+      gallery_blend_edge_width: '2',
+      gallery_blend_blur_radius: '3',
+      gallery_blend_strength: '100',
+    };
+    await boot(defaults);
+    expect(config.galleryBlend).toEqual({ enabled: false, edgeWidth: 2, blurRadius: 3, strength: 100 });
+    let saved: Record<string, string> = { ...defaults };
+    let revision = 1;
+    vi.mocked(invokeIpc).mockImplementation(async (_command, args) => {
+      saved = { ...saved, ...(args?.patch as Record<string, string>) };
+      return change(saved, ++revision);
     });
+    await config.setGalleryBlendEnabled(true);
+    await config.setGalleryBlendEdgeWidth(4);
+    await config.setGalleryBlendBlurRadius(12);
+    await config.setGalleryBlendStrength(60);
+    expect(setAppSettingsCalls().map((call) => call[1]?.patch)).toEqual([
+      { gallery_blend_enabled: 'true' },
+      { gallery_blend_edge_width: '4' },
+      { gallery_blend_blur_radius: '12' },
+      { gallery_blend_strength: '60' },
+    ]);
+    expect(config.galleryBlend).toEqual({ enabled: true, edgeWidth: 4, blurRadius: 12, strength: 60 });
 
-    it('在途 A 期间到达新 patch B:两次提交串行,最终值为 B', async () => {
-      await boot({ player_volume: '1' });
-      let releaseA: (() => void) | null = null;
-      vi.mocked(invokeIpc).mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseA = () => resolve(change({ player_volume: '0.5' }, 2));
-          }),
-      );
-      vi.mocked(invokeIpc).mockImplementationOnce(() =>
-        Promise.resolve(change({ player_volume: '0.8' }, 3)),
-      );
+    let fail!: (error: Error) => void;
+    vi.mocked(invokeIpc).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+    const saving = config.setGalleryBlendEnabled(false);
+    expect(config.galleryBlend.enabled).toBe(false);
+    const rejected = expect(saving).rejects.toThrow('disk');
+    fail(new Error('disk'));
+    await rejected;
+    expect(config.galleryBlend.enabled).toBe(true);
 
-      const a = writeSettings({ player_volume: '0.5' });
-      const b = writeSettings({ player_volume: '0.8' });
-      // B 已预览,但 A 仍在途:B 不得抢跑。
-      expect(readSetting('player_volume')).toBe('0.8');
-      expect(setAppSettingsCalls()).toHaveLength(1);
-
-      releaseA!();
-      await Promise.all([a, b]);
-
-      const calls = setAppSettingsCalls();
-      expect(calls).toHaveLength(2);
-      expect((calls[1][1] as { patch: Record<string, string> }).patch).toEqual({
-        player_volume: '0.8',
-      });
-      expect(readSetting('player_volume')).toBe('0.8');
-    });
+    vi.mocked(invokeIpc).mockResolvedValueOnce(change(defaults, ++revision, { snapshot: snapshot(defaults, revision, 1) }));
+    await resetSettings();
+    expect(config.galleryBlend).toEqual({ enabled: false, edgeWidth: 2, blurRadius: 3, strength: 100 });
   });
 
   describe('flush', () => {
-
-    it('flush 对在等待窗口内失败的写盘可靠抛错(退出流程据此拒绝退出)', async () => {
-      await boot();
-      vi.mocked(invokeIpc).mockRejectedValueOnce(new Error('disk full'));
-      // 消费方按既有姿态吞掉 rejection,失败仍需经 flush 上报。
-      void writeSettings({ player_volume: '0.5' }).catch(() => {});
-      await expect(flushSettings()).rejects.toThrow('disk full');
-    });
 
     it('flush 等待在途请求期间新到的防抖写入不会漏(窗口内 B 必须一并落盘)', async () => {
       vi.useFakeTimers();
@@ -218,6 +217,42 @@ describe('settingsPersistence', () => {
   });
 
   describe('恢复默认设置', () => {
+
+    it('恢复默认取消已排队但未发送的修改，只等待实际在途写入', async () => {
+      await boot({ thumb_webp_quality: '80', ai_batch_size: '0' });
+      let releaseActive!: (value: SettingsChange) => void;
+      vi.mocked(invokeIpc).mockImplementationOnce(() => new Promise((resolve) => {
+        releaseActive = resolve;
+      }));
+      const defaults = { thumb_webp_quality: '80', ai_batch_size: '0' };
+      vi.mocked(invokeIpc).mockImplementation(async (command) => {
+        if (command === IPC.CLEAR_SETTINGS) {
+          return change(defaults, 4, { snapshot: snapshot(defaults, 4, 1) });
+        }
+        return change({ thumb_webp_quality: '100', ai_batch_size: '32' }, 3);
+      });
+
+      const active = writeSettings({ thumb_webp_quality: '100' });
+      const queued = writeSettings({ ai_batch_size: '32' }).then(
+        () => 'saved',
+        (error: unknown) => error,
+      );
+      expect(setAppSettingsCalls()).toHaveLength(1);
+      expect(readSetting('ai_batch_size')).toBe('32');
+
+      const resetting = resetSettings();
+      releaseActive(change({ thumb_webp_quality: '100', ai_batch_size: '0' }, 2));
+      await active;
+      await resetting;
+
+      expect(await queued).toMatchObject({ reason: 'cancelled' });
+      expect(setAppSettingsCalls().map((call) => call[1]?.patch)).toEqual([
+        { thumb_webp_quality: '100' },
+      ]);
+      expect(vi.mocked(invokeIpc).mock.calls.filter(([command]) => command === IPC.CLEAR_SETTINGS)).toHaveLength(1);
+      expect(readSetting('thumb_webp_quality')).toBe('80');
+      expect(readSetting('ai_batch_size')).toBe('0');
+    });
 
     it('重置等待已发出的在途请求结束(不让旧 patch 在重置后落盘)', async () => {
       await boot({ player_volume: '1' });
@@ -297,8 +332,9 @@ describe('settingsPersistence', () => {
         },
       });
 
-      // 旧代次的待提交被取消(等待者 resolve,不算失败),显示值回到默认。
-      await expect(stale).resolves.toBeUndefined();
+      // 取消不得进入保存成功续体，也不算磁盘故障。
+      await expect(stale).rejects.toMatchObject({ reason: 'cancelled' });
+      await expect(flushSettings()).resolves.toBeUndefined();
       expect(readSetting('player_volume')).toBe('1');
 
       // 且永远不会再落盘。

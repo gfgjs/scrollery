@@ -1,10 +1,9 @@
-//! 模型资产下载的 IPC 侧编排(U-P2-b,2026-07-16 从 ipc/ai_commands.rs 迁出)。
+//! 模型资产下载的 IPC 侧编排。
 //!
 //! CLIP `download_model` 与人脸 `download_face_model` 共享的 Channel 下载编排:
-//! 进度 DTO、逐资产循环、落盘名安全白名单。此前寄居单一命令文件,兄弟命令文件
-//! 跨文件借用;独立成模块后两命令文件对称引用。
+//! 进度 DTO、逐资产循环、落盘名安全白名单，由两个命令模块共用。
 //!
-//! 层次边界(U-D-003):本模块持 `tauri::ipc::Channel`(IPC transport),**留在 ipc 层**;
+//! 本模块持 `tauri::ipc::Channel`(IPC transport)，留在 ipc 层；
 //! 通用 `crate::download` 只管传输机制(HTTPS/Range/镜像/校验),不得反向引入 Tauri IPC。
 
 use tracing::info;

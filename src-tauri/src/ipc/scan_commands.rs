@@ -29,25 +29,28 @@ fn require_scan_lifecycle<T>(value: Option<T>) -> Result<T> {
     value.ok_or_else(scan_database_clearing)
 }
 
-/// 添加新的扫描根目录。
+/// 添加新的扫描根目录；`merge_children=true` 时在事务中迁移已有子根，保留媒体及用户状态。
 #[tauri::command]
 pub async fn add_scan_root(
     app: AppHandle,
     path: String,
     alias: Option<String>,
+    merge_children: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ScanRoot> {
     // span 埋点(W1,D-312 info 档:任务型低频、await 覆盖 DB+卷探测真实工作)。
     let _span = crate::logging::SpanTimer::info("ipc:add_scan_root");
     // 8A：用 root 专用规范化（保留 UNC `//server/share` 前缀），使网络盘/挂载盘可作扫描根（§3.8）。
     let norm = normalize_root_path(&path);
-    let norm_for_scope = norm.clone();
 
     // R1-3：查重（读池）→ 落库（写锁）→ 卷探测（原生 syscall）全是同步阻塞，整段下沉 blocking；
     // 读写混排 + 中途 early-return，不拆套 read/write_blocking 助手（见 blocking.rs 头注释豁免口）。
     let state_arc = Arc::clone(&*state);
-    let root = tokio::task::spawn_blocking(move || {
-        state_arc.with_scan_lifecycle_read(|| -> Result<ScanRoot> {
+    let root = tokio::task::spawn_blocking(move || -> Result<ScanRoot> {
+        if merge_children.unwrap_or(false) {
+            return add_scan_root_merging_children(&state_arc, &norm, alias.as_deref());
+        }
+        require_scan_lifecycle(state_arc.with_scan_lifecycle_read(|| -> Result<ScanRoot> {
             // 检查根目录是否已存在
             {
                 let pool = state_arc.db_read_pool.get().map_err(AppError::from)?;
@@ -100,29 +103,112 @@ pub async fn add_scan_root(
             // S1：新根/顶级目录已入库（目录映射与成员变化）→ bump。
             state_arc.bump_data_version();
             Ok(root)
-        })
+        }))?
     })
     .await
-    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))?
-    .ok_or_else(scan_database_clearing)??;
+    .map_err(|e| AppError::internal("内部任务失败 | internal task failed", e))??;
 
     // Grant asset-protocol read access to this root so its images load via convertFileSrc
     // (the static config no longer opens whole drives). See E1 in docs/archive/perf_hardening_plan_v2.md.
     // 落库成功后才授 asset 协议读权限(审查 F-05 同款时序:授权面=进程生命周期,失败路径
     // 不得留下不属于媒体库的 WebView 可读面)。已存在根的 early-return 也走到这——重复授权幂等。
     // 失败只告警不阻断:仅影响图片显示,根已成立。
-    if let Err(e) = app
-        .asset_protocol_scope()
-        .allow_directory(&norm_for_scope, true)
-    {
+    if let Err(e) = app.asset_protocol_scope().allow_directory(&root.path, true) {
         tracing::warn!(
             "Failed to allow scan root {} in asset scope | 扫描根授权失败: {}",
-            norm_for_scope,
+            root.path,
             e
         );
     }
 
     Ok(root)
+}
+
+fn scan_merge_path_error() -> AppError {
+    AppError::Scan {
+        code: "scan_merge_invalid_path",
+        message: "无法确认合并目录的真实位置，原库未改动 | Cannot verify merge directory paths"
+            .into(),
+    }
+}
+
+fn add_scan_root_merging_children(
+    state: &AppState,
+    path: &str,
+    alias: Option<&str>,
+) -> Result<ScanRoot> {
+    require_scan_lifecycle(
+        state.with_scan_roots_reorganization(|| -> Result<ScanRoot> {
+            let parent = dunce::canonicalize(path).map_err(|_| scan_merge_path_error())?;
+            if !parent.is_dir() {
+                return Err(scan_merge_path_error());
+            }
+            let parent_path = normalize_root_path(&parent.to_string_lossy());
+            let roots = {
+                let pool = state.db_read_pool.get().map_err(AppError::from)?;
+                q::list_scan_roots(&pool)?
+            };
+            let mut sources = Vec::new();
+            let requested_prefix = format!("{}/", normalize_root_path(path).trim_end_matches('/'));
+            for root in roots {
+                let lexical_child = if cfg!(windows) {
+                    root.path
+                        .to_lowercase()
+                        .starts_with(&requested_prefix.to_lowercase())
+                } else {
+                    root.path.starts_with(&requested_prefix)
+                };
+                let canonical = match dunce::canonicalize(&root.path) {
+                    Ok(canonical) => canonical,
+                    Err(_) if lexical_child => return Err(scan_merge_path_error()),
+                    // 无关的离线库不应阻断另一个目录的合并。
+                    Err(_) => continue,
+                };
+                if canonical == parent {
+                    return Err(AppError::Scan {
+                        code: "scan_merge_conflict",
+                        message:
+                            "目标文件夹已存在于媒体库，未合并 | Target scan root already exists"
+                                .into(),
+                    });
+                }
+                if let Ok(relative) = canonical.strip_prefix(&parent) {
+                    if !canonical.is_dir() {
+                        return Err(scan_merge_path_error());
+                    }
+                    sources.push(q::ScanRootMergeSource {
+                        root_id: root.id,
+                        relative_path: relative.to_string_lossy().replace('\\', "/"),
+                    });
+                } else if lexical_child {
+                    // 指向父根外部的目录链接不能改归父根，否则重新扫描后会失去该库。
+                    return Err(scan_merge_path_error());
+                }
+            }
+            // 卷探测与 canonicalize 都在数据库写锁外完成；事务只迁移索引，不动真实资产。
+            let resolved = PlatformVolumeResolver.resolve(&parent_path);
+            let volume = NewVolume {
+                stable_id: resolved.stable_id,
+                label: None,
+                kind: resolved.kind,
+                last_mount_path: Some(resolved.mount_path),
+                last_seen: None,
+                is_online: true,
+            };
+            let root = {
+                let mut conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
+                q::merge_scan_root_children(&mut conn, &parent_path, alias, &volume, &sources)?
+            };
+            // 根级写入被当前闸门隔离；提交前不取消，失败便能继续原来的扫描。
+            for source in sources {
+                state.cancel_scan_under_root_gate(source.root_id);
+                state.tree_snapshots.invalidate_root(source.root_id);
+            }
+            state.bump_data_version();
+            state.dedup_folder_stats_cache.clear();
+            Ok(root)
+        }),
+    )?
 }
 
 /// 移除扫描根目录及其所有数据 (CASCADE)。

@@ -12,7 +12,7 @@
 //!
 //! fixture 用 lavfi(testsrc2/sine)运行时合成到 temp,不入库大二进制。
 //!
-//! 本文件含两类覆盖,**层级不同,如实分开说明**(V3 深审修复批 #11)。
+//! 本文件覆盖参数级链路与真实 worker 进程协议链路。
 //!
 //! `e2e_probe_remux_transcode_frames` 是**参数级链路**:以黑盒方式手写复现 worker 拼装的
 //! ffmpeg 命令(参数与各 `build_*_args` 一致)+ ffprobe 复核断言,验证真实 ffmpeg 确实吃
@@ -97,7 +97,7 @@ fn synth(
 }
 
 /// 探测 ffmpeg 是否内含 libopenh264 编码器(`-encoders` 输出核实,不假设固定存在——
-/// 不同渠道的 LGPL-shared 构建可能裁剪掉软编 H.264,#10 深审修复)。
+/// 不同渠道的 LGPL-shared 构建可能裁剪掉软编 H.264）。
 fn has_libopenh264(ffmpeg: &Path) -> bool {
     let out = Command::new(ffmpeg)
         .args(["-hide_banner", "-encoders"])
@@ -319,7 +319,7 @@ fn e2e_probe_remux_transcode_frames() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// **worker 进程级** e2e(#11 深审修复):真 spawn 编译出的 video-worker.exe,走真实
+/// worker 进程级 e2e：spawn 编译出的 video-worker.exe，走真实
 /// Hello/Ready 握手 + VideoSessionInit(真 ffmpeg 路径 + sha256)+ VideoProbe 一条完整
 /// 协议帧链路。协议帧读写样板抄 `exotic-protocol` 本 crate 的帧测试样式(`frame.rs`
 /// `#[cfg(test)]` roundtrip 用法)与 host 侧 `worker.rs` 的 spawn 握手流程。

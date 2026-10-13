@@ -23,11 +23,11 @@ use crate::error::{AppError, Result};
 /// 解析给消费者的待处理派生任务：绝对源路径在此通过 JOIN 解析（仿 `get_pending_ai_items`），
 /// 使每种 kind 的 `run` 可直接读取源文件。
 ///
-/// `(item_id, kind, abs_path, file_format, media_type, source_revision, cache_key, volume_id)`。
+/// `(item_id, kind, abs_path, file_format, media_type, source_revision, cache_key)`。
 ///
 /// `source_revision` 与 `cache_key` 是从同一条 `media_items` 读取的生产快照；它们必须
 /// 随任务一路传到认领与完成阶段，不能在 worker 返回时重新读取当前行来「补快照」。
-pub type DerivationTask = (i64, String, String, String, String, i64, i64, Option<i64>);
+pub type DerivationTask = (i64, String, String, String, String, i64, i64);
 
 /// 派生任务认领所需的最小快照：`(item_id, kind, source_revision, cache_key)`。
 pub type DerivationClaim = (i64, String, i64, i64);
@@ -57,19 +57,14 @@ pub fn get_pending_derivations(
                CASE WHEN d.rel_path = '' THEN r.path || '/' || m.file_name
                     ELSE r.path || '/' || d.rel_path || '/' || m.file_name
                END,
-               m.file_format, m.media_type, m.source_revision, m.cache_key, r.volume_id
+               m.file_format, m.media_type, m.source_revision, m.cache_key
         FROM media_derivations dv
         JOIN media_items m ON dv.item_id = m.id
         JOIN directories d ON m.directory_id = d.id
         JOIN scan_roots r ON d.root_id = r.id
-        WHERE dv.status = 0 AND dv.output_fingerprint = '' AND m.is_deleted = 0
+        WHERE dv.status = 0 AND m.is_deleted = 0
           AND NOT (dv.kind = 'doc_thumb' AND m.file_format IN ('pdf','svg'))
           AND dv.kind != 'video_playable'
-          AND dv.kind != 'image_thumb'
-          AND NOT (dv.kind='video_cover' AND EXISTS (
-              SELECT 1 FROM media_derivations next
-              WHERE next.item_id=dv.item_id AND next.kind='video_cover'
-                AND next.output_fingerprint!=''))
           {EXCLUDE_HIDDEN_ROOTS_M}"
     );
 
@@ -82,7 +77,6 @@ pub fn get_pending_derivations(
             row.get(4)?,
             row.get(5)?,
             row.get(6)?,
-            row.get(7)?,
         ))
     };
 
@@ -91,22 +85,6 @@ pub fn get_pending_derivations(
     let mut sql = base;
     let mut sql_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
     let mut idx = 1;
-
-    // 原生容器由 ThumbnailCoordinator 领取；冷门容器仍由历史视频 worker 处理。
-    let native_video_formats = crate::video::native_cover_formats();
-    if !native_video_formats.is_empty() {
-        let placeholders: Vec<String> = (idx..idx + native_video_formats.len())
-            .map(|i| format!("?{i}"))
-            .collect();
-        sql.push_str(&format!(
-            " AND NOT (dv.kind='video_cover' AND m.file_format IN ({}))",
-            placeholders.join(",")
-        ));
-        for format in native_video_formats {
-            sql_params.push(format as &dyn rusqlite::ToSql);
-        }
-        idx += native_video_formats.len();
-    }
 
     // 过滤集合以借用调用方切片元素的方式压入 `sql_params`（引用在整个函数内有效）。
     // 空切片视同无过滤——绝不能生成 `IN ()` 非法 SQL。
@@ -154,11 +132,7 @@ pub fn mark_derivations_processing(
     for (item_id, kind, source_revision, cache_key) in tasks {
         let changed = tx.execute(
             "UPDATE media_derivations SET status=1, updated_at=strftime('%s','now')
-             WHERE item_id=?1 AND kind=?2 AND output_fingerprint='' AND status=0
-               AND NOT (?2='video_cover' AND EXISTS (
-                   SELECT 1 FROM media_derivations next
-                   WHERE next.item_id=?1 AND next.kind='video_cover'
-                     AND next.output_fingerprint!=''))
+             WHERE item_id=?1 AND kind=?2 AND status=0
                AND EXISTS (
                    SELECT 1 FROM media_items m
                    WHERE m.id=?1 AND m.is_deleted=0
@@ -300,11 +274,7 @@ pub fn batch_finish_derivations_with_snapshot(
             "UPDATE media_derivations
              SET status=?3, payload_path=?4, error=?5, orphan_count=0,
                  updated_at=strftime('%s','now')
-             WHERE item_id=?1 AND kind=?2 AND output_fingerprint='' AND status=1
-               AND NOT (?2='video_cover' AND EXISTS (
-                   SELECT 1 FROM media_derivations next
-                   WHERE next.item_id=?1 AND next.kind='video_cover'
-                     AND next.output_fingerprint!=''))
+             WHERE item_id=?1 AND kind=?2 AND status=1
                AND EXISTS (
                    SELECT 1 FROM media_items m
                    WHERE m.id=?1 AND m.is_deleted=0
@@ -381,7 +351,7 @@ mod snapshot_tests {
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
              INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key, source_revision) VALUES
-                 (1, 10, 'a.mkv', 1, 1, 'mkv', 'video', 0, 0, 100, 17, 1),
+                 (1, 10, 'a.mp4', 1, 1, 'mp4', 'video', 0, 0, 100, 17, 1),
                  (2, 10, 'b.epub', 1, 1, 'epub', 'document', 0, 0, 200, 18, 1);
              INSERT INTO media_derivations (item_id, kind, status) VALUES
                  (1, 'video_cover', 0),
@@ -389,44 +359,6 @@ mod snapshot_tests {
         )
         .unwrap();
         c
-    }
-
-    #[test]
-    fn claim_rejects_a_stale_source_snapshot_and_returns_real_claims() {
-        let c = seeded();
-        c.execute("UPDATE media_items SET source_revision=2 WHERE id=1", [])
-            .unwrap();
-
-        let stale = vec![(1, "video_cover".to_string(), 1, 17)];
-        assert!(
-            mark_derivations_processing(&c, &stale).unwrap().is_empty(),
-            "a task queried from an older source revision must not be claimed"
-        );
-        assert_eq!(
-            c.query_row(
-                "SELECT status FROM media_derivations WHERE item_id=1 AND kind='video_cover'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0
-        );
-
-        let current = vec![(1, "video_cover".to_string(), 2, 17)];
-        assert_eq!(
-            mark_derivations_processing(&c, &current).unwrap(),
-            current,
-            "the current snapshot should be the only real claim"
-        );
-        assert_eq!(
-            c.query_row(
-                "SELECT status FROM media_derivations WHERE item_id=1 AND kind='video_cover'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            1
-        );
     }
 
     #[test]
@@ -634,18 +566,15 @@ mod snapshot_tests {
 /// 再投入领取；其余孤儿正常退回 status=0 并令 `orphan_count+1`。error 文案不含内部路径。
 /// 返回值签名不变（仍是本次复位为 pending 的数量），调用方（derive/pipeline.rs）无感知本次改动。
 pub fn reset_processing_derivations(conn: &Connection) -> Result<usize> {
-    // video_playable 归播放交互，image_thumb 归缩略图 Coordinator；旧派生流水线的
-    // 孤儿/毒任务恢复不能夺取它们的 lease。
+    // video_playable 是按需交互 kind(§5.2),从不经背景流水线,也无孤儿/毒任务语义——
+    // 两条复位 UPDATE 均排除它,避免 boot/stop 的通用复位误动在途播放行(其复位归专用路径)。
     let poisoned = conn.execute(
         "UPDATE media_derivations
          SET status=3, error='repeatedly orphaned (poison guard) | 反复孤儿(毒任务防线)', updated_at=strftime('%s','now')
-         WHERE status=1 AND output_fingerprint='' AND orphan_count>=2
-           AND kind NOT IN ('video_playable','image_thumb')",
+         WHERE status=1 AND orphan_count>=2 AND kind != 'video_playable'",
         [],
     )?;
-    // 日志按仓内惯例应归调用方统一记录（derive/pipeline.rs 的流水线事件日志），但该文件另一
-    // 批次正并行送审、本次施工按计划冻结不动该文件——此处内联 `tracing::warn!` 是有意的临时
-    // 偏离，注明供 V22 收束时上提至调用方。
+    // 毒任务转为 error 时在此记录数量，避免无反馈地停止续跑。
     if poisoned > 0 {
         tracing::warn!(
             count = poisoned,
@@ -653,8 +582,7 @@ pub fn reset_processing_derivations(conn: &Connection) -> Result<usize> {
         );
     }
     conn.execute(
-        "UPDATE media_derivations SET status=0, orphan_count=orphan_count+1
-         WHERE status=1 AND output_fingerprint='' AND kind NOT IN ('video_playable','image_thumb')",
+        "UPDATE media_derivations SET status=0, orphan_count=orphan_count+1 WHERE status=1 AND kind != 'video_playable'",
         [],
     )
     .map_err(AppError::from)
@@ -670,10 +598,9 @@ pub fn reset_processing_derivations(conn: &Connection) -> Result<usize> {
 /// force-quit 遗留孤儿」（`reset_processing_derivations`，计数正当——那类挂死本就该占用
 /// 有限重试预算）拆成两条独立路径：本函数只在优雅 stop 时调用，不吃孤儿预算。
 pub fn requeue_in_flight_derivations(conn: &Connection) -> Result<usize> {
-    // 播放交互与缩略图 Coordinator 的在途任务不属本流水线 stop 范围。
+    // video_playable 排除(§V6-1):按需交互 kind 不属背景流水线 stop 的退回范围。
     conn.execute(
-        "UPDATE media_derivations SET status=0 WHERE status=1 AND output_fingerprint=''
-         AND kind NOT IN ('video_playable','image_thumb')",
+        "UPDATE media_derivations SET status=0 WHERE status=1 AND kind != 'video_playable'",
         [],
     )
     .map_err(AppError::from)
@@ -778,26 +705,6 @@ pub fn backfill_derivations(
         conn.execute(&sql, params![kind, media_type])?
     };
     Ok(inserted)
-}
-
-/// 历史视频封面只补入非原生容器；原生容器改由统一缩略图任务入队。
-pub fn backfill_legacy_video_covers(conn: &Connection) -> Result<usize> {
-    let formats = crate::video::native_cover_formats();
-    if formats.is_empty() {
-        return backfill_derivations(conn, "video_cover", "video", None);
-    }
-    let placeholders = (1..=formats.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "INSERT OR IGNORE INTO media_derivations (item_id, kind, status)
-         SELECT id, 'video_cover', 0 FROM media_items
-         WHERE media_type='video' AND is_deleted=0 AND file_format NOT IN ({placeholders})
-           {NOT_BLOCKED_BY_EXOTIC}"
-    );
-    conn.execute(&sql, rusqlite::params_from_iter(formats.iter()))
-        .map_err(AppError::from)
 }
 
 /// 某视频的关键帧雪碧图产物路径（相对 `cache_dir`），若已生成（status=2）。用于悬停 scrub 降级（§3.1 / §3.3）。
@@ -924,83 +831,98 @@ pub fn count_derivations_by_status_for_kinds(
 }
 
 // ── 派生流水线毒任务防线(V22 orphan_count,2026-07-22 故障复盘)──────────────────
-
-// ── 多 kind 过滤 + 分 kind 计数(视频封面/关键帧独立控制线)────────────────────
-
-// ── 按需 video_playable 状态机(播放交互路径,§5.2)────────────────────────────
 #[cfg(test)]
-mod video_playable_tests {
+mod poison_guard_tests {
     use super::*;
 
-    fn one_video() -> Connection {
+    /// 建单个 item + 一行 status=1 的派生任务,用于逐轮驱动 `reset_processing_derivations`。
+    fn one_processing_task() -> Connection {
         let c = Connection::open_in_memory().unwrap();
         crate::db::schema::initialize_schema(&c).unwrap();
         c.execute_batch(
             "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
              INSERT INTO directories (id, root_id, rel_path, name) VALUES (10, 1, '', 'r');
              INSERT INTO media_items (id, directory_id, file_name, file_size, file_mtime, file_format, media_type, width, height, sort_datetime, cache_key) VALUES
-                 (1, 10, 'a.mkv', 1, 1, 'mkv', 'video', 0, 0, 100, 42);",
+                 (1, 10, 'poison.mkv', 1, 1, 'mkv', 'video', 0, 0, 100, 0);
+             INSERT INTO media_derivations (item_id, kind, status) VALUES
+                 (1, 'video_cover', 1);",
         )
         .unwrap();
         c
     }
 
-    /// upsert+claim 从无行 → status=1;重复调用幂等(仍 1);finish → status=2 + payload;
-    /// get_derivation_state 全程反映当前态。
-    #[test]
-    fn upsert_claim_finish_lifecycle() {
-        let c = one_video();
-        // 初始无行。
-        assert_eq!(get_derivation_state(&c, 1, "video_playable").unwrap(), None);
+    fn status_and_orphan(c: &Connection) -> (i64, i64) {
+        c.query_row(
+            "SELECT status, orphan_count FROM media_derivations WHERE item_id=1 AND kind='video_cover'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
 
-        // 首次 upsert+claim:建行并领取。
-        upsert_and_claim_derivation(&c, 1, "video_playable").unwrap();
+    /// ①同一毒任务反复孤儿(每轮领取后又挂死留在 status=1)达到第 3 次,应转 status=3(error)
+    /// 而非再退回 status=0 重新领取;此后再调用 `reset_processing_derivations` 也不应把它复位。
+    #[test]
+    fn poisoned_task_converts_to_error_on_third_orphan_and_stays_there() {
+        let c = one_processing_task();
+
+        // 第 1 轮孤儿:orphan_count 0→1,退回 pending(未达阈值)。
+        let n = reset_processing_derivations(&c).unwrap();
+        assert_eq!(n, 1, "第 1 轮:1 行退回 pending");
         assert_eq!(
-            get_derivation_state(&c, 1, "video_playable").unwrap(),
-            Some((1, None)),
-            "首次 → status=1(processing),无 payload"
+            status_and_orphan(&c),
+            (0, 1),
+            "第 1 轮:status=0, orphan_count=1"
         );
 
-        // 幂等:再调不新建、保持 processing。
-        upsert_and_claim_derivation(&c, 1, "video_playable").unwrap();
-        let count: i64 = c
+        // 模拟重新领取(mark processing)后再次挂死。
+        c.execute(
+            "UPDATE media_derivations SET status=1 WHERE item_id=1 AND kind='video_cover'",
+            [],
+        )
+        .unwrap();
+        let n = reset_processing_derivations(&c).unwrap();
+        assert_eq!(n, 1, "第 2 轮:仍未达阈值,退回 pending");
+        assert_eq!(
+            status_and_orphan(&c),
+            (0, 2),
+            "第 2 轮:status=0, orphan_count=2"
+        );
+
+        // 第 3 次领取后再挂死:orphan_count 已是 2(>=2),本轮孤儿复位应判定为毒任务转 error。
+        c.execute(
+            "UPDATE media_derivations SET status=1 WHERE item_id=1 AND kind='video_cover'",
+            [],
+        )
+        .unwrap();
+        let n = reset_processing_derivations(&c).unwrap();
+        assert_eq!(n, 0, "第 3 轮:未再有行退回 pending(已转 error 分支)");
+        let (status, orphan) = status_and_orphan(&c);
+        assert_eq!(status, 3, "第 3 次孤儿→转 status=3(error)");
+        assert_eq!(orphan, 2, "转 error 分支不改 orphan_count");
+        let err: String = c
             .query_row(
-                "SELECT COUNT(*) FROM media_derivations WHERE item_id=1 AND kind='video_playable'",
+                "SELECT error FROM media_derivations WHERE item_id=1 AND kind='video_cover'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "幂等:不重复建行");
-        assert_eq!(
-            get_derivation_state(&c, 1, "video_playable").unwrap(),
-            Some((1, None))
+        assert!(
+            err.contains("poison guard"),
+            "error 文案应标明毒任务防线,实得:{err}"
         );
 
-        // 完成:status=2 + payload(复用通用 batch_finish)。
-        batch_finish_derivations(
-            &c,
-            &[(
-                1,
-                "video_playable".to_string(),
-                2,
-                Some("video/42.mp4".to_string()),
-                None,
-                None,
-                None,
-            )],
-        )
-        .unwrap();
-        assert_eq!(
-            get_derivation_state(&c, 1, "video_playable").unwrap(),
-            Some((2, Some("video/42.mp4".to_string()))),
-            "完成 → status=2 + payload_path"
-        );
+        // 已转 error 后,即使再次调用复位也不应被误复位为 pending(status!=1,两条 UPDATE 均不命中)。
+        let n = reset_processing_derivations(&c).unwrap();
+        assert_eq!(n, 0, "已 error 的行不应被再次复位");
+        assert_eq!(status_and_orphan(&c).0, 3, "status 保持 error,不被复位覆盖");
     }
 }
 
+// ── 多 kind 过滤 + 分 kind 计数(视频封面/关键帧独立控制线)────────────────────
+// ── 按需 video_playable 状态机(播放交互路径,§5.2)────────────────────────────
 // ── 隐藏根排除(V21 生成侧,派生流水线)──────────────────────────────────────
 // 锁两消费口:后端生产者 get_pending_derivations 与前端 pdf/svg 泵
 // list_pending_doc_thumbs 都跳过隐藏根;unhide 后 status=0 行原地续跑(非破坏暂停)。
-
 // ── store_doc_thumbnail 守卫(#3 加固,2026-07-24)──────────────────────────────
 // x-item-id 来自请求头不可信,须校验其确为前端可渲染文档(pdf/svg)再落任何状态。

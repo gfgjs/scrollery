@@ -7,6 +7,7 @@
         class="tool"
         :class="{ 'tool--drop': dropIndex === index && dragIndex !== null && dragIndex !== index }"
         :data-tool-index="index"
+        :data-tool-key="key"
       >
         <!-- 拖拽手柄——仅此处发起排序，使卡片内控件仍可使用。
              真按钮 + 方向键即按即移(↑↓ 一位/Home End 首末),
@@ -56,7 +57,7 @@
             </div>
           </div>
           <div
-            v-if="scan.thumbGenProgress.isRunning || scan.thumbGenProgress.status === 'completed'"
+            v-if="scan.thumbGenProgress.status !== 'idle'"
             class="tool__progress"
           >
             <div
@@ -67,10 +68,12 @@
             </div>
             <div class="tool__progress-meta">
               <span>{{ scan.thumbGenProgress.generated }} / {{ scan.thumbGenProgress.total }}</span>
-              <span v-if="scan.thumbGenProgress.isRunning && scan.thumbGenPhaseLabel">{{ scan.thumbGenPhaseLabel }}</span>
               <span v-if="thumbElapsedStr" class="mono">{{ thumbElapsedStr }}</span>
             </div>
-            <div v-if="scan.thumbGenResultsLabel" class="tool__progress-meta">
+            <div v-if="scan.thumbGenProgress.isRunning && scan.thumbGenPhaseLabel" class="tool__description">
+              {{ scan.thumbGenPhaseLabel }}
+            </div>
+            <div v-if="scan.thumbGenResultsLabel" class="tool__description">
               {{ scan.thumbGenResultsLabel }}
             </div>
             <ThumbExecutionSummary />
@@ -164,7 +167,7 @@
                 <RefreshCw :size="14" class="spin-anim" />
               </UiIconButton>
               <UiIconButton
-                v-else-if="aiResumable"
+                v-else
                 :disabled="isAiInitialising"
                 :label="aiPaused ? t('sidebar.resume') : t('sidebar.start')"
                 @click="startOrResume"
@@ -202,9 +205,9 @@
             </div>
             <div class="tool__progress-meta">
               <span>{{ ai.status.analyzedItems }} / {{ ai.status.totalItems }}</span>
-              <span v-if="aiElapsedStr" class="mono push">{{ aiElapsedStr }}</span>
               <span class="mono">{{ ai.analyzeProgress }}%</span>
             </div>
+            <div v-if="aiElapsedStr" class="tool__description mono">{{ aiElapsedStr }}</div>
           </div>
           <!-- 等待原因（可观测性三修 #3）：运行中 + 有具体阻塞源 + 进度确实停滞才现身，
                不在正常吞吐间隙误报（isWaitingBlocked 判定见 useAnalysisController）。 -->
@@ -251,7 +254,7 @@
                 <RefreshCw :size="14" class="spin-anim" />
               </UiIconButton>
               <UiIconButton
-                v-else-if="faceResumable"
+                v-else
                 :disabled="isFaceStarting"
                 :label="facePaused ? t('sidebar.resume') : t('sidebar.start')"
                 @click="startOrResumeFace"
@@ -291,14 +294,14 @@
             </div>
             <div class="tool__progress-meta">
               <span>{{ face.status.processedItems }} / {{ face.status.totalItems }}</span>
-              <span v-if="face.status.personCount > 0" class="mono push">{{
+              <span class="mono">{{ face.analyzeProgress }}%</span>
+            </div>
+            <div v-if="face.status.personCount > 0" class="tool__description">{{
                 t('sidebar.peopleFacesCount', {
                   persons: face.status.personCount,
                   faces: face.status.faceCount,
                 })
-              }}</span>
-              <span class="mono">{{ face.analyzeProgress }}%</span>
-            </div>
+              }}</div>
           </div>
           <!-- 等待原因（可观测性三修 #3），与 AI 卡同款判定与文案映射。 -->
           <div v-if="face.isWaitingBlocked" class="tool__waiting-row">
@@ -319,10 +322,16 @@
         </div>
 
         <!-- 通用：置顶的设置项，使用其紧凑控件渲染。 -->
-        <div v-else-if="getSettingSpec(key)" class="tool__card">
+        <div
+          v-else-if="getSettingSpec(key)"
+          class="tool__card"
+          :class="{
+            'tool__card--inline': ['toggle', 'number', 'button'].includes(getSettingSpec(key)!.control),
+          }"
+        >
           <div class="tool__main">
             <span class="tool__icon"><component :is="getSettingSpec(key)!.icon" :size="18" /></span>
-            <span class="tool__label tool__label--ellipsis">{{
+            <span class="tool__label">{{
               $t(getSettingSpec(key)!.label)
             }}</span>
           </div>
@@ -472,9 +481,8 @@ function onKeyframesToggle(e: Event) {
 // ── AI 分析控制 + 计时 ───────────────────────────────────────────────────────
 const isAiInitialising = ref(false)
 
-// 已暂停 = 未运行但仍「期望运行」且有剩余（问题7 的续传态），且不在资源等待中——后者另有
-// 排队指示（waitingForSession），不算用户手动暂停。可开始 = 有待处理项。
-const aiResumable = computed(() => ai.status.pendingItems > 0)
+// 计数可能尚未刷新或模型尚未初始化，开始入口始终保留；能否执行由既有启动流程判断。
+// 已暂停 = 未运行但仍「期望运行」且有剩余，且不在资源等待中。
 const aiPaused = computed(
   () =>
     !ai.status.isAnalyzing &&
@@ -520,13 +528,6 @@ const { elapsedStr: aiElapsedStr } = useElapsedTimer(
 // ── 人脸识别控制（F5）────────────────────────────────────────────────────────
 const isFaceStarting = ref(false)
 
-// 兜底放宽：除 pending>0 外，「有总量但尚未全部处理完」也视为可开始——避免状态拉取时机
-// 缺口（加文件夹后 pending 未刷新）导致「开始」按钮该现不现（问题1）。
-const faceResumable = computed(
-  () =>
-    face.status.pendingItems > 0 ||
-    (face.status.totalItems > 0 && face.status.processedItems < face.status.totalItems),
-)
 const facePaused = computed(
   () =>
     !face.status.isAnalyzing &&
@@ -586,7 +587,7 @@ watch(
 
 // ── 共享的计时助手 ───────────────────────────────────────────────────────────
 // 一个 rAF 时钟：`isRunning()` 为真时走动，`keepAfter()` 为真时保留最后的值
-//（如已完成的任务）。返回 "Xm Y.ZZZs"。
+//（如已完成的任务）。侧栏只显示到秒，避免计时文本挤占进度空间。
 function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   const ms = ref(0)
   let startedAt: number | null = null
@@ -624,13 +625,13 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   })
 
   const elapsedStr = computed(() => {
-    if (ms.value === 0 && !isRunning() && !keepAfter()) return ''
+    // 挂载前已完成的任务没有本次计时，不能把未测得的耗时显示成零。
+    if (!isRunning() && (ms.value === 0 || !keepAfter())) return ''
     const total = ms.value
     const secs = Math.floor(total / 1000)
     const m = Math.floor(secs / 60)
     const s = secs % 60
-    const msPart = String(total % 1000).padStart(3, '0')
-    return `${m}m ${s}.${msPart}s`
+    return `${m}m ${s}s`
   })
 
   return { elapsedStr }
@@ -653,6 +654,7 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   align-items: stretch;
   gap: 4px;
   position: relative;
+  min-width: 0;
 }
 .tool__handle {
   display: flex;
@@ -660,6 +662,9 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   justify-content: center;
   /* 列表 padding 8 + 手柄 18 + gap 4 = 卡片左缘 30,对齐 --sidebar-indent 内容轨。 */
   width: 18px;
+  height: var(--control-size-compact);
+  align-self: flex-start;
+  margin-top: var(--spacing-sm);
   padding: 0; /* 压掉 UA button 默认内边距(全局 reset 未清 padding) */
   flex-shrink: 0;
   color: var(--color-text-tertiary);
@@ -667,7 +672,8 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   opacity: 0;
   transition: opacity var(--transition-fast);
 }
-.tool:hover .tool__handle {
+.tool:hover .tool__handle,
+.tool:focus-within .tool__handle {
   opacity: 0.6;
 }
 /* 键盘聚焦时手柄必须可见(平时 opacity:0 只对指针悬停现身)。 */
@@ -700,11 +706,11 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--spacing-xs);
+  gap: var(--spacing-sm);
   padding: var(--spacing-sm);
   background: var(--color-bg-surface);
   border: none;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   box-shadow: none;
 }
 .tool__card:hover {
@@ -712,9 +718,14 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
 }
 .tool__row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: var(--spacing-sm);
+  gap: var(--spacing-xs) var(--spacing-sm);
+  min-height: var(--control-size-compact);
+}
+.tool__row > .tool__main {
+  flex: 1 1 120px;
 }
 .ai-actions,
 .thumb-actions {
@@ -722,6 +733,7 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   align-items: center;
   gap: var(--spacing-2xs);
   flex-shrink: 0;
+  margin-inline-start: auto;
 }
 .tool__main {
   display: flex;
@@ -730,6 +742,8 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   min-width: 0;
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
+  line-height: 1.45;
+  min-height: var(--control-size-compact);
 }
 .tool__icon {
   width: 20px;
@@ -738,40 +752,67 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   justify-content: center;
 }
 .tool__label {
-  white-space: nowrap;
-  /* 一律可截断:长语言(如德语)标签在窄侧栏会撑破卡片;.tool__main 已有 min-width:0,
-     此处补 overflow 使 flex 收缩链完整生效。 */
+  /* 工具标题必须可读；窄侧栏允许标题和操作分行，避免只剩省略号。 */
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+  font-weight: 500;
 }
-.tool__label--ellipsis {
-  flex: 1;
+.tool__card--inline {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.tool__card--inline > .tool__main {
+  flex: 1 1 100px;
+}
+.tool__card--inline > .dynamic-control {
+  width: auto;
+  max-width: 100%;
+  margin-inline-start: auto;
 }
 
 /* ── Progress ─────────────────────────────────────────────────────────────── */
 .tool__progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  min-width: 0;
+  padding-top: var(--spacing-sm);
+  border-top: 1px solid var(--color-border);
   font-size: var(--font-size-xs);
-  color: var(--color-text-tertiary);
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
 }
 .tool__progress-meta {
   display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-2xs) var(--spacing-sm);
   justify-content: space-between;
   align-items: center;
+  font-variant-numeric: tabular-nums;
+}
+.tool__progress-meta > span {
+  min-width: 0;
+}
+.tool__description {
+  overflow-wrap: anywhere;
 }
 /* 视频派生卡的关键帧勾选行:紧凑小字,与卡内进度元字号一致。 */
 .video-derive-keyframes {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--spacing-xs);
   font-size: var(--font-size-xs);
   color: var(--color-text-tertiary);
   cursor: pointer;
   user-select: none;
+  line-height: 1.5;
 }
 .video-derive-keyframes input {
   accent-color: var(--color-accent);
-  margin: 0;
+  margin: 2px 0 0;
+  flex-shrink: 0;
 }
 .video-derive-keyframes input:disabled {
   cursor: not-allowed;
@@ -779,19 +820,29 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
 
 /* 等待原因行（可观测性三修 #3）：中性提示色，区别于下方失败面的错误色。 */
 .tool__waiting-row {
-  margin-top: var(--spacing-xs);
   font-size: var(--font-size-xs);
   color: var(--color-text-tertiary);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 /* 失败面行（审查 A11/F9）：错误色文本 + 行内重试按钮。 */
 .tool__error-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--spacing-xs);
-  margin-top: var(--spacing-sm);
   font-size: var(--font-size-xs);
   color: var(--color-error);
+  line-height: 1.5;
+}
+.tool__error-row > svg {
+  flex-shrink: 0;
+}
+.tool__error-row > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .tool__retry-btn {
   margin-left: auto;
@@ -802,6 +853,8 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
   background: transparent;
   color: var(--color-error);
   cursor: pointer;
+  flex-shrink: 0;
+  min-height: var(--control-size-compact);
   transition:
     background-color var(--transition-fast),
     color var(--transition-fast);
@@ -813,16 +866,11 @@ function useElapsedTimer(isRunning: () => boolean, keepAfter: () => boolean) {
 .mono {
   font-family: var(--font-mono);
 }
-.push {
-  margin-right: auto;
-  margin-left: var(--spacing-sm);
-}
 .progress-bar {
   height: 3px;
   border-radius: var(--radius-xs);
   background: var(--color-border);
   overflow: hidden;
-  margin-bottom: var(--spacing-xs);
 }
 .progress-bar__fill {
   height: 100%;

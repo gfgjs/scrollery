@@ -156,28 +156,24 @@ fn shared_budget(disk: u32) -> Arc<DiskBudget> {
     budget
 }
 
-/// 只在系统确认存在寻道惩罚且能取得单个设备号时自动调度；未知设备保持既有路径。
-pub(crate) fn for_root(path: &str) -> Option<Arc<DiskBudget>> {
-    let device = storage_device(path, None)?;
-    device
-        .incurs_seek_penalty
-        .then(|| shared_budget(device.number))
+#[cfg(test)]
+pub(crate) fn test_budget(header_limit: usize) -> Arc<DiskBudget> {
+    Arc::new(DiskBudget::new(0, header_limit))
 }
 
-/// 系统确认的单设备身份和寻道属性；未知、多盘卷保持 None。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StorageDevice {
-    pub number: u32,
-    pub incurs_seek_penalty: bool,
+/// 只在系统确认存在寻道惩罚且能取得单个设备号时自动调度；未知设备保持既有路径。
+pub(crate) fn for_root(path: &str) -> Option<Arc<DiskBudget>> {
+    let disk = seek_penalty_disk(path)?;
+    Some(shared_budget(disk))
 }
 
 #[cfg(not(windows))]
-pub(crate) fn storage_device(_path: &str, _expected_volume: Option<&str>) -> Option<StorageDevice> {
+fn seek_penalty_disk(_path: &str) -> Option<u32> {
     None
 }
 
 #[cfg(windows)]
-pub(crate) fn storage_device(path: &str, expected_volume: Option<&str>) -> Option<StorageDevice> {
+fn seek_penalty_disk(path: &str) -> Option<u32> {
     use std::ffi::c_void;
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows::core::PCWSTR;
@@ -208,12 +204,6 @@ pub(crate) fn storage_device(path: &str, expected_volume: Option<&str>) -> Optio
     }
     let end = volume.iter().position(|&v| v == 0)?;
     let name = String::from_utf16(&volume[..end]).ok()?;
-    // 可移动盘复用盘符时，旧卷记录不能借用新设备的并行额度。
-    if expected_volume.is_some_and(|expected| {
-        !expected.eq_ignore_ascii_case(&format!("win:{}", name.trim_end_matches('\\')))
-    }) {
-        return None;
-    }
     let file = std::fs::OpenOptions::new()
         .read(true)
         .access_mode(0)
@@ -236,7 +226,12 @@ pub(crate) fn storage_device(path: &str, expected_volume: Option<&str>) -> Optio
             std::ptr::null_mut(),
         )
     };
-    if ok == 0 || returned < 9 || descriptor[0] < 12 || descriptor[1] < 12 {
+    if ok == 0
+        || returned < 9
+        || descriptor[0] < 12
+        || descriptor[1] < 12
+        || descriptor[2] & 0xff == 0
+    {
         return None;
     }
     // STORAGE_DEVICE_NUMBER；跨盘卷不支持该请求时保持 Unknown，不按盘符猜物理盘。
@@ -253,8 +248,5 @@ pub(crate) fn storage_device(path: &str, expected_volume: Option<&str>) -> Optio
             std::ptr::null_mut(),
         )
     };
-    (ok != 0 && returned >= 12 && device[0] == 7).then_some(StorageDevice {
-        number: device[1],
-        incurs_seek_penalty: descriptor[2] & 0xff != 0,
-    })
+    (ok != 0 && returned >= 12 && device[0] == 7).then_some(device[1])
 }

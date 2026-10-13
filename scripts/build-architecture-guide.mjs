@@ -6,7 +6,8 @@ import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { Marked } from 'marked'
-import { launchGuideBrowser, inspectPage, inspectSourceLinks } from './architecture-guide/checks.mjs'
+import puppeteer from 'puppeteer-core'
+import { findBrowser, inspectPage, inspectSourceLinks } from './architecture-guide/checks.mjs'
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url))
 const DOCS = 'docs/architecture/'
@@ -252,8 +253,7 @@ function assemble() {
 
 async function main() {
   for (const doc of docs) renderDoc(doc)
-  const session = await launchGuideBrowser()
-  const { browser } = session
+  const browser = await puppeteer.launch({ executablePath: findBrowser(), headless: true })
   try {
     const page = await browser.newPage()
     await renderFigures(page)
@@ -280,7 +280,7 @@ async function main() {
       if (fs.existsSync(`${output}.tmp`)) fs.unlinkSync(`${output}.tmp`)
     }
   } finally {
-    await session.close()
+    await browser.close()
   }
 }
 main().catch((error) => { console.error(error.message); process.exitCode = 1 })

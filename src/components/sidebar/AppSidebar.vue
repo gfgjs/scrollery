@@ -1,6 +1,5 @@
 <template>
   <nav class="sidebar">
-    <!-- 顶栏重构 Phase G: 品牌 logo 已移入自绘标题栏(TitlebarBrand), 侧栏顶部不再置 logo -->
 
     <!-- 可滚动的手风琴区域。区块标题（经由 AccordionSection 的两根片段）是直接子
          元素，因此能在整个滚动范围内粘顶+粘底并堆叠——见 AccordionSection.vue。 -->

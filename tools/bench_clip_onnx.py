@@ -12,19 +12,19 @@
      报告 warmup 后的平均/中位延迟与吞吐。
 
 EP（执行器）：默认按可用性自动选（DmlExecutionProvider > CUDA > CPU）；--provider 可强制。
-注意本机当前 ORT 仅装了 CPU/Azure（App 运行时才有 DirectML）；GPU 基准请到带 DML 的环境跑。
+GPU 基准需在对应执行器可用的环境运行。
 
 用法示例（PowerShell）：
   # 先导出几个变体
-  python .models/export_clip_onnx.py --arch ViT-L-14-336 --batch 1 --skip-text
-  python .models/export_clip_onnx.py --arch ViT-L-14-336 --batch 8 --skip-text
-  python .models/export_clip_onnx.py --arch ViT-L-14-336 --dynamic-batch --skip-text
+  python tools/export_clip_onnx.py --arch ViT-L-14-336 --batch 1 --skip-text
+  python tools/export_clip_onnx.py --arch ViT-L-14-336 --batch 8 --skip-text
+  python tools/export_clip_onnx.py --arch ViT-L-14-336 --dynamic-batch --skip-text
   # 再分别基准
-  python .models/bench_clip_onnx.py --arch ViT-L-14-336 --batch 1
-  python .models/bench_clip_onnx.py --arch ViT-L-14-336 --batch 8
-  python .models/bench_clip_onnx.py --arch ViT-L-14-336 --dynamic-batch --infer-batch 8
+  python tools/bench_clip_onnx.py --arch ViT-L-14-336 --batch 1
+  python tools/bench_clip_onnx.py --arch ViT-L-14-336 --batch 8
+  python tools/bench_clip_onnx.py --arch ViT-L-14-336 --dynamic-batch --infer-batch 8
   # 带数值/语义校验
-  python .models/bench_clip_onnx.py --arch ViT-B-16 --batch 1 --prec fp16 --check
+  python tools/bench_clip_onnx.py --arch ViT-B-16 --batch 1 --prec fp16 --check
 """
 
 import argparse
@@ -36,7 +36,7 @@ import onnxruntime as ort
 
 from cn_clip.clip.utils import _MODEL_INFO, _MODELS
 
-# 与 export_clip_onnx.py 共用同一套路径/命名规则（脚本在 .models/ 自身）。
+# 与 export_clip_onnx.py 共用路径/命名规则；当前模型根指向脚本所在的 tools/ 目录。
 MODELS_DIR = os.path.dirname(os.path.abspath(__file__))
 CTX = 52
 

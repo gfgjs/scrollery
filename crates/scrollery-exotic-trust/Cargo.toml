@@ -1,5 +1,5 @@
 # crates/scrollery-exotic-trust/Cargo.toml
-# 插件平台共用的信任根与验签原语，依赖方向：plugin-api ← exotic-trust ← src-tauri。
+# 插件平台共用的信任根与验签原语，由 src-tauri 的安装与发行目录校验使用。
 # 默认内置占位公钥；发布可经 PICASA_EXOTIC_KEYSET_FILE 注入验签公钥集，私钥不入仓。
 
 [package]
@@ -15,19 +15,17 @@ path = "src/lib.rs"
 
 [features]
 # test-support：把 crypto 的确定性签名/keyset 构造工具（test_support 模块）暴露给**下游 crate 的测试**。
-# 必要性：crypto 迁出 src-tauri 后，src-tauri 的 installer/registry/package/install/license 测试仍需
+# 必要性：crypto 迁出 src-tauri 后，src-tauri 的 installer/registry/package/install 测试仍需
 # 这些工具，而 `#[cfg(test)]` 项**不跨 crate 可见**。故经本 feature 门控，由 src-tauri 在
 # [dev-dependencies] 启用；生产依赖不启用 → 测试密钥绝不编入 Release。
 test-support = []
 
 [dependencies]
-# 拿 LicenseError / LicenseStatus（verify_token/evaluate_token 的返回类型），最底叶 crate、单向依赖。
-scrollery-plugin-api = { path = "../scrollery-plugin-api" }
 # ring：离线 Ed25519 verify_strict（复用既有依赖，零新增）。
 ring = "0.17"
-# base64：License token / 公钥的 base64(url) 编解码。
+# base64：公钥及签名的 base64(url) 编解码。
 base64 = "0.22"
-# serde(+json)：keyset JSON 解析 + LicensePayload 反序列化。
+# serde(+json)：keyset JSON 解析。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # thiserror：CryptoError 结构化。

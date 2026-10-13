@@ -82,20 +82,26 @@ export function useEditPreview() {
   const previewHeight = ref(0)
   const loading = ref(false)
   const error = ref<IpcError | Error | null>(null)
+  let generation = 0
 
   function dispose(): void {
+    // 编辑器关闭后，正在解码的旧请求不得再分配无人释放的 Blob URL。
+    generation++
+    loading.value = false
     if (url.value) URL.revokeObjectURL(url.value)
     url.value = null
   }
 
   async function load(itemId: number): Promise<void> {
     dispose()
+    const request = generation
     loading.value = true
     error.value = null
     try {
       const raw = await invokeIpc<ArrayBuffer | Uint8Array | number[]>(IPC.GET_EDIT_PREVIEW, {
         itemId,
       })
+      if (request !== generation) return
       const packet = parseEditPreviewPacket(raw)
       sourceWidth.value = packet.sourceWidth
       sourceHeight.value = packet.sourceHeight
@@ -105,9 +111,9 @@ export function useEditPreview() {
       const blobBytes = Uint8Array.from(packet.encoded)
       url.value = URL.createObjectURL(new Blob([blobBytes], { type: packet.mimeType }))
     } catch (cause) {
-      error.value = cause as IpcError | Error
+      if (request === generation) error.value = cause as IpcError | Error
     } finally {
-      loading.value = false
+      if (request === generation) loading.value = false
     }
   }
 

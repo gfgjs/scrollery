@@ -1,5 +1,5 @@
 // src-tauri/src/scanner/enricher.rs
-//! 阶段 2：后台信息丰富 — EXIF、XMP 动态照片、实况照片配对、sort_datetime 修正。
+//! 后台补全 EXIF、XMP 动态照片、实况照片配对和 sort_datetime。
 //!
 //! 在快速扫描完成后异步运行。
 //! 发送 `db:media_enriched` 和 `enrichment:completed` Tauri 事件。
@@ -418,15 +418,46 @@ impl EnrichmentCompletedPayload {
 struct ScanGeneration<'a> {
     state: &'a AppState,
     root_id: i64,
-    generation: u64,
+    lease: EnrichmentLease,
+}
+
+#[derive(Clone, Copy)]
+enum EnrichmentLease {
+    Scan(u64),
+    Database(u64),
+}
+
+impl ScanGeneration<'_> {
+    fn is_current(self) -> bool {
+        match self.lease {
+            EnrichmentLease::Scan(generation) => self
+                .state
+                .is_scan_generation_current(self.root_id, generation),
+            EnrichmentLease::Database(epoch) => {
+                self.state.is_database_epoch_current(epoch)
+                    && !self.state.any_scan_running(&[self.root_id])
+            }
+        }
+    }
+
+    fn with_write<T>(self, action: impl FnOnce() -> T) -> Option<T> {
+        match self.lease {
+            EnrichmentLease::Scan(generation) => {
+                self.state
+                    .with_scan_generation_write(self.root_id, generation, action)
+            }
+            EnrichmentLease::Database(epoch) => self
+                .state
+                .with_scan_root_epoch_write(self.root_id, epoch, || {
+                    (!self.state.any_scan_running(&[self.root_id])).then(action)
+                })
+                .flatten(),
+        }
+    }
 }
 
 fn ensure_scan_generation(context: Option<ScanGeneration<'_>>) -> Result<()> {
-    if context.is_some_and(|context| {
-        !context
-            .state
-            .is_scan_generation_current(context.root_id, context.generation)
-    }) {
+    if context.is_some_and(|context| !context.is_current()) {
         return Err(AppError::Cancelled);
     }
     Ok(())
@@ -440,8 +471,7 @@ fn with_scan_db_write<T>(
 ) -> Result<T> {
     if let Some(context) = context {
         return context
-            .state
-            .with_scan_generation_write(context.root_id, context.generation, || {
+            .with_write(|| {
                 let conn = writer.lock().unwrap_or_else(|e| e.into_inner());
                 write(&conn)
             })
@@ -456,11 +486,7 @@ fn with_scan_db_write<T>(
 /// 只把极短的 bump/事件发布也绑定到当前代次，防止旧轮在新轮安装后刷新前端状态。
 fn with_scan_action(context: Option<ScanGeneration<'_>>, action: impl FnOnce()) -> Result<()> {
     if let Some(context) = context {
-        if context
-            .state
-            .with_scan_generation_write(context.root_id, context.generation, action)
-            .is_none()
-        {
+        if context.with_write(action).is_none() {
             return Err(AppError::Cancelled);
         }
         return Ok(());
@@ -533,7 +559,32 @@ pub fn run_enrichment_with_generation(
         Some(ScanGeneration {
             state,
             root_id,
-            generation,
+            lease: EnrichmentLease::Scan(generation),
+        }),
+    )
+}
+
+/// 文件监听补全绑定数据库 epoch 和源版本；用户扫描开始后让位，不占用扫描轮次。
+pub(crate) fn run_watch_enrichment(
+    app: &AppHandle,
+    state: &AppState,
+    root_id: i64,
+    epoch: u64,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    run_enrichment_inner(
+        app,
+        &state.db_writer,
+        root_id,
+        &format!("fs-watch-{root_id}-{epoch}"),
+        "date",
+        "datetime",
+        "desc",
+        cancel,
+        Some(ScanGeneration {
+            state,
+            root_id,
+            lease: EnrichmentLease::Database(epoch),
         }),
     )
 }
@@ -633,26 +684,11 @@ fn run_enrichment_inner(
     } else {
         "header_pipeline"
     };
-    let img_pool = reserved_core_pool();
-    let header_pool = header_read_pool();
+    // 文件监听经常触发无图片待处理的补全；拿到首个非空批次才创建线程，批间仍复用同一组池。
+    let image_pools = std::cell::OnceCell::new();
     // 批内流水线的累计分段计时与在途块峰值。口径是单根：多根同时富化时各自独立统计，
     // 这里的峰值不是全局上界。header/parse 在块级真重叠，累计服务时间不可相加当 wall。
     let pipeline_timing = PipelineTiming::default();
-    let header_workers = header_pool
-        .as_ref()
-        .map(rayon::ThreadPool::current_num_threads)
-        .unwrap_or_else(rayon::current_num_threads);
-    let parse_workers = img_pool
-        .as_ref()
-        .map(rayon::ThreadPool::current_num_threads)
-        .unwrap_or_else(rayon::current_num_threads);
-    info!(
-        root_id, run_id, image_io_mode,
-        disk = ?disk_budget.as_ref().map(|budget| budget.disk),
-        header_limit = ?disk_budget.as_ref().map(|budget| budget.header_limit),
-        supplemental_limit = ?disk_budget.as_ref().map(|_| 1),
-        "Image enrichment pipeline: batch={IMAGE_ENRICHMENT_BATCH}, header_chunk={HEADER_CHUNK_ITEMS}, max_inflight_header_chunks={MAX_INFLIGHT_HEADER_CHUNKS}, header_workers={header_workers}, parse_workers={parse_workers}"
-    );
 
     loop {
         if cancel.is_cancelled() {
@@ -784,6 +820,26 @@ fn run_enrichment_inner(
         // 文件句柄）峰值从整批降到 MAX_INFLIGHT_HEADER_CHUNKS 块。选批与写回仍是每
         // IMAGE_ENRICHMENT_BATCH 项一次，视图顺序/source_snapshot 校验/generation 语义不变；
         // 取消时整批放弃（不提前写部分结果，也不提前发布事件）。
+        let (img_pool, header_pool) = image_pools.get_or_init(|| {
+            let img_pool = reserved_core_pool();
+            let header_pool = header_read_pool();
+            let header_workers = header_pool
+                .as_ref()
+                .map(rayon::ThreadPool::current_num_threads)
+                .unwrap_or_else(rayon::current_num_threads);
+            let parse_workers = img_pool
+                .as_ref()
+                .map(rayon::ThreadPool::current_num_threads)
+                .unwrap_or_else(rayon::current_num_threads);
+            info!(
+                root_id, run_id, image_io_mode,
+                disk = ?disk_budget.as_ref().map(|budget| budget.disk),
+                header_limit = ?disk_budget.as_ref().map(|budget| budget.header_limit),
+                supplemental_limit = ?disk_budget.as_ref().map(|_| 1),
+                "Image enrichment pipeline: batch={IMAGE_ENRICHMENT_BATCH}, header_chunk={HEADER_CHUNK_ITEMS}, max_inflight_header_chunks={MAX_INFLIGHT_HEADER_CHUNKS}, header_workers={header_workers}, parse_workers={parse_workers}"
+            );
+            (img_pool, header_pool)
+        });
         let timing_before = pipeline_timing.snapshot();
         let pipeline_started = std::time::Instant::now();
         let parsed: Vec<ImageParseResult> = run_bounded_header_parse(
@@ -1405,7 +1461,7 @@ fn image_queue_fill_sql(order_clause: &str, sort_order: &str, table: &str) -> St
          SELECT m.id FROM media_items m
          LEFT JOIN image_meta im ON im.item_id = m.id
          JOIN directories d ON d.id = m.directory_id
-         WHERE d.root_id=?1 AND m.is_deleted=0 AND m.media_type='image' AND im.item_id IS NULL
+         WHERE d.root_id=?1 AND m.is_deleted=0 AND m.availability='online' AND m.media_type='image' AND im.item_id IS NULL
          {order_clause}, m.id {dir}"
     )
 }
@@ -1419,7 +1475,7 @@ fn image_queue_fetch_sql(table: &str) -> String {
          JOIN media_items m ON m.id = q.item_id
          JOIN directories d ON d.id = m.directory_id
          JOIN scan_roots r ON r.id = d.root_id
-         WHERE m.is_deleted=0 AND q.seq > ?2
+         WHERE m.is_deleted=0 AND m.availability='online' AND q.seq > ?2
          ORDER BY q.seq
          LIMIT ?1"
     )
@@ -1458,7 +1514,7 @@ fn image_batch_sql(
              LEFT JOIN image_meta im ON im.item_id = m.id
              JOIN directories d ON d.id = m.directory_id
              JOIN scan_roots r ON r.id = d.root_id
-             WHERE d.root_id=?1 AND m.is_deleted=0 AND m.media_type='image' AND im.item_id IS NULL
+             WHERE d.root_id=?1 AND m.is_deleted=0 AND m.availability='online' AND m.media_type='image' AND im.item_id IS NULL
              {cursor}
              ORDER BY m.sort_datetime {dir}, m.id {dir}
              LIMIT ?2"
@@ -1470,7 +1526,7 @@ fn image_batch_sql(
              LEFT JOIN image_meta im ON im.item_id = m.id
              JOIN directories d ON d.id = m.directory_id
              JOIN scan_roots r ON r.id = d.root_id
-             WHERE d.root_id=?1 AND m.is_deleted=0 AND m.media_type='image' AND im.item_id IS NULL
+             WHERE d.root_id=?1 AND m.is_deleted=0 AND m.availability='online' AND m.media_type='image' AND im.item_id IS NULL
              {order_clause}, m.id {dir}
              LIMIT ?2"
         )

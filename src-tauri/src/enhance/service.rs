@@ -1,15 +1,14 @@
 // src-tauri/src/enhance/service.rs
-//! 影像增强 host 侧服务（降噪/超分子系统 design.md §A/§B/§E）。
+//! 影像增强 host 侧服务。
 //!
-//! enhance **不进** exotic 任务化调度（D-OCR-7 同型豁免）：本服务直持 enhance-worker
-//! 子进程 + 内存 job 队列，由 IPC `enhance_start` 显式驱动。P0 job 队列为**内存态**
-//! （重启即丢，B 节裁决——交互任务，用户重发即可）。
+//! 本服务持有 enhance-worker 子进程和内存 job 队列，由 IPC `enhance_start` 驱动。
+//! 队列重启后不保留，未完成的交互任务需重新提交。
 //!
 //! 执行链（每 item）：准入门 → 参数校验 → EnhanceSessionInit → claim `{stem}-enhanced.{ext}`
 //! → EnhanceRun（worker 写 `{work_dir}/…tmp`）→ 容器级 EXIF 注入（不重编码）→ 同卷 rename
 //! → 单文件 ingest（编辑线 `ingest_single_file` 同款）。
 //!
-//! GPU 令牌（D2 天条）：执行期先 `BackgroundHeavyLimiter` CPU permit 后 `GpuToken`，
+//! 执行期先取得 `BackgroundHeavyLimiter` CPU permit，再取得 `GpuToken`，
 //! 与 CLIP/人脸争同一令牌，自然串行不并发推理。
 //!
 //! 取消：`cancel(job_id)` 置该 job 的 `CancellationToken`——`run_request`/limiter.acquire
@@ -48,20 +47,18 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// 弃用实例时给 worker 的体面退出宽限。
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
-/// 准入门：降噪/去伪影输入像素上限（与编辑线 D-008 同门，100MP）。
-/// ⚠ J-6 草案，bench 后终钉。
+/// 降噪/去伪影输入像素上限：100MP。
 const MAX_INPUT_PIXELS_DIRECT: u64 = 100_000_000;
 /// 准入门：4x 超分输入像素上限（输出像素 = 输入×scale² 反推得草案 16MP）。
-/// ⚠ J-6 草案，bench 后终钉。
 const MAX_INPUT_PIXELS_UPSCALE_4X: u64 = 16_000_000;
 
 /// 前端事件：队列/进度变化（前端据此 `get_enhance_queue` 拉全量，形态对齐 exotic:status-changed）。
 const EVT_QUEUE_CHANGED: &str = "enhance:queue-changed";
-/// per-tile 进度事件节流下限（深审 b）：Progress 帧每 ≥500ms 才推一次 queue-changed，
+/// per-tile 进度事件节流下限：Progress 帧每 ≥500ms 才推一次 queue-changed，
 /// 避免高频 tile 心跳打爆前端事件通道。
 const TILE_EMIT_THROTTLE: Duration = Duration::from_millis(500);
 /// RAW 插件 id（单源：`resources/exotic-catalog.json` 的 `exotic-image-raw` offering；
-/// 运行时经 catalog `resolve_format` 反查该 id，RAW 格式清单不在此手抄，深审 g）。
+/// 运行时经 catalog `resolve_format` 反查该 id，RAW 格式清单不在此重复维护）。
 const RAW_PLUGIN_ID: &str = "exotic-image-raw";
 
 // ── 参数 / DTO ────────────────────────────────────────────────────────────────
@@ -84,7 +81,7 @@ pub struct EnhanceParams {
     pub output_format: OutputFormatChoice,
 }
 
-/// job 生命周期状态（P0 内存态）。
+/// 内存队列中的 job 生命周期状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JobStatus {
@@ -105,9 +102,9 @@ pub struct JobDto {
     pub total: usize,
     /// 已完成 item 数。
     pub done: usize,
-    /// 本 job 累计已完成 tile 数（per-tile Progress 帧 live 计数，深审 b）。
+    /// 本 job 累计已完成 tile 数（per-tile Progress 帧计数）。
     pub tile_done: usize,
-    /// 预计总 tile 数（批 5.5：入队时按各 item 已知尺寸 + steps 链几何估算，与 worker
+    /// 预计总 tile 数（入队时按各 item 已知尺寸 + steps 链几何估算，与 worker
     /// `chain.rs` 同源公式 `plan_tiles(...).len()` 逐 step 累加、scale 逐 step 叠乘）。
     /// 0 = 无法估算（item 尺寸未知/尚未扫描）——前端据此回退为不定长进度态。
     pub tiles_total: u32,
@@ -121,9 +118,9 @@ struct JobRecord {
     status: JobStatus,
     total: usize,
     done: usize,
-    /// 累计已完成 tile 数（per-tile Progress 心跳，深审 b）。
+    /// 累计已完成 tile 数（per-tile Progress 心跳）。
     tile_done: usize,
-    /// 入队时估算的总 tile 数（批 5.5，不随执行更新——纯估算基线）。
+    /// 入队时估算的总 tile 数，不随执行更新。
     tiles_total: u32,
     error_code: Option<&'static str>,
     token: CancellationToken,
@@ -142,7 +139,7 @@ struct WorkerHandle {
     next_session_id: u64,
     /// 当前 worker 实例上是否已装载本 job 的 EnhanceSessionInit 会话。worker 一旦重建
     /// （drop_worker / ensure 重生）即失效——`send_request` 重发 EnhanceRun 前据此补发
-    /// init（深审 h：worker 死亡后 session_id 落到无会话的新实例必败）。
+    /// init，避免 worker 重建后向无会话实例发送旧 session_id。
     session_alive: bool,
 }
 
@@ -155,7 +152,7 @@ impl WorkerHandle {
         if let Some(old) = self.sup.take() {
             old.shutdown(SHUTDOWN_GRACE);
         }
-        self.session_alive = false; // 新实例无会话（深审 h）
+        self.session_alive = false; // 新实例无会话
         if !enhance_worker_ready() {
             return Err(eerr(
                 "enhance_worker_missing",
@@ -163,7 +160,7 @@ impl WorkerHandle {
             ));
         }
         let sup = spawn_enhance_worker().map_err(|e| {
-            // 深审 e：对外固定串，内部错误只进 tracing（不泄进程/路径细节）。
+            // 对外使用固定错误文案，内部错误只进 tracing，避免泄漏进程或路径细节。
             tracing::warn!("增强 worker 启动失败:{e}");
             eerr("enhance_io", "增强 worker 启动失败")
         })?;
@@ -175,7 +172,7 @@ impl WorkerHandle {
         if let Some(w) = self.sup.take() {
             w.shutdown(SHUTDOWN_GRACE);
         }
-        self.session_alive = false; // 会话随实例消亡（深审 h）
+        self.session_alive = false; // 会话随实例消亡
     }
 }
 
@@ -191,7 +188,7 @@ pub struct PreviewPaths {
 pub struct EnhanceService {
     worker: Mutex<WorkerHandle>,
     book: Mutex<JobBook>,
-    /// 启动后是否已清扫过 work_dir 残留（深审 f：进程首次用 work_dir 时清一次，重启即丢语义）。
+    /// 本进程是否已清扫过 work_dir 残留。
     work_dir_swept: AtomicBool,
 }
 
@@ -217,7 +214,7 @@ impl EnhanceService {
         }
     }
 
-    /// 进程首次触及 work_dir 时清扫残留文件（深审 f）：重启即丢语义，安全——本进程尚无
+    /// 进程首次触及 work_dir 时清扫残留文件：本进程尚无
     /// 在途产物，且 worker 锁全程串行（job 执行/预览互斥），不会误删在写文件。
     fn sweep_work_dir_once(&self, work_dir: &Path) {
         if self.work_dir_swept.swap(true, Ordering::SeqCst) {
@@ -251,7 +248,7 @@ impl EnhanceService {
 
     /// 入队一个 job（参数已在命令层校验 NaN/门控）：返回 job_id，状态 Queued。
     /// `tiles_total` 按各 item 的 DB 已知尺寸（未扫描出宽高则该 item 贡献 0）+ steps 链几何
-    /// 估算——与 worker `chain.rs` 预算总瓦片数同款公式，供前端进度条换算百分比（批 5.5）。
+    /// 估算值使用 worker `chain.rs` 的瓦片公式，供前端进度条换算百分比。
     pub fn enqueue(&self, state: &AppState, item_ids: Vec<i64>, params: EnhanceParams) -> u64 {
         let sorted_steps = sort_steps(params.steps.clone());
         let dims = item_dims(state, &item_ids);
@@ -303,7 +300,7 @@ impl EnhanceService {
         }
     }
 
-    /// per-tile 心跳（深审 b）：worker 每完成一个 tile 累加一次。
+    /// per-tile 心跳：worker 每完成一个 tile 累加一次。
     fn bump_tile(&self, job_id: u64) {
         let mut book = self.book.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(j) = book.jobs.iter_mut().find(|j| j.id == job_id) {
@@ -577,7 +574,7 @@ impl EnhanceService {
             steps: steps.to_vec(),
         };
         let run_timeout = op_timeouts::ENHANCE_SILENCE;
-        // per-tile 心跳（深审 b）：每 Progress 帧累加 tile 计数，节流推 queue-changed。
+        // 每个 Progress 帧累加 tile 计数，节流推送 queue-changed。
         let mut last_emit = Instant::now();
         let mut on_tile = |_p: &ProgressBody| {
             self.bump_tile(job_id);
@@ -586,7 +583,7 @@ impl EnhanceService {
                 last_emit = Instant::now();
             }
         };
-        // 深审 h：worker 死亡重建后本 EnhanceRun 前先补发 session_init。
+        // worker 死亡重建后，发起 EnhanceRun 前先补发 session_init。
         let body = send_request(
             handle,
             &run,
@@ -972,7 +969,7 @@ fn enhance_prefers_gpu(state: &AppState) -> bool {
     state.config.get("ai_provider_override").as_deref() != Some("cpu")
 }
 
-/// 同步准入用（深审 g，批 5 复核）：某 item 是否 RAW（catalog 单源）。DB 读失败/源缺失
+/// 同步准入：从 catalog 判断某 item 是否 RAW。DB 读失败或源缺失
 /// 一律按「非 RAW」放行——真正的缺失/不可用留异步链脱敏处理，本判据只挡 RAW 入队产生死 job。
 pub fn item_is_raw(state: &AppState, item_id: i64) -> bool {
     let Ok(conn) = state.db_read_pool.get() else {
@@ -985,7 +982,7 @@ pub fn item_is_raw(state: &AppState, item_id: i64) -> bool {
 }
 
 /// 该路径扩展名是否属 RAW（单源：catalog `exotic-image-raw` offering，经 `resolve_format`
-/// 反查插件 id；RAW 格式清单不在此手抄，深审 g）。
+/// 反查插件 id；RAW 格式清单不在此重复维护）。
 fn is_raw_format(state: &AppState, path: &Path) -> bool {
     let Some(ext) = path
         .extension()
@@ -1039,9 +1036,9 @@ fn enhance_model_descriptor(
 /// 发一个 enhance 请求（硬止损重试一次）：进程级异常 → 弃实例重建重发；retryable Failure →
 /// 退避重发；terminal Failure → 映射稳定码直返。
 ///
-/// `on_progress`：per-tile 进度回调（深审 b；仅 EnhanceRun 传，其余传 None）。
+/// `on_progress`：per-tile 进度回调，仅 EnhanceRun 传入。
 /// `session_restore`：`Some((init_req, init_timeout))` 时——worker 若已重建致会话失效
-/// （`!handle.session_alive`），重发本请求前先补发 `init_req` 重建会话（深审 h；仅绑定会话的
+/// （`!handle.session_alive`），重发本请求前先补发 `init_req` 重建会话（仅绑定会话的
 /// EnhanceRun 传，init 本身传 None 避免自递归）。
 fn send_request(
     handle: &mut WorkerHandle,
@@ -1053,13 +1050,14 @@ fn send_request(
 ) -> Result<SuccessBody, AppError> {
     let mut last: Option<String> = None;
     for _attempt in 1..=MAX_ATTEMPTS {
-        // 深审 h：会话随 worker 重建而失效，绑定会话的请求重发前先补发 init。
+        // 会话随 worker 重建而失效，绑定会话的请求重发前先补发 init。
         if let Some((init_req, init_to)) = session_restore {
             if !handle.session_alive {
                 let sup = handle.ensure()?;
                 let outcome = sup.run_request(init_req, init_to, &|| token.is_cancelled());
                 match outcome {
                     RawOutcome::Success { .. } => handle.session_alive = true,
+                    RawOutcome::Cancelled => return Err(eerr("enhance_io", "已取消")),
                     RawOutcome::Failure(fb) => return Err(map_worker_failure(&fb.code)),
                     RawOutcome::TimedOut | RawOutcome::Disconnected | RawOutcome::Protocol(_) => {
                         if token.is_cancelled() {
@@ -1081,6 +1079,7 @@ fn send_request(
         let sup = handle.ensure()?;
         match sup.run_request_with_progress(req, timeout, &|| token.is_cancelled(), progress) {
             RawOutcome::Success { body, .. } => return Ok(body),
+            RawOutcome::Cancelled => return Err(eerr("enhance_io", "已取消")),
             RawOutcome::Failure(fb) if fb.retryable && _attempt < MAX_ATTEMPTS => {
                 last = Some(fb.message);
                 std::thread::sleep(RETRY_BACKOFF);
@@ -1207,4 +1206,16 @@ fn finalize_output(
         return Err(eerr("enhance_io", "增强产物改名落盘失败"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_upscale_4x_16mp_boundary() {
+        // 4x 超分：输入 ≤16MP 放行，>16MP 拒。
+        assert!(admission_check(4_000, 4_000, 4).is_ok()); // 16MP
+        assert!(admission_check(4_001, 4_000, 4).is_err());
+    }
 }

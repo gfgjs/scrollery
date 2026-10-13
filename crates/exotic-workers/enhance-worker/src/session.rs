@@ -237,37 +237,30 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_resolves() {
-        let root = temp_dir("happy");
-        let prof = find_enhance_profile("scunet").unwrap();
-        let m = lay_model(&root, "scunet", &prof.file_fp16, b"weights");
-        let r = validate_enhance_init(1, &[m], root.to_str().unwrap(), root.to_str().unwrap())
-            .expect("合法载荷应通过校验");
-        assert_eq!(r.session_id, 1);
-        assert_eq!(r.models.len(), 1);
-        assert_eq!(r.models[0].0.id, "scunet");
+    fn sha256_mismatch_rejected_load_failed() {
+        let root = temp_dir("sha");
+        let prof = find_enhance_profile("drunet").unwrap();
+        let mut m = lay_model(&root, "drunet", &prof.file_fp32, b"weights");
+        m.sha256 = "0".repeat(64);
+        let e = validate_enhance_init(1, &[m], root.to_str().unwrap(), root.to_str().unwrap())
+            .unwrap_err();
+        assert_eq!(e.0, WorkerErrorCode::ModelLoadFailed);
+        assert!(e.1.contains("sha256"), "diagnostic: {}", e.1);
     }
 
     #[test]
-    fn dotdot_traversal_outside_models_root_rejected_load_failed() {
-        // handle 路径用 `..` 穿越出 models_root 子目录、指向根外的同名合法文件——
-        // canonicalize 后仍须被前缀校验拦下(不能靠字符串层面误判为"在 root 下")。
-        let models_root = temp_dir("dotdot-root");
-        let sibling = temp_dir("dotdot-sibling");
+    fn path_outside_models_root_rejected_load_failed() {
+        // 模型文件真实存在、契约齐全,但落在 models_root 之外 → 归属校验必须拦下
+        // (防宿主被劫持后诱导 worker 读任意路径,对齐 CLIP/OCR validate_and_resolve 先例)。
+        let work_dir = temp_dir("outside-work");
+        let elsewhere = temp_dir("outside-elsewhere");
         let prof = find_enhance_profile("scunet").unwrap();
-        let real = lay_model(&sibling, "scunet", &prof.file_fp16, b"weights");
-        let sibling_name = sibling.file_name().unwrap().to_str().unwrap();
-        let traversal_path = models_root
-            .join("..")
-            .join(sibling_name)
-            .join(&prof.file_fp16);
-        assert!(traversal_path.to_str().unwrap().contains(".."));
-        let mut m = real;
-        m.handle = ModelHandle::Path(traversal_path.to_string_lossy().into_owned());
+        let m = lay_model(&elsewhere, "scunet", &prof.file_fp16, b"weights");
+        let models_root = temp_dir("outside-root");
         let e = validate_enhance_init(
             1,
             &[m],
-            models_root.to_str().unwrap(),
+            work_dir.to_str().unwrap(),
             models_root.to_str().unwrap(),
         )
         .unwrap_err();

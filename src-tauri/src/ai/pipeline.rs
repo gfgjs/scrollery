@@ -1,11 +1,6 @@
 // src-tauri/src/ai/pipeline.rs
-//! Background AI analysis pipeline — 控制面(Producer/Writer)与入口。
-//! 后台 AI 分析流水线:控制面(生产者/写入器)与入口。
-//!
-//! T16 收束:推理恒经 ai-worker 子进程派发(worker_pipeline.rs),本模块只保留
-//! 两条路径曾共用的控制面——Producer(领取/让步/续传)、Writer(落库/状态机)、
-//! 孤儿恢复与 batch 解析。进程内 ort 推理中段(预处理线程池/推理线程/解码源决策)
-//! 已随 T16 删除,历史实现见 git。
+//! 后台 AI 分析流水线的入口与控制面：Producer 领取任务，Writer 落库并更新状态。
+//! 推理经 `worker_pipeline` 派发至 ai-worker；本模块还负责孤儿恢复与批量参数解析。
 //!
 //! 1. Producer: batch-query media_items WHERE ai_status=0 → AiTask 通道
 //! 2. 中段: worker_pipeline dispatch(攒批 → CPU permit → GPU 令牌 → EmbedBatch)
@@ -23,34 +18,33 @@ use crate::ai::profile::ModelProfile;
 use crate::db::models::AiStatus;
 use crate::db::queries::{
     batch_finish_ai_items, batch_update_ai_status, batch_update_ai_status_guarded,
-    get_pending_ai_items,
+    get_pending_ai_items, AiEmbeddingWrite,
 };
 use crate::state::AppState;
 
 /// 从数据库读取和写入嵌入向量的批次大小。
 const BATCH_SIZE: i64 = 512;
 
-/// 写入器时间驱动 flush 上界(2026-07-11 加固批 B-2):批未满也按此陈龄落库,
-/// 「满 512 或 3s 先到先落」。进度可见性与崩溃丢失窗口由此封顶;快速稳态仍满批走,
-/// 写事务频次不受影响(专家建议的固定 16/64 小批会把写事务放大 8-32 倍,不取)。
+/// 写入器的时间驱动 flush 上界：满 512 项或达到 3 秒时落库，限制进度延迟与崩溃丢失窗口。
 pub(crate) const WRITE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 从生产者发送到 worker 派发线程的任务项。
 pub(crate) struct AiTask {
     pub(crate) item_id: i64,
-    /// 原图绝对路径(缺 ai_cache 时现场派生的解码源,T18)。
+    /// 原图绝对路径，缺少 AI 缓存时用于现场派生。
     pub(crate) source_path: PathBuf,
     pub(crate) file_format: String,
-    /// 经 `ai_cache_path(cache_dir, cache_key)` 定位 AI 缓存;worker 端解码的唯一源。
+    /// 与源代次共同限定已提交 AI 缓存；未命中时仍可使用独立 AI 旧路径。
     pub(crate) cache_key: i64,
+    pub(crate) source_revision: i64,
 }
 
 /// 从消费者发送到写入器的嵌入向量结果。
 pub(crate) struct AiResult {
     pub(crate) item_id: i64,
-    /// 任务领取时的 `cache_key` 快照(X1 条件写:落库仅当行内当前值仍相等——SourceChanged
-    /// 失效会换 key,迟到写落空)。
+    /// 任务领取时的缓存键和源代次快照；换源即使复用 key，迟到写也落空。
     pub(crate) cache_key: i64,
+    pub(crate) source_revision: i64,
     /// 成功时为 `Some(bytes)`，推理失败时为 `None`。
     pub(crate) embedding: Option<Vec<u8>>,
 }
@@ -102,7 +96,7 @@ pub fn start_ai_pipeline(state: Arc<AppState>, generation: u64, token: Cancellat
     });
 }
 
-/// Blocking pipeline runner:T16 起恒走 worker 派发(进程内 ort 路径已删)。
+/// 在阻塞线程中运行 worker 派发流水线。
 fn run_pipeline_blocking(
     state: &Arc<AppState>,
     token: &CancellationToken,
@@ -110,7 +104,7 @@ fn run_pipeline_blocking(
     crate::ai::worker_pipeline::run_pipeline_worker_blocking(state, token)
 }
 
-/// 孤儿恢复(问题7,进程内与 worker 两条路径共用):Processing → Pending。
+/// 孤儿恢复：Processing → Pending。
 pub(crate) fn recover_orphaned_ai_items(state: &Arc<AppState>) {
     let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
     match crate::db::queries::reset_processing_ai_items(&conn) {
@@ -213,10 +207,11 @@ pub(crate) fn produce_tasks(
                     source_path: PathBuf::from(item.abs_path),
                     file_format: item.file_format,
                     cache_key: item.cache_key,
+                    source_revision: item.source_revision,
                 })
                 .is_err()
             {
-                break;
+                return; // 下游已关闭，停止继续领取并改写剩余项的状态。
             }
         }
     }
@@ -224,7 +219,7 @@ pub(crate) fn produce_tasks(
     info!("AI producer finished | AI 生产者已完成");
 }
 
-/// 统一解析有效 batch(进程内推理与 worker 派发/SessionInit 快照共用,T17 提取):
+/// 解析 worker 派发与 SessionInit 共用的有效 batch：
 /// 配置 `ai_batch_size`(0=按 VRAM 自动)→ 上限 256 防 OOM → 固定 batch 模型抬到 ≥k。
 ///
 /// A2:`ai_batch_size` 是 schema 设置类键,唯一真源已切到 `ConfigManager`(内存 `RwLock`
@@ -233,8 +228,7 @@ pub(crate) fn resolve_batch_size(state: &AppState, profile: &ModelProfile) -> us
     resolve_batch_size_from(state.config.get("ai_batch_size"), profile)
 }
 
-/// A2 前称「连接已在手的变体」——`conn` 参数已随 `ai_batch_size` 迁往 config.toml 而不再需要,
-/// 改收 `&ConfigManager`(与 `resolve_batch_size` 同源,消除原「先取池连接才能读配置」的间接层)。
+/// 从指定配置快照解析 batch 大小，供会话初始化使用。
 pub(crate) fn resolve_batch_size_with(
     config: &crate::config::ConfigManager,
     profile: &ModelProfile,
@@ -303,10 +297,10 @@ pub(crate) fn write_results(
     token: &CancellationToken,
     profile: &ModelProfile,
 ) {
-    let mut batch: Vec<(i64, String, Vec<u8>, i64, i64)> = Vec::with_capacity(BATCH_SIZE as usize);
+    let mut batch: Vec<AiEmbeddingWrite> = Vec::with_capacity(BATCH_SIZE as usize);
     let mut total_written = 0u64;
 
-    let mut failed_ids: Vec<(i64, i64)> = Vec::new();
+    let mut failed_ids: Vec<(i64, i64, i64)> = Vec::new();
     let mut last_flush = std::time::Instant::now();
 
     // 时间驱动 flush(2026-07-11 加固批 B-2):「满 512 或陈龄超 WRITE_FLUSH_INTERVAL,
@@ -323,11 +317,18 @@ pub(crate) fn write_results(
 
                 match result.embedding {
                     Some(emb) => {
-                        batch.push((result.item_id, profile.id.clone(), emb, 1, result.cache_key));
+                        batch.push((
+                            result.item_id,
+                            profile.id.clone(),
+                            emb,
+                            1,
+                            result.cache_key,
+                            result.source_revision,
+                        ));
                     }
                     None => {
                         // 推理失败 — 收集起来批量更新状态
-                        failed_ids.push((result.item_id, result.cache_key));
+                        failed_ids.push((result.item_id, result.cache_key, result.source_revision));
                     }
                 }
 
@@ -378,12 +379,8 @@ pub(crate) fn write_results(
 }
 
 /// 将一批嵌入向量刷新到数据库(X1:向量+Done 的条件写在 batch_finish_ai_items 内单事务完成,
-/// cache_key 已换的失效项整体跳过——迟到写不再能把旧内容向量+status=2 永久留库)。
-fn flush_batch(
-    state: &Arc<AppState>,
-    batch: &mut Vec<(i64, String, Vec<u8>, i64, i64)>,
-    total_written: &mut u64,
-) {
+/// 源代次或 cache_key 已换的失效项整体跳过——迟到写不再能把旧内容向量+status=2 留库)。
+fn flush_batch(state: &Arc<AppState>, batch: &mut Vec<AiEmbeddingWrite>, total_written: &mut u64) {
     let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
 
     match batch_finish_ai_items(&conn, batch) {
@@ -408,8 +405,10 @@ fn flush_batch(
         Err(e) => {
             warn!("Batch embedding write failed | 批量嵌入向量写入失败: {}", e);
             // 将失败的项标记为错误，避免无限重新处理(同样条件写:失效项不标)
-            let guarded: Vec<(i64, i64)> =
-                batch.iter().map(|(id, _, _, _, key)| (*id, *key)).collect();
+            let guarded: Vec<(i64, i64, i64)> = batch
+                .iter()
+                .map(|(id, _, _, _, key, revision)| (*id, *key, *revision))
+                .collect();
             let _ = batch_update_ai_status_guarded(&conn, &guarded, AiStatus::Error.as_i64());
         }
     }
@@ -418,7 +417,7 @@ fn flush_batch(
 }
 
 /// 将一批失败的项在数据库中标记为 `ai_status=3`（错误;X1 条件写,失效项不标)。
-fn flush_failed(state: &Arc<AppState>, failed_ids: &mut Vec<(i64, i64)>) {
+fn flush_failed(state: &Arc<AppState>, failed_ids: &mut Vec<(i64, i64, i64)>) {
     let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
     match batch_update_ai_status_guarded(&conn, failed_ids, AiStatus::Error.as_i64()) {
         Err(e) => warn!("Failed to mark items as error | 标记项为错误失败: {}", e),

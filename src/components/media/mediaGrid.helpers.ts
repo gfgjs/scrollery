@@ -1,5 +1,4 @@
-// src/components/media/mediaGrid.helpers.ts
-// MediaGrid 纯逻辑辅助(抽出便于单测,不碰组件状态)。
+// DOM 与 Canvas 网格共用的纯逻辑，不持有组件状态。
 
 import type { MediaMeta } from '../../types/layout'
 import type { DemoInfoText } from '../../utils/demoAlias'
@@ -61,8 +60,7 @@ export interface ThumbInfoItemFields {
  * 组装缩略图信息浮窗的文本行(按用户勾选的 elements 过滤):文件名/日期/分辨率/路径/GPS/
  * 相机/拍摄参数。轻量字段读 item(常驻布局行),重型字段读 meta(可视区懒加载,未到达时
  * 对应行缺席,数据到达后由调用方重渲染/重绘补上)。
- * demo(2026-09-16 演示打码):非空时把敏感字段的**文本**换成示例值,而每行的**存在性**判定
- * 仍走真实数据(不新增原来没有的行)。DOM 画廊不传此参,行为逐字不变。
+ * demo 非空时只替换敏感字段的文本；行的存在性仍由真实数据决定。
  */
 export function buildThumbInfoLines(
   item: ThumbInfoItemFields,
@@ -102,7 +100,7 @@ export function buildThumbInfoLines(
   return lines
 }
 
-// ── 文本文档卡(§3.4,DOM 与 Canvas 共享)────────────────────────────────────────
+// 文本文档卡由 DOM 与 Canvas 网格共用。
 
 /** 不栅格化的文本文档格式(pdf/svg/epub 有真实缩略图):渲染为 CSS/canvas「文本卡」。 */
 export const TEXT_CARD_FORMATS = [
@@ -129,11 +127,9 @@ export function isTextCardFormat(mediaType: string, fileFormat: string | undefin
 }
 
 /**
- * 有真实缩略图的文档格式在「封面确定缺失」时的文本卡降级(深审 defer ⑤)。
- * 目前仅 epub:后端 OPF 三级启发式找不到封面图(自制/转制书常见)→ 派生 status=3 →
- * thumb_status=2,原先落通用灰底占位,观感反不如 txt。仅 status===2(盖棺无封面)才降级;
- * pending(0)保持占位色等待封面,有封面(1)走正常缩略图,不抢。
- * pdf/svg 不入此表:其封面由前端渲染器兜底,失败即真不可渲染,文本卡无从谈起体验一致性。
+ * 有真实缩略图的文档格式在封面确定缺失时降级为文本卡。
+ * 目前仅 epub：封面提取最终失败且 thumb_status=2 时降级。
+ * pending(0)仍等待封面，有封面(1)走正常缩略图。pdf/svg 由前端渲染器处理，不采用此回退。
  */
 export function isTextCardFallback(
   mediaType: string,

@@ -1,12 +1,3 @@
-# crates/scrollery-plugin-api/Cargo.toml
-# 插件平台 · 开源契约叶 crate（Part6 §3.9.1a 去环定稿）。
-#
-# 唯一持「跨 crate 授权契约」的叶 crate:EntitlementProvider trait + LicenseStatus/LicenseError 等
-# DTO。**纯抽象、零密钥材料、零门控逻辑**（fork 拿到无价值）。三方单向依赖、无环:
-#   plugin-api（叶，无内部依赖）← src-tauri / free-stub / pro 各自单向 use。
-# 把 trait 放本叶 crate（而非 src-tauri）是为避免「src-tauri 持 trait + pro 反向实现 + src-tauri
-# overlay 链 pro」的 cargo crate 依赖环（§3.9.1a 已实证 B 版成环、A 版去环）。
-
 [package]
 name = "scrollery-plugin-api"
 version = "0.1.0"
@@ -17,7 +8,3 @@ publish = false
 [lib]
 name = "scrollery_plugin_api"
 path = "src/lib.rs"
-
-[dependencies]
-# LicenseError 用 thiserror 结构化（与 src-tauri 同系，已在缓存）。无 serde:当前 DTO 不跨 IPC 序列化。
-thiserror = "1"

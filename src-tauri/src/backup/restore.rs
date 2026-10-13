@@ -1,7 +1,6 @@
-//! 恢复暂存与校验(方案 B §6.1)。把备份包当**不可信输入**:白名单 + zip-slip/符号链接拒绝 +
-//! checked 尺寸(防 zip bomb)+ 逐条 SHA-256 → 解到 appdata 同卷 `restore-staging/{backupId}/` →
-//! 暂存库 quick_check/foreign_key_check/schema 门 + 老版迁移 → §3.2 abs_path 跨机 rebase →
-//! 返回摘要供双确认。**本模块只暂存校验,不动活库**(启动交换在 §6.2,阶段 3b)。
+//! 将备份包作为不可信输入：校验条目白名单、路径、大小和 SHA-256，解压到同卷暂存目录。
+//! 暂存库须通过完整性、外键和当前 schema 校验；跨机恢复时重写 appdata 文档路径。
+//! 本模块返回确认摘要，不修改活库；启动交换由 `swap` 处理。
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -28,6 +27,59 @@ pub const CODE_PATH_INVALID: &str = "restore_path_invalid";
 pub const CODE_SIZE_LIMIT: &str = "restore_size_limit";
 pub const CODE_DOCUMENT_MISSING: &str = "restore_document_missing";
 pub const CODE_IO: &str = "restore_io";
+/// 已进入启动恢复流程的暂存不得再清理或覆盖。
+pub const CODE_PENDING: &str = "restore_pending";
+/// 预检结果已被同一备份的新一轮预检替换。
+pub const CODE_STAGE_STALE: &str = "restore_stage_stale";
+
+const STAGING_TOKEN_FILE: &str = "stage-token";
+
+/// 应用可运行多个进程，恢复门闩必须覆盖所有共享 appdata 的实例。
+pub(super) struct RestoreLock {
+    _file: File,
+    #[cfg(windows)]
+    _parents: Vec<File>,
+}
+
+pub(super) fn acquire_restore_lock(app_data: &Path) -> Result<RestoreLock> {
+    let app_data = std::fs::canonicalize(app_data).map_err(io_err)?;
+    #[cfg(windows)]
+    let mut parents = Vec::new();
+    #[cfg(windows)]
+    for ancestor in app_data.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        parents.push(pin_directory(ancestor)?);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(3).custom_flags(0x0020_0000);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(app_data.join("restore.lock"))
+        .map_err(io_err)?;
+    let metadata = file.metadata().map_err(io_err)?;
+    if !metadata.is_file() || metadata_is_link(&metadata) {
+        return Err(path_invalid("恢复锁不允许链接或特殊文件"));
+    }
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => {
+            err(super::core::CODE_JOB_BUSY, "其他进程正在执行恢复任务")
+        }
+        std::fs::TryLockError::Error(error) => io_err(error),
+    })?;
+    Ok(RestoreLock {
+        _file: file,
+        #[cfg(windows)]
+        _parents: parents,
+    })
+}
 
 /// 条目数硬上限(远超真实库;防中央目录膨胀)。
 const MAX_ENTRIES: usize = 4_000_000;
@@ -78,9 +130,11 @@ pub fn is_safe_backup_id(id: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct RestoreStageResult {
     pub backup_id: String,
+    /// 本次预检的所有权标识，防止旧向导清理或确认同一备份的新暂存。
+    pub staging_token: String,
     /// 暂存目录(供 §6.2 arm/swap 阶段用)。
     pub staging_dir: String,
-    /// 暂存库(迁移后)的 schema 版本(== runtime CURRENT_VERSION)。
+    /// 暂存库的 schema 版本，须等于运行时 `SCHEMA_VERSION`。
     pub schema_version: u32,
     pub kind: String,
     pub created_at_utc: String,
@@ -92,16 +146,16 @@ pub struct RestoreStageResult {
 }
 
 /// 暂存目录 RAII 清理:失败即回收半装产物,不留残迹。成功后 `disarm` 保留(供交换阶段用)。
-struct StagingGuard(Option<PathBuf>);
-impl StagingGuard {
+struct StagingGuard<'a>(Option<&'a StagingLocation>);
+impl StagingGuard<'_> {
     fn disarm(mut self) {
         self.0 = None;
     }
 }
-impl Drop for StagingGuard {
+impl Drop for StagingGuard<'_> {
     fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = std::fs::remove_dir_all(p);
+        if let Some(location) = &self.0 {
+            let _ = location.remove_existing();
         }
     }
 }
@@ -112,6 +166,9 @@ pub fn restore_stage(
     package_path: &Path,
     target_app_data_dir: &Path,
 ) -> Result<RestoreStageResult> {
+    // 库入口也允许为尚未初始化的目标 appdata 首次预检。
+    std::fs::create_dir_all(target_app_data_dir).map_err(io_err)?;
+    let _lock = acquire_restore_lock(target_app_data_dir)?;
     // 1. 打开包 + 读 manifest(有界)。
     let file = File::open(package_path).map_err(io_err)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| corrupt("备份包无法打开"))?;
@@ -129,14 +186,15 @@ pub fn restore_stage(
     scan_central_directory(&mut archive, &manifest, target_app_data_dir)?;
 
     // 3. 解压 + 逐条 sha256 校验到 appdata 同卷 staging。失败 RAII 清理。
-    let staging = target_app_data_dir
-        .join("restore-staging")
-        .join(&manifest.backup_id);
-    let _ = std::fs::remove_dir_all(&staging); // 清前次残留
-    let cleanup = StagingGuard(Some(staging.clone()));
+    let location = StagingLocation::open(target_app_data_dir, &manifest.backup_id, true)?
+        .ok_or_else(|| err(CODE_IO, "暂存父目录缺失"))?;
+    location.ensure_not_pending(&manifest.backup_id)?;
+    location.remove_existing()?;
+    let staging = location.path.clone();
+    let cleanup = StagingGuard(Some(&location));
     extract_and_verify(&mut archive, &manifest, &staging)?;
 
-    // 4. 暂存库校验；格式 34 可在校验后原地升到当前格式。
+    // 4. 暂存库校验(quick_check / foreign_key_check)+ 格式标识必须等于当前格式。
     let staged_db = staging.join(ENTRY_DB);
     let schema_version = validate_staged_db(&staged_db)?;
 
@@ -151,9 +209,22 @@ pub fn restore_stage(
     let external_document_versions = read_external_count(&sconn)?;
     drop(sconn);
 
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut token = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut token)
+        .map_err(|_| err(CODE_IO, "无法创建暂存标识"))?;
+    let staging_token = crate::utils::hash::to_hex_lower(&token);
+    crate::thumbnail::generator::write_atomic(
+        &staging.join(STAGING_TOKEN_FILE),
+        staging_token.as_bytes(),
+    )
+    .map_err(io_err)?;
+
     cleanup.disarm(); // 成功:保留 staging
     Ok(RestoreStageResult {
         backup_id: manifest.backup_id,
+        staging_token,
         staging_dir: staging.to_string_lossy().to_string(),
         schema_version,
         kind: manifest.kind.file_infix().to_string(),
@@ -163,6 +234,402 @@ pub fn restore_stage(
         external_document_versions,
         appdata_document_count,
     })
+}
+
+/// 释放仍属于该预检结果的暂存；目录缺失或所有权已更新时幂等成功。
+/// 调用方须持有文件任务门闩，与预检及恢复确认串行执行。
+pub fn restore_discard(app_data: &Path, backup_id: &str, staging_token: &str) -> Result<()> {
+    let _lock = acquire_restore_lock(app_data)?;
+    let Some(location) = StagingLocation::open(app_data, backup_id, false)? else {
+        return Ok(());
+    };
+    location.ensure_not_pending(backup_id)?;
+    let Some(target) = location.open_target()? else {
+        return Ok(());
+    };
+    if location.token_matches(&target, staging_token)? {
+        location.remove(target)?;
+    }
+    Ok(())
+}
+
+pub(super) struct ValidatedStaging {
+    location: StagingLocation,
+    _target: File,
+}
+
+impl ValidatedStaging {
+    pub(super) fn path(&self) -> &Path {
+        &self.location.path
+    }
+}
+
+/// 调用方已持跨进程恢复锁；句柄在 arm 完成前保持目标目录固定。
+pub(super) fn validate_staging_owner(
+    app_data: &Path,
+    backup_id: &str,
+    staging_token: &str,
+) -> Result<ValidatedStaging> {
+    let location = StagingLocation::open(app_data, backup_id, false)?
+        .ok_or_else(|| err(CODE_STAGE_STALE, "预检已失效，请重新选择备份"))?;
+    location.ensure_not_pending(backup_id)?;
+    let target = location
+        .open_target()?
+        .ok_or_else(|| err(CODE_STAGE_STALE, "预检已失效，请重新选择备份"))?;
+    if !location.token_matches(&target, staging_token)? || !location.path.join(ENTRY_DB).is_file() {
+        return Err(err(CODE_STAGE_STALE, "预检已失效，请重新选择备份"));
+    }
+    Ok(ValidatedStaging {
+        location,
+        _target: target,
+    })
+}
+
+// 清理只接受从 appdata 派生的单段目录，绝不接受客户端提供的删除路径。
+struct StagingLocation {
+    #[cfg(windows)]
+    app_data: PathBuf,
+    path: PathBuf,
+    #[cfg(windows)]
+    _parents: Vec<File>,
+    #[cfg(unix)]
+    app_data_handle: File,
+    #[cfg(unix)]
+    parent_handle: File,
+}
+
+fn metadata_is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn checked_directory(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io_err(e)),
+    };
+    if !metadata.is_dir()
+        || metadata_is_link(&metadata)
+        || std::fs::canonicalize(path).map_err(io_err)? != path
+    {
+        return Err(path_invalid("恢复暂存路径不是本机受控目录"));
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn pin_directory(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0 | FILE_LIST_DIRECTORY.0)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+        .map_err(io_err)?;
+    let metadata = file.metadata().map_err(io_err)?;
+    if !metadata.is_dir() || metadata_is_link(&metadata) {
+        return Err(path_invalid("恢复暂存目录不允许链接"));
+    }
+    Ok(file)
+}
+
+pub(super) fn read_regular_file(path: &Path) -> Result<Option<File>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(io_err)?;
+            if !metadata.is_file() || metadata_is_link(&metadata) {
+                return Err(path_invalid("恢复标记不允许链接或特殊文件"));
+            }
+            Ok(Some(file))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, name: &std::ffi::OsStr) -> Result<Option<File>> {
+    use rustix::fs::{openat, Mode, OFlags};
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+            Err(path_invalid("恢复暂存目录不允许链接"))
+        }
+        Err(e) => Err(io_err(e.into())),
+    }
+}
+
+#[cfg(unix)]
+fn read_regular_at(parent: &File, name: &str) -> Result<Option<File>> {
+    use rustix::fs::{openat, Mode, OFlags};
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let file = File::from(fd);
+            if !file.metadata().map_err(io_err)?.is_file() {
+                return Err(path_invalid("恢复标记不允许特殊文件"));
+            }
+            Ok(Some(file))
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(rustix::io::Errno::LOOP) => Err(path_invalid("恢复标记不允许链接")),
+        Err(e) => Err(io_err(e.into())),
+    }
+}
+
+#[cfg(unix)]
+fn remove_directory_contents(directory: &File, preserve_token: bool) -> Result<()> {
+    use rustix::fs::{openat, unlinkat, AtFlags, Dir, Mode, OFlags};
+    let entries = Dir::read_from(directory).map_err(|e| io_err(e.into()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| io_err(e.into()))?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        if preserve_token && name.to_bytes() == STAGING_TOKEN_FILE.as_bytes() {
+            continue;
+        }
+        // 仅从固定目录句柄打开子项；链接只删除目录项，永不沿链接递归。
+        let flags = match openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                remove_directory_contents(&File::from(fd), false)?;
+                AtFlags::REMOVEDIR
+            }
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => AtFlags::empty(),
+            Err(e) => return Err(io_err(e.into())),
+        };
+        match unlinkat(directory, name, flags) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => (),
+            Err(e) => return Err(io_err(e.into())),
+        }
+    }
+    Ok(())
+}
+
+impl StagingLocation {
+    fn open(app_data: &Path, backup_id: &str, create_parent: bool) -> Result<Option<Self>> {
+        if !is_safe_backup_id(backup_id) {
+            return Err(path_invalid("非法 backupId | invalid backup id"));
+        }
+        let app_data = std::fs::canonicalize(app_data).map_err(io_err)?;
+        #[cfg(windows)]
+        let mut parents = Vec::new();
+        #[cfg(windows)]
+        for ancestor in app_data.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            // 固定整条祖先链，禁止校验后将父目录替换成 junction 再引导递归删除。
+            parents.push(pin_directory(ancestor)?);
+        }
+        #[cfg(unix)]
+        let app_data_handle = {
+            use rustix::fs::{open, Mode, OFlags};
+            File::from(
+                open(
+                    &app_data,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| io_err(e.into()))?,
+            )
+        };
+        let parent = app_data.join("restore-staging");
+        if create_parent {
+            #[cfg(windows)]
+            match std::fs::create_dir(&parent) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(io_err(e)),
+            }
+            #[cfg(unix)]
+            match rustix::fs::mkdirat(
+                &app_data_handle,
+                "restore-staging",
+                rustix::fs::Mode::from_raw_mode(0o700),
+            ) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => (),
+                Err(e) => return Err(io_err(e.into())),
+            }
+        }
+        if !checked_directory(&parent)? {
+            return Ok(None);
+        }
+        #[cfg(windows)]
+        parents.push(pin_directory(&parent)?);
+        #[cfg(unix)]
+        let Some(parent_handle) =
+            open_directory_at(&app_data_handle, std::ffi::OsStr::new("restore-staging"))?
+        else {
+            return Ok(None);
+        };
+        let path = parent.join(backup_id);
+        checked_directory(&path)?;
+        Ok(Some(Self {
+            #[cfg(windows)]
+            app_data,
+            path,
+            #[cfg(windows)]
+            _parents: parents,
+            #[cfg(unix)]
+            app_data_handle,
+            #[cfg(unix)]
+            parent_handle,
+        }))
+    }
+
+    fn ensure_not_pending(&self, backup_id: &str) -> Result<()> {
+        #[cfg(windows)]
+        let marker = read_regular_file(&self.app_data.join("pending-restore.json"))?;
+        #[cfg(unix)]
+        let marker = read_regular_at(&self.app_data_handle, "pending-restore.json")?;
+        let Some(marker) = marker else {
+            return Ok(());
+        };
+        let mut text = String::new();
+        marker
+            .take(16 * 1024)
+            .read_to_string(&mut text)
+            .map_err(io_err)?;
+        let pending: super::swap::PendingRestore = serde_json::from_str(&text).map_err(|_| {
+            err(
+                super::swap::CODE_MARKER_CORRUPT,
+                "恢复标记损坏，暂存不能清理或覆盖",
+            )
+        })?;
+        let pending_path = Path::new(&pending.staging_dir);
+        let is_pending = if pending.backup_id == backup_id || pending_path == self.path {
+            true
+        } else {
+            match std::fs::canonicalize(pending_path) {
+                Ok(path) => path == self.path,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(io_err(e)),
+            }
+        };
+        if is_pending {
+            return Err(err(CODE_PENDING, "恢复已确认，暂存必须保留到重启完成"));
+        }
+        Ok(())
+    }
+
+    fn open_target(&self) -> Result<Option<File>> {
+        #[cfg(windows)]
+        {
+            if !checked_directory(&self.path)? {
+                return Ok(None);
+            }
+            pin_directory(&self.path).map(Some)
+        }
+        #[cfg(unix)]
+        {
+            open_directory_at(&self.parent_handle, self.path.file_name().unwrap())
+        }
+    }
+
+    fn token_matches(&self, _target: &File, staging_token: &str) -> Result<bool> {
+        if staging_token.len() != 32 || !staging_token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Ok(false);
+        }
+        #[cfg(windows)]
+        let token = read_regular_file(&self.path.join(STAGING_TOKEN_FILE))?;
+        #[cfg(unix)]
+        let token = read_regular_at(_target, STAGING_TOKEN_FILE)?;
+        let Some(token) = token else {
+            return Ok(false);
+        };
+        let mut stored = String::new();
+        token.take(33).read_to_string(&mut stored).map_err(io_err)?;
+        Ok(stored == staging_token)
+    }
+
+    fn remove_existing(&self) -> Result<()> {
+        if let Some(target) = self.open_target()? {
+            self.remove(target)?;
+        }
+        Ok(())
+    }
+
+    fn remove(&self, target: File) -> Result<()> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            for entry in std::fs::read_dir(&self.path).map_err(io_err)? {
+                let entry = entry.map_err(io_err)?;
+                if entry.file_name() == STAGING_TOKEN_FILE {
+                    continue;
+                }
+                let kind = entry.file_type().map_err(io_err)?;
+                if kind.is_dir() || kind.is_symlink_dir() {
+                    std::fs::remove_dir_all(entry.path()).map_err(io_err)?;
+                } else {
+                    std::fs::remove_file(entry.path()).map_err(io_err)?;
+                }
+            }
+            // 所有内容删完才移除所有权标记，文件占用失败不会使重试丢失授权。
+            match std::fs::remove_file(self.path.join(STAGING_TOKEN_FILE)) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(io_err(e)),
+            }
+            drop(target);
+            std::fs::remove_dir(&self.path).map_err(io_err)?;
+        }
+        #[cfg(unix)]
+        {
+            remove_directory_contents(&target, true)?;
+            match rustix::fs::unlinkat(&target, STAGING_TOKEN_FILE, rustix::fs::AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => (),
+                Err(e) => return Err(io_err(e.into())),
+            }
+            rustix::fs::unlinkat(
+                &self.parent_handle,
+                self.path.file_name().unwrap(),
+                rustix::fs::AtFlags::REMOVEDIR,
+            )
+            .map_err(|e| io_err(e.into()))?;
+        }
+        Ok(())
+    }
 }
 
 fn read_manifest(archive: &mut zip::ZipArchive<File>) -> Result<Manifest> {
@@ -326,20 +793,13 @@ fn copy_hashing(src: &mut impl Read, dst: &mut impl Write, declared: u64) -> Res
     Ok((total, crate::utils::hash::to_hex_lower(&hasher.finalize())))
 }
 
-/// 暂存库先做完整性检查；仅格式 34 在已校验的暂存副本上事务升级，再复检。
-/// 未知格式仍拒绝，绝不触碰当前活库。
+/// 暂存库须通过 quick_check 和外键检查，且格式标识等于当前格式。
+/// 过旧或过新的包均返回 `CODE_SCHEMA_INCOMPATIBLE`，不修改暂存库结构。
 fn validate_staged_db(staged_db: &Path) -> Result<u32> {
     let conn = Connection::open(staged_db).map_err(db_err)?;
     quick_check(&conn)?;
     foreign_key_check(&conn)?;
     let pkg_version = crate::db::schema::read_schema_version(&conn);
-    if pkg_version == 34 {
-        crate::db::schema::initialize_schema(&conn)
-            .map_err(|_| err(CODE_SCHEMA_INCOMPATIBLE, "备份库结构升级失败"))?;
-        quick_check(&conn)?;
-        foreign_key_check(&conn)?;
-        return Ok(crate::db::schema::SCHEMA_VERSION);
-    }
     if pkg_version != crate::db::schema::SCHEMA_VERSION {
         return Err(err(
             CODE_SCHEMA_INCOMPATIBLE,
@@ -543,48 +1003,292 @@ mod tests {
         run_backup(&params, &CancellationToken::new()).unwrap().path
     }
 
-    /// 跨机 rebase(§3.2 fixture 硬要求:源/目标 appdata 路径不同):恢复暂存后,暂存库内
-    /// appdata 版本的 abs_path 指向**目标机** documents,不是源机路径;文件已解压到 staging。
+    fn arm_preview(target: &Path, staged: &RestoreStageResult) -> Result<()> {
+        super::super::arm_restore(
+            target,
+            &staged.backup_id,
+            Path::new(&staged.staging_dir),
+            &staged.staging_token,
+            "rollback",
+            "2026-10-04T00:00:00Z",
+            "20261004-000000",
+            "0.1.0",
+            &CancellationToken::new(),
+        )
+    }
+
     #[test]
-    fn restore_stage_rebases_appdata_paths_cross_machine() {
-        let root = unique_dir("rebase");
-        let src_app = root.join("machineA/appdata");
-        let dest = root.join("backups");
-        let pkg = make_package(&src_app, &dest, "bk-rebase-1");
-
-        // 目标机 appdata 路径与源不同。
-        let tgt_app = root.join("machineB/appdata");
-        std::fs::create_dir_all(&tgt_app).unwrap();
-
-        let res = restore_stage(&pkg, &tgt_app).expect("restore_stage 应成功");
-        assert_eq!(res.backup_id, "bk-rebase-1");
-        assert_eq!(res.schema_version, crate::db::schema::SCHEMA_VERSION);
-        assert_eq!(res.appdata_document_count, 1);
-        assert_eq!(res.roots.len(), 1);
-
-        // 暂存库内 abs_path 已 rebase 到目标机路径。
-        let staged_db = PathBuf::from(&res.staging_dir).join("db/scrollery.db");
-        let conn = Connection::open(&staged_db).unwrap();
-        let abs: String = conn
-            .query_row(
-                "SELECT abs_path FROM document_versions WHERE id=100",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let expected = tgt_app.join("documents").join("42").join("100.txt");
-        assert_eq!(
-            PathBuf::from(&abs),
-            expected,
-            "abs_path 须 rebase 到目标机 documents,不留源机前缀"
+    fn restore_discard_releases_only_staged_data() {
+        let root = tempfile::tempdir().unwrap();
+        let package = make_package(
+            &root.path().join("source"),
+            &root.path().join("backups"),
+            "owned",
         );
-        // 源机路径绝不残留。
-        assert!(!abs.contains("machineA"), "rebase 后不得残留源机路径:{abs}");
-        // 版本文件已解压到 staging。
-        assert!(PathBuf::from(&res.staging_dir)
-            .join("documents/42/100.txt")
-            .is_file());
-        let _ = std::fs::remove_dir_all(&root);
+        let target = root.path().join("target");
+        let live_db = seed_source(&target);
+        let original_db = std::fs::read(&live_db).unwrap();
+        let old = target.join("restore-old/owned/keep.txt");
+        let neighbor = target.join("restore-staging/neighbor/keep.txt");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&neighbor, b"neighbor").unwrap();
+        let staged = restore_stage(&package, &target).unwrap();
+        let staging = Path::new(&staged.staging_dir);
+        assert!(staging.join(ENTRY_DB).is_file());
+        assert!(staging.join("documents/42/100.txt").is_file());
+
+        restore_discard(&target, &staged.backup_id, &staged.staging_token).unwrap();
+        assert!(!staging.exists());
+        restore_discard(&target, &staged.backup_id, &staged.staging_token).unwrap();
+        assert_eq!(std::fs::read(&live_db).unwrap(), original_db);
+        assert_eq!(
+            std::fs::read(target.join("documents/42/100.txt")).unwrap(),
+            "版本正文内容".as_bytes()
+        );
+        assert_eq!(std::fs::read(&old).unwrap(), b"old");
+        assert_eq!(std::fs::read(&neighbor).unwrap(), b"neighbor");
+        assert!(package.is_file());
+    }
+
+    #[test]
+    fn restore_staging_ownership_rejects_outdated_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let package = make_package(
+            &root.path().join("source"),
+            &root.path().join("backups"),
+            "same-id",
+        );
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let first = restore_stage(&package, &target).unwrap();
+        let second = restore_stage(&package, &target).unwrap();
+        assert_ne!(first.staging_token, second.staging_token);
+        assert_eq!(first.staging_dir, second.staging_dir);
+
+        restore_discard(&target, &first.backup_id, &first.staging_token).unwrap();
+        assert!(Path::new(&second.staging_dir).join(ENTRY_DB).is_file());
+        assert!(matches!(
+            arm_preview(&target, &first),
+            Err(AppError::Restore {
+                code: CODE_STAGE_STALE,
+                ..
+            })
+        ));
+        assert_eq!(
+            validate_staging_owner(&target, &second.backup_id, &second.staging_token)
+                .unwrap()
+                .path(),
+            Path::new(&second.staging_dir)
+        );
+        restore_discard(&target, &second.backup_id, &second.staging_token).unwrap();
+        assert!(!Path::new(&second.staging_dir).exists());
+    }
+
+    #[test]
+    fn restore_pending_preserves_staging_until_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let package = make_package(
+            &root.path().join("source"),
+            &root.path().join("backups"),
+            "armed",
+        );
+        let target = root.path().join("target");
+        seed_source(&target);
+        let staged = restore_stage(&package, &target).unwrap();
+        let other_package = make_package(
+            &root.path().join("other-source"),
+            &root.path().join("backups"),
+            "other",
+        );
+        let other_stage = restore_stage(&other_package, &target).unwrap();
+        arm_preview(&target, &staged).unwrap();
+        let marker = target.join("pending-restore.json");
+        let original_marker = std::fs::read(&marker).unwrap();
+        assert!(matches!(
+            arm_preview(&target, &other_stage),
+            Err(AppError::Restore {
+                code: CODE_PENDING,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&marker).unwrap(), original_marker);
+        let original_db = std::fs::read(Path::new(&staged.staging_dir).join(ENTRY_DB)).unwrap();
+        assert!(matches!(
+            restore_discard(&target, &staged.backup_id, &staged.staging_token),
+            Err(AppError::Restore {
+                code: CODE_PENDING,
+                ..
+            })
+        ));
+        assert!(matches!(
+            restore_stage(&package, &target),
+            Err(AppError::Restore {
+                code: CODE_PENDING,
+                ..
+            })
+        ));
+        // 标记不能解析也不能被当成「未确认」，以免破坏崩溃后的恢复现场。
+        std::fs::write(target.join("pending-restore.json"), b"{broken").unwrap();
+        assert!(matches!(
+            restore_discard(&target, &staged.backup_id, &staged.staging_token),
+            Err(AppError::Restore {
+                code: super::super::swap::CODE_MARKER_CORRUPT,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(Path::new(&staged.staging_dir).join(ENTRY_DB)).unwrap(),
+            original_db
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_discard_keeps_ownership_after_cleanup_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let package = make_package(
+            &root.path().join("source"),
+            &root.path().join("backups"),
+            "retry",
+        );
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let staged = restore_stage(&package, &target).unwrap();
+        let staging = Path::new(&staged.staging_dir);
+        let locked_path = staging.join("zz-locked.txt");
+        std::fs::write(&locked_path, b"busy").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked_path)
+            .unwrap();
+        assert!(matches!(
+            restore_discard(&target, &staged.backup_id, &staged.staging_token),
+            Err(AppError::Restore { code: CODE_IO, .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(staging.join(STAGING_TOKEN_FILE)).unwrap(),
+            staged.staging_token
+        );
+        assert!(locked_path.is_file());
+        drop(locked);
+        restore_discard(&target, &staged.backup_id, &staged.staging_token).unwrap();
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn restore_operations_respect_cross_process_lock() {
+        const CHILD_DIR: &str = "SCROLLERY_RESTORE_LOCK_TEST_DIR";
+        if let Some(target) = std::env::var_os(CHILD_DIR) {
+            let target = PathBuf::from(target);
+            let busy = |result: Result<()>| {
+                assert!(matches!(
+                    result,
+                    Err(AppError::Restore {
+                        code: super::super::core::CODE_JOB_BUSY,
+                        ..
+                    })
+                ))
+            };
+            busy(restore_discard(
+                &target,
+                "locked",
+                "11111111111111111111111111111111",
+            ));
+            busy(restore_stage(Path::new("unused"), &target).map(|_| ()));
+            busy(super::super::arm_restore(
+                &target,
+                "locked",
+                Path::new("unused"),
+                "11111111111111111111111111111111",
+                "rb",
+                "unused",
+                "unused",
+                "0.1.0",
+                &CancellationToken::new(),
+            ));
+            busy(super::super::perform_swap_at_boot(&target).map(|_| ()));
+            busy(super::super::rollback_restore_at_boot(&target, "locked"));
+            super::super::finalize_restore_verified(&target, "locked");
+            assert!(target
+                .join("restore-staging/locked/db/scrollery.db")
+                .is_file());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let package = make_package(
+            &root.path().join("source"),
+            &root.path().join("backups"),
+            "locked",
+        );
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let staged = restore_stage(&package, &target).unwrap();
+        let lock = acquire_restore_lock(&target).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backup::restore::tests::restore_operations_respect_cross_process_lock",
+                "--nocapture",
+            ])
+            .env(CHILD_DIR, &target)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        drop(lock);
+        restore_discard(&target, &staged.backup_id, &staged.staging_token).unwrap();
+        assert!(!Path::new(&staged.staging_dir).exists());
+    }
+
+    #[test]
+    fn restore_discard_rejects_path_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(outside.join("owned")).unwrap();
+        let protected = outside.join("owned/keep.txt");
+        std::fs::write(&protected, b"outside").unwrap();
+        assert!(matches!(
+            restore_discard(&target, "../../outside", "11111111111111111111111111111111"),
+            Err(AppError::Restore {
+                code: CODE_PATH_INVALID,
+                ..
+            })
+        ));
+        let link = target.join("restore-staging");
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(matches!(
+            restore_discard(&target, "owned", "11111111111111111111111111111111"),
+            Err(AppError::Restore {
+                code: CODE_PATH_INVALID,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&protected).unwrap(), b"outside");
+        // 只移除测试创建的链接本身，再让 TempDir 回收本用例目录。
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
     }
 
     /// 篡改:包内 DB 字节被改一位 → SHA-256 不符 → restore_corrupt,且 staging 已清(RAII)。
@@ -661,75 +1365,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// #1 端到端:manifest.backupId 含路径穿越 → restore_stage 判 restore_path_invalid,
-    /// 且不在 appdata 外制造/删除任何目录(remove_dir_all/解压落点均被拦在校验前)。
+    /// 备份库格式非当前:过旧与过新走**同一条**拒绝路径 → 统一 restore_schema_incompatible,
+    /// 且拒绝路径绝不改动暂存库(不「修好」标识、不建结构)。直接单测暂存库校验函数。
     #[test]
-    fn restore_stage_rejects_malicious_backup_id() {
-        let root = unique_dir("badid");
-        let tgt = root.join("target");
-        std::fs::create_dir_all(&tgt).unwrap();
+    fn staged_db_other_format_is_rejected() {
+        for bogus in [
+            crate::db::schema::SCHEMA_VERSION + 1,
+            crate::db::schema::SCHEMA_VERSION - 1,
+        ] {
+            let root = unique_dir("otherfmt");
+            let db = root.join("scrollery.db");
+            let conn = Connection::open(&db).unwrap();
+            crate::db::schema::initialize_schema(&conn).unwrap();
+            conn.execute(
+                "UPDATE app_config SET value=?1 WHERE key='schema_version'",
+                params![bogus.to_string()],
+            )
+            .unwrap();
+            drop(conn);
 
-        // 造一个 backupId 越界、payload 仅 db 的假包(校验应在解压/清理前拦下)。
-        let manifest = r#"{"formatVersion":1,"backupId":"../../escape","kind":"manual",
-            "appVersion":"0.1.0","schemaVersion":21,"createdAtUtc":"2026-07-19T00:00:00Z","roots":[],
-            "counts":{"items":0,"albums":0,"tags":0,"namedPersons":0},"externalDocumentVersions":0,
-            "payload":[{"path":"db/scrollery.db","bytes":4,"sha256":"00"}]}"#;
-        let pkg = root.join("badid.scrollerybackup");
-        {
-            let f = File::create(&pkg).unwrap();
-            let mut zip = zip::ZipWriter::new(f);
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            zip.start_file(ENTRY_MANIFEST, opts).unwrap();
-            zip.write_all(manifest.as_bytes()).unwrap();
-            zip.finish().unwrap();
-        }
-
-        match restore_stage(&pkg, &tgt) {
-            Err(AppError::Restore { code, .. }) => {
-                assert_eq!(code, CODE_PATH_INVALID, "越界 backupId 应判 path_invalid")
+            match validate_staged_db(&db) {
+                Err(AppError::Restore { code, .. }) => {
+                    assert_eq!(code, CODE_SCHEMA_INCOMPATIBLE, "标识 {bogus}")
+                }
+                other => panic!("期望 restore_schema_incompatible(标识 {bogus}),得 {other:?}"),
             }
-            other => panic!("期望 restore_path_invalid,得 {other:?}"),
+            // 拒绝路径不得「修好」标识,也不得建立任何结构。
+            let conn = Connection::open(&db).unwrap();
+            assert_eq!(crate::db::schema::read_schema_version(&conn), bogus);
+            drop(conn);
+            let _ = std::fs::remove_dir_all(&root);
         }
-        // 越界目录绝不被创建(escape 应落在 target 之外的 root 下)。
-        assert!(!root.join("escape").exists());
-        assert!(!root.join("restore-staging").exists());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn staged_34_db_is_upgraded_before_restore() {
-        let root = unique_dir("format34");
-        let db = root.join("scrollery.db");
-        let conn = Connection::open(&db).unwrap();
-        crate::db::schema::initialize_schema(&conn).unwrap();
-        conn.execute_batch(
-            "ALTER TABLE media_derivations RENAME TO media_derivations_v35;
-             CREATE TABLE media_derivations (
-                 item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
-                 kind TEXT NOT NULL, status INTEGER NOT NULL DEFAULT 0,
-                 payload_path TEXT, error TEXT,
-                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-                 orphan_count INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY (item_id, kind)
-             );
-             DROP TABLE media_derivations_v35;
-             CREATE INDEX idx_deriv_pending ON media_derivations(kind, status) WHERE status < 2;
-             UPDATE app_config SET value='34' WHERE key='schema_version';",
-        )
-        .unwrap();
-        drop(conn);
-
-        assert_eq!(
-            validate_staged_db(&db).unwrap(),
-            crate::db::schema::SCHEMA_VERSION
-        );
-        let conn = Connection::open(&db).unwrap();
-        assert_eq!(
-            crate::db::schema::read_schema_version(&conn),
-            crate::db::schema::SCHEMA_VERSION
-        );
-        drop(conn);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,9 +1,6 @@
 <template>
-  <!-- 画廊「视图控件」(行高/布局/分组排序/导出视图): 顶栏重构 Phase G。G8: 拆成 4 个独立折叠项
-       (行高 0 / 布局 1 / 分组排序 2 / 导出当前视图 3, U-2 方案 A ②补入), 各自作一个 data-toolbar-item,
-       由统一 useToolbarOverflow 按优先序依次折(globalIndex = baseIndex + offset, baseIndex=chip 数)。
-       复用 G7 的 .fold-item(CSS Grid 收缩)。内联横向收缩; 菜单(视图 ⋯)竖排靠 v-show 显折叠项。
-       状态全在 store, 两实例天然同步。 -->
+  <!-- 行高、布局、分组排序和导出视图各占一个折叠项；useToolbarOverflow 按顺序折叠。
+       baseIndex 为筛选 chip 数，内联与菜单实例共享 store 状态。 -->
   <!-- 行高 (offset 0) -->
   <div
     v-show="inDom(0)"
@@ -30,7 +27,7 @@
       </div>
     </div>
   </div>
-  <!-- 布局切换 (offset 1，T20)：宫格 ⇄ 等高行 -->
+  <!-- 布局切换：宫格 ⇄ 等高行。 -->
   <div
     v-show="inDom(1)"
     :data-toolbar-item="itemAttr"
@@ -197,7 +194,7 @@ const exportStore = useExportStore()
 const exportEntries = useExportEntries()
 const { t } = useI18n()
 
-// 重复镜头(2026-09-02 方案 §4.1/§4.2):激活时普通分组/组内排序/无缝/升降序控件被镜头排列
+// 重复镜头激活时，普通分组、组内排序、无缝和升降序控件由镜头排列
 // 分段控件替换;mode 由 useGalleryQuerySync 从 URL 收敛(URL 是事实源),本组件只发动作。
 const lens = useDuplicateLensStore()
 const lensActive = computed(() => lens.isLensActive)
@@ -215,7 +212,7 @@ function folded(offset: number): boolean {
   )
 }
 
-// 布局模式切换（T20）：宫格 ⇄ 等高行。setLayoutMode 持久化；relayout watch 监听 layoutMode 触发重算。
+// 布局模式在宫格与等高行之间切换；setLayoutMode 持久化后由 relayout watch 重算。
 function toggleLayoutMode() {
   ui.setLayoutMode(ui.layoutMode === 'grid' ? 'justified' : 'grid')
 }
@@ -224,10 +221,8 @@ function toggleSortOrder() {
   ui.sortOrder = ui.sortOrder === 'desc' ? 'asc' : 'desc'
 }
 
-// 导出当前视图(U-2 方案 A ②):descriptor 组装收在 useExportEntries,本组件只管触发唤出既有对话框
-// (同 MediaGrid.vue startExportSelection 的调用姿态)。
-// ViewStale 重试回调(P3):重跑 buildCurrentViewExportPayload 取 selection,而非借用当前选区
-// (严禁回退借用选区——此前 ExportDialog 的重试无条件用选区重建,会把视图导出静默换成选区)。
+// 导出描述由 useExportEntries 组装，本组件触发导出对话框。
+// ViewStale 重试时重跑 buildCurrentViewExportPayload 获取视图条目，避免误用当前选区。
 function exportCurrentView() {
   const { selection, source } = exportEntries.buildCurrentViewExportPayload(
     t('export.currentViewName'),

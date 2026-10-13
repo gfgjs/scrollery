@@ -1,28 +1,14 @@
-<!-- OCR 模型分节（B′ 路线，T10）：预下载两档 + 档位切换。模板仿 FaceModelLibrary.vue
-     （固定小模型组下载形态），进度/下载调用姿态照 ModelLibrary.vue:260-284。
-     未授权态分节仍显示（D-OCR-6：模型下载免费，识别命令才验 license）；顶部小字提示授权态 + 商店链接。 -->
+<!-- OCR 模型可提前下载，识别前单独免费激活。 -->
 <template>
   <CollapsibleCard id="ocrModels" :title="$t('settings.ocrTitle')">
     <p class="ocr-models__hint">{{ $t('settings.ocrHint') }}</p>
 
-    <!-- 授权态提示：未授权也可预下载模型,识别命令才验 license(D-OCR-6)。文案复用 T9 已写入的
-         ocr.unlicensed/ocr.licenseExpired 顶层 key(settings 节未新增专用 key,避免与 T9 独占的
-         locale 文件产生写入冲突)。 -->
-    <div v-if="status && status.availability !== 'authorized'" class="ocr-models__auth">
-      {{
-        status.availability === 'licenseExpired' ? $t('ocr.licenseExpired') : $t('ocr.unlicensed')
-      }}
-      <a
-        v-if="status.storeUrl"
-        :href="status.storeUrl"
-        target="_blank"
-        rel="noopener noreferrer"
-        class="ocr-models__auth-link"
-        >{{ $t('store.builtinTitle') }}</a
-      >
+    <div v-if="status && status.availability === 'inactive'" class="ocr-models__auth">
+      {{ $t('ocr.unlicensed') }}
+      <RouterLink to="/plugins">{{ $t('exotic.activateAction') }}</RouterLink>
     </div>
 
-    <!-- 逐档判定(J14):任一档清单未就绪即提示,不再取单一全局标志。 -->
+    <!-- 任一档模型清单未就绪即提示。 -->
     <div v-if="anyManifestUnready" class="ocr-models__unready">
       {{ $t('settings.ocrManifestUnready') }}
     </div>
@@ -88,9 +74,8 @@ import CollapsibleCard from './CollapsibleCard.vue'
 import { useConfigStore } from '../../stores/configStore'
 import { useToastStore } from '../../stores/toastStore'
 import { invokeIpc, ipcErrorMessage } from '../../utils/ipc'
-import { IPC } from '../../constants/ipc'
-// T9 并行在飞:resetOcrStatusCache 从 useOcr 导入。若 T9 尚未落地,该导入会使
-// vue-tsc/构建报错——此为已知依赖态,非本卡缺陷(见任务卡 T10 回执)。
+import { IPC, EVENTS } from '../../constants/ipc'
+import { useTauriListen } from '../../composables/useTauriListen'
 import { resetOcrStatusCache } from '../../composables/useOcr'
 import type { OcrStatus, OcrTier } from '../../types/ocr'
 import type { ModelDownloadProgress } from '../../types/ai'
@@ -105,7 +90,7 @@ const progress = reactive<Record<string, { received: number; total: number }>>({
 const errors = reactive<Record<string, string>>({})
 const switching = ref(false)
 
-/** 逐档判定(J14):任一档清单未就绪即提示——顶部横幅不再取单一全局标志。 */
+/** 任一档模型清单未就绪时显示顶部提示。 */
 const anyManifestUnready = computed(
   () => status.value?.tiers.some((tier) => !tier.manifestReady) ?? false,
 )
@@ -159,6 +144,10 @@ async function useTier(tier: OcrTier) {
     switching.value = false
   }
 }
+
+useTauriListen(EVENTS.FEATURE_ACTIVATION_CHANGED, () => {
+  void refresh().catch(() => { status.value = null })
+})
 
 onMounted(async () => {
   await config.loadConfig()

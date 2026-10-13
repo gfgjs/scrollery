@@ -43,9 +43,12 @@ export function usePager(opts: PagerOptions) {
   }
 
   function onKeydown(e: KeyboardEvent) {
-    // 输入框聚焦时不劫持（替换规则/搜索等）。
+    // 修饰键属于文字选区、浏览器及应用命令；中继键也须保留原生行为。
+    if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return
     const t = e.target as HTMLElement | null
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+    if (t?.isContentEditable || t?.closest?.('input, textarea, select, [contenteditable], [role="slider"]')) return
+    // 按钮焦点下仍可用方向键翻页，但 Space 必须留给其原生激活。
+    if (e.key === ' ' && t?.closest?.('button, a[href], [role="button"]')) return
 
     const c = opts.container()
     switch (e.key) {

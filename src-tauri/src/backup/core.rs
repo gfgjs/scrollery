@@ -1,10 +1,10 @@
-//! 备份引擎(方案 B §5)。**纯函数**:时间戳 / backup_id / retention 由调用方注入,
-//! 便于单测确定性。**须在持 `AppState.document_storage_guard` write guard 的 blocking 上下文
-//! 调用**(方案 §3.1:VACUUM 快照与 documents 文件须来自同一逻辑时点)。
+//! 备份引擎：时间戳、backup_id 与 retention 由调用方注入，便于确定性测试。
+//! 须在持 `AppState.document_storage_guard` 写锁的 blocking 上下文调用，
+//! 保证 VACUUM 快照与 documents 文件来自同一逻辑时点。
 //!
 //! 流程:preflight(可写)→ VACUUM INTO 一致快照 → quick_check + 计数/根/schema 版本读 →
-//! 文档一致性逐行校验(§3.1)→ zip 流式打包(逐条未压缩 SHA-256)→ manifest 最后写 →
-//! `*.tmp` 同卷 rename 为正式包 → 仅成功后对**自动包**做 retention(B-6)。
+//! 文档一致性逐行校验 → zip 流式打包(逐条未压缩 SHA-256)→ manifest 最后写 →
+//! `*.tmp` 同卷 rename 为正式包 → 仅成功后对**自动包**做 retention。
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -23,7 +23,7 @@ use super::manifest::{
 };
 use crate::error::{AppError, Result};
 
-// ── 稳定错误码(方案 §9;透到 IPC `code` 字段供前端分流)────────────────────────────
+// ── 稳定错误码(透到 IPC `code` 字段供前端分流)────────────────────────────────────
 pub const CODE_DIR_UNSET: &str = "backup_dir_unset";
 pub const CODE_DIR_NOT_WRITABLE: &str = "backup_dir_not_writable";
 pub const CODE_DOC_INCONSISTENT: &str = "backup_document_inconsistent";
@@ -32,7 +32,7 @@ pub const CODE_IO: &str = "backup_io";
 pub const CODE_JOB_BUSY: &str = "file_job_busy";
 
 fn err(code: &'static str, msg: &str) -> AppError {
-    // message 一律固定文案,**不携带绝对路径 / SQL / 内部错误串**(泄漏面,方案 §9)。
+    // message 一律固定文案,**不携带绝对路径 / SQL / 内部错误串**(泄漏面)。
     AppError::Backup {
         code,
         message: msg.to_string(),
@@ -129,7 +129,7 @@ pub struct BackupOutcome {
     pub backup_id: String,
 }
 
-/// 执行一次完整备份(方案 §5)。见模块文档的前置不变量。
+/// 执行一次完整备份。见模块文档的前置不变量。
 pub fn run_backup(p: &BackupParams, cancel: &CancellationToken) -> Result<BackupOutcome> {
     // 0. preflight:目的地存在且可写(尝试写一个探针文件)。
     ensure_dest_writable(p.dest_dir)?;
@@ -137,8 +137,7 @@ pub fn run_backup(p: &BackupParams, cancel: &CancellationToken) -> Result<Backup
     // 1. 工作目录 + VACUUM INTO 暂存库(独立连接 + 同 PRAGMA,参数绑定路径)。
     // 放 **app_data_dir**(本地源卷)而非 dest_dir:dest 可能是慢速 USB/NAS,VACUUM 出的完整 catalog
     // 若写到那儿,还要再读回 hash+deflate、再写 tmp——三次全量过慢链,且全程持文档一致性 write guard
-    // 阻塞文档保存。只有最终 tmp→正式包的原子 rename 须与正式包同卷(见第 5 步),VACUUM 暂存不必
-    // (审查 #15)。
+    // 阻塞文档保存。只有最终 tmp→正式包的原子 rename 须与正式包同卷(见第 5 步),VACUUM 暂存不必。
     let work_dir = p
         .app_data_dir
         .join(format!(".scrollery-backup-work-{}", p.backup_id));
@@ -172,15 +171,15 @@ pub fn run_backup(p: &BackupParams, cancel: &CancellationToken) -> Result<Backup
     }
 
     // 4. zip 流式打包到 `*.tmp`(db → documents → manifest 最后写)。
-    let final_name = format!(
-        "Scrollery-{}-{}.{}",
-        p.kind.file_infix(),
-        p.timestamp_label,
-        BACKUP_FILE_EXT
-    );
-    let final_path = p.dest_dir.join(&final_name);
-    let tmp_path = p.dest_dir.join(format!("{final_name}.tmp"));
-    let _ = std::fs::remove_file(&tmp_path); // 清残留 tmp
+    let name_prefix = format!("Scrollery-{}-{}", p.kind.file_infix(), p.timestamp_label);
+    let final_name = format!("{name_prefix}.{BACKUP_FILE_EXT}");
+    // 独占随机临时名并由句柄写包；失败由 TempPath 清理，不猜测旧临时文件的归属。
+    let (file, mut tmp_path) = tempfile::Builder::new()
+        .prefix(&format!(".{final_name}."))
+        .suffix(".tmp")
+        .tempfile_in(p.dest_dir)
+        .map_err(|_| err(CODE_DIR_NOT_WRITABLE, "无法创建备份临时文件"))?
+        .into_parts();
 
     let meta = ManifestMeta {
         backup_id: p.backup_id.clone(),
@@ -192,17 +191,56 @@ pub fn run_backup(p: &BackupParams, cancel: &CancellationToken) -> Result<Backup
         counts,
         external_document_versions,
     };
-    if let Err(e) = write_package(&tmp_path, &staging_db, &docs, meta, cancel) {
-        let _ = std::fs::remove_file(&tmp_path); // 失败/取消:清 tmp,不留半截包
-        return Err(e);
-    }
-    if cancel.is_cancelled() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(cancelled());
-    }
+    write_package(file, &staging_db, &docs, meta, cancel)?;
 
-    // 5. 同卷 rename → 正式包(原子落名;此后视为已提交,不再取消)。
-    std::fs::rename(&tmp_path, &final_path).map_err(|_| err(CODE_IO, "备份改名落盘失败"))?;
+    // 5. 从同秒现有最大序号继续，不能回填轮转留下的空位，否则新包会被误判为旧包。
+    let suffix_prefix = format!("{name_prefix}-");
+    let extension = format!(".{BACKUP_FILE_EXT}");
+    let mut max_sequence = 0u64;
+    let entries = std::fs::read_dir(p.dest_dir).map_err(|_| err(CODE_IO, "读取备份目的地失败"))?;
+    for entry in entries {
+        let entry = entry.map_err(|_| err(CODE_IO, "读取备份目的地失败"))?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let sequence = if name == final_name {
+            Some(1)
+        } else {
+            name.strip_prefix(&suffix_prefix)
+                .and_then(|tail| tail.strip_suffix(&extension))
+                .filter(|digits| !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()))
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .filter(|sequence| *sequence >= 2)
+        };
+        max_sequence = max_sequence.max(sequence.unwrap_or(0));
+    }
+    let mut sequence = max_sequence
+        .checked_add(1)
+        .ok_or_else(|| err(CODE_IO, "备份重名序号已耗尽"))?;
+    // 同卷无覆盖发布；扫描后出现的同名文件也保留。成功后已提交，不再取消。
+    let final_path = loop {
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let candidate = if sequence == 1 {
+            p.dest_dir.join(&final_name)
+        } else {
+            p.dest_dir
+                .join(format!("{name_prefix}-{sequence}.{BACKUP_FILE_EXT}"))
+        };
+        match tmp_path.persist_noclobber(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                tmp_path = e.path;
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| err(CODE_IO, "备份重名序号已耗尽"))?;
+            }
+            Err(_) => return Err(err(CODE_IO, "备份改名落盘失败")),
+        }
+    };
     let bytes = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
 
     // 6. retention:仅对自动包、仅成功产包后(B-6)。删失败不阻断。
@@ -224,17 +262,15 @@ fn ensure_dest_writable(dest_dir: &Path) -> Result<()> {
     if !dest_dir.is_dir() {
         return Err(err(CODE_DIR_NOT_WRITABLE, "备份目的地不存在或不是目录"));
     }
-    let probe = dest_dir.join(".scrollery-backup-writable-probe");
-    match std::fs::write(&probe, b"ok") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            Ok(())
-        }
-        Err(_) => Err(err(CODE_DIR_NOT_WRITABLE, "备份目的地不可写")),
-    }
+    // 匿名临时文件独占创建并随句柄清理，不覆盖同名用户文件，也不按路径猜测清理所有权。
+    let mut probe = tempfile::tempfile_in(dest_dir)
+        .map_err(|_| err(CODE_DIR_NOT_WRITABLE, "备份目的地不可写"))?;
+    probe
+        .write_all(b"ok")
+        .map_err(|_| err(CODE_DIR_NOT_WRITABLE, "备份目的地不可写"))
 }
 
-/// VACUUM INTO 一致快照(方案 §5.3):独立连接 + 同生产 PRAGMA,**参数绑定**目标路径。
+/// VACUUM INTO 一致快照:独立连接 + 同生产 PRAGMA,**参数绑定**目标路径。
 /// synchronous=NORMAL 下 SQLite 在命令成功返回前同步输出;此后再入 zip。
 fn vacuum_into(source_db_path: &Path, staging_db: &Path) -> Result<()> {
     let conn = Connection::open(source_db_path).map_err(db_io)?;
@@ -268,12 +304,12 @@ fn hash_file_xxh3(path: &Path) -> Result<String> {
     Ok(format!("{:016x}", hasher.digest()))
 }
 
-/// 逐行校验 `storage='appdata'` 文档版本(方案 §3.1),返回可入包的清单。任一失败返回
+/// 逐行校验 `storage='appdata'` 文档版本,返回可入包的清单。任一失败返回
 /// `backup_document_inconsistent`,不产「成功」包。
 ///
 /// `verify_hash`:是否在此就地校验 content_hash。preflight(`documents_consistent`)传 `true`
 /// (报告用,须独立于打包);`run_backup` 传 `false`——内容 xxh3 校验下沉到打包的单遍读,避免
-/// 二次整读(审查 #14)。无论真假,期望 content_hash 都随 `ValidatedDoc` 带出供打包比对。
+/// 二次整读。无论真假,期望 content_hash 都随 `ValidatedDoc` 带出供打包比对。
 fn validate_appdata_documents(
     conn: &Connection,
     app_data_dir: &Path,
@@ -340,7 +376,7 @@ fn validate_appdata_documents(
     Ok(out)
 }
 
-/// preflight 用:检查 `storage='appdata'` 文档版本是否全部一致(方案 §5.1)。全一致返回 `true`,
+/// preflight 用:检查 `storage='appdata'` 文档版本是否全部一致。全一致返回 `true`,
 /// 任一行不一致返回 `false`(不 Err——preflight 是报告而非硬失败;真正的硬门在 `run_backup`)。
 /// 传入活库只读连接。
 pub fn documents_consistent(conn: &Connection, app_data_dir: &Path) -> bool {
@@ -353,17 +389,15 @@ pub fn dest_writable(dest_dir: &Path) -> bool {
     ensure_dest_writable(dest_dir).is_ok()
 }
 
-/// zip 打包到 `tmp_path`:db → 各 document → manifest 最后写。逐条流式计算未压缩 SHA-256
+/// zip 打包到独占临时文件句柄:db → 各 document → manifest 最后写。逐条流式计算未压缩 SHA-256
 /// (读一遍源、边喂 hasher 边喂 deflate,大库不进内存驻留)。收尾 fsync 确保落盘。
 fn write_package(
-    tmp_path: &Path,
+    file: File,
     staging_db: &Path,
     docs: &[ValidatedDoc],
     meta: ManifestMeta,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let file =
-        File::create(tmp_path).map_err(|_| err(CODE_DIR_NOT_WRITABLE, "无法创建备份临时文件"))?;
     let mut zip = ZipWriter::new(BufWriter::new(file));
     // large_file(true):大库 DB 可能超 4GB,强制 ZIP64 局部头(自有 restore 读取,无兼容负担)。
     let opts = SimpleFileOptions::default()
@@ -373,7 +407,7 @@ fn write_package(
     let mut payload = Vec::with_capacity(docs.len() + 1);
     // DB 条目无 content_hash → 不比对(None)。
     payload.push(add_file_streaming(
-        &mut zip, ENTRY_DB, staging_db, opts, None,
+        &mut zip, ENTRY_DB, staging_db, opts, None, cancel,
     )?);
     for d in docs {
         if cancel.is_cancelled() {
@@ -387,6 +421,7 @@ fn write_package(
             &d.abs_path,
             opts,
             d.content_hash.as_deref(),
+            cancel,
         )?);
     }
 
@@ -409,7 +444,7 @@ fn write_package(
 }
 
 /// 把一个文件**单遍**流式写入 zip 条目,同时计算未压缩内容的 SHA-256(入 manifest;zip CRC 不能
-/// 替代,§4)。`expected_xxh3` 非空时,顺便同算 xxh3 并与之比对(§#14:content_hash 校验融进这一遍
+/// 替代)。`expected_xxh3` 非空时,顺便同算 xxh3 并与之比对(content_hash 校验融进这一遍
 /// 读,避免 validate 再整读一次)——不符即 `backup_document_inconsistent`。
 fn add_file_streaming(
     zip: &mut ZipWriter<BufWriter<File>>,
@@ -417,17 +452,35 @@ fn add_file_streaming(
     src_path: &Path,
     opts: SimpleFileOptions,
     expected_xxh3: Option<&str>,
+    cancel: &CancellationToken,
 ) -> Result<PayloadEntry> {
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
     zip.start_file(entry_name, opts)
         .map_err(|_| err(CODE_IO, "写备份条目失败"))?;
     let mut f = File::open(src_path).map_err(|_| err(CODE_IO, "读取待备份文件失败"))?;
+    stream_file_contents(zip, entry_name, &mut f, expected_xxh3, cancel)
+}
+
+fn stream_file_contents(
+    zip: &mut ZipWriter<BufWriter<File>>,
+    entry_name: &str,
+    source: &mut impl Read,
+    expected_xxh3: Option<&str>,
+    cancel: &CancellationToken,
+) -> Result<PayloadEntry> {
     let mut hasher = Sha256::new();
     let verify = expected_xxh3.filter(|s| !s.is_empty());
     let mut xh = verify.map(|_| Xxh3::new());
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
-        let n = f
+        // 大库或单个大文档也须分块响应取消；先检查再读，避免后续设备错误盖过取消终态。
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        let n = source
             .read(&mut buf)
             .map_err(|_| err(CODE_IO, "读取待备份文件失败"))?;
         if n == 0 {
@@ -454,8 +507,8 @@ fn add_file_streaming(
     })
 }
 
-/// 自动包 retention(B-6):仅删「文件名前缀 `Scrollery-auto-` + 扩展名 + manifest.kind==auto
-/// 验证通过」的包;按文件名(内嵌时间戳=时间序)保留最新 `keep` 份。永不碰手动包 / 陌生文件 /
+/// 自动包 retention:仅删「文件名前缀 `Scrollery-auto-` + 扩展名 + manifest.kind==auto
+/// 验证通过」的包;按时间戳与同秒序号保留最新 `keep` 份。永不碰手动包 / 陌生文件 /
 /// 无法解析的包。删失败不阻断(尽力而为)。
 fn apply_auto_retention(dest_dir: &Path, keep: usize) {
     let Ok(read) = std::fs::read_dir(dest_dir) else {
@@ -468,8 +521,13 @@ fn apply_auto_retention(dest_dir: &Path, keep: usize) {
             autos.push(path);
         }
     }
-    autos.sort(); // 文件名前缀同 → 时间戳字典序 == 时间序(升序)
-    autos.reverse(); // 最新在前
+    // 去掉扩展名后按自然序倒排：无后缀的首包最旧，数字后缀不受 -9/-10 字典序影响。
+    autos.sort_by(|a, b| {
+        crate::utils::natural_sort::natural_cmp(
+            &b.file_stem().unwrap_or_default().to_string_lossy(),
+            &a.file_stem().unwrap_or_default().to_string_lossy(),
+        )
+    });
     for old in autos.into_iter().skip(keep) {
         let _ = std::fs::remove_file(&old);
     }
@@ -516,15 +574,81 @@ mod tests {
     use crate::backup::manifest::Manifest;
     use xxhash_rust::xxh3::xxh3_64;
 
-    /// 造一套源:app_data_dir 内的 scrollery.db(跑迁移)+ 一个扫描根 + 一个 appdata 文档版本
+    #[test]
+    fn writable_probe_preserves_existing_file_and_leaves_no_temporary_file() {
+        let dest = tempfile::tempdir().unwrap();
+        let existing = dest.path().join(".scrollery-backup-writable-probe");
+        std::fs::write(&existing, b"existing user content").unwrap();
+
+        ensure_dest_writable(dest.path()).expect("已有同名文件不妨碍可写目录检查");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"existing user content");
+        let entries: Vec<_> = std::fs::read_dir(dest.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![existing.file_name().unwrap().to_os_string()],
+            "检查完成后只能留下原有文件，不能残留探针"
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_entry_reads_before_a_later_io_error() {
+        struct CancelAfterRead {
+            file: File,
+            cancel: CancellationToken,
+            bytes_after_cancel: usize,
+        }
+        impl Read for CancelAfterRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let already_cancelled = self.cancel.is_cancelled();
+                let n = self.file.read(buf)?;
+                if already_cancelled {
+                    self.bytes_after_cancel += n;
+                    return Err(std::io::Error::other("取消后模拟设备离线"));
+                }
+                self.cancel.cancel();
+                Ok(n)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("large-document.txt");
+        std::fs::write(&source, vec![b'a'; 128 * 1024]).unwrap();
+        let cancel = CancellationToken::new();
+        let mut reader = CancelAfterRead {
+            file: File::open(&source).unwrap(),
+            cancel: cancel.clone(),
+            bytes_after_cancel: 0,
+        };
+        let target = File::create(tmp.path().join("package.tmp")).unwrap();
+        let mut zip = ZipWriter::new(BufWriter::new(target));
+        zip.start_file("documents/42/1.txt", SimpleFileOptions::default())
+            .unwrap();
+        let result =
+            stream_file_contents(&mut zip, "documents/42/1.txt", &mut reader, None, &cancel);
+        assert!(cancel.is_cancelled(), "在真实文件首块读取后请求取消");
+        assert_eq!(reader.bytes_after_cancel, 0, "取消后不得再读取下一块");
+        assert!(
+            matches!(
+                result,
+                Err(AppError::Backup {
+                    code: CODE_CANCELLED,
+                    ..
+                })
+            ),
+            "取消应保留专用终态，不被后续读取错误覆盖: {result:?}"
+        );
+    }
+
+    /// 造一套源:app_data_dir 内的 scrollery.db(跑初始化)+ 一个扫描根 + 一个 appdata 文档版本
     /// (真文件 + content_hash)+ 一个 external 版本(不入包只计数)。返回 (db_path, app_data_dir)。
     fn seed_source(app_data: &Path) -> PathBuf {
         std::fs::create_dir_all(app_data).unwrap();
         let db_path = app_data.join("scrollery.db");
         let conn = Connection::open(&db_path).unwrap();
         crate::db::schema::initialize_schema(&conn).unwrap();
-
-        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap(); // 免造 media_items 满列行
 
         conn.execute(
             "INSERT INTO scan_roots (id, path, alias, is_hidden) VALUES (1, ?1, '照片库', 0)",
@@ -533,6 +657,18 @@ mod tests {
         .unwrap();
 
         let item_id = 42i64;
+        conn.execute(
+            "INSERT INTO directories (id, root_id, rel_path, name) VALUES (1, 1, 'sub', 'sub')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_items \
+             (id, directory_id, file_name, file_size, file_mtime, file_format, sort_datetime, cache_key) \
+             VALUES (?1, 1, 'doc.txt', 1, 1, 'txt', 1, 1)",
+            params![item_id],
+        )
+        .unwrap();
         let docdir = app_data.join("documents").join(item_id.to_string());
         std::fs::create_dir_all(&docdir).unwrap();
         let content = "版本正文内容";
@@ -609,6 +745,8 @@ mod tests {
             "20260719-000000",
             None,
         );
+        let unrelated_tmp = dest.join("Scrollery-backup-20260719-000000.scrollerybackup.tmp");
+        std::fs::write(&unrelated_tmp, b"unrelated temporary content").unwrap();
         let outcome = run_backup(&p, &CancellationToken::new()).expect("backup 应成功");
 
         assert!(outcome.path.exists(), "正式包应存在");
@@ -682,46 +820,101 @@ mod tests {
                 entry.path
             );
         }
-        let _ = std::fs::remove_dir_all(&root);
-    }
+        drop(archive);
 
-    /// 文档不一致(行引用的文件被删)→ 返回 backup_document_inconsistent,且**不产任何包**。
-    #[test]
-    fn backup_rejects_inconsistent_documents_and_produces_no_package() {
-        let root = unique_dir("inconsistent");
-        let app_data = root.join("appdata");
-        let dest = root.join("dest");
-        std::fs::create_dir_all(&dest).unwrap();
-        let db = seed_source(&app_data);
-        // 删掉 appdata 版本文件 → 行引用缺失文件。
-        std::fs::remove_file(app_data.join("documents").join("42").join("100.txt")).unwrap();
-
-        let p = params(
+        // 同秒再次备份也须生成独立完整包；既有包与不属于本次任务的临时文件均不得被覆盖。
+        let original_bytes = std::fs::read(&outcome.path).unwrap();
+        let mut repeated = params(
             &db,
             &app_data,
             &dest,
             BackupKind::Manual,
-            "20260719-000001",
+            "20260719-000000",
             None,
         );
-        let e = run_backup(&p, &CancellationToken::new()).expect_err("应因文档不一致失败");
-        match e {
-            AppError::Backup { code, .. } => assert_eq!(code, CODE_DOC_INCONSISTENT),
-            other => panic!("期望 Backup{{backup_document_inconsistent}},得 {other:?}"),
-        }
-        // 目的地不得留下任何正式包或 tmp。
-        let packages: Vec<_> = std::fs::read_dir(&dest)
-            .unwrap()
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|n| n.contains(".scrollerybackup"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert!(packages.is_empty(), "不一致时不得产包(含 tmp)");
+        repeated.backup_id = "second-backup-in-same-second".into();
+        let second = run_backup(&repeated, &CancellationToken::new()).unwrap();
+        assert_ne!(second.path, outcome.path, "同秒备份不得复用旧包路径");
+        assert_eq!(std::fs::read(&outcome.path).unwrap(), original_bytes);
+        assert_eq!(
+            std::fs::read(&unrelated_tmp).unwrap(),
+            b"unrelated temporary content"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dest)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == BACKUP_FILE_EXT))
+                .count(),
+            2,
+            "两个完整包均须可由备份列表发现"
+        );
+        let restore_target = root.join("restore-target");
+        let first_stage = crate::backup::restore_stage(&outcome.path, &restore_target).unwrap();
+        let second_stage = crate::backup::restore_stage(&second.path, &restore_target).unwrap();
+        assert_eq!(first_stage.backup_id, p.backup_id);
+        assert_eq!(second_stage.backup_id, repeated.backup_id);
+        assert_eq!(first_stage.appdata_document_count, 1);
+        assert_eq!(second_stage.appdata_document_count, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 同秒自动备份产生后缀名时，保留最新包，不能把刚完成的新包当作较旧包删除。
+    #[test]
+    fn same_second_auto_retention_keeps_newest_package() {
+        let root = tempfile::tempdir().unwrap();
+        let app_data = root.path().join("appdata");
+        let dest = root.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let db = seed_source(&app_data);
+        let mut p = params(
+            &db,
+            &app_data,
+            &dest,
+            BackupKind::Auto,
+            "20261004-120000",
+            Some(1),
+        );
+        let create_checked = |params: &BackupParams| {
+            let outcome = run_backup(params, &CancellationToken::new()).unwrap();
+            assert!(outcome.path.exists(), "轮转不得删除刚发布的最新备份");
+            let mut archive = zip::ZipArchive::new(File::open(&outcome.path).unwrap()).unwrap();
+            let manifest: Manifest =
+                serde_json::from_reader(archive.by_name(ENTRY_MANIFEST).unwrap()).unwrap();
+            assert_eq!(manifest.backup_id, params.backup_id);
+            outcome
+        };
+        let first = create_checked(&p);
+        p.backup_id = "second-auto-in-same-second".into();
+        let second = create_checked(&p);
+        assert!(!first.path.exists(), "较旧自动包应按保留份数删除");
+        p.backup_id = "third-auto-in-same-second".into();
+        let third = create_checked(&p);
+        assert!(!second.path.exists(), "删除首包后不得回填较旧序号");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+
+        // 同一轮转过程改为保留两份，继续同秒产包；孔洞也不能打乱次新包的顺序。
+        p.auto_retention = Some(2);
+        p.backup_id = "fourth-auto-in-same-second".into();
+        let fourth = create_checked(&p);
+        assert!(third.path.exists());
+        p.backup_id = "fifth-auto-in-same-second".into();
+        let fifth = create_checked(&p);
+        assert!(fourth.path.exists());
+        assert!(!third.path.exists());
+        p.backup_id = "sixth-auto-in-same-second".into();
+        let sixth = create_checked(&p);
+        assert!(fifth.path.exists());
+        assert!(!fourth.path.exists());
+        p.backup_id = "seventh-auto-in-same-second".into();
+        let seventh = create_checked(&p);
+        assert!(sixth.path.exists());
+        assert!(seventh.path.exists());
+        assert!(!fifth.path.exists());
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 2);
     }
 
     /// §#14 融合校验:文档内容被篡改(行 content_hash 不变、文件字节改动)→ 打包单遍读时 xxh3

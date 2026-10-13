@@ -12,7 +12,7 @@
           <div class="toast__row">
             <component :is="iconMap[toast.type]" :size="16" class="toast__icon" />
             <span class="toast__msg">{{ toast.message }}</span>
-            <!-- 关闭是真按钮:此前是裸 svg 挂 click,键盘不可达。 -->
+            <!-- 使用按钮保证键盘可关闭。 -->
             <button
               type="button"
               class="toast__close"

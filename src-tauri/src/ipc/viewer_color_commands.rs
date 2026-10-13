@@ -2,9 +2,6 @@
 //! 导入/列举/删除。target **不由前端传参**——后端从 `ConfigManager` 读 `viewer_color_target`
 //! 与 `viewer_color_custom_id` 两键(config 单源,防前后端口径分叉),派生路径含 target_id,
 //! URL 天然随 target 变化。
-//!
-//! 平台门控(D-414):移动端(android/ios)锁 sRGB——`get_viewer_color_url` 返 `Ok(None)`
-//! (直显原图),import/list/delete 返 `unsupported_platform`(先例 `ipc::reveal.rs:37-41`)。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +11,7 @@ use tauri::State;
 
 use crate::error::{AppError, Result};
 use crate::state::AppState;
-use crate::viewer_color::{color_err, CODE_UNSUPPORTED_PLATFORM, ICC_MAX_BYTES};
+use crate::viewer_color::{color_err, ICC_MAX_BYTES};
 
 /// 自定义 ICC profile 的展示信息(设置页「已导入」列表)。
 #[derive(Debug, Clone, Serialize)]
@@ -28,28 +25,17 @@ pub struct IccProfileInfo {
     pub file_size_bytes: u64,
 }
 
-/// 判定当前编译目标是否为移动端(D-414 平台门控)。
-macro_rules! is_mobile {
-    () => {
-        cfg!(any(target_os = "android", target_os = "ios"))
-    };
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // ① 派生 URL 获取
 // ════════════════════════════════════════════════════════════════════════════
 
 /// 获取查看器大图应显示的派生文件绝对路径(正斜杠,调用方 `convertFileSrc` 包装)。
-/// `None` = 直显原图(target=srgb / 移动端 / 非 image / 未选自定义 / 卷内不可用 / 格式不支持)。
+/// `None` = 直显原图(target=srgb / 非 image / 未选自定义 / 卷内不可用 / 格式不支持)。
 #[tauri::command]
 pub async fn get_viewer_color_url(
     item_id: i64,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<String>> {
-    if is_mobile!() {
-        // 移动端锁 sRGB:直显原图(D-414)。
-        return Ok(None);
-    }
     // config 单源读 target(前端不传参)。srgb / custom 未选(含 custom_id 空,主线行为钉)→ None。
     let target_str = state.config.get("viewer_color_target").unwrap_or_default();
     let custom_id = state
@@ -135,20 +121,12 @@ fn render_viewer_color(
 // ④ 自定义 ICC 导入 / 列举 / 删除
 // ════════════════════════════════════════════════════════════════════════════
 
-/// 平台门控错误(import/list/delete 在移动端不可用)。
-fn unsupported_platform() -> AppError {
-    color_err(CODE_UNSUPPORTED_PLATFORM, "当前平台不支持自定义色域")
-}
-
 /// 导入自定义 ICC profile。校验链见 [`import_icc_blocking`]。
 #[tauri::command]
 pub async fn import_icc_profile(
     file_path: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<IccProfileInfo> {
-    if is_mobile!() {
-        return Err(unsupported_platform());
-    }
     let app_data_dir = state.app_data_dir.clone();
     tokio::task::spawn_blocking(move || import_icc_blocking(&app_data_dir, &file_path))
         .await
@@ -158,9 +136,6 @@ pub async fn import_icc_profile(
 /// 列举已导入的自定义 ICC profile。
 #[tauri::command]
 pub async fn list_icc_profiles(state: State<'_, Arc<AppState>>) -> Result<Vec<IccProfileInfo>> {
-    if is_mobile!() {
-        return Err(unsupported_platform());
-    }
     let app_data_dir = state.app_data_dir.clone();
     tokio::task::spawn_blocking(move || Ok(list_icc_blocking(&app_data_dir)))
         .await
@@ -174,9 +149,6 @@ pub async fn delete_icc_profile(
     profile_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<()> {
-    if is_mobile!() {
-        return Err(unsupported_platform());
-    }
     // 代次在**操作开始时**读取:删除文件是耗时工作,期间若发生「恢复默认设置」,本操作携带的旧代次
     // 会被统一入口拒绝,不会把「删除前看到的选择」回灌进已重置的配置(耗时操作后回读新代次再灌旧
     // 意图是明确禁止的)。

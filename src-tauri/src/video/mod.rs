@@ -1,53 +1,33 @@
-// src-tauri/src/video/mod.rs
-//! Video backend abstraction (§1.4.1 / §3.2) — the capability-trait layer for video
-//! probing & frame extraction, plus a tiny runtime registry that picks the best backend
-//! for a given extension.
-//!
-//! This is the first concrete backend trait of the §1.4 plan: rather than landing an empty
-//! abstraction in P0, the trait is introduced here together with its first real
-//! implementation (`MediaFoundationBackend`, Windows, zero-bundle). FFmpeg (feature `ffmpeg`,
-//! Perf-only) and AVFoundation (macOS) slot in later behind the same trait.
-//!
-//! 视频后端抽象（§1.4.1 / §3.2）—— 视频探测与取帧的能力 trait 层，外加一个极小的运行期注册表，
-//! 按扩展名挑选最佳后端。这是 §1.4 计划落地的第一个具体后端 trait：不在 P0 留空抽象，
-//! 而是与首个真实实现（`MediaFoundationBackend`，Windows，零捆绑）一并引入。FFmpeg
-//! （feature `ffmpeg`，仅 Perf）与 AVFoundation（macOS）后续按同一 trait 接入。
+//! 视频探测与取帧的后端接口，按扩展名选择 Windows Media Foundation 或已就绪的视频 worker。
 
 use std::path::Path;
 
 use crate::engine::traits::DecodedImage;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 
 #[cfg(windows)]
 pub mod d3d;
-#[cfg(windows)]
-mod file_stream;
-/// MF 解码帧后处理（media_foundation.rs 尾段拆出，零 unsafe 耦合，见超长文件拆分方案 tierB-3）。
+/// MF 解码帧后处理。
 #[cfg(windows)]
 mod frame_post;
 #[cfg(windows)]
 pub mod media_foundation;
-/// MF 属性/编解码器辅助（media_foundation.rs 尾段拆出，纯 GUID/PROPVARIANT 解析，见
-/// 超长文件拆分方案 tierB-3）。
+/// MF 属性与编解码器辅助。
 #[cfg(windows)]
 mod mf_attrs;
-/// 视频格式扩展 · host 侧 Service 型 worker(design.md §2.1;backend_for 接入见下方 §8 V5)。
+/// 视频 worker 的宿主侧服务。
 pub mod worker_service;
-// V6 播放链路后端(design.md §5.1/§5.4):判定表 + 独立可播产物缓存池。
+// 播放链路的判定表与独立可播产物缓存池。
 pub mod playable_cache;
-/// 视频格式扩展 · 播放链路编排内核(design.md §5;超长文件拆分方案 tierB-2):从
-/// `ipc/video_commands.rs` 拆出的 resolve/派生/进度私有调用链,命令壳留在原文件。
+/// 播放链路的解析、派生与进度编排；命令入口位于 `ipc/video_commands.rs`。
 pub(crate) mod playback_orchestrator;
 pub mod playback_policy;
-/// 视频格式扩展 · 缩略图后端桥(design.md §1 修正2 / §8 V5):把 `VideoBackend` trait 委托给
+/// 缩略图后端桥：把 `VideoBackend` trait 委托给
 /// `worker_service::VideoWorkerService`,供 `backend_for()` 覆盖 MF 不认的容器。
 pub mod worker_backend;
 
-/// Cheaply-probed video metadata (no full decode). Dimensions are **display** dimensions —
-/// rotation already applied, so `width`/`height` are what the upright frame measures
-/// (mirrors how image EXIF orientation swaps w/h). Layout depends on these (§3.2).
 /// 廉价探测的视频元数据（不全解码）。宽高为**显示**尺寸 —— 已应用 rotation，
-/// 即 `width`/`height` 是正立帧的尺寸（与图片 EXIF orientation 交换宽高同理）。布局强依赖之（§3.2）。
+/// 即 `width`/`height` 是正立帧的尺寸。
 #[derive(Debug, Clone)]
 pub struct VideoInfo {
     pub width: u32,
@@ -63,12 +43,9 @@ pub struct VideoInfo {
     pub codec: Option<String>,
 }
 
-/// Video capability backend (§1.4.1). Each implementation handles a set of containers and
-/// returns **upright** RGBA frames (rotation applied) so callers never re-handle orientation.
-/// 视频能力后端（§1.4.1）。每个实现处理一组容器，返回**正立**的 RGBA 帧（已应用旋转），
+/// 视频能力后端。每个实现处理一组容器，返回**正立**的 RGBA 帧（已应用旋转），
 /// 调用方无需再处理方向。
 pub trait VideoBackend: Send + Sync {
-    /// Stable backend id, e.g. "media-foundation" | "ffmpeg".
     /// 稳定后端 id，如 "media-foundation" | "ffmpeg"。
     fn name(&self) -> &'static str;
 
@@ -81,61 +58,12 @@ pub trait VideoBackend: Send + Sync {
     /// 解码一帧正立封面，长边 ≤ `max_long_edge`（0 = 原生尺寸;绝不上采样）。时间戳由后端
     /// 自选（≈ min(1s, 时长 10%)，含黑帧规避）—— 时长取自同一解码会话，调用方**不要**为选
     /// 时间戳而先行 probe（那会多开一次解码会话）。
-    fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage> {
-        self.cover_bounded(path, max_long_edge, u64::MAX)
-    }
-
-    /// 在像素分配前按调用方额度检查封面输出。
-    fn cover_bounded(
-        &self,
-        path: &Path,
-        max_long_edge: u32,
-        max_pixel_bytes: u64,
-    ) -> Result<DecodedImage>;
-
-    /// 调用方已有 codec 元数据时可作为设备选择提示；未知或过期时后端仍须按实际流解码。
-    fn cover_with_codec_hint(
-        &self,
-        path: &Path,
-        max_long_edge: u32,
-        _codec_hint: Option<&str>,
-    ) -> Result<DecodedImage> {
-        self.cover(path, max_long_edge)
-    }
+    fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage>;
 
     /// 解码 `n` 张正立、等尺寸、跨视频均匀采样的帧，用于悬停/进度条 scrub 雪碧图（§3.3）。
     /// 返回帧共享同一格尺寸 —— 格高固定为 `cell_height`(px,设置键 `sprite_cell_height`,批次C），
     /// 格宽按视频显示比例推导。
-    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>> {
-        self.keyframes_bounded(path, n, cell_height, u64::MAX)
-    }
-
-    /// 采样前限制整组输出帧的像素总量。
-    fn keyframes_bounded(
-        &self,
-        path: &Path,
-        n: usize,
-        cell_height: u32,
-        max_pixel_bytes: u64,
-    ) -> Result<Vec<DecodedImage>>;
-}
-
-pub(crate) fn check_frame_collection_budget(
-    width: u32,
-    height: u32,
-    count: usize,
-    limit: u64,
-) -> Result<()> {
-    let bytes = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .and_then(|bytes| bytes.checked_mul(count as u64));
-    if width == 0 || height == 0 || count == 0 || bytes.is_none_or(|bytes| bytes > limit) {
-        return Err(AppError::Internal(
-            "video frame collection exceeds pixel budget".into(),
-        ));
-    }
-    Ok(())
+    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>>;
 }
 
 /// 批量视频元数据探测的结果状态。`Succeeded` 只表示后端返回了结果，调用方仍应校验
@@ -232,10 +160,7 @@ impl Default for VideoProbeRuntime {
     }
 }
 
-/// 供 setup 期一次性注入 `AppState` 句柄(视频格式扩展子系统 design.md §8 V5)。`backend_for()`
-/// 据此判定 video-worker 桥是否可用;未注入(如纯单测环境、非视频格式扩展相关构建路径)时
-/// `backend_for` 对 MF 不认的容器恒回退 `None`,与 V5 之前的行为完全一致(零回归)。
-/// 仅写一次(晚绑定,与 `AppState::set_exotic_coordinator`/`set_video_worker_service` 同姿态)。
+/// setup 期一次性注入 `AppState`；未绑定时，`backend_for` 无法启用 video worker 桥。
 static VIDEO_HOST_STATE: std::sync::OnceLock<std::sync::Arc<crate::state::AppState>> =
     std::sync::OnceLock::new();
 
@@ -244,9 +169,7 @@ pub fn bind_app_state(state: std::sync::Arc<crate::state::AppState>) {
     let _ = VIDEO_HOST_STATE.set(state);
 }
 
-/// video-worker 桥的核心门控判据(抽成纯函数供单测:构造完整 `AppState`/`ExoticHost` 成本高,
-/// 而 `backend_for` 里这行 `authorized && ffmpeg_ready` 正是「插件不可用→None」这条红线的
-/// 全部逻辑——单测直接钉住该布尔表达式,和 `backend_for` 内联调用保持逐字一致)。
+/// 只有授权且 FFmpeg 组件就绪时才启用 video worker 桥。
 fn video_bridge_gate_open(authorized: bool, ffmpeg_ready: bool) -> bool {
     authorized && ffmpeg_ready
 }
@@ -283,12 +206,8 @@ fn worker_backend_if_ready() -> Option<Box<dyn VideoBackend>> {
     None
 }
 
-/// Pick the best available backend for a lowercase extension (§1.4.3). Windows 下先试 Media
-/// Foundation;MF 不认的容器(mkv/webm/flv/ogv 等)再试 video-worker 桥(§1 修正2 / §8 V5)——
-/// 判定「便宜」:只做状态查询(catalog/授权折叠 + FFmpeg 就绪的纯文件系统检查),**不 spawn**
-/// 任何进程;真正的 worker 子进程按需惰性起于首次实际派活(`VideoWorkerService::ensure_session`,
-/// 位于 `worker_service.rs`,本函数不重复该判定)。无匹配时调用方标记 `unsupported`。
-/// 为小写扩展名挑选最佳可用后端（§1.4.3）。
+/// 为扩展名挑选后端：Windows 优先 Media Foundation，其余尝试已授权且 FFmpeg 就绪的 worker。
+/// 这里仅查询可用性；worker 在首次派活时启动。
 pub fn backend_for(ext: &str) -> Option<Box<dyn VideoBackend>> {
     let ext = ext.to_ascii_lowercase();
     #[cfg(windows)]
@@ -300,30 +219,4 @@ pub fn backend_for(ext: &str) -> Option<Box<dyn VideoBackend>> {
     }
     let _ = &ext;
     worker_backend_if_ready()
-}
-
-/// 本机原生封面任务的容器集合；旧视频 worker 的冷门格式由原有派生路径负责。
-pub fn native_cover_formats() -> &'static [&'static str] {
-    #[cfg(windows)]
-    {
-        media_foundation::MF_VIDEO_EXTS
-    }
-    #[cfg(not(windows))]
-    {
-        &[]
-    }
-}
-
-/// 原生封面策略只选择系统后端，绝不落到旧 `backend_for` 的 FFmpeg worker 回退。
-pub fn native_cover_backend_for(ext: &str) -> Option<Box<dyn VideoBackend>> {
-    #[cfg(windows)]
-    {
-        let mf = media_foundation::MediaFoundationBackend;
-        if mf.can_handle(&ext.to_ascii_lowercase()) {
-            return Some(Box::new(mf));
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = ext;
-    None
 }

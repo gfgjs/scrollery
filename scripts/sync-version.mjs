@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 版本号单一事实源工具(Part7-T5 / Part7 §3.2 R3)。
+// 版本号同步与发布 tag 校验工具。
 // 锚 = 根 Cargo.toml 的 [workspace.package] version;零依赖,node 直跑。
 //
 // 用法:
@@ -10,7 +10,7 @@
 //
 // 附带结构断言(--check / --write / --check-tag 前置跑;--print 为纯查询不跑):
 //   ① tauri.conf.json 不得含顶层 "version" —— 缺省时 Tauri codegen 回退 CARGO_PKG_VERSION,
-//      这才是单源;字段若指向 Cargo.toml 会 JSON 解析失败(tauri-utils config.rs,§3.2 已核)。
+//      版本由 Cargo 包版本提供；字段若指向 Cargo.toml 会导致 JSON 解析失败。
 //   ② src-tauri/Cargo.toml 须为 version.workspace = true,禁独立版本回潮。
 
 import { readFileSync, writeFileSync } from 'node:fs';

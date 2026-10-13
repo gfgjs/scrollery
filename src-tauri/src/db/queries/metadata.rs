@@ -42,7 +42,7 @@ pub fn get_metadata_workload_with_video_retry(
          LEFT JOIN image_meta im ON im.item_id = m.id
          LEFT JOIN video_meta vm ON vm.item_id = m.id
          LEFT JOIN audio_meta am ON am.item_id = m.id
-         WHERE d.root_id=?1 AND m.is_deleted=0 AND (
+         WHERE d.root_id=?1 AND m.is_deleted=0 AND m.availability='online' AND (
              (m.media_type='image' AND im.item_id IS NULL) OR
              {video_predicate} OR
              (m.media_type='audio' AND am.item_id IS NULL)
@@ -211,7 +211,7 @@ pub fn get_videos_needing_meta_with_retry(
          JOIN directories d ON d.id = m.directory_id
          JOIN scan_roots r ON r.id = d.root_id
          LEFT JOIN video_meta vm ON vm.item_id = m.id
-         WHERE d.root_id = ?1 AND m.is_deleted = 0 AND m.media_type = 'video'
+         WHERE d.root_id = ?1 AND m.is_deleted = 0 AND m.availability = 'online' AND m.media_type = 'video'
            AND {video_meta_predicate} AND m.id > ?3
          ORDER BY m.id ASC
          LIMIT ?2"
@@ -247,7 +247,7 @@ pub fn get_audios_needing_meta(
          JOIN directories d ON d.id = m.directory_id
          JOIN scan_roots r ON r.id = d.root_id
          LEFT JOIN audio_meta am ON am.item_id = m.id
-         WHERE d.root_id = ?1 AND m.is_deleted = 0 AND m.media_type = 'audio'
+         WHERE d.root_id = ?1 AND m.is_deleted = 0 AND m.availability = 'online' AND m.media_type = 'audio'
            AND am.item_id IS NULL AND m.id > ?3
          ORDER BY m.id ASC
          LIMIT ?2",

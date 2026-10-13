@@ -6,15 +6,15 @@ import { ref, computed, effectScope } from 'vue'
 import { Channel } from '@tauri-apps/api/core'
 import { generateOperationId, invokeIpc } from '../utils/ipc'
 import { logger } from '../utils/logger'
-import { listen } from '@tauri-apps/api/event'
+import { listenAppEvent } from '../utils/appEvents'
 import { useTauriListen } from '../composables/useTauriListen'
 import type { ScanRoot } from '../types/media'
 import type {
   ScanChannelPayload,
-  MediaEnrichedPayload,
-  EnrichmentCompletedPayload,
   ThumbResultCounts,
   ThumbExecutionCount,
+  MediaEnrichedPayload,
+  EnrichmentCompletedPayload,
 } from '../types/ipc'
 import { IPC, EVENTS } from '../constants/ipc'
 import i18n from '../i18n'
@@ -177,6 +177,12 @@ export const useScanStore = defineStore('scan', () => {
       // 根管理动作或更新的刷新请求可能在本请求完成前改变列表；旧响应不得覆盖
       // 新状态（尤其是 remove/add 后的设置页列表）。
       if (isCurrentRootRequest(requestSerial)) {
+        // 合并导入会在后端事务中移除旧根；被取消的旧代次不再发布终态，须随有效列表
+        // 清掉已移除根的进度、看门狗和快速扫描基线，避免保留十分钟的虚假运行态。
+        const currentRootIds = new Set(roots.map(({ id }) => id))
+        for (const { id } of scanRoots.value) {
+          if (!currentRootIds.has(id)) clearRootRunState(id)
+        }
         scanRoots.value = roots
         applied = true
       }
@@ -188,10 +194,10 @@ export const useScanStore = defineStore('scan', () => {
     return applied && !waitedForDatabaseClear
   }
 
-  async function addScanRoot(path: string, alias?: string): Promise<ScanRoot> {
+  async function addScanRoot(path: string, alias?: string, mergeChildren = false): Promise<ScanRoot> {
     if (databaseClearBarrier) await waitForDatabaseClear()
     const requestSerial = ++rootsRequestSerial
-    const root = await invokeIpc<ScanRoot>(IPC.ADD_SCAN_ROOT, { path, alias: alias ?? null })
+    const root = await invokeIpc<ScanRoot>(IPC.ADD_SCAN_ROOT, { path, alias: alias ?? null, mergeChildren })
     if (
       isCurrentRootRequest(requestSerial) &&
       !scanRoots.value.some((r) => r.id === root.id)
@@ -317,7 +323,7 @@ export const useScanStore = defineStore('scan', () => {
   // 首次调用时并无天然的组件/composable scope 可挂。手工开一个 effectScope 兜底,
   // 在其 run() 的同步回调内调用 useTauriListen——语义等价于原裸 listen()（进程内长驻,
   // 从不解绑)：本 store 是全局单例、无 $dispose/reset 会拆监听的路径,故此 scope 生命周期
-  // = 应用级,故意不留 scope.stop() 调用点(若未来 store 长出销毁路径,记得在此接 stop())。
+  // = 应用级，故意不留 scope.stop() 调用点。
   // 用 detached scope(effectScope(true)):否则若首次触发恰在某个活动 Vue scope 内,本 scope
   // 会挂为其子 scope,父 scope 卸载时连带 stop 拆掉全局监听,「应用级」主张即失效。
   // enrichListenersReady 在任何 await/异步间隙之前就同步置真,并发重复调用天然幂等
@@ -381,7 +387,7 @@ export const useScanStore = defineStore('scan', () => {
     ensureEnrichmentListeners()
     const runId = generateOperationId()
     // 默认策略:已有过成功全量扫描的根走 quick(未变目录在 walker 层免 per-file stat);
-    // 首次扫描/显式 false 走全量建立基线。quickOverride 供未来「强制全量重建」入口使用。
+    // 首次扫描/显式 false 走全量建立基线；quickOverride 可强制选择扫描策略。
     const quick = quickOverride ?? fullScanCompleted.has(rootId)
 
     // 新一轮扫描:上一轮的富化终态标记作废(允许本轮 completed 正常移交 enriching)。
@@ -580,8 +586,8 @@ export const useScanStore = defineStore('scan', () => {
     status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error'
     currentItem?: string
     phase?: string
-    results: ThumbResultCounts
-    executions: ThumbExecutionCount[]
+    results?: ThumbResultCounts
+    executions?: ThumbExecutionCount[]
   }
 
   const thumbGenProgress = ref<ThumbGenProgress>({
@@ -591,69 +597,34 @@ export const useScanStore = defineStore('scan', () => {
     status: 'idle',
     currentItem: undefined,
     phase: undefined,
-    results: { available: 0, direct: 0, failed: 0, newlyGenerated: 0, cacheHit: 0, temporarilyUnavailable: 0 },
-    executions: [],
   })
-  const thumbGenPhaseLabel = computed(() => {
-    switch (thumbGenProgress.value.phase) {
-      case 'fast':
-        return i18n.global.t('settings.thumbPhaseFast')
-      case 'heavy':
-        return i18n.global.t('settings.thumbPhaseHeavy')
-      case 'exception':
-        return i18n.global.t('settings.thumbPhaseException')
-      case 'image_rs':
-        return i18n.global.t('settings.thumbPhaseImageRs')
-      case 'video':
-        return i18n.global.t('settings.thumbPhaseVideo')
-      default:
-        return ''
-    }
-  })
+
+  const thumbGenPhaseLabel = computed(() =>
+    thumbGenProgress.value.phase === 'image' ? i18n.global.t('settings.thumbPhaseImage') : '',
+  )
   const thumbGenResultsLabel = computed(() => {
     const results = thumbGenProgress.value.results
-    if (!results) return ''
-    return i18n.global.t('settings.thumbDetailedResults', results)
+    return results ? i18n.global.t('settings.thumbDetailedResults', { ...results }) : ''
   })
   const thumbGenHardwareLabel = computed(() => {
     const { executions = [], results, status } = thumbGenProgress.value
-    const gpuKinds = new Set<string>()
-    let cpu = false
-    let unknown = false
-    for (const { native, count } of executions) {
-      if (count <= 0) continue
-      if (!native || native.backend === 'videoMf') {
-        unknown = true
-      } else if (native.backend === 'imageD2d' || native.backend === 'imageVpl') {
-        gpuKinds.add(native.adapterKind === 'integrated' || native.adapterKind === 'discrete'
-          ? native.adapterKind : 'unknown')
-      } else if (native.backend === 'videoMfHardwareMft') {
-        // MF 已确认硬件 MFT，但回传的 LUID 仍是候选，不能据此断言解码设备类型。
-        gpuKinds.add('unknown')
-      } else {
-        cpu = true
-      }
-    }
-    let key: string
-    if (gpuKinds.size) {
-      key = gpuKinds.has('unknown') ? 'gpuUnknown'
-        : gpuKinds.size > 1 ? 'mixed'
-          : gpuKinds.has('integrated') ? 'integrated' : 'discrete'
-    } else if (unknown) key = 'unknown'
-    else if (cpu) key = 'cpu'
+    const active = executions.filter(({ count }) => count > 0)
+    let key: 'unknown' | 'cpu' | 'direct' | 'cache' | 'waiting'
+    if (active.some(({ backend }) => backend !== 'wic' && backend !== 'image-rs')) key = 'unknown'
+    else if (active.length) key = 'cpu'
     else if (results?.direct) key = 'direct'
     else if (results?.cacheHit) key = 'cache'
     else if (status === 'idle') return ''
     else key = status === 'running' ? 'waiting' : 'unknown'
-    const label = i18n.global.t(`settings.thumbHardware.${key}`)
-    return unknown && gpuKinds.size
-      ? `${label} · ${i18n.global.t('settings.thumbHardware.unknown')}` : label
+    return i18n.global.t(`settings.thumbHardware.${key}`)
   })
   const thumbGenExecutionDetails = computed(() =>
-    thumbGenProgress.value.executions
+    (thumbGenProgress.value.executions ?? [])
       .filter(({ count }) => count > 0)
-      .map(({ native, count }) =>
-        `${i18n.global.t(`settings.thumbBackends.${native?.backend ?? 'unknown'}`)} × ${count}`),
+      .map(({ backend, count }) => {
+        const key = backend === 'wic' ? 'imageWic' : backend === 'image-rs' ? 'imageRs' : 'unknown'
+        return `${i18n.global.t(`settings.thumbBackends.${key}`)} × ${count}`
+      }),
   )
   const thumbGenSummaryTitle = computed(() =>
     [thumbGenResultsLabel.value, thumbGenHardwareLabel.value, ...thumbGenExecutionDetails.value]
@@ -673,11 +644,11 @@ export const useScanStore = defineStore('scan', () => {
     status: 'error' | 'completed' | 'running' | 'cancelled' | 'idle'
     currentItem?: string
     phase?: string
-    results: ThumbResultCounts
-    executions: ThumbExecutionCount[]
+    results?: ThumbResultCounts
+    executions?: ThumbExecutionCount[]
   }
 
-  // withSideEffects=false 用于启动回填:completed/cancelled 快照只恢复显示,
+  // withSideEffects=false 用于启动回填:终态快照只恢复显示,
   // 不再触发 invalidateLayout(启动时布局本就是新取的)。
   function applyThumbGenPayload(msg: ThumbGenEventPayload, withSideEffects = true) {
     thumbGenProgress.value = {
@@ -687,12 +658,14 @@ export const useScanStore = defineStore('scan', () => {
       status: msg.status,
       currentItem: msg.currentItem,
       phase: msg.phase,
-      results: msg.results ?? { available: 0, direct: 0, failed: 0, newlyGenerated: 0, cacheHit: 0, temporarilyUnavailable: 0 },
-      executions: msg.executions ?? [],
+      results: msg.results,
+      executions: msg.executions,
     }
-    // 当生成完成（完成/取消）时，使布局失效，
-    // 以便网格从数据库重新获取最新的 thumb_status/thumb_path。
-    if (withSideEffects && (msg.status === 'completed' || msg.status === 'cancelled' || msg.status === 'error')) {
+    // 错误终态也可能已有成功提交，网格须重新获取最新的 thumb_status/thumb_path。
+    if (
+      withSideEffects &&
+      (msg.status === 'completed' || msg.status === 'cancelled' || msg.status === 'error')
+    ) {
       const media = useMediaStore()
       media.invalidateLayout()
     }
@@ -702,8 +675,10 @@ export const useScanStore = defineStore('scan', () => {
   // 监听尚未挂上」的窗口期漏事件。
   let thumbGenListenerPromise: Promise<unknown> | null = null
   let thumbGenUpdateRevision = 0
+  // 命令归属独立于进度版本：同轮进度不作废停止回包，新一轮启动则必须隔离旧命令收尾。
+  let thumbGenCommandSerial = 0
   function ensureThumbGenListener(): Promise<unknown> {
-    thumbGenListenerPromise ??= listen<ThumbGenEventPayload>(EVENTS.THUMB_GEN_PROGRESS, (e) => {
+    thumbGenListenerPromise ??= listenAppEvent<ThumbGenEventPayload>(EVENTS.THUMB_GEN_PROGRESS, (e) => {
       ++thumbGenUpdateRevision
       applyThumbGenPayload(e.payload)
     })
@@ -716,6 +691,7 @@ export const useScanStore = defineStore('scan', () => {
     await ensureThumbGenListener()
     const revision = ++thumbGenUpdateRevision
     const snap = await invokeIpc<ThumbGenEventPayload>(IPC.FULL_THUMB_GEN_STATUS).catch(() => null)
+    // 查询期间已有事件或用户操作时，旧快照不能覆盖更新的状态。
     if (revision !== thumbGenUpdateRevision || !snap || snap.status === 'idle') return
     applyThumbGenPayload(snap, snap.status === 'running')
   }
@@ -743,6 +719,7 @@ export const useScanStore = defineStore('scan', () => {
     // 先订阅再启动:total==0 时后端在 invoke 返回前就发 completed,晚订阅会漏终态。
     await ensureThumbGenListener()
 
+    const commandSerial = ++thumbGenCommandSerial
     ++thumbGenUpdateRevision
     thumbGenProgress.value = {
       generated: 0,
@@ -751,22 +728,24 @@ export const useScanStore = defineStore('scan', () => {
       status: 'running',
       currentItem: undefined,
       phase: undefined,
-      results: { available: 0, direct: 0, failed: 0, newlyGenerated: 0, cacheHit: 0, temporarilyUnavailable: 0 },
-      executions: [],
     }
 
     try {
       await invokeIpc(command)
     } catch (e) {
-      thumbGenProgress.value.isRunning = false
-      thumbGenProgress.value.status = 'error'
+      if (commandSerial === thumbGenCommandSerial) {
+        thumbGenProgress.value.isRunning = false
+        thumbGenProgress.value.status = 'error'
+      }
       throw e
     }
   }
 
   async function stopFullThumbnailGeneration() {
+    const commandSerial = ++thumbGenCommandSerial
     ++thumbGenUpdateRevision
     await invokeIpc(IPC.STOP_FULL_THUMBNAIL_GENERATION)
+    if (commandSerial !== thumbGenCommandSerial) return
     thumbGenProgress.value.isRunning = false
     if (thumbGenProgress.value.status === 'running') {
       thumbGenProgress.value.status = 'cancelled'

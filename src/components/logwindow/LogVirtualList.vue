@@ -1,7 +1,7 @@
 <script setup lang="ts">
-// 虚拟滚动日志行列表(日志能力重构 S4,方案 §5/§9.4 S4)。@tanstack/vue-virtual 提供
+// 虚拟滚动日志行列表。@tanstack/vue-virtual 提供
 // anchorTo:'end' + followOnAppend + measureElement 三原语,恰好覆盖「行高不一(msg 换行)+
-// 实时追加 + 底部跟随/上滚退出跟随」,免自写滚动锚定状态机(方案 §5 依据)。
+// 实时追加 + 底部跟随/上滚退出跟随」，无需自行维护滚动锚定状态机。
 //
 // live 模式(followBottom=true):新增行到达时若用户仍在底部,视图跟随;用户上滚后
 // followOnAppend 内部自动停止跟随(库行为,非本组件手写)。history 模式(followBottom=false):

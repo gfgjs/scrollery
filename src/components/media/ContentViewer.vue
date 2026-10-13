@@ -1,8 +1,5 @@
 <template>
-  <!-- 顶栏重构 P4-b:看图台从 body 覆盖层迁为 shell 内路由(/view/:id)。去 Teleport/backdrop,
-       三层容器(content-viewer 填充 .app-content / __inner 守卫 media.detailItem / detail-panel
-       原布局)刻意保留原缩进,内核(useMediaDetail 缩放/平移/翻页/信息/exotic/人脸)逐字节不动;
-       过渡态:控制条暂留本组件,待 P5-5 收敛入顶栏上下文工具栏。 -->
+  <!-- 看图台由 /view/:id 路由驱动；detailItem 未就绪时不渲染内部面板。 -->
   <div class="content-viewer">
     <div v-if="media.detailItem" class="content-viewer__inner">
       <!-- 面板 -->
@@ -10,7 +7,6 @@
            padding 动画与信息面板 translateX 滑入同用 --transition-normal,逐帧同步不脱节。 -->
       <div class="detail-panel" :class="{ 'is-info-open': ui.viewerInfoVisible }">
         <!-- ── 视图器 ───────────────────────────────────────────────────── -->
-        <!-- 点图不再关信息面板(2026-07-14):面板改停靠且仅手动开合,原 @click=onImageClick 撤除。 -->
         <div
           class="detail-viewer"
           :class="{ 'has-bottom-controls': detailControlsVisible }"
@@ -20,18 +16,21 @@
           @click="onViewerClick"
           @contextmenu.prevent="onContextMenu"
         >
-          <!-- 不可用占位（缺失检测 Part2 §3.2）：卷离线 / 文件缺失 / 加载失败时给明确提示，
+          <!-- 卷离线、文件缺失或加载失败时给明确提示，
                而非任由 <img>/<video> 显示浏览器的 broken 图标（体验差、不知所以然）。 -->
           <div v-if="isUnavailable" class="detail-viewer__unavailable">
             <ImageOff :size="56" />
             <p class="detail-viewer__unavailable-title">{{ unavailableInfo.title }}</p>
             <p class="detail-viewer__unavailable-hint">{{ unavailableInfo.hint }}</p>
           </div>
-          <!-- Exotic 授权 gate（Part5 T12）：未授权的 exotic 格式（如未购买 PSD）显示购买/激活引导，
+          <!-- 未激活的 exotic 格式（如 PSD）显示免费激活引导，
                而非任由 <img> 尝试解码注定失败的原图。已授权 / 普通格式不进此分支（showExoticGate=false）。 -->
           <div v-else-if="showExoticGate" class="detail-viewer__gate" @click.stop>
             <PluginGate
               :entitlement="exoticGate.entitlement.value"
+              :loading="exoticGate.loading.value"
+              :failed="exoticGate.failed.value"
+              @retry="refreshExoticGate"
               :feature-name="exoticFeatureName"
               @activate="activateOpen = true"
             />
@@ -81,12 +80,11 @@
 
               />
             </template>
-            <!-- 视频:自研播放器编排层(播放器线 GC)。transform 施加在内部 <video>、控制条不随缩放;
+            <!-- 视频由 VideoPlayer 编排。transform 施加在内部 <video>、控制条不随缩放；
                  @loadedmetadata 继续驱动 updateZoomRatio;失败经其内部 VideoDiagnostics 接管(不走 onMediaError)。
-                 源改走 useVideoSource(视频格式扩展子系统 design.md §5.3):direct/derived 才挂真实
+                 useVideoSource 仅在 direct/derived 时挂载真实
                  <video>,其余态(preparing/needsComponent/needsHevcExt/needsConfirm/error/cancelled)只挂
-                 引导覆盖层——cancelled 态显式给出「重新准备」入口(不留白,详见 useVideoSource 内注释),
-                 videoRef 为空时命令层调用已按现状 optional chaining no-op(§顶部「视频动作透传」注释)。 -->
+                 引导覆盖层；cancelled 态提供「重新准备」入口。videoRef 为空时命令调用跳过。 -->
             <template v-else-if="detail.mediaType === 'video'">
               <VideoPlayer
                 v-if="videoSource.src.value"
@@ -104,7 +102,7 @@
                 :intrinsic-height="detail.height"
                 :resolve-verdict="videoSource.verdict.value"
                 :toolbar-hidden="controlsHidden"
-                @loadedmetadata="updateZoomRatio"
+                @loadedmetadata="onVideoMetadata"
                 @toggle-toolbar="toggleControls"
               />
               <VideoPreparingOverlay
@@ -240,7 +238,7 @@
             >
               <PencilLine :size="18" />
             </UiIconButton>
-            <!-- OCR 文字提取入口(D-OCR-6):按钮常显,未授权/未装模型点击后由 useOcr 引导跳转,
+            <!-- OCR 文字提取入口(D-OCR-6):按钮常显,未激活/未装模型点击后由 useOcr 引导跳转,
                  不隐藏按钮(与编辑按钮「显式不支持文案」哲学一致)。 -->
             <UiIconButton
               v-if="detail.mediaType === 'image'"
@@ -258,8 +256,8 @@
             >
               <Sparkles :size="18" />
             </UiIconButton>
-            <!-- 渲染色域切换(D-414):微操归左组;移动端锁 sRGB 不出入口,视频不支持渲染色域切换不出。 -->
-            <ViewerColorMenu v-if="detail.mediaType === 'image' && !isMobilePlatform" />
+            <!-- 渲染色域切换仅用于图片。 -->
+            <ViewerColorMenu v-if="detail.mediaType === 'image'" />
           </div>
 
           <!-- 中间: 文件名 -->
@@ -291,9 +289,7 @@
                 :stroke-width="detail.isFavorited ? 0 : 2"
               />
             </UiIconButton>
-            <!-- 移动端 opener 不支持 reveal(D-001/R-09):动作整个不出。 -->
             <UiIconButton
-              v-if="!isMobilePlatform"
               :label="t('contextMenu.showInExplorer')"
               @click="showInExplorer"
             >
@@ -421,7 +417,9 @@
                   :key="n"
                   class="star"
                   :class="{ filled: n <= (detail.rating ?? 0) }"
-
+                  :aria-label="t('detail.starCount', { count: n })"
+                  :aria-pressed="n === detail.rating"
+                  :title="t('detail.starCount', { count: n })"
                   @click="setRating(n)"
                 >
                   <Star
@@ -464,14 +462,15 @@
   />
 
   <!-- Exotic 激活对话框（Part5 T12）：gate 的「已购买？激活」入口 → 输入 token → 后端验签。 -->
-  <ExoticActivateDialog
+  <FeatureActivationDialog
     :open="activateOpen"
+    :feature-id="exoticGate.entitlement.value?.pluginId ?? ''"
     :feature-name="exoticFeatureName"
     @close="activateOpen = false"
     @activated="onExoticActivated"
   />
 
-  <!-- 编辑是编译进 Host 的付费内建 feature：入口保持可见，未授权时复用 PluginGate 购买/激活形态。 -->
+  <!-- 编辑是编译进 Host 的内建功能：入口保持可见，未激活时复用 PluginGate 免费激活形态。 -->
   <UiDialog
     :open="editGateOpen"
     :title="t('edit.premiumName')"
@@ -480,17 +479,18 @@
     @close="editGateOpen = false"
   >
     <PluginGate
-      :entitlement="editingGate.entitlement.value"
+      :entitlement="editingGate.availability.value"
       :loading="editingGate.loading.value"
       :failed="!!editingGate.error.value"
-      @retry="editingGate.fetchEntitlement"
+      @retry="editingGate.fetchActivation"
       :feature-name="t('edit.premiumName')"
       :feature-desc="t('edit.premiumDesc')"
       @activate="openEditingActivation"
     />
   </UiDialog>
-  <ExoticActivateDialog
+  <FeatureActivationDialog
     :open="editActivateOpen"
+    feature-id="feature-editing"
     :feature-name="t('edit.premiumName')"
     @close="onEditingActivationClosed"
     @activated="onEditingActivated"
@@ -504,13 +504,12 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useTauriListen } from '../../composables/useTauriListen'
 import { resolveAssetUrl } from '../../utils/assetUrl'
-import { isMobilePlatform } from '../../utils/platform'
 import { useI18n } from 'vue-i18n'
 import ContextMenu from '../common/ContextMenu.vue'
 import ColorLabelPicker from '../common/ColorLabelPicker.vue'
 import FolderTreeSelectorDialog from '../common/FolderTreeSelectorDialog.vue'
 import PluginGate from '../exotic/PluginGate.vue'
-import ExoticActivateDialog from '../exotic/ExoticActivateDialog.vue'
+import FeatureActivationDialog from '../exotic/FeatureActivationDialog.vue'
 import UiIconButton from '../ui/UiIconButton.vue'
 import UiDialog from '../ui/UiDialog.vue'
 import EditOverlay from './EditOverlay.vue'
@@ -521,14 +520,14 @@ import OcrResultPanel from './OcrResultPanel.vue'
 import ViewerColorMenu from './ViewerColorMenu.vue'
 import EnhanceDialog from '../enhance/EnhanceDialog.vue'
 import type { EnhanceSource } from '../../types/enhance'
-import { useImageEditor, requestDiscardEdits } from '../../composables/useImageEditor'
+import { useImageEditor } from '../../composables/useImageEditor'
 import { useViewerColorSource } from '../../composables/useViewerColorSource'
-import { useOfficialEntitlement } from '../../composables/useOfficialEntitlement'
+import { useFeatureActivation } from '../../composables/useFeatureActivation'
 import { useExoticGate } from '../../composables/useExoticGate'
 import { readSettingBool } from '../../composables/settingsValues'
 import { writeSettings } from '../../stores/settingsPersistence'
 import { useOcr } from '../../composables/useOcr'
-import { gateModeFor } from '../../composables/usePluginEntitlement'
+import { gateModeFor } from '../../composables/usePluginAvailability'
 import { usePersonStore } from '../../stores/personStore'
 import { useMediaStore } from '../../stores/mediaStore'
 import { useDuplicateLensStore } from '../../stores/duplicateLensStore'
@@ -537,7 +536,7 @@ import { useHistoryStore } from '../../stores/historyStore'
 import { useUiStore } from '../../stores/uiStore'
 import { useConfigStore } from '../../stores/configStore'
 import { useMediaDetail } from '../../composables/useMediaDetail'
-// 顶栏重构 P4-b:路由驱动 + activeViewer 单源。route 提供 :id 与 back,viewerStore 承载顶栏上下文。
+// 路由提供条目 id 与返回导航，viewerStore 承载顶栏上下文。
 import { useRoute, useRouter } from 'vue-router'
 import {
   useViewerStore,
@@ -575,9 +574,7 @@ import {
   Sparkles,
 } from '@lucide/vue'
 import { EVENTS } from '../../constants/ipc'
-// 超长文件拆分方案(2026-07-25 分析/analysis/ContentViewer-vue.md §2.1)下沉的 composable:
-// 只接受 getter/ref 参数,不反向 import 组件;不得在内部重复调用已在本文件创建一次的
-// useMediaDetail() 等单例状态源。
+// 下列 composable 接收 getter/ref，不反向依赖组件；useMediaDetail 等状态源仅在此处创建。
 import { useContentViewerPosterSource } from '../../composables/useContentViewerPosterSource'
 import { useContentViewerPreload } from '../../composables/useContentViewerPreload'
 import { useContentViewerRouteNav } from '../../composables/useContentViewerRouteNav'
@@ -598,9 +595,9 @@ const route = useRoute()
 const router = useRouter()
 const viewer = useViewerStore()
 const { t } = useI18n()
-// 图片简单编辑(方案 C §7):单实例贯穿本组件生命周期,EditOverlay 只呈现、不持有状态。
+// 编辑状态贯穿查看器生命周期；EditOverlay 只负责呈现。
 const editor = useImageEditor()
-const editingGate = useOfficialEntitlement()
+const editingGate = useFeatureActivation('feature-editing')
 const editGateOpen = ref(false)
 const editActivateOpen = ref(false)
 let editingActivationSucceeded = false
@@ -612,14 +609,13 @@ const enhanceOpen = ref(false)
 const detail = computed(() => media.detailItem!)
 
 // ── 查看器渲染色域换源(2026-07-23 自定义 ICC 与色域切换,方案 B §0⑥)──────────────────────
-// 「原图先显 + 完成后换源」:absPath 优先取派生色域文件 URL,未就绪/不适用(srgb/移动端/非
+// 「原图先显 + 完成后换源」:absPath 优先取派生色域文件 URL,未就绪/不适用(srgb/非
 // image)时回落原图,与 D-413(编辑链 sRGB 不动,EditOverlay 吃原图路径不经 absPath)互不影响。
 const viewerColor = useViewerColorSource({
   detail: () =>
     media.detailItem ? { id: media.detailItem.id, mediaType: media.detailItem.mediaType } : null,
   target: () => config.viewerColorTarget,
   customId: () => config.viewerColorCustomId,
-  isMobile: isMobilePlatform,
 })
 const originalAssetUrl = computed(() =>
   detail.value ? resolveAssetUrl(detail.value.absPath) : '',
@@ -637,10 +633,11 @@ const placeholderImgRef = ref<HTMLImageElement | null>(null)
 const isImageLoaded = ref(false)
 
 watch(
-  () => detail.value?.id,
+  [() => detail.value?.id, absPath],
   () => {
     isImageLoaded.value = false
   },
+  { flush: 'sync' },
 )
 
 // ── 邻近预加载与极速飞掠保护（Burst Mode） ───────────────────────────────────
@@ -737,15 +734,15 @@ function onVisibleImageError(event: Event) {
 }
 
 // ── Exotic 授权 gate（Part5 T12 增量3）───────────────────────────────────────
-// 打开某项时解析其 exotic 授权态；未授权（purchase/blocked）→ 视图区显 PluginGate 引导，
+// 打开某项时解析其 exotic 激活状态；未激活（activation/blocked）→ 视图区显 PluginGate 引导，
 // 而非渲染注定失败的原图。普通格式（非 exotic catalog）resolveForItem 直接放行、不发 IPC。
 const exoticGate = useExoticGate()
 const activateOpen = ref(false)
 
-// gate 只在「有产品未授权」或「纯不可用」时接管视图；已授权 / 放行走原渲染。
+// gate 只在「有产品未激活」或「纯不可用」时接管视图；已激活 / 放行走原渲染。
 const showExoticGate = computed(() => {
   const m = gateModeFor(exoticGate.entitlement.value)
-  return exoticGate.failed.value || exoticGate.loading.value || m === 'purchase' || m === 'blocked'
+  return exoticGate.failed.value || exoticGate.loading.value || m === 'activation' || m === 'blocked'
 })
 // 传给 gate / 激活对话框的功能名：用格式名（如 PSD）给出上下文；gate 无名时会退回通用标题。
 const exoticFeatureName = computed(() =>
@@ -755,8 +752,8 @@ const exoticFeatureName = computed(() =>
 function refreshExoticGate(): void {
   if (detail.value) void exoticGate.resolveForItem(detail.value.id, detail.value.fileFormat)
 }
-useTauriListen(EVENTS.OFFICIAL_LICENSE_CHANGED, () => {
-  void editingGate.fetchEntitlement()
+useTauriListen(EVENTS.FEATURE_ACTIVATION_CHANGED, () => {
+  void editingGate.fetchActivation()
   refreshExoticGate()
 })
 
@@ -775,7 +772,7 @@ watch(
   { immediate: true },
 )
 
-// 激活成功 → 重解析授权态（转 Authorized 后 showExoticGate 归 false，gate 自动撤下）。
+// 激活成功 → 重解析激活状态（转 Ready 后 showExoticGate 归 false，gate 自动撤下）。
 async function onExoticActivated() {
   const item = media.detailItem
   if (item) await exoticGate.resolveForItem(item.id, item.fileFormat)
@@ -848,6 +845,7 @@ const {
   state,
   viewerRef,
   currentImageElement,
+  isImageLoaded: () => isImageLoaded.value,
   videoRef,
   detail: () => detail.value,
   media,
@@ -903,8 +901,8 @@ const { ctxMenu, moveCopyDialog, onContextMenu, onMoveCopyConfirm } = useContent
 async function openEditor(): Promise<void> {
   if (!detail.value) return
   editGateOpen.value = true
-  const entitlement = await editingGate.fetchEntitlement()
-  if (entitlement?.availability === 'authorized' && detail.value) {
+  const entitlement = await editingGate.fetchActivation()
+  if (entitlement?.activated === true && detail.value) {
     editGateOpen.value = false
     editor.open(detail.value)
   }
@@ -936,7 +934,7 @@ function openEnhance(): void {
   enhanceOpen.value = true
 }
 
-// 深审裁决:切项(翻页/换看图)必须收口旧 OCR 结果面板,不得带着上一项的文字残留到新项。
+// 切项时关闭旧 OCR 结果面板，避免上一项的文字留在新项。
 watch(
   () => detail.value?.id,
   () => ocr.closePanel(),
@@ -953,10 +951,10 @@ function onEditingActivationClosed(): void {
   if (!editingActivationSucceeded) editGateOpen.value = true
 }
 
-async function onEditingActivated(): Promise<void> {
+function onEditingActivated(): void {
   editingActivationSucceeded = true
-  const entitlement = await editingGate.fetchEntitlement()
-  if (entitlement?.availability === 'authorized' && detail.value) editor.open(detail.value)
+  void editingGate.fetchActivation()
+  if (detail.value) editor.open(detail.value)
 }
 
 /** EditOverlay 取消/关闭(已内部走过「有改动则二次确认」)。 */
@@ -1023,24 +1021,14 @@ useTauriListen(EVENTS.VOLUMES_CHANGED, () => {
 })
 
 function closeViewer() {
-  // 离开查看器回来处(网格);P4-a 已让网格重挂载恢复滚动位。无 back 记录(未来 OS 深链直达)回退根。
+  // 返回网格时由网格恢复滚动位；没有返回记录的深链入口回到根路由。
   if (router.options.history.state.back != null) router.back()
   else void router.push('/')
 }
 
-/** 顶栏/命令层的「返回画廊」统一入口:编辑中先走「有改动二次确认」,确认放弃后才真正离开。 */
+/** 顶栏/命令层的返回入口，编辑状态由统一路由守卫在离开前确认。 */
 function close() {
-  if (editor.status.value === 'idle') {
-    closeViewer()
-    return
-  }
-  if (editor.status.value === 'saving') return
-  void (async () => {
-    if (await requestDiscardEdits(editor)) {
-      editor.close()
-      closeViewer()
-    }
-  })()
+  closeViewer()
 }
 
 // ── 沉浸模式(顶栏重构 P4-c)──────────────────────────────────────────────────
@@ -1128,6 +1116,19 @@ const viewerApi: ViewerApi = {
 defineExpose(viewerApi)
 
 let viewerToken: number | null = null
+function onVideoMetadata(metadata: { itemId: number | null; src: string; width: number; height: number }): void {
+  const it = media.detailItem
+  if (!it || it.id !== metadata.itemId || videoSource.src.value !== metadata.src) return
+  // 快扫尺寸是布局占位值；原文件已解码时，以实际尺寸统一信息面板和底栏。
+  // 派生播放文件可能缩小过，不能把其尺寸当成原资产尺寸。
+  if (videoSource.mode.value === 'direct' && metadata.width > 0 && metadata.height > 0) {
+    it.width = metadata.width
+    it.height = metadata.height
+    if (viewerToken !== null) viewer.patch(viewerToken, { fileInfo: toViewerFileInfo(it) })
+  }
+  updateZoomRatio()
+}
+
 function viewerSnapshot(): Omit<ActiveViewer, 'immersive'> {
   const it = media.detailItem!
   return {

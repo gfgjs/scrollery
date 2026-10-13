@@ -1,9 +1,4 @@
-// src-tauri/src/video/frame_post.rs
-//! Media Foundation 解码帧的后处理（尾段抽出，全程不碰 `IMFSourceReader`，与
-//! `Session`/`ReaderCallback` 等异步回调核心无引用关系）。
-//!
-//! Post-processing for decoded MF frames — extracted from `media_foundation.rs`; never touches
-//! `IMFSourceReader`, no reference into the async-callback core.
+//! Media Foundation 解码帧的后处理，不访问 `IMFSourceReader` 或异步回调状态。
 
 use crate::engine::traits::DecodedImage;
 

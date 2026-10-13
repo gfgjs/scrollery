@@ -34,7 +34,3 @@ export const isWindows = currentPlatform === 'windows'
 
 /** Linux:本期标题栏能力降级(Snap Layouts no-op),仍走自绘分支但不叠 native child HWND。 */
 export const isLinux = currentPlatform === 'linux'
-
-/** Android/iOS:opener 不支持 reveal(D-001)——「在文件管理器中显示」类动作须隐藏/禁用,
- *  后端直调返回稳定 `unsupported_platform` 仅是兜底(S 线审查 R-09)。 */
-export const isMobilePlatform = currentPlatform === 'android' || currentPlatform === 'ios'

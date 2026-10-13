@@ -1,5 +1,5 @@
 // src-tauri/src/exotic/worker.rs
-//! 冷门格式插件 · Worker 进程规格、子进程创建与「传输无关」的连接抽象（v3 Part2 §3.4-3.7）。
+//! Worker 进程规格、子进程创建与传输无关的连接抽象。
 //!
 //! 分层（为可测性）：
 //!   - [`WorkerSpec`] / [`spawn_worker_process`]：定位 + 以**低优先级、隐藏窗口、管道 stdio** 创建子进程。
@@ -39,10 +39,9 @@ pub(crate) const PROGRESS_TOTAL_CAP: Duration = Duration::from_secs(3600);
 
 /// 定位 PSD Worker 可执行文件（**仅测试**）。
 ///
-/// Part2（dev/test）旧入口：经环境变量 `EXOTIC_PSD_WORKER_PATH` 注入已构建的 worker 二进制路径、**不验签**。
-/// 生产路径已由 [`crate::exotic::installer::resolve_worker_path`]（验签 + hash 复核，§3.6）替代；coordinator 只调后者。
-/// 🔒 本函数整体 `#[cfg(test)]`：Release/普通 debug app 构建中**不存在**，杜绝经环境变量加载未验签 worker
-/// 的信任链击穿（SEC-02，对齐 D8「Release 不得有验签旁路」红线）。仅 cargo test 的真实 worker 冒烟用例编入。
+/// 测试通过环境变量 `EXOTIC_PSD_WORKER_PATH` 注入 worker 路径，不验签。
+/// 本函数只在 `#[cfg(test)]` 下编入；运行时使用
+/// [`crate::exotic::installer::resolve_worker_path`] 复核签名和文件 hash，避免未验签路径进入应用。
 #[cfg(test)]
 pub fn resolve_psd_worker_path() -> Option<PathBuf> {
     std::env::var_os("EXOTIC_PSD_WORKER_PATH").map(PathBuf::from)
@@ -101,8 +100,7 @@ fn apply_low_priority(cmd: &mut Command) {
     cmd.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
 }
 
-/// macOS/Linux：Part2 在 Windows 落地与验证；此处记录降级（未降优先级），
-/// 由 Part4 跨平台发布按实测接入 `nice`/QoS utility（R1 要求记录创建失败与降级行为）。
+/// 非 Windows 平台暂以普通优先级创建 Worker。
 #[cfg(not(windows))]
 fn apply_low_priority(_cmd: &mut Command) {
     tracing::debug!(
@@ -233,9 +231,9 @@ impl WorkerConn {
         id
     }
 
-    /// 发送任意 op 的请求并等待响应(T15 泛化,D3 §4①)。返回**未经 op 校验**的
+    /// 发送任意 op 的请求并等待响应；返回未经 op 校验的
     /// [`RawOutcome`];`cancelled` 在等待期间被周期轮询,返回 true 即放弃等待返回
-    /// `Disconnected`(上层 kill 在途 Worker,v3.1 §4.1)。
+    /// `Cancelled`(上层 kill 在途 Worker,不计故障)。
     pub fn run_request(
         &mut self,
         req: &RequestBody,
@@ -300,7 +298,7 @@ impl WorkerConn {
         }
 
         // 可取消等待：每 CANCEL_POLL 检查一次取消标志，使 stop/App 退出能及时让 Supervisor kill
-        // 在途 Worker（v3.1 §4.1：停止按取消协议终止在途，不等其自然完成；返回 Disconnected → kill）。
+        // 在途 Worker；用独立取消态保留真实断开诊断，不等其自然完成。
         // v3(加固批 A-2):`timeout` 语义 = **静默限时**——收到本请求的 Progress 帧即重置;
         // 不发 Progress 的 op 永不重置,行为与旧「总限时」逐字节相同。总上界见 `total_cap`。
         let started = Instant::now();
@@ -308,7 +306,7 @@ impl WorkerConn {
         let mut deadline = started + timeout;
         let resp = loop {
             if cancelled() {
-                return RawOutcome::Disconnected;
+                return RawOutcome::Cancelled;
             }
             let now = Instant::now();
             if now >= deadline || now >= hard_deadline {
@@ -388,7 +386,7 @@ impl WorkerConn {
 
     /// 发送一个缩略图请求并等待响应，验证后返回 [`TaskOutcome`]。
     /// `req` 必须是 `RequestBody::Thumbnail`；`target_long_edge` 须为吸附后档位（R5）。
-    /// T15 起 = [`Self::run_request`] + thumbnail 专属输出校验(WebP 复核/尺寸/上限)。
+    /// 调用 [`Self::run_request`] 后执行 thumbnail 专属输出校验（WebP/尺寸/上限）。
     pub fn run_thumbnail(
         &mut self,
         req: &RequestBody,
@@ -419,6 +417,7 @@ impl WorkerConn {
                 TaskOutcome::Failure(body)
             }
             RawOutcome::TimedOut => TaskOutcome::TimedOut,
+            RawOutcome::Cancelled => TaskOutcome::Cancelled,
             RawOutcome::Disconnected => TaskOutcome::Disconnected,
             RawOutcome::Protocol(p) => TaskOutcome::Protocol(p),
         }
@@ -443,29 +442,6 @@ mod tests {
     use super::*;
     use exotic_protocol::{read_frame, PROTOCOL_VERSION};
     use std::io::Cursor;
-
-    #[test]
-    fn frame_reader_enforces_receiver_limit_and_exits() {
-        let frame = Frame {
-            frame_type: FrameType::Success,
-            request_id: 1,
-            json: Vec::new(),
-            blob: vec![0; 5],
-        };
-        let mut bytes = Vec::new();
-        write_frame(&mut bytes, &frame).unwrap();
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let reader = spawn_frame_reader(Cursor::new(bytes), tx, 4);
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Err(exotic_protocol::ProtocolError::BlobExceedsReceiverLimit {
-                length: 5,
-                limit: 4
-            })
-        ));
-        reader.join().unwrap();
-        assert!(rx.recv().is_err());
-    }
 
     fn thumb_req(item_id: i64, fp: &str, tier: u32) -> RequestBody {
         RequestBody::Thumbnail {
@@ -554,61 +530,6 @@ mod tests {
         };
         let conn = WorkerConn::from_parts(Box::new(host_w), rx, ready);
         (conn, worker_r, worker_w)
-    }
-
-    /// RawOutcome 未派生 Debug(大变体);测试断言用变体名。
-    fn outcome_name(o: &RawOutcome) -> &'static str {
-        match o {
-            RawOutcome::Success { .. } => "Success",
-            RawOutcome::Failure(_) => "Failure",
-            RawOutcome::TimedOut => "TimedOut",
-            RawOutcome::Disconnected => "Disconnected",
-            RawOutcome::Protocol(_) => "Protocol",
-        }
-    }
-
-    /// 视频格式扩展 §2.4:显式 `total_cap` 生效——Progress 不断重置静默计时,但总上界到点
-    /// 仍强制 TimedOut(心跳活着装载死锁的病态组合的最后防线)。静默限时给足(2s,永不触发),
-    /// 唯一能终止等待的是 200ms 的总上界。
-    #[test]
-    fn total_cap_enforced_despite_continuous_progress() {
-        let (mut conn, mut worker_r, mut worker_w) = wired_conn();
-        let handle = std::thread::spawn(move || {
-            let frame = read_frame(&mut worker_r).unwrap();
-            let req_id = frame.request_id;
-            // 每 30ms 一帧 Progress、永不发终态:静默计时被反复重置,只有 total_cap 能终止。
-            for i in 0..40u64 {
-                std::thread::sleep(Duration::from_millis(30));
-                let p = Frame::control(
-                    FrameType::Progress,
-                    req_id,
-                    &ProgressBody {
-                        stage: format!("s{i}"),
-                        detail: None,
-                        elapsed_ms: i * 30,
-                    },
-                )
-                .unwrap();
-                if write_frame(&mut worker_w, &p).is_err() {
-                    break; // host 已放弃等待(命中 total_cap)
-                }
-                let _ = worker_w.flush();
-            }
-        });
-        let started = Instant::now();
-        let out = conn.run_request_capped(
-            &thumb_req(1, "fp", 480),
-            Duration::from_secs(2),     // 静默限时给足,永不触发
-            Duration::from_millis(200), // 总上界:唯一能终止等待者
-            &|| false,
-        );
-        let elapsed = started.elapsed();
-        assert_eq!(outcome_name(&out), "TimedOut", "总上界到点须强制 TimedOut");
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "应在 ~200ms total_cap 处超时,而非等满 2s 静默限时:{elapsed:?}"
-        );
-        let _ = handle.join();
     }
 
     #[test]

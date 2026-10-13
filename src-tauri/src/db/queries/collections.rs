@@ -12,6 +12,7 @@ use crate::error::{AppError, Result};
 //   该类型 + is_favorited（走 idx_media_fav 快路径，红心即收藏，无需写 album_items）。
 // 用户夹（kind='user'）成员实体：存 album_items，可跨类型混装。
 // list_collections 用 CASE 分别计算两类的 cover/count。
+// 自动封面与计数同画廊排除实况附件；保留原成员关系，解除配对后仍可见。
 
 fn map_collection(row: &Row<'_>) -> rusqlite::Result<Collection> {
     Ok(Collection {
@@ -38,6 +39,7 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<Collection>> {
             CASE WHEN a.kind='system'
                  THEN (SELECT m.id FROM media_items m
                        WHERE m.media_type=a.media_type_filter AND m.is_favorited=1 AND m.is_deleted=0
+                         AND m.companion_of IS NULL
                          {EXCLUDE_HIDDEN_ROOTS_M}
                        ORDER BY m.sort_datetime DESC LIMIT 1)
                  ELSE COALESCE(
@@ -45,16 +47,19 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<Collection>> {
                         WHERE m.id=a.cover_item_id {EXCLUDE_HIDDEN_ROOTS_M}),
                        (SELECT ai.item_id FROM album_items ai
                         JOIN media_items m ON ai.item_id=m.id
-                        WHERE ai.album_id=a.id AND m.is_deleted=0 {EXCLUDE_HIDDEN_ROOTS_M}
+                        WHERE ai.album_id=a.id AND m.is_deleted=0 AND m.companion_of IS NULL
+                          {EXCLUDE_HIDDEN_ROOTS_M}
                         ORDER BY ai.added_at DESC LIMIT 1))
             END AS cover_item_id,
             CASE WHEN a.kind='system'
                  THEN (SELECT COUNT(*) FROM media_items m
                        WHERE m.media_type=a.media_type_filter AND m.is_favorited=1 AND m.is_deleted=0
+                         AND m.companion_of IS NULL
                          {EXCLUDE_HIDDEN_ROOTS_M})
                  ELSE (SELECT COUNT(*) FROM album_items ai
                        JOIN media_items m ON ai.item_id=m.id
-                       WHERE ai.album_id=a.id AND m.is_deleted=0 {EXCLUDE_HIDDEN_ROOTS_M})
+                       WHERE ai.album_id=a.id AND m.is_deleted=0 AND m.companion_of IS NULL
+                         {EXCLUDE_HIDDEN_ROOTS_M})
             END AS item_count,
             a.sort_order
          FROM albums a
@@ -82,11 +87,13 @@ pub fn list_deleted_collections(conn: &Connection) -> Result<Vec<Collection>> {
                       WHERE m.id=a.cover_item_id {EXCLUDE_HIDDEN_ROOTS_M}),
                      (SELECT ai.item_id FROM album_items ai
                       JOIN media_items m ON ai.item_id=m.id
-                      WHERE ai.album_id=a.id AND m.is_deleted=0 {EXCLUDE_HIDDEN_ROOTS_M}
+                      WHERE ai.album_id=a.id AND m.is_deleted=0 AND m.companion_of IS NULL
+                        {EXCLUDE_HIDDEN_ROOTS_M}
                       ORDER BY ai.added_at DESC LIMIT 1)) AS cover_item_id,
             (SELECT COUNT(*) FROM album_items ai
              JOIN media_items m ON ai.item_id=m.id
-             WHERE ai.album_id=a.id AND m.is_deleted=0 {EXCLUDE_HIDDEN_ROOTS_M}) AS item_count,
+             WHERE ai.album_id=a.id AND m.is_deleted=0 AND m.companion_of IS NULL
+               {EXCLUDE_HIDDEN_ROOTS_M}) AS item_count,
             a.sort_order
          FROM albums a
          WHERE a.kind='user' AND a.deleted_at IS NOT NULL
@@ -105,7 +112,8 @@ pub fn recent_collections(conn: &Connection, limit: i64) -> Result<Vec<Collectio
             (SELECT m.id FROM media_items m
              WHERE m.id=a.cover_item_id {EXCLUDE_HIDDEN_ROOTS_M}) AS cover_item_id,
             (SELECT COUNT(*) FROM album_items ai JOIN media_items m ON ai.item_id=m.id
-             WHERE ai.album_id=a.id AND m.is_deleted=0 {EXCLUDE_HIDDEN_ROOTS_M}) AS item_count,
+             WHERE ai.album_id=a.id AND m.is_deleted=0 AND m.companion_of IS NULL
+               {EXCLUDE_HIDDEN_ROOTS_M}) AS item_count,
             a.sort_order
          FROM albums a
          WHERE a.kind='user' AND a.deleted_at IS NULL

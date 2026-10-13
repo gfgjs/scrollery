@@ -1,11 +1,8 @@
 <template>
-  <!-- 顶栏重构 Phase G: 结构容器。移窗拖拽(2026-07-14 改)已由 WindowChrome 根上的 useWindowDrag
-       委托实现(整行含按钮按住越阈值即拖、轻点即用),故各容器不再挂 data-tauri-drag-region;
-       行高滑块/搜索框/下拉等原生表单控件由 useWindowDrag 的排除选择器自动排除,保各自手势。 -->
-  <!-- data-window-drag-surface:各 flex 容器的间隙是「纯空隙拖拽面」——命中容器本体即 pointerdown 即时
-       移窗(useWindowDrag 路径 B / VSCode 级);容器内的按钮/可点 div 靠 matches 判定落进阈值路径,不受影响。 -->
+  <!-- WindowChrome 的 useWindowDrag 处理移窗拖拽；按钮按住越阈值才拖动，表单控件保留自身手势。 -->
+  <!-- flex 空隙命中容器时可立即拖窗；交互子项由 useWindowDrag 使用阈值判定。 -->
   <div class="toolbar__left" data-window-drag-surface>
-    <!-- 画廊侧栏显隐开关(2026-07-14):画廊态收起/展开左侧栏。状态在 uiStore(gallerySidebarVisible),
+    <!-- 画廊侧栏显隐状态在 uiStore(gallerySidebarVisible)，
          与查看器侧栏各自独立、互不干扰。轻点触发切换,按住拖动则移窗(useWindowDrag 阈值判定)。 -->
     <UiIconButton
       class="toolbar__sidebar-toggle"
@@ -15,11 +12,10 @@
       <PanelLeftClose v-if="ui.gallerySidebarVisible" :size="17" />
       <PanelLeftOpen v-else :size="17" />
     </UiIconButton>
-    <!-- Title / breadcrumb -->
     <!-- 标题 / 面包屑 -->
     <div class="toolbar__breadcrumb" data-window-drag-surface>
       <span class="toolbar__title">{{ title }}</span>
-      <!-- 计数区(2026-07-14 源头解耦):视图计数(viewTotalItems)恒 ≤ 全库计数(totalItems),故用**全库计数**
+      <!-- 计数区：视图计数(viewTotalItems)不大于全库计数(totalItems)，故用全库计数
            作隐藏 sizer 撑出最大宽度、实际值与之同格(inline-grid)叠放 → 计数变窄不改本区宽度 → 不撑动右侧
            flex:1 的 foldable → 不触发折叠 recompute(根除「筛选致计数 543,449→2 变窄 → 顶栏闪展再收」的耦合源)。 -->
       <span v-if="media.stats" class="toolbar__count">
@@ -33,10 +29,9 @@
     </div>
   </div>
 
-  <!-- 统一折叠容器(Phase G G5): chips + 视图控件在同一个 flex:1 容器内, 一套 useToolbarOverflow
+  <!-- chips 与视图控件在同一个 flex:1 容器内，由 useToolbarOverflow
        按优先序逐项折——视图控件整块作一个 data-toolbar-item 放在末尾(优先级最低→最先折), chips
-       从尾折。单容器 → 折叠某项不改容器自身宽度(始终填满), 可用宽只随窗口单调变化, 根除 G4 真机
-       暴露的振荡(视图控件折叠释放 flex 空间致已折 chips 弹回)。 -->
+       从尾折。容器宽度不会因折叠某项而变化，避免折叠项反复弹回。 -->
   <div
     ref="foldableRef"
     class="toolbar__foldable"
@@ -47,7 +42,7 @@
     data-window-drag-surface
   >
     <GalleryFilterChips variant="inline" :visible-count="visibleCount" :measuring="measuring" />
-    <!-- 视图控件(G8): 拆成 3 个独立折叠项(行高/布局/分组排序), 各自 data-toolbar-item 在组件内部
+    <!-- 视图控件有 3 个独立折叠项(行高/布局/分组排序)，各自 data-toolbar-item 在组件内部
          (非透传), 由统一 useToolbarOverflow 依次折。baseIndex=chipCount(排在 chips 之后→最先折)。
          组件是多根 fold-item 片段, 只传 props 不透传 class/attr(避免 __vnode 踩空)。 -->
     <GalleryViewControls
@@ -79,8 +74,7 @@
     </UiIconButton>
   </div>
 
-  <!-- Right controls -->
-  <!-- 右侧控件 -->
+    <!-- 右侧控件 -->
   <div class="toolbar__right" data-window-drag-surface>
     <!-- H-Lab 横向画廊实验室入口(多布局候选真人调研;docs/designs/2026-07-02-horizontal-gallery-lab.md) -->
     <UiIconButton
@@ -101,10 +95,7 @@
       <EyeOff v-if="demoPrivacyEnabled" :size="18" />
       <ScanEye v-else :size="18" />
     </UiIconButton>
-    <!-- 撤销/重做/全屏已迁标题栏 ContextualToolbar(顶栏重构 P3);键盘 Ctrl+Z/Y(本组件 keydown)
-         与 F11(AppShell)保持不变。 -->
 
-    <!-- Search -->
     <!-- 搜索 -->
     <div
       v-if="!lens.isLensActive"
@@ -139,7 +130,7 @@
         v-model="currentSearchQuery"
         type="search"
         :placeholder="searchPlaceholder"
-        @keydown.esc.prevent="onEscape"
+        @keydown.esc="onEscape"
         @keydown.down="onKeydownDown"
         @keydown.up="onKeydownUp"
         @keydown.enter="onKeydownEnter"
@@ -235,7 +226,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import {
@@ -300,9 +291,7 @@ const showHGalleryLab =
 //   全展开再带过渡收回, 且视图弹层若开着, ⋯ 锚点漂移会让弹层横跳(2026-07-14 真机 bug 根因)。
 // (标题/搜索聚焦改的是「预留区」宽 → foldable 作为 flex:1 兄弟随之 resize → RO 自动 recompute,
 //  无需显式重测。)
-// chip 侧的反应源**不再手工枚举**(S 线 §5 三处描述符化之三,也是最危险的一处):漏一项 → 该 chip
-// 文案变宽却不重测 → 顶栏闪展再收,而且无编译/SSR/测试信号,只在真机抖动。改由描述符自报
-// (chipWidthKey 含「存在性」+ 各 chip 的 widthDeps),新增 chip 时反应源与 chip 在同一处声明。
+// chip 宽度依赖由描述符自报（chipWidthKey 含存在性与各项 widthDeps），避免文案变宽却不重测。
 // 留在此处的两类:locale(影响每一个 chip,不是某一个的私事)、视图控件侧(groupBy·语义模式决定
 // 组内排序 select 是否出现)。
 const foldableRef = ref<HTMLElement | null>(null)
@@ -331,8 +320,7 @@ const {
 })
 
 // chip 项数由描述符推导(清除 chip 仅在有活动筛选时存在);视图控件是其后的第 chipCount 项。
-// 原为手写 `hasActiveFilters ? 8 : 7` —— 与模板里的 0..7 字面量各写一遍,插一个 chip 要两处同步改,
-// 漏改则视图控件 baseIndex 偏移、折叠位次全错(S 线 §5)。镜头激活时普通 chip 暂停、计数随存在性收敛。
+// 镜头激活时普通 chip 暂停，计数随描述符的存在性变化。
 const chipCount = computed(() => chipCountOf(chipState.value))
 // 视图控件在末尾 → 任何溢出都先折它: hasOverflow ⟺ 视图控件已折。
 const viewControlsFolded = computed(() => hasOverflow.value)
@@ -375,9 +363,7 @@ function toggleViewMenu() {
   viewMenuOpen.value = !viewMenuOpen.value
 }
 
-// ── 网格键盘快捷键:经注册表分发(P5-6 键位同源,2026-07-10 收敛网格路径)──────────
-// 此前 undo/redo 在此硬编码 ctrl+z/y、tooltip 却读 grid.ts 的 keybinding 常量——正是 P5-6 要消灭
-// 的双源漂移(ctrl+shift+z 可用但 tooltip 不显)。组合键分发(eventToCombo)落地后统一走注册表:
+// 网格组合键和提示文案均读取命令注册表：
 // grid.undo(mod+z)/grid.redo(mod+y,别名 mod+shift+z)/grid.toggleFullscreen(F11)。
 function onGlobalKeydown(e: KeyboardEvent) {
   // Esc 关闭已开的 ⋯ 弹层(backdrop 点击关闭之外补一个键盘出口)。
@@ -403,6 +389,16 @@ onBeforeUnmount(() => {
 const isSearchFocused = ref(false)
 const searchInputRef = ref<HTMLInputElement>()
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+
+// 模式变化会清空已提交查询，旧输入的延迟提交也必须同步撤销，避免在新模式下复活。
+watch(
+  () => ai.searchMode,
+  () => {
+    if (searchTimer) clearTimeout(searchTimer)
+    searchTimer = null
+  },
+  { flush: 'sync' },
+)
 
 // 标题复用侧栏词条以保持入口一致；map 在 computed 内重建并调 t()，locale 切换时自动重算。
 const title = computed(() => {
@@ -481,7 +477,10 @@ function onSearchBlur() {
   isMixedDropdownOpen.value = false
 }
 
-function onEscape() {
+// 输入法组字时，这些键属于选词操作，不能切换搜索候选或提前提交旧文本。
+function onEscape(e: KeyboardEvent) {
+  if (e.isComposing) return
+  e.preventDefault()
   if (isMixedDropdownOpen.value) {
     isMixedDropdownOpen.value = false
   } else {
@@ -490,6 +489,7 @@ function onEscape() {
 }
 
 function onKeydownDown(e: KeyboardEvent) {
+  if (e.isComposing) return
   if (ai.searchMode === 'mixed' && isMixedDropdownOpen.value) {
     e.preventDefault()
     mixedDropdownIndex.value = (mixedDropdownIndex.value + 1) % 2
@@ -498,6 +498,7 @@ function onKeydownDown(e: KeyboardEvent) {
 }
 
 function onKeydownUp(e: KeyboardEvent) {
+  if (e.isComposing) return
   if (ai.searchMode === 'mixed' && isMixedDropdownOpen.value) {
     e.preventDefault()
     mixedDropdownIndex.value = (mixedDropdownIndex.value + 1) % 2
@@ -506,6 +507,7 @@ function onKeydownUp(e: KeyboardEvent) {
 }
 
 function onKeydownEnter(e: KeyboardEvent) {
+  if (e.isComposing) return
   if (ai.searchMode === 'mixed' && isMixedDropdownOpen.value) {
     e.preventDefault()
     isMixedDropdownOpen.value = false

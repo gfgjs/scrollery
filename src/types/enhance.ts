@@ -1,5 +1,5 @@
 // src/types/enhance.ts
-// 影像增强类型定义（降噪/超分子系统 P0 批 5，消费 enhance_commands.rs 七命令）。
+// 影像增强类型，对应 enhance_commands.rs 的 IPC 载荷。
 // 每个类型与 Rust serde 形态严格对齐——见类型头注标注的后端出处与 rename 规则。
 //
 // ⚠ 两处 serde 口径差异（load-bearing，勿抹平）：
@@ -19,7 +19,7 @@ export type { ModelDownloadProgress }
 export type EnhanceModelTask = 'denoise' | 'dejpegArtifact' | 'upscale'
 
 /** 后端统一能力判定，优先显示阻断下载/购买的发行前提。 */
-export type EnhanceReadiness = 'ready' | 'workerMissing' | 'manifestUnready' | 'unlicensed' | 'modelMissing'
+export type EnhanceReadiness = 'ready' | 'workerMissing' | 'manifestUnready' | 'inactive' | 'modelMissing'
 
 /**
  * 增强任务种类——协议 step 口径（EnhanceStep.task = exotic_protocol::EnhanceTask，serde snake_case）。
@@ -46,7 +46,6 @@ export interface EnhanceModelInfo {
 /** enhance_status 返回（EnhanceStatusDto，serde camelCase）。 */
 export interface EnhanceStatus {
   availability: Availability
-  storeUrl: string | null
   workerReady: boolean
   /** 增强协议尚未回传提供器，当前为 null。 */
   provider: string | null
@@ -95,7 +94,7 @@ export interface EnhanceJob {
 }
 
 /**
- * 前后对比预览结果（enhance_preview 实现后返回 { beforePath, afterPath }）。
+ * 前后对比预览结果：enhance_preview 返回 { beforePath, afterPath }。
  * 只有授权、worker 与模型都可用时才会执行预览。
  */
 export interface EnhancePreviewResult {
@@ -120,7 +119,7 @@ export interface EnhanceSource {
 /** 稳定错误码联合（enhance_commands.rs / service.rs 的 AppError::Enhance code）。 */
 export type EnhanceErrorCode =
   | 'enhance_input_too_large'
-  | 'enhance_unlicensed'
+  | 'enhance_inactive'
   | 'enhance_input_unsupported'
   | 'enhance_model_missing'
   | 'enhance_worker_missing'

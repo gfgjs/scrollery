@@ -46,7 +46,7 @@
               />
               <RefreshCw v-else :size="14" />
             </UiIconButton>
-            <!-- 显式快速/完整入口（P1-4）：自动按钮按 mtime 基线自选模式，这里让用户明确指定。
+            <!-- 快速/完整入口供用户明确选择；自动按钮按 mtime 基线自选模式。
                  快速只处理目录增删（mtime 未变目录被剪枝），完整逐文件复查——在其他软件里
                  改过文件内容（同大小改写）后必须用完整扫描才能刷新到位。运行中禁用：先停止
                  再选模式，避免误重启正在跑的扫描。 -->
@@ -126,7 +126,7 @@
       </div>
     </div>
 
-    <!-- 目录移动半完成恢复（P0-1）：有未完成项才出现，重试按阶段日志 id 发起。 -->
+    <!-- 目录移动有未完成项时显示恢复入口，重试按阶段日志 id 发起。 -->
     <DirectoryMoveRecoveryList />
   </AccordionSection>
 </template>
@@ -199,7 +199,7 @@ async function toggleScan(rootId: number) {
   }
 }
 
-// 显式快速/完整入口（P1-4）：唯一差别就是 quickOverride——快速为 true（按目录 mtime 剪枝增量），
+// 快速/完整入口的差别是 quickOverride：快速模式按目录 mtime 剪枝增量，
 // 完整为 false（逐文件复查，兜住快速扫不到的「就地编辑」）。
 async function startExplicitScan(rootId: number, quick: boolean) {
   // 扫描进行中不重启：两个按钮已 disabled，这里再挡一次键盘/程序触发。

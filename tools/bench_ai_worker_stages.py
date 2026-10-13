@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# tools/bench_ai_worker_stages.py
 # ai-worker EmbedBatch 阶段基准(独立只读驱动:不经 app/不启 app、不写应用 DB)。
 #
 # 目的:在固定同一样本上,用真实 ai-worker + 真实 ai_thumbs WebP 缓存,按 host 请求批
@@ -13,8 +12,7 @@
 # 协议:exotic-protocol v3 帧(EXOT + 24B 定长头 + JSON + blob);stdout 只走帧,stderr 只走日志。
 # 只读硬约束:DB 以 file:...?mode=ro 打开;缓存只读既有文件;不写应用 DB / 配置。
 #
-# 用法(默认值即本机 dev 现场):
-#   python tools/bench_ai_worker_stages.py --out docs/planning/<本任务>/bench-ai-worker-stages.json
+# 用法:python tools/bench_ai_worker_stages.py --out <结果文件.json>
 
 import argparse
 import array

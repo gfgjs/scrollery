@@ -1,5 +1,5 @@
 // crates/scrollery-ai-core/tests/ocr_golden.rs
-//! OCR 模型级 golden 回归（`#[ignore]`，模型与 fixture 就绪后手工运行）。
+//! OCR 模型级 characterization + 速度基准(均 `#[ignore]`,本机手跑非 CI)。
 //!
 //! 依赖已下载模型(env `OCR_MODELS_DIR`)与检入 fixture(`tests/fixtures/ocr/`)。
 //! fixture 或模型缺失时以明确 `eprintln` 提前 return(**不 panic**),避免误伤 CI/他人机器。

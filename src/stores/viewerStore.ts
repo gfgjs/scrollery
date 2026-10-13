@@ -1,9 +1,4 @@
-// src/stores/viewerStore.ts
-// activeViewer 单一事实源 —— 补现状缺失的「当前打开资产」全局态(设计文档 §3.3 / L2)。
-// 立项时(2026-07-08)图/视走 body 覆盖层(MediaDetailOverlay)、文档/音频走独立路由,两条路径
-// 无贯穿的「当前查看器上下文」全局状态,媒体类型判定三层拼凑。本 store 收敛为单源,供上下文
-// 工具栏(L4)与命令 when 谓词(L3)统一消费。Phase 4 已把覆盖层一并路由化(MediaDetailOverlay
-// 退役 → ContentViewer),现全部查看器统一经 /view/:id 等路由 populate 到此。
+// 当前查看器的共享状态，供上下文工具栏与命令谓词消费；各查看器通过 populate 发布。
 
 import { defineStore } from 'pinia'
 import { shallowRef, computed } from 'vue'
@@ -49,6 +44,8 @@ export interface ViewerApi {
   next?: () => void
   prev?: () => void
   close?: () => void
+  /** 应用退出前保存当前文档；失败返回 false，保留窗口供用户重试。 */
+  prepareClose?: () => Promise<boolean>
   toggleImmersive?: () => void
   // ── 图像 / 视频 ───────────────────────────────────────────
   zoomIn?: () => void

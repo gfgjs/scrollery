@@ -1,8 +1,7 @@
 // src-tauri/src/tasks.rs
-//! 启动期后台任务聚合装配(自 `lib.rs::run()` 的 setup 段 r 迁出,D-450 纯结构移动,
-//! 行为不变):5 个常驻任务 + 句柄池。
+//! 启动期后台任务和句柄池装配。
 //!
-//! 顺序不变量(拆分方案 §3.1):
+//! 顺序不变量:
 //! - 必须在 `app.manage(app_state)` **之后**调用(部分任务持 `AppState` clone);
 //! - `handles_pool` 创建后必须**立即** `app.manage`——`RunEvent::ExitRequested`/`Exit`
 //!   靠 `try_state` 取出它 abort + join,漏掉 manage 即失去优雅停止。
@@ -56,6 +55,8 @@ pub fn spawn_all(
     let volwatch_handle =
         crate::scanner::volume_watch::spawn(app.handle().clone(), app_state_for_volwatch);
     handles_pool.lock().unwrap().push(volwatch_handle);
+    let file_watch_handle = crate::scanner::fs_watch::spawn(app.handle().clone(), state.clone());
+    handles_pool.lock().unwrap().push(file_watch_handle);
 
     // B-file-iii：开机后台预建全局 filter-invariant filename rank。延迟 15s 避让冷启动首帧
     // IPC 高峰（构建持一个读池连接 ~546ms release / 数秒 dev，避免与首帧读争抢），此后用户
@@ -102,9 +103,9 @@ pub fn spawn_all(
     handles_pool.lock().unwrap().push(h1);
 
     let cache_dir_clone = cache_dir;
-    // 缓存治理周期任务(Part3-T6 / §3.3):对账 GC(删 DB 无主孤儿)→ LRU 上限收敛。
+    // 缓存治理周期任务：对账 GC(删 DB 无主孤儿)→ LRU 上限收敛。
     // 节奏:启动后 5 分钟首跑(错开上方 3 分钟的 PRAGMA optimize,避开冷启动高峰),
-    // 此后每 24h 一轮;「全量重建完成后即时触发」为 T6 余项,暂未接事件。
+    // 此后每 24h 一轮。
     // epoch 护栏:GC 只删早于进程启动时刻的文件——本会话新写的产物可能尚未落
     // DB 行(写文件与写行之间有窗口),留到下次会话收敛,见 reconcile_orphan_gc。
     let gc_epoch = std::time::SystemTime::now();

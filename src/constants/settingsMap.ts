@@ -31,7 +31,8 @@ import {
 import type { Component } from 'vue'
 
 /** 控件注册段；面向用户的页面分组与顺序见 settingsLayout。 */
-export type SettingsSection = 'general' | 'thumbnails' | 'video' | 'aiModels' | 'debug' | 'danger'
+export type SettingsSection =
+  'general' | 'thumbnails' | 'video' | 'aiModels' | 'experimental' | 'debug' | 'danger'
 
 /** select 类控件的选项:labelKey 走 i18n;语言名等「自名不随界面语言变」的场景用 label 原文。 */
 export interface SettingOptionSpec {
@@ -41,8 +42,7 @@ export interface SettingOptionSpec {
 }
 
 /**
- * 单个设置项的声明式注册(设计 §8):新增常规设置只需在此登记一行 + i18n 文案,
- * SettingsView 的行体与 DynamicSettingControl 的控件形态均由注册表驱动。
+ * 常规设置在此登记控件与 i18n 文案，页面和 DynamicSettingControl 按注册表渲染。
  */
 export interface SettingSpec {
   icon: Component
@@ -55,7 +55,7 @@ export interface SettingSpec {
   /** 改名后仍可检索的原术语。 */
   searchTermsKey?: string
   /** 数字控件旁的单位。 */
-  unit?: 'px' | '%' | 'KB' | 'MB' | 'MiB'
+  unit?: 'px' | '%' | 'KB' | 'MB'
   section: SettingsSection
   /** 控件形态:toggle/select/number 走 DynamicSettingControl 通用分派;
    *  button=动作按钮;segmented/custom=特例控件。 */
@@ -73,10 +73,7 @@ export interface SettingSpec {
  * 注册表本体。
  * 插入顺序是注册段的默认行序；页面按 settingsLayout 中的功能分组展示。
  *
- * 类型锁(2026-07-06 审查 P1-20):用 `satisfies` 而非 `: Record<string, SettingSpec>` 注解——
- * 后者把键宽化为 string,`keyof typeof` 拿不到具体键集,拼错 settingKey 编译期无感(运行时
- * `undefined.label` 崩)。`satisfies` 既校验每项符合 SettingSpec,又保留字面键集,导出 SettingKey
- * 联合供 props/绑定表用于编译期对账。不加 `as const`:避免 options 变 readonly 波及消费方。
+ * satisfies 校验配置并保留字面键集；不加 as const，以免 options 成为只读数组。
  */
 export const SETTINGS_MAP = {
   /* ── 外观 general ─────────────────────────────────────────── */
@@ -107,9 +104,7 @@ export const SETTINGS_MAP = {
       { value: 'en-US', label: 'English' },
     ],
   },
-  // 窗口材质(毛玻璃,2026-08-24):仅 Windows 生效(Rust 侧 DWM 背板,与 uiStore
-  // 窗口材质、不透明度与两套配色同属一份主题草稿,控件在 ThemeSettings 内整体呈现;
-  // 旧窗口玻璃浓度项(glass*Opacity)随浓度模型一并删除,不再在注册表登记。
+  // 窗口材质、不透明度与配色同属主题草稿，控件由 ThemeSettings 统一呈现。
   uiFontSize: {
     icon: Type,
     label: 'settings.uiFontSize',
@@ -121,8 +116,7 @@ export const SETTINGS_MAP = {
     min: 12,
     max: 24,
   },
-  // 标题栏与 Gallery 工具栏合并/分离(useTitlebarMode):开=工具栏并入自绘标题栏同一行(默认,Phase G);
-  // 关=独立成标题栏下方第二条 bar(S3 分层)。切换 live 生效。
+  // 顶栏合并时工具栏与自绘标题栏同排，分离时置于标题栏下方；切换即时生效。
   titlebarMerged: {
     icon: Rows3,
     label: 'settings.titlebarMerged',
@@ -169,8 +163,7 @@ export const SETTINGS_MAP = {
       { value: 'right', labelKey: 'settings.alignRight' },
     ],
   },
-  // 时间轴两项宽度:轴宽(.timeline-sidebar 列宽,决定密度带/条可见性)与滚动条 thumb 宽相互独立,
-  // 同置「界面」节紧挨字号(UI 尺度类),避免落在「缩略图」节难找(原 timelineScrollWidth 之误)。
+  // 时间轴侧栏宽度与滚动条滑块宽度独立配置。
   timelineAxisWidth: {
     icon: Map,
     label: 'settings.timelineAxisWidth',
@@ -205,8 +198,7 @@ export const SETTINGS_MAP = {
     min: 24,
     max: 120,
   },
-  // 轴视窗不透明度缩放(2026-07-24):时间轴/minimap 半透明拖动视窗共享,100=默认观感。
-  // 上限 200 保时间轴 color-mix 乘后 ≤100%(见 uiScale.applyAxisViewportOpacity)。
+  // 时间轴与 minimap 共用视窗不透明度缩放；上限 200 保证合成后不超过 100%。
   axisViewportOpacity: {
     icon: Map,
     label: 'settings.axisViewportOpacity',
@@ -236,8 +228,7 @@ export const SETTINGS_MAP = {
     section: 'general',
     control: 'toggle',
   },
-  // 窗口化沉浸模式(2026-07-23):非全屏(且非查看器沉浸)时自动隐藏顶栏/底栏,鼠标移到窗口
-  // 边缘唤出。与 F11 全屏沉浸独立——不改全屏行为,只是把同一套“隐藏+唤出”机制挪进窗口态。
+  // 窗口化沉浸隐藏顶栏与底栏，鼠标移至边缘唤出；与全屏沉浸独立。
   autoHideChromeWindowed: {
     icon: Maximize,
     label: 'settings.autoHideChromeWindowed',
@@ -259,8 +250,7 @@ export const SETTINGS_MAP = {
       { value: 'exit', labelKey: 'settings.closeBehaviorExit' },
     ],
   },
-  // 查看器渲染色域(2026-07-23 自定义 ICC 与色域切换,方案 B §0⑤):仅作用大图查看器(ContentViewer),
-  // 桌面先行、移动端锁 sRGB(D-414,SettingsView 侧以 v-if="!isMobilePlatform" 隐藏本行 + 管理行)。
+  // 色域设置仅作用于大图查看器。
   viewerColorTarget: {
     icon: Palette,
     label: 'settings.viewerColorTarget',
@@ -326,8 +316,8 @@ export const SETTINGS_MAP = {
     section: 'thumbnails',
     control: 'select',
     options: [
-      { value: 'cpu', labelKey: 'settings.thumbStrategyCpu' },
       { value: 'gpu', labelKey: 'settings.thumbStrategyGpu' },
+      { value: 'cpu', labelKey: 'settings.thumbStrategyCpu' },
       { value: 'direct', labelKey: 'settings.thumbStrategyDirect' },
     ],
   },
@@ -348,72 +338,6 @@ export const SETTINGS_MAP = {
     control: 'segmented',
   },
   // WebP 编码质量:1..=99 有损,100=无损(encode_as_webp 契约);变更即复位存量重生成。
-  thumbFastThreads: {
-    icon: Gauge,
-    label: 'settings.thumbFastThreads',
-    descKey: 'settings.thumbFastThreadsDesc',
-    section: 'thumbnails',
-    control: 'number',
-    min: 0,
-    max: 64,
-  },
-  thumbTailThreads: {
-    icon: Gauge,
-    label: 'settings.thumbTailThreads',
-    descKey: 'settings.thumbTailThreadsDesc',
-    section: 'thumbnails',
-    control: 'number',
-    min: 1,
-    max: 16,
-  },
-  thumbGpuInflight: {
-    icon: Gauge,
-    label: 'settings.thumbGpuInflight',
-    descKey: 'settings.thumbGpuInflightDesc',
-    section: 'thumbnails',
-    control: 'number',
-    min: 1,
-    max: 64,
-  },
-  thumbGpuPerAdapter: {
-    icon: Gauge,
-    label: 'settings.thumbGpuPerAdapter',
-    descKey: 'settings.thumbGpuPerAdapterDesc',
-    section: 'thumbnails',
-    control: 'number',
-    min: 1,
-    max: 64,
-  },
-  thumbProcessMemoryMb: {
-    icon: Gauge,
-    label: 'settings.thumbProcessMemoryMb',
-    descKey: 'settings.thumbProcessMemoryMbDesc',
-    section: 'thumbnails',
-    control: 'number',
-    min: 128,
-    max: 16384,
-    unit: 'MiB',
-  },
-  thumbTotalMemoryMb: {
-    icon: Gauge,
-    label: 'settings.thumbTotalMemoryMb',
-    descKey: 'settings.thumbTotalMemoryMbDesc',
-    section: 'thumbnails',
-    control: 'number',
-    min: 128,
-    max: 32768,
-    unit: 'MiB',
-  },
-  thumbWorksetMb: {
-    icon: Gauge,
-    label: 'settings.thumbWorksetMb',
-    descKey: 'settings.thumbWorksetMbDesc',
-    section: 'thumbnails',
-    control: 'number',
-    min: 512,
-    max: 16384,
-    unit: 'MiB',
-  },
   thumbWebpQuality: {
     icon: Image,
     label: 'settings.thumbWebpQuality',
@@ -446,8 +370,7 @@ export const SETTINGS_MAP = {
     min: 100,
     max: 100000,
   },
-  // 缓存占用统计(§3.3.3):后端 get_cache_stats 遍历缓存目录,分类目字节+文件数;
-  // 特例行=进入自动拉取一次 + 手动刷新按钮(遍历大缓存有秒级 IO,不做轮询)。
+  // 缓存统计涉及目录遍历，进入时拉取并支持手动刷新，不做轮询。
   cacheStats: {
     icon: Database,
     label: 'settings.cacheStats',
@@ -535,8 +458,47 @@ export const SETTINGS_MAP = {
     ],
   },
 
+  /* ── 实验性功能 ─────────────────────────────────────────── */
+  galleryBlendEnabled: {
+    icon: Image,
+    label: 'settings.galleryBlendEnabled',
+    descKey: 'settings.galleryBlendEnabledDesc',
+    section: 'experimental',
+    control: 'toggle',
+  },
+  galleryBlendEdgeWidth: {
+    icon: Image,
+    label: 'settings.galleryBlendEdgeWidth',
+    descKey: 'settings.galleryBlendEdgeWidthDesc',
+    section: 'experimental',
+    control: 'number',
+    unit: 'px',
+    min: 0,
+    max: 8,
+  },
+  galleryBlendBlurRadius: {
+    icon: Palette,
+    label: 'settings.galleryBlendBlurRadius',
+    descKey: 'settings.galleryBlendBlurRadiusDesc',
+    section: 'experimental',
+    control: 'number',
+    unit: 'px',
+    min: 0,
+    max: 24,
+  },
+  galleryBlendStrength: {
+    icon: Gauge,
+    label: 'settings.galleryBlendStrength',
+    descKey: 'settings.galleryBlendStrengthDesc',
+    section: 'experimental',
+    control: 'number',
+    unit: '%',
+    min: 0,
+    max: 100,
+  },
+
   /* ── 开发者工具 debug(非破坏性诊断项)──────────────────────── */
-  // 画廊 / 时间轴 DOM↔Canvas 渲染引擎(实验性):canvas 为原型,超大库 / iOS 会自动回退 DOM。
+  // 画廊 / 时间轴 DOM↔Canvas 渲染引擎(实验性)：画廊 Canvas 按视口绘制。
   // 状态经 useRenderMode 共享单例(存 config.toml),切换 live 生效。
   performancePanel: {
     icon: Gauge,
@@ -591,7 +553,7 @@ export const SETTINGS_MAP = {
     // 特例行:描述=可点击路径,控件=换目录按钮。
     customRow: true,
   },
-  // 外置配置文件(config.toml,批次B):路径展示 + 用外部编辑器打开按钮。
+  // 配置文件路径展示与外部编辑器入口。
   configFile: {
     icon: FileCog,
     label: 'settings.configFile',
@@ -600,7 +562,7 @@ export const SETTINGS_MAP = {
     // 特例行:描述=说明文案+当前路径,控件=打开编辑器按钮。
     customRow: true,
   },
-  // 独立日志窗口入口(日志能力重构 S4,方案 §5「设置区入口+独立日志窗口」)。
+  // 独立日志窗口入口。
   openLogWindow: {
     icon: Terminal,
     label: 'settings.openLogWindow',
@@ -608,7 +570,7 @@ export const SETTINGS_MAP = {
     section: 'debug',
     control: 'button',
   },
-  // 语义是纯前端 cache-busting 重载,不销毁任何数据——不归 danger(设计 §8.4:Error 只用于 destructive)。
+  // 仅刷新前端缓存，不销毁数据，归普通操作。
   clearBrowserCache: {
     icon: RotateCcw,
     label: 'settings.clearBrowserCache',
@@ -617,7 +579,7 @@ export const SETTINGS_MAP = {
     control: 'button',
   },
 
-  /* ── 危险操作 danger(设计 §7.2:破坏性项不与普通设置混排;行序=破坏性递增,清库最后)── */
+  /* 危险操作独立分组，按破坏性递增排序，清库最后。 */
   clearAllThumbnails: {
     icon: Trash2,
     label: 'settings.clearAllThumbnails',
@@ -648,13 +610,11 @@ export const SETTINGS_MAP = {
   },
 } satisfies Record<string, SettingSpec>
 
-/** 注册表的合法键联合(P1-20):props / 绑定表用它替代宽 string,拼错键即编译期红。 */
+/** 注册表键联合，供 props 与绑定表进行编译期校验。 */
 export type SettingKey = keyof typeof SETTINGS_MAP
 
 /**
- * 按运行时字符串键安全检索(P1-20):键可能来自持久化的置顶列表(可含已废弃键),
- * 故返回 `SettingSpec | undefined`——消费方必须判空,杜绝原先 `SETTINGS_MAP[typo].label`
- * 的运行时 `undefined.label` 崩溃。编译期已知键的场景直接用 `SETTINGS_MAP[key as SettingKey]`。
+ * 检索持久化字符串键，已废弃或未知键返回 undefined，调用方须判空。
  */
 export function getSettingSpec(key: string): SettingSpec | undefined {
   return (SETTINGS_MAP as Record<string, SettingSpec>)[key]

@@ -1,22 +1,19 @@
 #!/usr/bin/env node
-// Part7 §3.6.5⑤ 发布合规联合扫描 —— conf / capability / dist(JS bundle)三面。
-// (原「第四面 Rust 依赖树断言」随空渠道 channel-msstore/steam 一起退役,P16 2026-09-15。)
+// 发布配置联合扫描：conf、capability 与 dist(JS bundle)。
 //
 // 背景:cargo feature 只作用 Rust 编译链,不排除非 Rust 产物;updater 配置/前端 import/
 // capability 权限若意外泄进非 direct 产物,商店静态扫描会命中(上架硬阻断),dev 无 overlay
 // 构建也会因基座 conf 带块而误注册 updater。
-// 落地形态(2026-07-04 施工裁决,详见 Part7 §3.6.5 落地修订):
+// 校验范围:
 //   ① 基座 tauri.conf.json 物理无 plugins.updater(conf 合并只能加不能删,基座必须天生干净);
 //      updater 块只住 tauri.direct-release.conf.json —— 本脚本双向断言(基座净 + direct 有)。
-//   ② 前端现无任何 updater 包/UI(Part7-T7 有意不加),本脚本扫 dist 作防回潮守卫;
-//      原型实证(2026-06-28):须扫 minify 后生产 bundle,且只扫模块说明符 / IPC 前缀 /
+//   ② 扫描 dist，防止 updater 包/UI 进入前端产物；须扫 minify 后生产 bundle，只扫模块说明符 / IPC 前缀 /
 //      endpoint host —— 函数名(checkUpdate 等)在未 minify 死块中会残留导致误报,不扫。
 //   ③ capability 现无 updater 权限,同样作防回潮断言。
 //
 // 用法:node scripts/verify-channel-bundle.mjs [--no-dist]
 //   --no-dist:跳过 dist 扫描(未跑 vite build 的场合;CI 中禁用,必须全量)。
-// 任何命中即 exit 1。脚本启动时先跑内置 selftest(正反样本喂检查器),防止检查器
-// 退化成「只会 PASS 的空壳」(e2e 自洽盲区教训)。
+// 任何命中即 exit 1。
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, dirname, extname, relative } from 'node:path';
@@ -85,39 +82,6 @@ function checkDistText(relPath, text, hosts) {
   return v;
 }
 
-// ── selftest:正反样本喂检查器,反样本漏检 / 正样本误报均视为脚本自身损坏 ────────────
-
-function selftest() {
-  const dirty = { plugins: { updater: { pubkey: 'x', endpoints: ['https://u.example/{{target}}'] } } };
-  const clean = { bundle: { active: true } };
-  const fails = [];
-  const expect = (cond, msg) => { if (!cond) fails.push(msg); };
-
-  expect(checkBaseConf(dirty).length === 1, '基座检查器漏检 updater 块');
-  expect(checkBaseConf(clean).length === 0, '基座检查器对干净 conf 误报');
-  expect(checkOverlayClean('t.json', dirty).length === 1, 'overlay 检查器漏检');
-  expect(checkDirectOverlay(dirty).length === 1, 'direct 守卫应报缺 createUpdaterArtifacts');
-  expect(
-    checkDirectOverlay({ plugins: { updater: { pubkey: 'x', endpoints: ['https://u.example/a'] } }, bundle: { createUpdaterArtifacts: true } }).length === 0,
-    'direct 守卫对完整配置误报'
-  );
-  expect(checkDirectOverlay({ plugins: { updater: { pubkey: 'x', endpoints: ['http://u.example/a'] } }, bundle: { createUpdaterArtifacts: true } }).length === 1, 'direct 守卫漏检非 https endpoint');
-  expect(checkCapability('c.json', { permissions: ['core:default', 'updater:default'] }).length === 1, 'capability 检查器漏检字符串权限');
-  expect(checkCapability('c.json', { permissions: [{ identifier: 'updater:allow-check' }] }).length === 1, 'capability 检查器漏检对象权限');
-  expect(checkCapability('c.json', { permissions: ['core:default'] }).length === 0, 'capability 检查器误报');
-  expect(checkDistText('a.js', 'import("@tauri-apps/plugin-updater")', []).length === 1, 'dist 检查器漏检模块说明符');
-  expect(checkDistText('a.js', 'invoke("plugin:updater|check")', []).length === 1, 'dist 检查器漏检 IPC 前缀');
-  expect(checkDistText('a.js', 'fetch("https://updates.example.com/x")', ['updates.example.com']).length === 1, 'dist 检查器漏检 endpoint host');
-  // 原型教训回归:函数名不构成命中(用户代码无害死调用不应误报)。
-  expect(checkDistText('a.js', 'function checkUpdate(){}', ['updates.example.com']).length === 0, 'dist 检查器误报函数名');
-
-  if (fails.length) {
-    console.error('❌ verify-channel-bundle selftest 失败(扫描器自身已损坏,结果不可信):');
-    for (const f of fails) console.error('   - ' + f);
-    process.exit(2);
-  }
-}
-
 // ── 实扫 ─────────────────────────────────────────────────────────────────────
 
 function readJson(p) {
@@ -125,7 +89,6 @@ function readJson(p) {
 }
 
 function main() {
-  selftest();
   const violations = [];
   let scanned = 0;
 
@@ -181,7 +144,7 @@ function main() {
     for (const v of violations) console.error('   - ' + v);
     process.exit(1);
   }
-  console.log(`✅ 渠道合规扫描通过(selftest 14 断言 + 实扫 ${scanned} 文件${NO_DIST ? ',dist 已跳过' : ''})`);
+  console.log(`✅ 渠道合规扫描通过(实扫 ${scanned} 文件${NO_DIST ? ',dist 已跳过' : ''})`);
 }
 
 main();

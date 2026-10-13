@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cancel-viewport-thumbnail-request"
+description = "Enables the cancel_viewport_thumbnail_request command without any pre-configured scope."
+commands.allow = ["cancel_viewport_thumbnail_request"]
+
+[[permission]]
+identifier = "deny-cancel-viewport-thumbnail-request"
+description = "Denies the cancel_viewport_thumbnail_request command without any pre-configured scope."
+commands.deny = ["cancel_viewport_thumbnail_request"]

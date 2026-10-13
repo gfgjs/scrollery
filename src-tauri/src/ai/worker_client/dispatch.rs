@@ -31,13 +31,14 @@ impl AiWorkerClient {
                     last_err = Some(e.to_string());
                     self.drop_worker();
                     if cancelled() {
-                        return Err(AppError::System("AI worker 批请求已取消".into()));
+                        return Err(e);
                     }
                     continue;
                 }
             };
             let w = self.worker.as_mut().expect("ensure_session 后必有实例");
             match w.run_batch(req, timeout, cancelled) {
+                RawOutcome::Cancelled => return Err(AppError::Cancelled),
                 RawOutcome::Success { body, blob } => match validate(&desc, &body, &blob) {
                     Ok(out) => return Ok(out),
                     Err(msg) => {
@@ -93,7 +94,10 @@ impl AiWorkerClient {
                 }
             }
             if cancelled() {
-                return Err(AppError::System("AI worker 批请求已取消".into()));
+                return Err(AppError::System(format!(
+                    "AI worker 批请求失败后停止重试:{}",
+                    last_err.as_deref().unwrap_or_default()
+                )));
             }
         }
         Err(AppError::System(format!(
@@ -171,7 +175,7 @@ impl AiWorkerClient {
         )
     }
 
-    /// OCR 批(交互恒单图;批口面向未来):结果与 `items` 同序对齐(校验见
+    /// OCR 批：结果与 `items` 同序对齐（校验见
     /// [`validate_ocr_batch_output`])。
     ///
     /// **不复用 [`run_validated`](Self::run_validated)**——它的 ensure 是 CLIP 会话;本圈
@@ -201,13 +205,14 @@ impl AiWorkerClient {
                     last_err = Some(e.to_string());
                     self.drop_worker();
                     if cancelled() {
-                        return Err(AppError::System("OCR 批请求已取消".into()));
+                        return Err(e);
                     }
                     continue;
                 }
             }
             let w = self.worker.as_mut().expect("ensure_ocr_session 后必有实例");
             match w.run_batch(&req, timeout, cancelled) {
+                RawOutcome::Cancelled => return Err(AppError::Cancelled),
                 RawOutcome::Success { body, blob } => {
                     match validate_ocr_batch_output(items, &body, &blob) {
                         Ok(out) => return Ok(out),
@@ -271,7 +276,10 @@ impl AiWorkerClient {
                 }
             }
             if cancelled() {
-                return Err(AppError::System("OCR 批请求已取消".into()));
+                return Err(AppError::System(format!(
+                    "OCR 批请求失败后停止重试:{}",
+                    last_err.as_deref().unwrap_or_default()
+                )));
             }
         }
         Err(AppError::System(format!(

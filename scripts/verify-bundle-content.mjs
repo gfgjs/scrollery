@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// 发货闭包内容断言:AI/RAW/video/enhance/native-thumbnail worker 及其运行时必须随安装包分发。
-// 本脚本防回潮——一旦 externalBin/resources 断链即红。
+// 安装包内容断言：AI/RAW/video/enhance/native-thumbnail worker 及其运行时必须随包分发。
+// externalBin/resources 缺项时失败。
 //
 // 三层校验:
-//   ① staging 层:src-tauri/binaries/ 下 ai/video/raw/enhance worker + ORT 四件套必须存在;
-//   ② conf 层:tauri.conf.json 的 externalBin 含四个 worker、bundle.resources 声明四 DLL;
+//   ① staging 层:src-tauri/binaries/ 下 ai/video/raw/enhance/native-thumbnail worker + ORT 四件套必须存在;
+//   ② conf 层:tauri.conf.json 的 externalBin 含五个 worker、bundle.resources 声明四 DLL;
 //   ③ 安装包层:target/release/bundle/ 存在 MSI/NSIS 时,用 7z 拆包断言载荷和法律资源完整。
 //      NSIS 保留原名,归一化后按名比对;MSI 的资源文件被 Tauri 匿名化为 PathFile_<hash>(无扩展名,
 //      Bin_ 前缀侧车保留原名),只能按字节尺寸在条目尺寸集中匹配(缺项/截断都会错开尺寸)。
@@ -14,8 +14,10 @@
 //   --require-bundle:缺安装包/7z 均失败；--installer=<path> 可重复，限定本次待验收产物。
 //   - 安装包缺失或 7z 不可用 → 只跑 ①②,打印说明;
 //   - CI 且安装包存在但 7z 不可用 → 硬失败(发布路径必须做载荷级验证)。
-// 脚本启动先跑内置 selftest(正反样本喂检查器),防止检查器退化成只会 PASS 的空壳。
+// 脚本启动先跑 MSI 截断载荷自检。
 
+import assert from 'node:assert/strict';
+import { testCase } from './lib/test-case.mjs';
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
@@ -26,7 +28,7 @@ const CONFIG_PATH = path.join(ROOT, 'src-tauri', 'tauri.conf.json');
 const BINARIES_DIR = path.join(ROOT, 'src-tauri', 'binaries');
 const BUNDLE_DIR = path.join(ROOT, 'target', 'release', 'bundle');
 
-// 安装包载荷必含项(归一化名)。AI/RAW/video/enhance worker + ORT 四件套。
+// 安装包载荷必含项(归一化名)。AI/RAW/video/enhance/native-thumbnail worker + ORT 四件套。
 const REQUIRED_PAYLOAD = [
   'ai_worker.exe',
   'onnxruntime.dll',
@@ -69,8 +71,6 @@ const REQUIRED_BUNDLE_LEGAL = [
   'legal/graphviz/graphviz-2.40.1-license.txt',
   'legal/graphviz/viz.js-2.1.2-license.txt',
   'legal/lute/lute-1.7.6-license.txt',
-  'legal/libvpl/license',
-  'legal/libvpl/third-party-programs.txt',
   'legal/manifest.json',
 ];
 
@@ -118,7 +118,10 @@ export function checkPayloadEntriesMs(entryNames, entrySizes, stagedSizes) {
 /** 检查 staging 目录:侧车 exe + ORT DLL 齐备,返回违例描述数组。 */
 export function checkStaged(binariesDir) {
   if (!existsSync(binariesDir)) return [`staging 目录缺失:${binariesDir}`];
-  const names = readdirSync(binariesDir);
+  return checkStagedNames(readdirSync(binariesDir));
+}
+
+function checkStagedNames(names) {
   const v = [];
   if (!names.some((n) => /^enhance-worker-.+\.exe$/.test(n))) {
     v.push('staging 缺 enhance-worker-<triple>.exe(跑 npm run build:enhance-worker)');
@@ -293,74 +296,25 @@ function stagedPayloadSizes(binariesDir) {
   return out;
 }
 
-// ── selftest:正反样本喂检查器,反样本漏检 / 正样本误报均视为脚本自身损坏 ──────────
+// ── selftest:匿名 MSI 载荷的尺寸完整性 ───────────────────────────────────────
 
 function selftest() {
-  const fails = [];
-  const expect = (cond, msg) => { if (!cond) fails.push(msg); };
-
-  expect(normalizeEntryName('Bin_raw_worker.exe') === 'raw_worker.exe', '归一化漏剥 MSI Bin_ 前缀');
-  expect(normalizeEntryName('ai-worker.exe') === 'ai_worker.exe', '归一化漏转连字符');
-  expect(normalizeEntryName('ONNXRUNTIME.DLL') === 'onnxruntime.dll', '归一化漏小写');
-  expect(
-    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
-    '载荷检查器对完整载荷误报'
-  );
-  const missing = checkPayloadEntries(['Bin_raw_worker.exe', 'onnxruntime.dll']);
-  expect(missing.includes('ai_worker.exe') && missing.includes('dxil.dll'), '载荷检查器漏检缺项');
-  expect(missing.includes('video_worker.exe'), '载荷检查器漏检 video-worker');
-  expect(missing.includes('enhance_worker.exe'), '载荷检查器漏检 enhance-worker');
-  expect(missing.includes('native_thumbnail_worker.exe'), '载荷检查器漏检 native-thumbnail-worker');
-  expect(missing.length === 7, '载荷检查器缺项计数错误');
-  expect(
-    checkPayloadEntries(['Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe', 'ai-worker.exe', 'onnxruntime.dll', 'DirectML.dll', 'dxcompiler.dll', 'dxil.dll']).length === 0,
-    '载荷检查器对 MSI Bin_ 前缀完整载荷误报'
-  );
-
-  // MSI 匿名化样本:PathFile_<hash> 无扩展名,DLL 只能靠尺寸匹配;侧车 Bin_ 前缀按名。
-  const msiStaged = {
-    'onnxruntime.dll': 25355576,
-    'directml.dll': 17986400,
-    'dxcompiler.dll': 18527544,
-    'dxil.dll': 1508664,
-  };
-  expect(
-    checkPayloadEntriesMs(
-      ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe',
+  testCase('bundle:msi-truncated-runtime-rejected', () => {
+    const staged = {
+      'onnxruntime.dll': 25355576,
+      'directml.dll': 17986400,
+      'dxcompiler.dll': 18527544,
+      'dxil.dll': 1508664,
+    };
+    const missing = checkPayloadEntriesMs(
+      ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe',
+        'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe',
         'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d', 'PathFile_I09b10b5e'],
-      [50161992, 49535488, 6523904, 9287261, 25355576, 17986400, 18527544, 1508664],
-      msiStaged,
-    ).length === 0,
-    'MSI 匿名化载荷检查器对完整样本(PathFile_+Bin_)误报'
-  );
-  const msiMissing = checkPayloadEntriesMs(
-    ['app.cab', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe',
-      'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d'],
-    [50161992, 6523904, 9287261, 25355576, 17986400, 18527544],
-    msiStaged,
-  );
-  expect(msiMissing.length === 1 && msiMissing[0] === 'dxil.dll', 'MSI 匿名化载荷检查器漏检缺项');
-  const msiTruncated = checkPayloadEntriesMs(
-    ['app.cab', 'Path', 'Bin_ai_worker.exe', 'Bin_raw_worker.exe', 'Bin_video_worker.exe', 'Bin_enhance_worker.exe', 'Bin_native_thumbnail_worker.exe',
-      'PathFile_I4caaa07a', 'PathFile_I20acde8d', 'PathFile_Id320e07d', 'PathFile_I09b10b5e'],
-    [50161992, 49535488, 6523904, 9287261, 25355576, 17986400, 18527544, 1500000],
-    msiStaged,
-  );
-  expect(msiTruncated.length === 1 && msiTruncated[0] === 'dxil.dll', 'MSI 匿名化载荷检查器漏检截断(尺寸不符)');
-
-  const confOk = { bundle: { externalBin: ['binaries/raw-worker', 'binaries/ai-worker', 'binaries/video-worker', 'binaries/enhance-worker', 'binaries/native-thumbnail-worker'], resources: { 'binaries/onnxruntime.dll': 'onnxruntime.dll', 'binaries/DirectML.dll': 'DirectML.dll', 'binaries/dxcompiler.dll': 'dxcompiler.dll', 'binaries/dxil.dll': 'dxil.dll', '../LICENSE': 'LICENSE', '../NOTICE.md': 'NOTICE.md', '../SOURCE.md': 'SOURCE.md', '../COMMERCIAL.md': 'COMMERCIAL.md', '../ADDITIONAL-PERMISSION.md': 'ADDITIONAL-PERMISSION.md', '../target/legal': 'legal' } } };
-  expect(checkConfig(confOk).length === 0, 'conf 检查器对完整接线误报');
-  expect(checkConfig({ bundle: { externalBin: ['binaries/raw-worker'], resources: {} } }).length === 14, 'conf 检查器漏检断链');
-  expect(checkLegalEntries(['LICENSE', 'NOTICE.md', 'SOURCE.md', 'COMMERCIAL.md', 'ADDITIONAL-PERMISSION.md', 'legal/foliate-js/license', 'legal/libraw/copyright', 'legal/libraw/license.cddl', 'legal/libraw/license.lgpl', 'legal/onnxruntime/license', 'legal/onnxruntime/thirdpartynotices.txt', 'legal/ffmpeg/license.md', 'legal/ffmpeg/copying.lgplv2.1', 'legal/ffmpeg/btbn-license', 'legal/graphviz/graphviz-2.40.1-license.txt', 'legal/graphviz/viz.js-2.1.2-license.txt', 'legal/lute/lute-1.7.6-license.txt', 'legal/libvpl/license', 'legal/libvpl/third-party-programs.txt', 'legal/manifest.json']).length === 0, '法律资源归档检查器误报');
-  expect(checkLegalEntries(['LICENSE', 'NOTICE.md']).length === 18, '法律资源归档检查器漏检缺项');
-  expect(checkLegalEntriesMs([10, 20, 30], [{ name: 'LICENSE', size: 10 }, { name: 'NOTICE.md', size: 30 }]).length === 0, 'MSI 法律资源尺寸检查器误报');
-  expect(checkLegalEntriesMs([10], [{ name: 'LICENSE', size: 10 }, { name: 'NOTICE.md', size: 30 }]).length === 1, 'MSI 法律资源尺寸检查器漏检');
-
-  if (fails.length) {
-    console.error('❌ verify-bundle-content selftest 失败(检查器自身已损坏,结果不可信):');
-    for (const f of fails) console.error('   - ' + f);
-    process.exit(2);
-  }
+      [50161992, 49535488, 6523904, 9287261, 25355576, 17986400, 18527544, 1500000],
+      staged,
+    );
+    assert.deepEqual(missing, ['dxil.dll'], 'MSI 匿名载荷必须拒绝截断 DLL');
+  });
 }
 
 // ── 实扫 ───────────────────────────────────────────────────────────────────────

@@ -1,24 +1,6 @@
-# Part7-T6(2026-07-04):dev 推理运行时的 ORT DLL 指路。
-#
-# 背景:ort 走 load-dynamic(见 scrollery-ai-core/Cargo.toml 与 engine.rs 坑1),
-# 运行期按 ORT_DYLIB_PATH 加载 onnxruntime.dll(DirectML.dll/dxcompiler/dxil 由
-# onnxruntime 从自身所在目录连带加载,故指向一个文件即覆盖四件套)。
-# T6 之前 dev 靠「bundle.resources → tauri-build 复制进 target 目录 + lib.rs exe 旁探测」;
-# 该资源声明已随 T6 删除(bundle 不再携带 ONNX DLL,AI 运行时随插件分发,Part8),
-# dev 改由本文件把路径直指 npm 包内的 DLL(devDependencies onnxruntime-node,
-# `npm install` 即就位)——cargo run / cargo test / tauri dev 启动的进程及其
-# ai-worker 子进程都会继承本变量;lib.rs 的解析优先级 1(已设则保留)与之衔接。
-#
-# 注:
-# - force 缺省为 false:外部显式设置的 ORT_DYLIB_PATH 优先,本文件不覆盖。
-# - 值为 win32 路径(napi-v6/win32/x64);mac/Linux dev 推理本就未落地(T19 defer),
-#   届时按平台产物另行接线(cargo [env] 不支持按平台分节,须换机制或容忍无效路径——
-#   路径无效仅在真正发起推理时报 ModelLoadFailed,不影响构建与测试)。
-# - 打包产物不受影响:安装版无此变量,走 lib.rs 优先级 2(exe 旁 onnxruntime.dll,
-#   由未来的 AI 插件包/worker 分发落位,Part8)。
-# - CI 红线(2026-07-23 裁决 J16):ci.yml 的 rust/rust-linux 两 job 不跑 npm 步骤,
-#   本相对路径在 CI 上无 node_modules 可指——真加载 ORT(load_session_pool 类)的测试
-#   必须 #[ignore] 手跑;日后若要进 CI,须同一变更给两 job 补 npm ci(或单包
-#   materialize)步骤,否则 ModelLoadFailed 假故障。ci.yml 侧有对称注释。
+# Windows x64 开发进程及其 worker 从 npm 依赖加载 ORT；其余 DLL 位于同一目录。
+# 外部设置的 ORT_DYLIB_PATH 优先。本路径不适用于其他平台，也不会自动注入安装版。
+# 打包运行时由 scripts/build-ai-worker.mjs 复制到 worker 旁。
+# CI 的 Rust job 不安装 npm 依赖；真实 ORT 测试需单独准备运行时，不能直接依赖此路径。
 [env]
 ORT_DYLIB_PATH = { value = "node_modules/onnxruntime-node/bin/napi-v6/win32/x64/onnxruntime.dll", relative = true }

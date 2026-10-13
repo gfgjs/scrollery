@@ -1,17 +1,16 @@
-// src/themes/generate.ts
-// 唯一的颜色生成入口(方案 §4.2/§6):种子 + 模式 → 用途明确的有限颜色集合。
+// 颜色生成入口：种子与模式生成用途明确的有限色板。
 //
 // 契约:generateTheme 不访问 DOM、存储或框架;相同种子与模式必定产生相同色板;层次对比度
 // 只改变派生层,不改动三个用户种子,也不作用为整页滤镜。输出全部是 hex / rgb / rgba 实色,
 // 不向 Canvas 传 var() 或 color-mix()——组件、Canvas、预览与启动样式消费同一结果。
 //
-// 系数表是首版起始值,集中在 THEME_COEFFICIENTS 内调优(输入语义不变)。有对比门槛的用途
+// 系数集中在 THEME_COEFFICIENTS。有对比门槛的用途
 // (正文/辅助文字、有含义的控件边界、强调色文字)不写死系数,而是按门槛反推混色量:固定系数
 // 在任意用户配色上都无法保证达标。
 
 import type { ThemeMode, ThemePalette, ThemeSeed, ThemeVisualStyle } from './types'
 import { GALLERY_AUTO } from './types'
-import { shellBackgroundFor } from './visualStyles'
+import { lineToneFor, shellBackgroundFor, type LineTone } from './visualStyles'
 import {
   ensureContrast,
   isLightColor,
@@ -33,7 +32,7 @@ const WHITE = '#ffffff'
 const BLACK = '#000000'
 
 /**
- * 统一系数表(方案 §4.2 起始规则)。入参是归一化后的层次对比度 c = contrast / 100。
+ * 统一系数表。入参是归一化后的层次对比度 c = contrast / 100。
  * 每个用途只在此写一次,组件不得重复计算。
  */
 export const THEME_COEFFICIENTS = {
@@ -87,7 +86,7 @@ export const THEME_CONSTANTS = {
   docPaperDark: 0.035,
 } as const
 
-/** 状态语义色:各自保持语义,不随 accent 变成同一种颜色(方案 §4.2)。 */
+/** 状态语义色各自保持含义，不随 accent 改变。 */
 const STATUS_COLORS: Record<ThemeMode, { success: string; warning: string; error: string; info: string }> = {
   light: { success: '#18702f', warning: '#a14705', error: '#b21f26', info: '#0959a4' },
   dark: { success: '#34c759', warning: '#ff9f0a', error: '#ff665d', info: '#64d2ff' },
@@ -104,10 +103,7 @@ const BADGE_DOC_COLORS = {
 
 /**
  * 图片上方徽标与评分的专用色:压在照片上,底色不可知,故用固定遮罩 + 高亮类别点,
- * 两模式共用、不随主题漂移(方案 §4.2「图片上方的时长／徽标继续使用专用遮罩色」)。
- *
- * 这里是与色板同批产出的单点来源:渲染侧不再保留第二份颜色常量(旧声明点见
- * components/media/mediaGridCanvas.palette.ts 的 CANONICAL_BADGE_COLORS,由 B 批迁移删除)。
+ * 两模式共用，不随主题变化。
  */
 export const CANONICAL_MEDIA_COLORS = {
   scrim: 'rgba(0, 0, 0, 0.6)',
@@ -138,6 +134,7 @@ function deriveSurfaceColors(
   accent: string,
   c: number,
   light: boolean,
+  line: LineTone,
   includeInputBg = false,
 ) {
   const surface = light
@@ -149,20 +146,21 @@ function deriveSurfaceColors(
   const inputBg = mix(background, foreground, THEME_COEFFICIENTS.inputBg(c))
   const bases = controlBases(background, surface, elevated)
   if (includeInputBg) bases.push(inputBg)
+  const lineMix = (t: number) => mix(background, line.color, Math.min(1, t * line.gain))
   return {
     surface,
     elevated,
     inset: light
       ? mix(background, foreground, THEME_COEFFICIENTS.inset(c))
       : mix(background, BLACK, THEME_CONSTANTS.darkInset),
-    hover: mix(background, foreground, THEME_COEFFICIENTS.hover(c)),
+    hover: lineMix(THEME_COEFFICIENTS.hover(c)),
     selection: mix(background, accent, THEME_COEFFICIENTS.selection(c)),
     textSecondary: mix(background, foreground, THEME_COEFFICIENTS.textSecondary(c)),
     textTertiary: mix(background, foreground, THEME_COEFFICIENTS.textTertiary(c)),
-    border: mix(background, foreground, THEME_COEFFICIENTS.border(c)),
-    borderStrong: mix(background, foreground, THEME_COEFFICIENTS.borderStrong(c)),
-    borderSubtle: mix(background, foreground, THEME_COEFFICIENTS.borderSubtle(c)),
-    divider: mix(background, foreground, THEME_COEFFICIENTS.divider(c)),
+    border: lineMix(THEME_COEFFICIENTS.border(c)),
+    borderStrong: lineMix(THEME_COEFFICIENTS.borderStrong(c)),
+    borderSubtle: lineMix(THEME_COEFFICIENTS.borderSubtle(c)),
+    divider: lineMix(THEME_COEFFICIENTS.divider(c)),
     inputBg,
     controlBorder: mixUntilContrast(
       background, foreground, bases, MIN_CONTROL_CONTRAST, THEME_CONSTANTS.controlFloor,
@@ -190,7 +188,8 @@ export function generateTheme(
   const light = mode === 'light'
   const { background, foreground, accent } = seed
 
-  const main = deriveSurfaceColors(background, foreground, accent, c, light)
+  const line = lineToneFor(foreground, mode, visualStyle)
+  const main = deriveSurfaceColors(background, foreground, accent, c, light, line)
   const { surface, elevated, inset, controlBorder, controlTrack, textSecondary, textTertiary } = main
 
   // 选中浅背景与强调色悬停:两者都与强调色相关,先算出来供强调色文字一并判定。
@@ -203,7 +202,7 @@ export function generateTheme(
   const shellBackground = shellBackgroundFor(background, accent, mode, visualStyle)
   const shell = visualStyle === 'standard'
     ? main
-    : deriveSurfaceColors(shellBackground, foreground, accent, c, light, true)
+    : deriveSurfaceColors(shellBackground, foreground, accent, c, light, line, true)
   const shellBases = [shellBackground, shell.surface, shell.elevated]
   const shellTextPrimary = visualStyle === 'standard'
     ? foreground
@@ -289,7 +288,8 @@ export function generateTheme(
     divider: main.divider,
     controlBorder,
     controlTrack,
-    focusRing: withAlpha(accent, 0.45),
+    // 焦点轮廓是 :focus-visible 的唯一线索：森林外壳底色较深，0.45 叠加后不足 3:1，故单独加实。
+    focusRing: withAlpha(accent, visualStyle === 'forest' ? 0.85 : 0.45),
     inputBg: main.inputBg,
     toggleThumb: light ? WHITE : background,
 

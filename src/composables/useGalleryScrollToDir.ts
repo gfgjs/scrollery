@@ -52,8 +52,8 @@ export function useGalleryScrollToDir(deps: GalleryScrollToDirDeps) {
   }
 
   // 布局计算期间点侧栏文件夹:先把 dirId 记进挂起变量,交由下方顶层 watcher 在计算完成后消费。
-  // P1-13:原实现在此异步回调里 new 一个嵌套 watch,该 watch 脱离组件 effect scope(setup 已返回)
-  // → 卸载不回收;若计算中途离开画廊,未来 compute 完成时会对已死组件跑 scrollToDir 干扰活组件。
+  // 此异步回调不能新建嵌套 watch：setup 已返回，会脱离组件 effect scope；若计算中途离开画廊，
+  // 卸载无法回收该 watcher，迟到的计算结果仍会对已卸载组件执行滚动。
   let pendingScrollWhileComputing: number | null = null
   let deferredScrollTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -88,7 +88,7 @@ export function useGalleryScrollToDir(deps: GalleryScrollToDirDeps) {
   )
 
   onBeforeUnmount(() => {
-    // 卸载时清理挂起的延迟滚动定时器(P1-13),避免 50ms 窗口内卸载后仍对死组件滚动。
+    // 卸载时清理挂起的延迟滚动定时器，避免 50ms 窗口内卸载后仍对死组件滚动。
     if (deferredScrollTimer) clearTimeout(deferredScrollTimer)
   })
 

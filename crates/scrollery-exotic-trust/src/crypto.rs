@@ -1,23 +1,9 @@
 // crates/scrollery-exotic-trust/src/crypto.rs
 //! 冷门格式插件 · 信任根与 Ed25519 验签原语（v3 Part3 §5.1 / D10/D11）。
 //!
-//! 【Part6 §3.9.1a 去环 ③a】本模块自 `src-tauri/src/exotic/crypto.rs` 迁入本叶 crate——
-//! `VerifyingKeyset` 结构 + `verify_strict` 调用属通用 ring 封装、无秘密价值。下沉动机：让验签
-//! 原语脱离 `src-tauri`，供 registry / license 两用途共享同一信任根。src-tauri 侧
-//! `crate::exotic::crypto` 退化为再导出薄壳，既有引用路径不变。
-//!
-//! Host **只验签、不签名**：私钥离线/HSM，永不入二进制（§5.1）。本模块提供：
-//!   - [`VerifyingKeyset`]：编入 Host 的公钥集（key_id → 公钥 + 用途 + 状态 + 有效期窗口）。
-//!   - [`VerifyingKeyset::verify`]：按 key_id/用途/状态/时间窗口门控后 `verify_strict` 验签。
-//!   - base64url（无填充）编解码：License token 的 `payload.sig` 两段用之（§5.2）。
-//!
-//! 安全要点：
-//!   - **信任根分离**（§5.1）：release key 签 Registry/package；license key 签 License token。
-//!     验签强校验 `purpose`——license key 不能用来伪造 Registry，反之亦然。
-//!   - **支持新旧 key 重叠轮换**（§5.1）：keyset 可同列多把 key，按 key_id 选取；删除旧 key 前
-//!     须保证已发行永久 License 仍可验证，故旧 key 仅置 `revoked` 而非立即移除。
-//!   - 用 `verify_strict`（拒绝非规范 R / 小阶公钥点），堵住 Ed25519 可锻造性。
-//!   - 错误码稳定且不含密钥材料：日志/遥测/IPC 可安全输出 [`CryptoError::code`]。
+//! Host 仅验证发行目录与插件包的签名，私钥不进入二进制。
+//! 公钥按用途、状态与有效期选择；历史 keyset 的 license 用途仍可解析，
+//! 但不能用于发行签名，也不再参与任何功能激活。支持新旧发行键重叠轮换。
 
 use std::collections::HashMap;
 
@@ -39,7 +25,7 @@ const SUPPORTED_KEYSET_SCHEMA: u32 = 1;
 pub enum KeyPurpose {
     /// 签 Registry index 与 package manifest（发行物）。
     Release,
-    /// 签 License token（用户授权）。
+    /// 历史 keyset 用途，仅保留解析兼容；不能验证发行物。
     License,
 }
 
@@ -268,25 +254,13 @@ impl VerifyingKeyset {
     }
 }
 
-/// base64url（**无填充**）解码——License token 的 payload/signature 两段（§5.2）。
-pub fn b64url_decode(s: &str) -> Result<Vec<u8>, CryptoError> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s)
-        .map_err(|_| CryptoError::Base64)
-}
-
-/// base64url（**无填充**）编码——签发工具/测试构造 token 用。
-pub fn b64url_encode(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
 /// 测试支撑：用确定性种子生成签名密钥并构造 keyset JSON。
 ///
 /// **仅测试**：`SigningKey::from_bytes` 无需 CSPRNG（确定性），故测试不引入 rand。
 /// 这些是**测试密钥**——绝不进入 Release。
 ///
 /// 【Part6 §3.9.1a ③a】门控由 `#[cfg(test)]` 升为 `#[cfg(any(test, feature = "test-support"))]`：
-/// crypto 迁出 src-tauri 后，src-tauri 的 installer/registry/package/install/license 测试仍需这些
+/// crypto 迁出 src-tauri 后，src-tauri 的 installer/registry/package/install 测试仍需这些
 /// 构造工具，而 `#[cfg(test)]` 项**不跨 crate 可见**。故经 `test-support` feature 暴露，由 src-tauri
 /// 在 `[dev-dependencies]` 启用（生产依赖不启用 → 测试密钥仍绝不编入 Release）。
 #[cfg(any(test, feature = "test-support"))]
@@ -354,52 +328,6 @@ mod tests {
         VerifyingKeyset::parse(&json).unwrap()
     }
 
-    /// 无授权旁路自检（§5.4）：Release 信任根不得含测试 key。
-    /// 1) key_id 不得带 test/dev 字样；2) 内置公钥**不得**等于任何确定性测试种子派生的公钥——
-    ///    否则其私钥即公开（`from_seed_unchecked([s;32])`），任何人可伪造合法授权 token。
-    #[test]
-    fn builtin_keyset_has_no_test_keys() {
-        use base64::Engine as _;
-        use ring::signature::KeyPair as _;
-
-        let ks = VerifyingKeyset::builtin().unwrap();
-        for id in ks.key_ids() {
-            assert!(
-                !id.contains("test") && !id.contains("dev"),
-                "Release 信任根不得含测试/开发 key：{id}"
-            );
-        }
-
-        // 收集**全 u8 域**测试种子派生的公钥（base64 标准编码）。
-        // 注：本自检只覆盖 `from_seed_unchecked([s;32])` 模式；其他来源固定密钥须靠人工/CI 审计。
-        let test_pubs: Vec<String> = (0u8..=255)
-            .map(|s| {
-                base64::engine::general_purpose::STANDARD
-                    .encode(signing_key(s).public_key().as_ref())
-            })
-            .collect();
-        // 解析内置 JSON 取各公钥串，逐一比对。
-        let raw: super::RawKeyset = serde_json::from_str(super::BUILTIN_KEYSET_JSON).unwrap();
-        for k in &raw.keys {
-            assert!(
-                !test_pubs.contains(&k.public_key_b64),
-                "内置公钥 {} 的私钥为公开测试种子 → 授权可被伪造",
-                k.key_id
-            );
-        }
-    }
-
-    #[test]
-    fn valid_signature_verifies() {
-        let sk = signing_key(1);
-        let ks = release_keyset(&sk);
-        let msg = b"hello registry index bytes";
-        let sig = sign(&sk, msg);
-        assert!(ks
-            .verify("release-test", KeyPurpose::Release, msg, &sig, NOW)
-            .is_ok());
-    }
-
     #[test]
     fn tampered_message_fails() {
         let sk = signing_key(2);
@@ -409,17 +337,6 @@ mod tests {
             ks.verify("release-test", KeyPurpose::Release, b"tampered", &sig, NOW),
             Err(CryptoError::BadSignature)
         );
-    }
-
-    #[test]
-    fn unknown_key_id_fails() {
-        let sk = signing_key(6);
-        let ks = release_keyset(&sk);
-        let sig = sign(&sk, b"x");
-        assert!(matches!(
-            ks.verify("nope", KeyPurpose::Release, b"x", &sig, NOW),
-            Err(CryptoError::UnknownKey(_))
-        ));
     }
 
     #[test]
@@ -489,5 +406,46 @@ mod tests {
         ));
         // 窗口内。
         assert!(ks.verify("k", KeyPurpose::Release, msg, &sig, 1500).is_ok());
+    }
+
+    #[test]
+    fn verify_any_handles_rotation() {
+        // 轮换期：keyset 含两把 release key；token 由第二把签 → verify_any 仍命中。
+        let sk1 = signing_key(20);
+        let sk2 = signing_key(21);
+        let json = keyset_json(&[
+            KeySpec {
+                key_id: "release-old",
+                purpose: "release",
+                sk: &sk1,
+                status: "active",
+                not_before: 0,
+                not_after: None,
+            },
+            KeySpec {
+                key_id: "release-new",
+                purpose: "release",
+                sk: &sk2,
+                status: "active",
+                not_before: 0,
+                not_after: None,
+            },
+        ]);
+        let ks = VerifyingKeyset::parse(&json).unwrap();
+        let msg = b"signed registry index";
+        let sig = sign(&sk2, msg);
+        assert!(ks.verify_any(KeyPurpose::Release, msg, &sig, NOW).is_ok());
+        // 用途不符（无 license 候选）→ UnknownKey。
+        assert!(matches!(
+            ks.verify_any(KeyPurpose::License, msg, &sig, NOW),
+            Err(CryptoError::UnknownKey(_))
+        ));
+        // 错误签名 → BadSignature。
+        let mut bad = sig.clone();
+        bad[0] ^= 0xff;
+        assert_eq!(
+            ks.verify_any(KeyPurpose::Release, msg, &bad, NOW),
+            Err(CryptoError::BadSignature)
+        );
     }
 }

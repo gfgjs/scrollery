@@ -1,6 +1,5 @@
 // src/composables/useContentViewerPosterSource.ts
-// 从 ContentViewer.vue 下沉(超长文件拆分方案 2.1):图片加载占位 + 视频海报候选(含 404 自愈)。
-// 纯逻辑搬迁,不改变原调用点/参数/时序——见 docs/planning/2026-07-25-超长文件拆分方案/analysis/ContentViewer-vue.md。
+// 查看器图片加载占位 + 视频海报候选(含 404 自愈)。
 
 import { ref, computed, watch, onMounted } from 'vue'
 import { invokeIpc } from '../utils/ipc'
@@ -62,12 +61,19 @@ export function useContentViewerPosterSource(options: { detail: () => MediaDetai
   const healedPosterIds = new Set<number>()
   watch(
     videoPosterCandidate,
-    (url) => {
+    (url, _previous, onCleanup) => {
       posterBroken.value = false
       if (!url) return
       const img = new Image()
+      let active = true
+      // 换项或卸载时取消探测；A→B→A 的旧失败不能凭相同 URL 隐藏新封面或误触自愈。
+      onCleanup(() => {
+        active = false
+        img.onerror = null
+        img.src = ''
+      })
       img.onerror = () => {
-        if (url !== videoPosterCandidate.value) return // 已切换查看项,过期探测丢弃
+        if (!active || url !== videoPosterCandidate.value) return
         posterBroken.value = true
         const id = detail()?.id
         if (id != null && !healedPosterIds.has(id)) {

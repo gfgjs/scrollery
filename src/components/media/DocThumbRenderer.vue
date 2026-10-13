@@ -1,18 +1,11 @@
 <template>
-  <!-- Hidden offscreen renderer (§3.4 Lite 路径). 无可见 DOM —— canvas 程序化创建后即弃。 -->
+  <!-- 离屏渲染器没有可见内容；canvas 在渲染时创建。 -->
   <div class="doc-thumb-renderer"></div>
 </template>
 
 <script setup lang="ts">
-// DocThumbRenderer —— 文档缩略图的前端离屏渲染器（需求4, §3.4 Lite 路径）。
-//
-// 设计要点：
-//  - **轻量取舍**：Lite 变体无 native 栅格化器 → pdf/svg 由前端 Webview 离屏渲染截图，
-//    经 store_doc_thumbnail 回传后端落盘（epub 封面由后端 zip 处理，不经此组件）。
-//  - **单线程节流**：同一时刻只渲染一个文档；每个之间让出主线程，避免卡主窗口。
-//  - **仅窗口可见时跑**：visibilitychange 暂停/恢复（风险表：占用主窗口/单线程 → 严格节流）。
-//  - **pdf.js 懒加载**：仅当真的遇到 PDF 时才动态 import，避免拖慢启动 / 膨胀首屏包。
-//  - **失败即标记**：渲染失败回传空字节，后端标 status=3，避免无限重试坏文件。
+// PDF/SVG 缩略图在 WebView 离屏渲染后回传后端；epub 封面由后端处理。
+// 窗口可见时逐个处理，PDF 渲染器按需加载。连续失败两次后才上报空字节终止重试。
 
 import { onMounted, onBeforeUnmount } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
@@ -38,11 +31,11 @@ function canvasToPng(canvas: HTMLCanvasElement): Promise<Blob> {
   })
 }
 
-// 渲染 PDF 首页 → PNG + 总页数（T10:文档已打开,顺带取 numPages 回填 document_meta,
+// 渲染 PDF 首页 → PNG + 总页数（文档已打开，顺带取 numPages 回填 document_meta，
 // 免为页数二次解析文档）。PDF 透明 → 先铺白底，避免黑/透明缩略图。
 async function renderPdf(url: string): Promise<{ blob: Blob; pages: number | null }> {
   const lib = await getPdfjs()
-  // isEvalSupported:false —— 关闭 pdf.js 字型渲染的 eval 优化路径(P1-23,配合 CSP 删 unsafe-eval)。
+  // 关闭 pdf.js 字型渲染的 eval 优化路径，以满足不开放 unsafe-eval 的 CSP。
   const doc = await lib.getDocument({ url, isEvalSupported: false }).promise
   try {
     const pages = doc.numPages ?? null
@@ -101,10 +94,8 @@ async function renderOne(doc: PendingDocThumb): Promise<{ blob: Blob; pages: num
   throw new Error(`unsupported doc thumb format: ${doc.fileFormat}`)
 }
 
-// ── 失败预算:首败不判死,第 2 次才上报空字节(后端标 status=3 停止重试)────────────
-// pdf.js 懒加载/asset 协议偶发抖动等瞬态失败原先一击即永久裂图(空字节 → 派生 status=3,
-// 无自愈路径,只能清缓存)。给每个 item 两次机会:首败留在 pending(下轮泵重试),
-// 复败才盖棺。成功/盖棺即清计数,Map 大小受 pending 文档数约束。
+// 首次失败保留 pending 供下轮重试；第二次失败才上报空字节，避免瞬态错误永久标坏文件。
+// 成功或终止时清除计数，Map 规模受待处理文档数约束。
 const MAX_ATTEMPTS = 2
 const failedAttempts = new Map<number, number>()
 
@@ -124,7 +115,7 @@ async function pump() {
         if (document.visibilityState !== 'visible') break
         try {
           const { blob, pages } = await renderOne(doc)
-          // raw body 直传字节(①):PNG 经 JSON 数字数组每字节膨胀 ~4 字符(300KB→1-2MB 串),
+          // raw body 直传字节：PNG 经 JSON 数字数组每字节膨胀约 4 字符，
           // Uint8Array 走 Tauri raw InvokeBody 零膨胀;元数据走自定义 headers。
           const bytes = new Uint8Array(await blob.arrayBuffer())
           const headers: Record<string, string> = { 'x-item-id': String(doc.itemId) }

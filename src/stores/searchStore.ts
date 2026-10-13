@@ -1,15 +1,10 @@
-// src/stores/searchStore.ts
-// 搜索状态协调门面（S2-a）：搜索状态此前碎片在三处——AppToolbar 局部态（pendingMixedQuery
-// 混合草稿）、uiStore（searchQuery/searchScope 普通搜索）、aiStore（semanticQuery/
-// searchMode/activeMixedQueryType 语义与混合），导致「已提交的搜索是什么、如何重新执行」
-// 无单一读/写表面，URL 深链回填不了查询。
+// 搜索状态协调门面：普通搜索由 uiStore 持有，语义搜索由 aiStore 持有。
 //
 // 本 store 不做物理存储合并——committedQuery/mode/scope 投影自 ui/ai 原字段，commit*
-// 委托 aiStore 既有 action（其 runSemanticSearch 内含 searchToken 代次守卫、语义模式下
-// group/sort 临时覆盖与 previousGroupBy 复位等协调逻辑，这些是搬迁风险高收益低的来源）。
+// 委托 aiStore 的 action 保留查询代次守卫及临时分组/排序协调逻辑。
 // 对外提供：①可序列化读表面（mode/scope/committedQuery，供写入 URL query）；②保证执行的
 // 写表面（apply/clear/commit*，供 URL 回填时真正触发查询）。
-// draftMixedQuery 从 AppToolbar 局部态提升至此。
+// draftMixedQuery 在此共享。
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
@@ -26,7 +21,7 @@ export const useSearchStore = defineStore('search', () => {
   /** 当前搜索模式（投影自 aiStore.searchMode）。 */
   const mode = computed<SearchMode>(() => useAiStore().searchMode)
 
-  /** 普通搜索的检索范围（投影自 uiStore.searchScope）。仅 normal 模式生效。 */
+  /** 文字搜索的检索范围（投影自 uiStore.searchScope）；混合模式文件名候选提交时固定为 filename。 */
   const scope = computed<string>(() => useUiStore().searchScope)
 
   /**
@@ -81,7 +76,11 @@ export const useSearchStore = defineStore('search', () => {
       return
     }
     if (index === 0) void ai.runSemanticSearch(query)
-    else ai.setNormalSearchQueryInMixedMode(query)
+    else {
+      // 混合模式明确选择“文件名”，不能沿用普通模式隐藏的目录、位置等范围。
+      useUiStore().searchScope = 'filename'
+      ai.setNormalSearchQueryInMixedMode(query)
+    }
   }
 
   /**

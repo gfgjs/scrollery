@@ -427,7 +427,15 @@ export class Paginator extends HTMLElement {
         'max-inline-size', 'max-block-size', 'max-column-count',
     ]
     #root = this.attachShadow({ mode: 'closed' })
-    #observer = new ResizeObserver(() => this.render())
+    #resizeFrame = null
+    #observer = new ResizeObserver(() => {
+        // 重排会改变 iframe 与容器尺寸，移到下一帧并合并通知，避免观察回调内再次触发布局。
+        if (this.#resizeFrame !== null) return
+        this.#resizeFrame = requestAnimationFrame(() => {
+            this.#resizeFrame = null
+            this.render()
+        })
+    })
     #top
     #background
     #container
@@ -439,7 +447,7 @@ export class Paginator extends HTMLElement {
     #margin = 0
     #index = -1
     #anchor = 0 // anchor view to a fraction (0-1), Range, or Element
-    #justAnchored = false
+    #anchoredScrollOffset = null
     #locked = false // while true, prevent any further navigation
     #styles
     #styleMap = new WeakMap()
@@ -549,6 +557,9 @@ export class Paginator extends HTMLElement {
         </div>
         `
 
+        // Tauri 为主文档样式注入 nonce；仅让阅读器自有样式继承，章节原有 style 不授权。
+        this.#root.querySelector('style').nonce = document.getElementById('theme-default-css')?.nonce ?? ''
+
         this.#top = this.#root.getElementById('top')
         this.#background = this.#root.getElementById('background')
         this.#container = this.#root.getElementById('container')
@@ -559,8 +570,10 @@ export class Paginator extends HTMLElement {
         this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
-                if (this.#justAnchored) this.#justAnchored = false
-                else this.#afterScroll('scroll')
+                const anchoredOffset = this.#anchoredScrollOffset
+                this.#anchoredScrollOffset = null
+                // 锚定未移动时不会产生 scroll；只忽略仍在锚定位置的自生事件，不能吞掉首次用户滚动。
+                if (this.start !== anchoredOffset) this.#afterScroll('scroll')
             }
         }, 250))
 
@@ -752,7 +765,8 @@ export class Paginator extends HTMLElement {
         return { height, width, margin, gap, columnWidth }
     }
     render() {
-        if (!this.#view) return
+        // 章节 iframe 切换期间 body 尚未建立，首轮排版由 load 回调在正文就绪后完成。
+        if (!this.#view?.document?.body) return
         this.#view.render(this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
@@ -955,7 +969,7 @@ export class Paginator extends HTMLElement {
         // don't set new anchor if relocation was to scroll to anchor
         if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
             this.#anchor = range
-        else this.#justAnchored = true
+        else this.#anchoredScrollOffset = this.start
 
         const index = this.#index
         const detail = { reason, range, index }
@@ -977,8 +991,10 @@ export class Paginator extends HTMLElement {
             const afterLoad = doc => {
                 if (doc.head) {
                     const $styleBefore = doc.createElement('style')
+                    $styleBefore.nonce = document.getElementById('theme-default-css')?.nonce ?? ''
                     doc.head.prepend($styleBefore)
                     const $style = doc.createElement('style')
+                    $style.nonce = $styleBefore.nonce
                     doc.head.append($style)
                     this.#styleMap.set(doc, [$styleBefore, $style])
                 }
@@ -1119,7 +1135,9 @@ export class Paginator extends HTMLElement {
         this.#view.document.defaultView.focus()
     }
     destroy() {
-        this.#observer.unobserve(this)
+        this.#observer.disconnect()
+        if (this.#resizeFrame !== null) cancelAnimationFrame(this.#resizeFrame)
+        this.#resizeFrame = null
         this.#view.destroy()
         this.#view = null
         this.sections[this.#index]?.unload?.()

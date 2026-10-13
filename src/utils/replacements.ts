@@ -1,5 +1,5 @@
 // src/utils/replacements.ts
-// 替换规则的前端应用（§5.2，Lite 路径用 JS；Perf 路径走原生 aho-corasick）。字面量规则合并为
+// 替换规则的前端应用（Lite 路径用 JS；Perf 路径走原生 aho-corasick）。字面量规则合并为
 // 单次扫描（按 find 长度降序 → 最长匹配优先，避免级联）；正则规则按 sort_order 顺序逐条应用。
 // 中文无词边界，故不加 \b。
 

@@ -1,11 +1,11 @@
 // src-tauri/src/enhance/mod.rs
-//! 影像增强 host 侧子系统（降噪/超分子系统 design.md §A/§B/§E）。
+//! 影像增强 host 侧子系统。
 //!
-//! - [`registry`]:模型下载清单 + 安装态判定（照 `ai::ocr_registry`）。
+//! - [`registry`]:模型下载清单与安装态判定。
 //! - [`service`]:`EnhanceService`——内存 job 队列、enhance-worker 惰性持有、GPU 令牌、
 //!   claim/EXIF/rename、单文件 ingest。
 //!
-//! enhance **不进** exotic 任务化调度（D-OCR-7 同型豁免）；由 IPC `enhance_start` 显式驱动。
+//! enhance 由 IPC `enhance_start` 驱动，使用独立服务处理请求。
 
 pub mod capability;
 pub(crate) mod exif_inject;

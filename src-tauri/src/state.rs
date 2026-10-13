@@ -4,14 +4,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockWriteGuard};
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::ai::search_control::SearchControl;
 use crate::db::{DbPool, DbWriter};
-use crate::engine::EngineArena;
 use crate::exotic::CatalogStore;
 use crate::layout::cache::new_layout_cache;
 use crate::layout::items_cache::{
@@ -125,9 +124,6 @@ pub struct AppState {
     /// H-Lab 横向画廊实验布局缓存——与 layout_cache 平行且互不可见(实验解耦契约)。
     pub h_layout_cache: crate::layout::HLayoutCache,
 
-    /// 图像引擎容器（格式 → 引擎分发）。
-    pub engine_arena: EngineArena,
-
     /// 冷门格式能力目录（内置 + 远程合并的只读快照）。扫描分类与缩略图路由的「能力真相」。
     /// 持 `Arc<CatalogStore>`，热路径经 `.snapshot()` 取 `Arc<CatalogSnapshot>`（一次读锁）。
     pub exotic_catalog: std::sync::Arc<CatalogStore>,
@@ -139,15 +135,12 @@ pub struct AppState {
 
     /// 缩略图配置（缓存目录、大小、跳过阈值）。
     pub thumb_config: RwLock<ThumbConfig>,
-
-    /// 全库与视口图片任务共用的领取执行出口及工作集额度。
-    pub thumb_coordinator: crate::thumbnail::coordinator::ThumbnailCoordinator,
-    /// 缩略图、派生和插件封面共用的估算工作集窗口。
-    pub(crate) background_workset_budget:
-        std::sync::Arc<crate::thumbnail::coordinator::MemoryBudget>,
-    /// 各缩略图及旧派生入口共用源卷并发额度。
-    pub(crate) background_volume_io_budget:
-        std::sync::Arc<crate::thumbnail::coordinator::VolumeIoBudget>,
+    /// 视口批次仅登记请求身份与取消令牌，不持有共享服务任务。
+    pub(crate) viewport_requests: crate::thumbnail::viewport::ViewportRequests,
+    /// 图片入口共用常驻服务；worker 仅持本状态的 Weak，避免自引用。
+    pub(crate) image_service: OnceLock<Arc<crate::thumbnail::service::ImageService>>,
+    /// 公共缓存根句柄随库生命周期撤销，不能跨清理操作锁住旧缓存目录。
+    pub(crate) artifact_writer: crate::thumbnail::artifact_io::ArtifactWriter,
 
     /// (2026-07-18 审查 F-02):旧轮收尾曾无条件清槽+发终态,「停止→立即重启」时会清掉新轮
     /// 刚安装的句柄并把新轮快照盖成 cancelled。语义同 `ai_analysis_token` 的 compare-and-clear。
@@ -239,9 +232,10 @@ pub struct AppState {
     /// 问题6):coordinator 循环须在 Pipeline panic 后存活,运行态判定不得因毒锁级联 panic。
     pub exotic_analysis_token: Mutex<Option<CancellationToken>>,
 
-    /// 缩略图重型项、derivation 与 exotic 共享的公平后台重活池（R4）。重型缩略图在领取
-    /// DB lease 前取 permit；视口保留席位不阻塞等额度，以免拖住后续快速项。
-    /// 预算与缩略图额度同源，低核数下保底 2；等待者按 FIFO 授权。
+    /// 由 derivation 与 exotic 两条流水线共享的公平后台重活池（R4）：两个子系统在重活前都从**本**
+    /// limiter 取 permit，故持续派生不会饿死 exotic（FIFO 公平，
+    /// 等待有上界）。预算 = `available_parallelism()`：exotic 空闲时 derivation 不受影响；二者并发时
+    /// 共享同一全局预算、按到达顺序公平交错。
     pub background_heavy_limiter: std::sync::Arc<crate::exotic::limiter::BackgroundHeavyLimiter>,
 
     /// GPU 推理令牌(Part4 D2/T11):全局额度 1 的**物理并发**闸——AI/face worker 池发
@@ -281,6 +275,9 @@ pub struct AppState {
     /// 该任务持有。占用时新任务返回 `file_job_busy`,**不取消旧任务**(方案 §5.2:不静默抢占)。
     /// 语义同 `gpu_analysis_owner`;check-and-claim 在单锁区原子完成。
     pub file_job_owner: Mutex<Option<&'static str>>,
+
+    /// 目录复制独立代次槽；文件任务门闩保持占用直到复制或取消清理真正结束。
+    pub directory_copy_token: RunTokenSlot,
 
     /// 数据备份任务的取消令牌槽(带运行代次,方案 B §5.1)。文件任务采 thumb/derive 的「finish
     /// 返回值门控终态发布」姿态(**非** ai/face 的 !is_cancelled 姿态,审阅线 F-013)。存在即运行。
@@ -486,6 +483,298 @@ fn enter_database_lifecycle_write<'a>(
     }
 }
 
+#[cfg(test)]
+mod scan_run_tests {
+    use super::*;
+
+    /// 旧轮若已进入写区，新轮安装必须在线性化闸门外等待，不能插入到旧写入中间。
+    #[test]
+    fn generation_gate_orders_old_write_before_new_install() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        let gate = Arc::new(Mutex::new(()));
+        let current_generation = Arc::new(AtomicU64::new(1));
+        let write_started = Arc::new(AtomicBool::new(false));
+        let (claimed_tx, claimed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (new_installed_tx, new_installed_rx) = mpsc::channel();
+        let gate_for_old = Arc::clone(&gate);
+        let generation_for_old = Arc::clone(&current_generation);
+        let started_for_old = Arc::clone(&write_started);
+
+        let old = std::thread::spawn(move || {
+            with_scan_generation_gate(
+                &gate_for_old,
+                || generation_for_old.load(Ordering::Acquire) == 1,
+                || {
+                    claimed_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    started_for_old.store(true, Ordering::Release);
+                },
+            )
+            .expect("旧轮在新轮安装前应取得写权限");
+        });
+
+        claimed_rx.recv().unwrap();
+        let gate_for_new = Arc::clone(&gate);
+        let generation_for_new = Arc::clone(&current_generation);
+        let new = std::thread::spawn(move || {
+            let _gate = gate_for_new.lock().unwrap_or_else(|e| e.into_inner());
+            generation_for_new.store(2, Ordering::Release);
+            new_installed_tx.send(()).unwrap();
+        });
+
+        assert!(
+            new_installed_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "旧轮写入尚未返回时，新轮不得完成安装"
+        );
+        release_tx.send(()).unwrap();
+        old.join().unwrap();
+        new.join().unwrap();
+        assert!(write_started.load(Ordering::Acquire));
+        assert_eq!(current_generation.load(Ordering::Acquire), 2);
+    }
+
+    /// 根归属调整失败只能释放闸门，不得让既有扫描或派生任务的 epoch 一并失效。
+    #[test]
+    fn root_reorganization_preserves_scans_and_resumes_waiting_writes_after_failure() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let writer = crate::db::create_write_connection(&db_path).unwrap();
+        writer
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE scan_writes (root_id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let pool = crate::db::create_read_pool(&db_path, 1).unwrap();
+        let (config, _) =
+            crate::config::ConfigManager::load_or_init(tmp.path().join("config.toml")).unwrap();
+        let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::sink());
+        let state = Arc::new(AppState::new(
+            writer,
+            pool,
+            Arc::new(config),
+            tmp.path().join("cache"),
+            tmp.path().join("logs"),
+            crate::logging::LogRingBuffer::new(Arc::from("root-reorganization-test"), 1),
+            log_writer.error_counter(),
+            tmp.path().to_path_buf(),
+            tmp.path().join("exotic"),
+            256,
+            0,
+            "balanced".into(),
+            "cpu".into(),
+            false,
+            80,
+            Arc::new(CatalogStore::with_snapshot(
+                crate::exotic::catalog::CatalogSnapshot::empty(),
+            )),
+        ));
+        let (generation, cancel) = state.replace_scan_run_token_with_id(1, Some("merging"));
+        let (unrelated_generation, unrelated_cancel) =
+            state.replace_scan_run_token_with_id(2, Some("unrelated"));
+        let epoch = state.current_database_epoch().unwrap();
+        let root_gate = state.scan_generation_write_gate(1);
+        let unrelated_gate = state.scan_generation_write_gate(2);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+
+        let reorganizing_state = Arc::clone(&state);
+        let reorganizing = std::thread::spawn(move || {
+            reorganizing_state.with_scan_roots_reorganization(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err::<(), _>("synthetic reorganization failure")
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.scan_lifecycle_gate.try_read().is_err());
+        assert!(root_gate.try_lock().is_err());
+        assert!(unrelated_gate.try_lock().is_err());
+        assert!(state.database_lifecycle_active.load(Ordering::Acquire));
+        assert_eq!(
+            state.database_lifecycle_epoch.load(Ordering::Acquire),
+            epoch
+        );
+        assert!(state.is_scan_generation_current(1, generation));
+        assert!(state.is_scan_generation_current(2, unrelated_generation));
+        assert!(!cancel.is_cancelled());
+        assert!(!unrelated_cancel.is_cancelled());
+
+        let writing_state = Arc::clone(&state);
+        let old_attempt_tx = attempt_tx.clone();
+        let old_written_tx = written_tx.clone();
+        let writing = std::thread::spawn(move || {
+            old_attempt_tx.send(()).unwrap();
+            let result = writing_state.with_scan_generation_write(1, generation, || {
+                writing_state
+                    .db_writer
+                    .lock()
+                    .unwrap()
+                    .execute("INSERT INTO scan_writes (root_id) VALUES (?1)", [1])
+                    .unwrap()
+            });
+            old_written_tx.send(result).unwrap();
+        });
+        let starting_state = Arc::clone(&state);
+        let starting = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let (new_generation, new_cancel) = starting_state
+                .try_replace_scan_run_token_with_id(3, Some("new"))
+                .expect("重组结束后仍应接受新扫描");
+            assert!(!new_cancel.is_cancelled());
+            let result = starting_state.with_scan_generation_write(3, new_generation, || {
+                starting_state
+                    .db_writer
+                    .lock()
+                    .unwrap()
+                    .execute("INSERT INTO scan_writes (root_id) VALUES (?1)", [3])
+                    .unwrap()
+            });
+            written_tx.send(result).unwrap();
+        });
+        attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            written_rx.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!state.scan_tokens.lock().unwrap().contains_key(&3));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            reorganizing.join().unwrap(),
+            Some(Err("synthetic reorganization failure"))
+        );
+        assert_eq!(
+            written_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            written_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some(1)
+        );
+        writing.join().unwrap();
+        starting.join().unwrap();
+
+        assert_eq!(state.current_database_epoch(), Some(epoch));
+        assert_eq!(state.with_database_lifecycle_read(epoch, || 1), Some(1));
+        assert!(state.is_scan_generation_current(1, generation));
+        assert!(state.is_scan_generation_current(2, unrelated_generation));
+        assert!(!cancel.is_cancelled());
+        assert!(!unrelated_cancel.is_cancelled());
+        assert_eq!(
+            state
+                .scan_run_ids
+                .lock()
+                .unwrap()
+                .get(&2)
+                .map(String::as_str),
+            Some("unrelated")
+        );
+        assert_eq!(
+            state.with_scan_generation_write(2, unrelated_generation, || {
+                state
+                    .db_writer
+                    .lock()
+                    .unwrap()
+                    .execute("INSERT INTO scan_writes (root_id) VALUES (?1)", [2])
+                    .unwrap()
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .db_writer
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM scan_writes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            3
+        );
+    }
+
+    /// 两个生命周期写者并发排队时，后一个写者不能带着 `previous_active=false` 离开，
+    /// 否则首个写者恢复 active 后会再次被错误覆盖，令整个数据库生命周期永久失效。
+    #[test]
+    fn concurrent_lifecycle_writers_restore_active_after_both_finish() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let transition_gate = Arc::new(Mutex::new(()));
+        let lifecycle_gate = Arc::new(RwLock::new(()));
+        let active = Arc::new(AtomicBool::new(true));
+        let epoch = Arc::new(AtomicU64::new(1));
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (release_second_tx, release_second_rx) = mpsc::channel();
+
+        let first = {
+            let transition_gate = Arc::clone(&transition_gate);
+            let lifecycle_gate = Arc::clone(&lifecycle_gate);
+            let active = Arc::clone(&active);
+            let epoch = Arc::clone(&epoch);
+            std::thread::spawn(move || {
+                let guard = enter_database_lifecycle_write(
+                    &transition_gate,
+                    &lifecycle_gate,
+                    &active,
+                    &epoch,
+                );
+                first_entered_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+                drop(guard);
+            })
+        };
+        let second = {
+            let transition_gate = Arc::clone(&transition_gate);
+            let lifecycle_gate = Arc::clone(&lifecycle_gate);
+            let active = Arc::clone(&active);
+            let epoch = Arc::clone(&epoch);
+            std::thread::spawn(move || {
+                let guard = enter_database_lifecycle_write(
+                    &transition_gate,
+                    &lifecycle_gate,
+                    &active,
+                    &epoch,
+                );
+                second_entered_tx.send(()).unwrap();
+                release_second_rx.recv().unwrap();
+                drop(guard);
+            })
+        };
+
+        first_entered_rx.recv().unwrap();
+        assert!(!active.load(Ordering::Acquire));
+        assert!(
+            second_entered_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "第二个写者必须在 transition gate 外等待"
+        );
+
+        release_first_tx.send(()).unwrap();
+        second_entered_rx.recv().unwrap();
+        assert!(!active.load(Ordering::Acquire));
+        release_second_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(active.load(Ordering::Acquire));
+        assert_eq!(epoch.load(Ordering::Acquire), 3);
+    }
+}
+
 #[allow(clippy::items_after_test_module)]
 impl AppState {
     // 应用全局状态聚合构造，各依赖独立必需、无合理分组，沿用本仓库既有约定标注。
@@ -503,6 +792,7 @@ impl AppState {
         thumb_size: u32,
         thumb_skip_max_kb: u64,
         thumb_strategy: String,
+        gpu_engine: String,
         ai_hq_cache: bool,
         thumb_webp_quality: u8,
         exotic_catalog: std::sync::Arc<CatalogStore>,
@@ -514,11 +804,6 @@ impl AppState {
             .get("ai_cache_short_edge")
             .and_then(|v| v.parse().ok())
             .unwrap_or(crate::thumbnail::cache::AI_CACHE_SHORT_EDGE);
-        let (thumbnail_workers, shared_cpu_permits) = crate::thumbnail::qos::processing_budgets();
-        let thumb_coordinator =
-            crate::thumbnail::coordinator::ThumbnailCoordinator::new(thumbnail_workers);
-        let background_workset_budget = thumb_coordinator.workset_budget();
-        let background_volume_io_budget = thumb_coordinator.volume_io_budget();
         Self {
             db_writer,
             db_read_pool,
@@ -543,22 +828,21 @@ impl AppState {
             data_version: AtomicU64::new(1),
             dedup_view_epoch: AtomicU64::new(1),
             h_layout_cache: crate::layout::hcache::new_h_layout_cache(),
-            engine_arena: EngineArena::phase1(),
             exotic_catalog,
             thumb_config: RwLock::new(ThumbConfig {
                 cache_dir,
                 size: thumb_size,
                 skip_max_bytes: thumb_skip_max_kb * 1024,
                 strategy: thumb_strategy,
+                gpu_engine,
                 ai_hq_cache,
                 webp_quality: thumb_webp_quality,
                 ai_cache_short_edge,
-                output_fingerprint: None,
             }),
+            viewport_requests: Default::default(),
+            image_service: OnceLock::new(),
+            artifact_writer: crate::thumbnail::artifact_io::ArtifactWriter::default(),
             thumb_gen_token: RunTokenSlot::new(),
-            thumb_coordinator,
-            background_workset_budget,
-            background_volume_io_budget,
             thumb_gen_lifecycle_gate: Mutex::new(()),
             thumb_gen_progress: Mutex::new(None),
             thumb_serve_dpr: AtomicU32::new(1000),
@@ -576,11 +860,16 @@ impl AppState {
             gpu_analysis_owner: Mutex::new(None),
             derivation_token: RunTokenSlot::new(),
             exotic_analysis_token: Mutex::new(None),
-            // 快速缩略图保留一席，其余 CPU 准入由尾批、派生和其它后台重活共享。
-            background_heavy_limiter:
-                crate::exotic::limiter::BackgroundHeavyLimiter::with_fast_reservation(
-                    shared_cpu_permits,
-                ),
+            // 后台重活并发预算 = 可用并行度，**下限 2**（Part3 §3.5.2 / T12）。
+            // 取 max(2)：单核/受限容器（available_parallelism()==1）下，若预算=1 则派生 dispatch 线程
+            // 取走唯一额度后阻塞、rayon worker 空等且 exotic 完全饿死；保底 2 让派生与 exotic 至少能交错。
+            // derivation 与 exotic 共享此池（R4）。
+            background_heavy_limiter: crate::exotic::limiter::BackgroundHeavyLimiter::new(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .max(2),
+            ),
             // GPU 推理令牌额度恒 1(D2 §3.1;多 permit 放行留 T22 按 VRAM 档位实测)。
             gpu_token: crate::exotic::limiter::GpuToken::new(),
             exotic_coordinator: std::sync::OnceLock::new(),
@@ -588,6 +877,7 @@ impl AppState {
             interactive_until_ms: AtomicI64::new(0),
             document_storage_guard: RwLock::new(()),
             file_job_owner: Mutex::new(None),
+            directory_copy_token: RunTokenSlot::new(),
             backup_token: RunTokenSlot::new(),
             backup_progress: Mutex::new(None),
             backup_cancelling: AtomicBool::new(false),
@@ -1049,23 +1339,12 @@ impl AppState {
         let _ = self.video_worker_service.set(s);
     }
 
-    /// 构造运行期 [`crate::exotic::ExoticHost`]：组合 catalog（能力真相）+ 只读连接池（安装真相）+ keyring（授权真相）。
-    /// 廉价（Arc/Pool clone），命令与调度按需新建、不缓存——确保读到最新
-    /// 安装/授权状态（安装、激活后立即生效）。
+    /// 按需构造宿主，读取同一数据库中的安装和免费激活状态。
     pub fn exotic_host(&self) -> crate::exotic::ExoticHost {
-        // 组合根按渠道装配授权 provider；for_runtime 只消费统一接口。
         crate::exotic::ExoticHost::for_runtime(
             self.exotic_catalog.clone(),
             self.db_read_pool.clone(),
-            crate::exotic::default_entitlement_provider(),
         )
-    }
-
-    /// 命令层取授权 provider 的统一入口（审查 R1-1）：激活 / 撤销与 evaluate 全走
-    /// [`crate::exotic::default_entitlement_provider`] 装配，确保全部授权路径使用同一信任根。
-    /// 与 [`Self::exotic_host`] 同理按需新建、不缓存（廉价，读到最新态）。
-    pub fn entitlement_provider(&self) -> std::sync::Arc<dyn crate::exotic::EntitlementProvider> {
-        crate::exotic::default_entitlement_provider()
     }
 
     /// 已装插件根目录（`<exotic_dir>/plugins`；各插件装到其下 `<plugin_id>`）。
@@ -1283,7 +1562,7 @@ impl AppState {
 
     /// 在已持有指定根级闸门时取消当前扫描。
     ///
-    /// 只供 `with_scan_root_exclusive` 的闭包调用；不能单独使用，否则会绕过闸门破坏
+    /// 只供持有生命周期与该根闸门的管理闭包调用；不能单独使用，否则会绕过闸门破坏
     /// generation 写入的线性化顺序。
     pub(crate) fn cancel_scan_under_root_gate(&self, root_id: i64) {
         let mut tokens = self.scan_tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -1451,6 +1730,19 @@ impl AppState {
             return None;
         }
         Some(action())
+    }
+
+    /// 在捕获的数据库代次内独占根；避免监听快照在清库后写入复用的 ID。
+    pub(crate) fn with_scan_root_epoch_write<T>(
+        &self,
+        root_id: i64,
+        epoch: u64,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        self.with_scan_root_exclusive(root_id, || {
+            (self.database_lifecycle_epoch.load(Ordering::Acquire) == epoch).then(action)
+        })
+        .flatten()
     }
 
     /// 以固定顺序（root_id 升序）独占多个扫描根的写闸门；同一根只取一次。
@@ -1663,15 +1955,52 @@ impl AppState {
         action()
     }
 
+    /// 独占扫描根归属调整，保留不受迁移影响的后台任务和数据库 epoch。
+    ///
+    /// 合并根只改索引归属，资产路径、ID 与缓存不变。先等现有写区结束再修改，
+    /// 失败时不撤销任何扫描；调用方仅在事务提交后取消已移除根的扫描令牌。
+    /// 闭包不可跨 await，也不可再次取得生命周期或根级闸门。
+    pub(crate) fn with_scan_roots_reorganization<T, F>(&self, action: F) -> Option<T>
+    where
+        F: FnOnce() -> T,
+    {
+        let _transition = self
+            .database_lifecycle_transition_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _lifecycle = self
+            .scan_lifecycle_gate
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.database_lifecycle_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let gates: Vec<_> = self
+            .scan_write_gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let _guards: Vec<_> = gates
+            .iter()
+            .map(|gate| gate.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        Some(action())
+    }
+
     /// 标记生命周期 inactive、取得全局写锁并递增 epoch。inactive 的发布在等待写锁前完成，
     /// 所以新的根管理/扫描/缩略图写入即使排在写锁后面，也会在执行点被拒绝。
     fn enter_database_lifecycle_write(&self) -> DatabaseLifecycleWriteGuard<'_> {
-        enter_database_lifecycle_write(
+        let guard = enter_database_lifecycle_write(
             &self.database_lifecycle_transition_gate,
             &self.scan_lifecycle_gate,
             &self.database_lifecycle_active,
             &self.database_lifecycle_epoch,
-        )
+        );
+        // 已等待读区中的写盘结束；先关闭固定祖先的句柄，再允许清缓存/换库。
+        self.artifact_writer.reset();
+        guard
     }
 
     /// 为全量缩略图生成创建新的取消令牌,返回 (运行代次, token)。运行代次供完成回调

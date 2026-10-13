@@ -1,4 +1,4 @@
-//! 应用配置命令(§ 6.1 — config)。
+//! 应用配置命令。
 //!
 //! # 两条互不相通的读写路径
 //! - **用户设置**:唯一真源是 <app_data_dir>/config.toml(config::SETTING_DEFS 登记的全部键)。
@@ -9,7 +9,7 @@
 //!
 //! 两条路径**互不兜底**:设置类键送到通用键值命令会被明确拒绝(稳定码
 //! config_setting_key_requires_snapshot),而不是悄悄走回旧路径;反之亦然。这是「设置只有一个入口、
-//! 一个真源」的强制条件(2026-09-16 设置集中保存,方案 §5.1)。
+//! 一个真源」的强制条件。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,8 +22,7 @@ use crate::db::queries::{get_config, set_config};
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
-/// 日志级别热重载句柄的再导出:logging 模块在装配 subscriber 时经此处写入。实现已随设置影响
-/// 逻辑一起迁到 config::effects——它按批归约应用,不再散在各命令里。
+/// 日志级别热重载句柄的再导出；设置副作用由 `config::effects` 按批应用。
 pub use crate::config::effects::LOG_RELOAD;
 
 /// 状态类键边界:设置类键与两清单外的键一律以稳定 code 拒绝。读写两个入口共用(未知键既不读 DB

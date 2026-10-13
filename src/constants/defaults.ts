@@ -9,13 +9,15 @@ export const DEFAULTS = {
   THUMB_QUALITY: 80,
   THUMB_FORMAT: 'webp',
   THUMB_STRATEGY: 'cpu',
+  GPU_ENGINE: 'wic',
   SIDEBAR_WIDTH: 260,
   GRID_ROW_HEIGHT: 200,
   GRID_GAP: 4,
-  // 配置重构批次C(2026-07-22)修正:此前 150 与 AppToolbar.vue 混合/语义搜索防抖的实际硬编码值
-  // (500ms)长期不一致——本常量在被 uiStore.searchDebounceMs 接线消费前从未被任何调用点真正
-  // 读取过,是摆设值;改为与既有真实行为对齐的 500。uiStore.ts 的 searchDebounceMs/
-  // resizeDebounceMs 两个 ref 以本文件同名常量为初始默认值(单源,见其声明处)。
+  GALLERY_BLEND_ENABLED: false,
+  GALLERY_BLEND_EDGE_WIDTH: 2,
+  GALLERY_BLEND_BLUR_RADIUS: 3,
+  GALLERY_BLEND_STRENGTH: 100,
+  // 搜索防抖默认值与 uiStore 的初始值同源。
   SEARCH_DEBOUNCE_MS: 500,
   RESIZE_DEBOUNCE_MS: 300,
   // 视口上下各保留的离屏缓冲行数；据此换算自适应像素缓冲，避免极小行高时多渲染数百个单元。

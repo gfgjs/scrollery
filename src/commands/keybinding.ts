@@ -1,7 +1,4 @@
-// 键位同源(顶栏重构 P5-6):命令的 `keybinding` 常量既是 tooltip 显示源、也是查看器 keydown
-// 分发源,杜绝「显示 ≠ 行为」漂移。此前快捷键在两处各写一份(i18n 串如「信息 (i)」+ 组件
-// keydown 的 `if (e.key === 'i')`),改标签不改监听、或反之,tooltip 就会撒谎。收敛为单源后
-// 改一处两处同步。
+// tooltip 与按键分发共用命令的 keybinding，避免展示键位与实际行为漂移。
 
 import { isMac } from '../utils/platform'
 import { commandRegistry } from './registry'

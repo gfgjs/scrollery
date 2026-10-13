@@ -1,22 +1,16 @@
-// src-tauri/src/video/worker_backend.rs
-//! 视频格式扩展子系统 · 缩略图后端桥(design.md §1 修正2 / §8 V5)。
+//! 视频 worker 到 [`crate::video::VideoBackend`] 的桥接。
 //!
-//! `WorkerVideoBackend` 实现既有 `VideoBackend` trait([`crate::video::VideoBackend`]),
-//! 把 probe/cover/keyframes 三方法委托给 host 侧 [`crate::video::worker_service::VideoWorkerService`]
-//! (video-worker 子进程,同一 worker 兼供缩略图后端,§1 修正2)。MF 后端(`media_foundation.rs`)
-//! 不认的容器(mkv/webm/flv/ogv 等)经 `backend_for()` 接入本桥,派生流水线(`derive/video.rs`)
-//! 零改造即自动获得覆盖 —— `kind.rs` 的 `is_implemented` 只是编译期粗粒度门,真实按扩展名的
-//! 可用性判定内聚在 `backend_for` 返回 `None`/`Some` 上,本文件即该判定新增的第二分支。
+//! `WorkerVideoBackend` 将 probe/cover/keyframes 委托给 [`crate::video::worker_service::VideoWorkerService`]。
+//! `backend_for()` 用它处理 Media Foundation 不认的容器。
 //!
 //! ## 同步 trait ↔ 异步 Service 桥接
-//! `VideoBackend` 三方法是**同步**签名(供 rayon 派生池直调,§1.4.1);`VideoWorkerService` 的
-//! 公开方法是 **async**(内部经 std 线程 driver + `tokio::sync::oneshot` 交割结果,§2.1)。
+//! `VideoBackend` 三方法是同步签名；`VideoWorkerService` 的公开方法是 async。
 //! 派生任务运行在 `spawn_blocking` 内嵌的 `rayon::scope` 工作线程上 —— rayon 自有线程池、
 //! 非 tokio 托管,不能假设外层 `Handle::current()` 可用。桥接方案:本文件持一个**独立、
 //! 惰性初始化**的单线程 `tokio::runtime::Runtime`,只用于 `block_on` 这三个 async 调用 ——
 //! 不依赖调用方是否处于 tokio 上下文,也不额外起工作线程(`current_thread`)。
 //!
-//! ## host 不信任 worker(§6 / `exotic::worker.rs:11-12` 先例)
+//! ## host 校验 worker 结果
 //! Cover/Keyframes 回传的 WebP blob 经 [`VideoWorkerService`] 传输到本层后,**仍需独立解码
 //! 复核**:雪碧条声明的切格元数据 `{cell_width,cell_height,n}` 必须与独立解码得到的实际尺寸
 //! 完全吻合,否则整批拒收(见 [`decode_sprite_cells`])。
@@ -44,7 +38,7 @@ fn bridge_rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// `VideoBackend` 实现:probe/cover/keyframes 委托给 [`VideoWorkerService`](§2.1)。
+/// `VideoBackend` 实现：probe/cover/keyframes 委托给 [`VideoWorkerService`]。
 pub struct WorkerVideoBackend {
     service: Arc<VideoWorkerService>,
 }
@@ -82,12 +76,7 @@ impl VideoBackend for WorkerVideoBackend {
         Ok(map_probe_info(info))
     }
 
-    fn cover_bounded(
-        &self,
-        path: &Path,
-        max_long_edge: u32,
-        max_pixel_bytes: u64,
-    ) -> Result<DecodedImage> {
+    fn cover(&self, path: &Path, max_long_edge: u32) -> Result<DecodedImage> {
         let item_id = pseudo_item_id(path);
         let fingerprint = fingerprint_of(path)?;
         let (blob, _info) = bridge_rt()
@@ -98,16 +87,10 @@ impl VideoBackend for WorkerVideoBackend {
                 VideoFramesMode::Cover { max_long_edge },
             ))
             .map_err(|e| map_service_err(e, path))?;
-        decode_cover_webp(&blob, max_long_edge, max_pixel_bytes)
+        decode_cover_webp(&blob, max_long_edge)
     }
 
-    fn keyframes_bounded(
-        &self,
-        path: &Path,
-        n: usize,
-        cell_height: u32,
-        max_pixel_bytes: u64,
-    ) -> Result<Vec<DecodedImage>> {
+    fn keyframes(&self, path: &Path, n: usize, cell_height: u32) -> Result<Vec<DecodedImage>> {
         let n_u32 = n.max(1) as u32;
         let item_id = pseudo_item_id(path);
         let fingerprint = fingerprint_of(path)?;
@@ -127,7 +110,7 @@ impl VideoBackend for WorkerVideoBackend {
                 "video-worker 未回传雪碧条切格元数据 | missing video_frames info".into(),
             )
         })?;
-        decode_sprite_cells(&blob, info, n_u32, cell_height, max_pixel_bytes)
+        decode_sprite_cells(&blob, info, n_u32, cell_height)
     }
 }
 
@@ -220,23 +203,14 @@ const COVER_MAX_OUTPUT_PIXELS: u64 = 16_000_000;
 /// 独立解码 Cover 单帧 WebP(host 不信任 worker,§6 / `exotic::worker.rs:11-12` 先例)。
 /// `max_long_edge`(0 = 原生尺寸,不做长边校验)是本次请求档位 —— 解码后须核对实际尺寸
 /// 未越出「请求档位 + 容差」,且总像素不超上限,否则整批拒收(同 `exotic/validate.rs` 先例)。
-fn decode_cover_webp(
-    blob: &[u8],
-    max_long_edge: u32,
-    max_pixel_bytes: u64,
-) -> Result<DecodedImage> {
-    let reader =
-        image::ImageReader::with_format(std::io::Cursor::new(blob), image::ImageFormat::WebP);
-    let img = crate::engine::image_rs::decode_image_reader_bounded(
-        reader,
-        max_pixel_bytes.min(COVER_MAX_OUTPUT_PIXELS * 4),
-    )
-    .map_err(|e| {
-        AppError::Internal(format!(
-            "封面 WebP 独立解码失败 | cover WebP decode failed: {e}"
-        ))
-    })?
-    .into_rgba8();
+fn decode_cover_webp(blob: &[u8], max_long_edge: u32) -> Result<DecodedImage> {
+    let img = image::load_from_memory_with_format(blob, image::ImageFormat::WebP)
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "封面 WebP 独立解码失败 | cover WebP decode failed: {e}"
+            ))
+        })?
+        .to_rgba8();
     let (width, height) = (img.width(), img.height());
     if max_long_edge > 0 {
         let long = width.max(height);
@@ -272,7 +246,6 @@ fn decode_sprite_cells(
     info: VideoFramesInfo,
     requested_n: u32,
     requested_cell_height: u32,
-    max_pixel_bytes: u64,
 ) -> Result<Vec<DecodedImage>> {
     if info.n != requested_n || info.cell_height != requested_cell_height {
         return Err(AppError::Internal(format!(
@@ -281,21 +254,13 @@ fn decode_sprite_cells(
             info.n, info.cell_height
         )));
     }
-    super::check_frame_collection_budget(
-        info.cell_width,
-        info.cell_height,
-        info.n as usize,
-        max_pixel_bytes,
-    )?;
-    let reader =
-        image::ImageReader::with_format(std::io::Cursor::new(blob), image::ImageFormat::WebP);
-    let img = crate::engine::image_rs::decode_image_reader_bounded(reader, max_pixel_bytes)
+    let img = image::load_from_memory_with_format(blob, image::ImageFormat::WebP)
         .map_err(|e| {
             AppError::Internal(format!(
                 "雪碧条 WebP 独立解码失败 | sprite WebP decode failed: {e}"
             ))
         })?
-        .into_rgba8();
+        .to_rgba8();
     let (w, h) = (img.width(), img.height());
     let (cell_w, cell_h, n) = (info.cell_width, info.cell_height, info.n);
     if cell_w == 0 || cell_h == 0 || n == 0 {

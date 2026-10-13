@@ -1,6 +1,5 @@
-<!-- 前后对比分割拖杆（降噪/超分子系统 P0 批 5）：左=原图 before、右=增强 after，中缝可拖动。
-     数据源容错：beforeSrc/afterSrc 任一缺失（P0 后端 enhance_preview 返 enhance_not_implemented）
-     → 显示「预览即将可用」占位态，组件仍可挂载，不阻塞主流程（4.5 批实现后数据自然接上）。 -->
+<!-- 前后对比分割拖杆：左侧原图、右侧增强图，中缝可拖动。
+     beforeSrc/afterSrc 任一缺失时显示占位态，组件仍可挂载，不阻塞主流程。 -->
 <template>
   <div class="ba">
     <div v-if="!ready" class="ba__placeholder">

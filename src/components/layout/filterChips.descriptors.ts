@@ -1,36 +1,15 @@
-// 顶栏筛选 chips 的**唯一事实源**（S 线 §5 / D-008）。
-//
-// ## 为什么要有这个文件
-//
-// chip 列表此前散在**三处**，各自手写、互不知道对方存在：
-//
-// | 处 | 原形态 | 漏配后果 |
-// |---|---|---|
-// | `GalleryFilterChips.vue` | `inDom(0)…folded(7)` 字面量索引，映射只活在模板顶部一行注释里 | 插一个 chip 就要把后面每个数字加一，错了 = 折错 chip |
-// | `AppToolbar.vue` `chipCount` | `hasActiveFilters ? 8 : 7` | 与模板脱节 = 视图控件 baseIndex 偏移，折叠位次全错 |
-// | `AppToolbar.vue` `overflowRemeasureKey` | 手工枚举筛选字段 | **最危险**：漏一项 → 该 chip 文案变宽不触发重测 → 顶栏闪展再收，且**无编译/SSR/测试信号**，只在真机抖动 |
-//
-// 三处的共同点是「同一个列表被抄了三遍」。抄漏不报错 —— 这正是 experience.md §14 的元教训
-// （按症状类别建不变量，别按单触发器打补丁）与顶栏 round7 已踩过的坑（docked 分支漏配对齐，
-// 同样无信号）。故把列表收敛成一个数组，三处全部**推导**出来。
-//
-// ## 为什么不做成「全数据驱动模板」
-//
-// 各 chip 的**内容**结构差异很大（普通按钮 / 内联 StarRating / ColorLabelPicker / 开弹层的日期
-// chip），硬塞进一个 `v-for` 要么得写一堆 `v-if` 分支，要么得给每种搞一个动态组件 —— 那是为
-// DRY 而 DRY，可读性净亏。真正会出错的从来不是 chip 长什么样，而是**它排第几、在不在、宽度受
-// 谁影响**。故本文件只收敛这三件事，chip 本体仍留模板里写死。
+// 顶栏筛选 chip 的顺序、存在性和宽度依赖统一由此描述；模板仍负责各 chip 的具体内容。
+// AppToolbar 与 GalleryFilterChips 从同一描述符计算数量和折叠位次，避免插入 chip 后位置漂移。
 
 /**
  * chip 标识。**顺序即优先级**：靠前越晚被折叠（`useToolbarOverflow` 按可见前 N 项切分）。
  *
- * 「重复项」chip（2026-09-02 方案 §4.1）恒在首位固定可见,是筛选 chip 集合首段的镜头入口;
+ * 「重复项」chip 恒在首位固定可见，是重复镜头入口；
  * 「已暂停 N 个筛选」摘要 chip 仅在镜头激活且有普通筛选时存在(紧随其后)。
  *
- * 常显顺序依 §5/D-008：图片 | 视频 | 文档 | 音频 | LIVE | 收藏 | …。
- * 文档/音频补进来的依据是实测：文档 4,818 项（主体 txt 4,615）有实际价值；音频 32 项近乎空但无害。
+ * 常显顺序为图片、视频、文档、音频、LIVE、收藏等。
  *
- * LIVE/收藏**不是**媒体类型，是与媒体类型相交的布尔 facet —— 仅 UI 同列，领域模型分离（§5）。
+ * LIVE/收藏是与媒体类型相交的布尔筛选维度。
  */
 export type FilterChipId =
   | 'duplicates'
@@ -50,14 +29,14 @@ export type FilterChipId =
 /**
  * 描述符读到的筛选状态**结构子集**。
  *
- * 有意不收 `filterStore` 实例：本模块是纯函数，测试不该为了问「date chip 排第几」去建一个 pinia。
- * 普通筛选维度补齐了 livePhotoOnly/favoritedOnly/mediaTypeCount（「已暂停 N 个筛选」要逐维度计数,
+ * 不接收 `filterStore` 实例，以保持本模块为纯函数。
+ * 普通筛选维度包含 livePhotoOnly/favoritedOnly/mediaTypeCount（「已暂停 N 个筛选」要逐维度计数，
  * 仅有 hasActiveFilters 布尔不够）。构造统一走 `chipStateOf`,勿在组件里手抄字段表。
  */
 export interface FilterChipState {
   hasActiveFilters: boolean
   mediaTypeCount: number
-  /** 已选细分格式（S 线 P3）。触发器文案随其**个数**变宽：「格式」→「格式 3」。 */
+  /** 已选细分格式；触发器文案随数量变宽，如「格式 3」。 */
   fileFormats: readonly string[]
   livePhotoOnly: boolean
   favoritedOnly: boolean
@@ -66,9 +45,9 @@ export interface FilterChipState {
   dateFrom: number | null
   dateTo: number | null
   /**
-   * 重复镜头激活（2026-09-02 方案 §4.1）。激活时普通筛选 chip **整体暂停**:普通筛选值原样保留但
+   * 重复镜头激活时普通筛选 chip 整体暂停：筛选值原样保留但
    * 不参与镜头查询,UI 收束为 duplicates chip + 摘要 chip——普通 chip 与「清除」全部隐没,防在
-   * 镜头内误改筛选(镜头内不可修改,§4.1)。
+   * 镜头内误改筛选。
    */
   lensActive: boolean
 }

@@ -1,9 +1,7 @@
 #!/usr/bin/env node
-// 仓库路径卫生门禁(2026-07-11 加固批 A-5)
+// 仓库路径卫生门禁。
 //
-// 起因:src-tauri/.cargo/config.toml 里硬编码的绝对路径被 R2-7 改名施工机械替换成
-// 死路径,cargo 「就近优先」使其劫持 tauri dev → worker ort 装载无限阻塞(事故全链
-// 见 docs/experience.md §5)。本门禁把这一类雷挡在入仓时刻:
+// 嵌套 cargo config 会因就近优先覆盖仓库根配置；配置里的绝对路径在换机后会失效。
 //
 //   R1 嵌套 cargo config:`.cargo/config(.toml)` 只允许存在于仓库根——子目录副本
 //      就是「就近覆盖」劫持面,且极易被遗忘。

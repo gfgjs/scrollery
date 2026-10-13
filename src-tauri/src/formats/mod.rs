@@ -1,18 +1,12 @@
-//! 已注册格式的**运行时并集** = 内置表（`utils::format::BUILTIN_FORMATS`）∪ exotic Catalog。
+//! 已注册格式的运行时并集：内置表与 exotic Catalog。
 //!
-//! 为什么单独成模块（S 线 D-007）：`utils::format` **不能**引用 `exotic::catalog` —— 反向依赖
-//! 已存在（`exotic/catalog.rs` 装载期要调 `classify_media_type` 判 common 冲突），放一起即成环。
-//! 而「已注册格式全集」在语义上也不属于 exotic —— exotic 只是它的一个 **source**。故合并层
-//! 独立在此，向下依赖 `utils::format` 与 `exotic::catalog` 两侧。
+//! `exotic::catalog` 依赖 `utils::format` 判定内置格式冲突；合并层单独放置，避免反向依赖。
 //!
-//! **分层**（S 线 §6.1）：
+//! 两层数据用途不同：
 //! - `utils::format::RegisteredFormatDef` = **内部**定义，带处理能力字段（`phase1_image` /
 //!   `document_subtype`）。
 //! - [`FormatDescriptor`] = **UI 投影**，只有 `ext/media_type/group/source`。处理能力字段
-//!   **不下发** —— 避免把「能不能派生」误当成「能不能筛」（availability ⊥ registered）。
-//!
-//! **不写死总数**：当前 66 内置 + 1 PSD = 67 只是**数据快照**，不是协议常量。新增普通冷门格式
-//! 只需给 Catalog 加 offering，本模块、facet、筛选链路与契约测试全部自动覆盖。
+//!   不下发，避免把派生能力误当成筛选条件。
 
 use serde::Serialize;
 
@@ -29,7 +23,7 @@ pub enum FormatSource {
     Exotic { plugin_id: String },
 }
 
-/// 下发给 UI 的只读格式描述（P3 的格式弹层与 facet 分组据此渲染）。
+/// 下发给 UI 的只读格式描述，供格式弹层与 facet 分组使用。
 ///
 /// `group` 是 **UI 显示分组**：一个 UI 概念 → 多个物理扩展名（JPEG={jpg,jpeg}、RAW={cr2,…}）。
 /// DB / IPC 状态 / URL **始终存 `ext`**，`group` 不落库。
@@ -48,8 +42,7 @@ pub struct FormatDescriptor {
 /// （`CatalogError::CommonFormatConflict`），故此处无需再做冲突消解。
 ///
 /// exotic 格式的 `group` 恒为 `None`：Catalog schema 目前没有 group 元数据，而一个 offering 的
-/// 多个 `formats` **只表示同一插件能处理它们**，不等于一个 UI alias group（D-007）。将来若需
-/// 别名合组，走 Catalog schema 的显式可选 group 字段，禁止从 offering 边界猜测。
+/// 多个 `formats` 只表示同一插件能处理它们，不能据此推断为同一 UI 分组。
 pub fn merged_formats(catalog: &CatalogSnapshot) -> Vec<FormatDescriptor> {
     let mut out: Vec<FormatDescriptor> = builtin_formats()
         .iter()

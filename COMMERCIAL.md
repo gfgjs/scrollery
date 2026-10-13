@@ -14,12 +14,8 @@ scopes and are not interchangeable:
 - **Official end-user distribution.** The official stable release is planned as
   a paid, one-time purchase under an end-user commercial license. Individuals
   and organizations buy through this channel when they want the official signed
-  build, its updates, and its support rather than building from source. One
-  perpetual official-edition activation covers advanced image editing, OCR, image
-  enhancement, and the PSD engine. Each feature still requires supported platforms
-  and its runtime resources; image enhancement is not yet ready because release
-  model assets have not been delivered. RAW decoding and video format extensions
-  remain free.
+  build, its updates, and its support rather than building from source. The current
+  four professional features use independent free local activation, described below. RAW decoding and video format extensions remain free.
 - **Enterprise / OEM licensing.** For organizations that need to ship
   first-party Scrollery code under terms the AGPL cannot support — closed-source
   integration, white-label, or embedded distribution — the alternative is a
@@ -79,10 +75,13 @@ integration, the term and territory, and the fees and payment terms.
 
 There is no self-serve checkout, no published price list, and no live online
 end-user license agreement or payment flow. Commercial terms are settled
-individually when a concrete need arises. The application currently displays
-"Purchasing is not yet available". Activation uses one official-edition token;
-uninstalling a plugin preserves that license, and removing the local license
-disables the included paid features without deleting plugins, models, or files.
+individually when a concrete need arises. Advanced image editing, OCR, image
+enhancement, and the PSD engine currently each have an “Activate for free” button.
+Clicking it saves a local state without an account, license key, online verification,
+device binding, or expiry. Activation persists across restarts, plugin uninstallation,
+and settings resets. Plugin installation, platform compatibility, and model readiness
+still determine availability; enhancement release models have not been delivered.
+Any future paid activation would use separate purchase records.
 
 ## Scope of the AGPL release
 
@@ -130,7 +129,7 @@ Scrollery 的第一方源码以 **GNU Affero General Public License 第 3 版(�
 
 **商业授权不能做的事:** 不能改变第三方组件的许可,各依赖保持自身许可,声明见 [NOTICE.md](NOTICE.md);不缩小他人的 AGPL 权利,也不限制你通过公开渠道已依 AGPL 取得的权利;不授予商标权,见 [TRADEMARK.md](TRADEMARK.md);不撤回已按 AGPL 发布的代码在 AGPL 下的发布。
 
-**当前可用性:** 目前没有自助购买流程、没有公开价目表,也没有在线的终端用户许可协议或支付闭环。商业条款在出现具体需求时逐案确定。
+**当前可用性:** 目前没有自助购买流程、没有公开价目表,也没有在线的终端用户许可协议或支付闭环。商业条款在出现具体需求时逐案确定。图片高级编辑、OCR、影像增强和 PSD 引擎当前均可逐项点击“免费激活”，仅保存本机状态，无账号、注册码、联网验证、设备绑定或期限。重启、卸载插件和重置设置均保留激活记录。实际可用性仍取决于插件安装、平台兼容和模型准备；影像增强尚缺发行模型。未来若引入付费激活，将另行保存购买凭据。
 
 **AGPL 发布的范围:** 本仓库当前发布的第一方源码以 AGPL-3.0-only 授权。如 AGPL-3.0 第 8 条所定,只要你遵守许可,依本许可取得的权利不因项目改变许可决策而被撤销,项目也不会撤回已按 AGPL 发布的代码在 AGPL 下的发布;若你违反许可条款,许可将终止。此前以 Mozilla Public License 2.0 发布过的版本仍按其发布时的条款提供。在商业授权达成之前,对这里以 AGPL 发布的第一方代码而言,AGPL 及上述限定附加许可构成生效的授权基础;本文件不代表软件未来版本的许可。
 

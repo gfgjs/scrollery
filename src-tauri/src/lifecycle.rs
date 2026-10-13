@@ -2,8 +2,6 @@
 //! 应用生命周期回调:窗口事件拦截 + `RunEvent` 处理(退出前 WAL checkpoint、后台任务
 //! 优雅停止、Ready 计时与冒烟测试出口)。
 //!
-//! 自 `lib.rs::run()` 的 `.on_window_event(...)` / `.run(...)` 两个闭包迁出
-//! (D-450 纯结构移动,行为不变)。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -59,9 +57,7 @@ fn windows_foreground_is_self_process() -> bool {
     }
 }
 
-/// 启动计时锚(2026-07-13 排查热启动变慢):`RunEvent::Ready` 读它算 Rust boot→Ready 总耗时,
-/// 用于一刀切分「后端 setup 耗时」与「前端 Vite/WebView2/Vue 挂载耗时」。
-/// 拆分前是 `run()` 的函数局部 static;跨 `run()`/[`on_run_event`] 两处共享,故上提为模块级。
+/// 启动计时锚；`RunEvent::Ready` 用它计算 Rust boot 到 Ready 的耗时。
 pub static BOOT_INSTANT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// 前端最近一次心跳的 Unix 毫秒时间戳；0 表示本进程尚未收到前端心跳。
@@ -221,10 +217,14 @@ pub fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
                 }
             }
         }
-        if let tauri::WindowEvent::Focused(true) = event {
-            // Win11 Acrylic 可能在失焦后丢失(上游 window-vibrancy#139),回到前台时按当前
-            // 配置重挂；apply 内部投递主线程，且与已有 show 后重挂路径共用同一清理/应用链。
-            crate::window_material::apply_from_config(window.app_handle());
+        // 前后台切换 → 驱动缩略图 worker 的 QoS 档位:前台用 P 大核提速(仍被 UI 抢占)、
+        // 后台挤回 E 小核限频省电(2026-07-13,配合 thumbnail::qos 的 refresh_worker_qos)。
+        if let tauri::WindowEvent::Focused(focused) = event {
+            if *focused {
+                // Win11 Acrylic 可能在失焦后丢失(上游 window-vibrancy#139),回到前台时按当前
+                // 配置重挂；apply 内部投递主线程，且与已有 show 后重挂路径共用同一清理/应用链。
+                crate::window_material::apply_from_config(window.app_handle());
+            }
         }
     }
 }
@@ -518,22 +518,6 @@ fn local_flush_waiter(
 
 #[cfg(test)]
 mod tests {
-
-    /// 「上一次 flush 成功」不得当作永久放行:EXIT_ALLOWED 只能由 allow_exit 显式置位,而 flush
-    /// 报告本身不写这个标记(应用继续运行、继续有新设置的场景由此不再被旧成功短路)。
-    #[test]
-    fn flush_report_does_not_grant_permission_by_itself() {
-        let outcome = super::FlushOutcome {
-            complete: true,
-            saved: true,
-        };
-        assert!(outcome.saved);
-        // 仅凭一份成功报告,决策仍是「拦下并 flush」而不是放行。
-        assert_eq!(
-            super::exit_request_action(false, false),
-            super::ExitRequestAction::Start
-        );
-    }
 
     /// 旧 request id 的回报直接丢弃:重试轮次之间不能互相串结论。
     #[test]

@@ -83,15 +83,9 @@
           />
         </div>
 
-        <!-- T16 方案B(B1.5):bucket 分段渲染。容器总高 = 真实逻辑高、零坐标平移;
-             等高算术分段(useBucketVirtualScroll),仅渲染愿望窗口内的 1-3 个段——可见性
-             是纯算术,无 IntersectionObserver、无全量占位 div、无内联函数 ref(B1 真机
-             根因 C/D 由此结构性消除)。段行未到时以骨架条纹占位(--loading)。
-             卡片标记(data-item-id 与全部 handlers)是选区/拖拽/可视 patch 的公共消费面;
-             行体抽在 MediaGridRow(T16 收尾)。 -->
-        <!-- Canvas 渲染模式(§9 T4 最简原型):与下方 DOM 分支互斥,canvasMode 时接管。
-             底层引擎(bucket)不变,canvas 消费 activeRows 同源数据。
-             §8.1 browse-only:is-selection-mode 在镜头态强制 false(Canvas 不画 checkbox/拖拽手柄)。 -->
+        <!-- bucket 按逻辑坐标划分可视段，并封顶物理占位高度；段行未到时显示骨架。
+             DOM 行体由 MediaGridRow 渲染，卡片标记与事件供选区、拖拽和可视更新共用。 -->
+        <!-- Canvas 与 DOM 共用布局和选区；此分支接管可视窗口绘制与算术命中。 -->
         <MediaGridCanvas
           v-if="canvasMode"
           :rows="activeRowsRef"
@@ -108,6 +102,7 @@
           :is-selection-mode="selection.isSelectionMode.value && !lensActive"
           :scrolling="isScrolling"
           :enable-hover-scale="config.enableHoverScale"
+          :gallery-blend="config.galleryBlend"
           :show-thumb-info="ui.showThumbInfo"
           :show-drag-handle="ui.showDragHandle"
           :patch-tick="canvasPatchTick"
@@ -251,7 +246,7 @@
             @jump="scrollToY"
             @scrubbing="axisScrubbing = $event"
           />
-          <!-- Canvas 版原型(单画布 + hover 放大镜,§9 二期对比):同 props/emit 可直接替换。 -->
+          <!-- Canvas 时间轴与 DOM 时间轴使用相同 props 和事件。 -->
           <TimelineScrubberCanvas
             v-else-if="timelineVisible"
             ref="timelineCanvasRef"
@@ -264,8 +259,7 @@
             @jump="scrollToY"
             @scrubbing="axisScrubbing = $event"
           />
-          <!-- 无缝 minimap 轴(2026-07-17):微缩内容预览 + 视口框,双引擎经 currentLogicalY/
-               scrollToY 通吃(与 MediaScrollbar 同理由,对引擎无感知)。 -->
+          <!-- minimap 的内容预览与视口框使用 currentLogicalY，跳转经 scrollToY 还原逻辑位置。 -->
           <MinimapAxis
             v-else-if="minimapVisible"
             :total-height="media.totalHeight"
@@ -282,11 +276,7 @@
       </div>
     </Transition>
 
-    <!-- 轴控制簇(2026-07-24 迁底栏):chevron/形态钮/渲染药丸 Teleport 到底栏
-         #statusbar-axis-outlet(与选区 outlet 同模式),底栏内恒显、不再依赖 hover 才现,
-         且天然脱离画廊层叠上下文——不必再靠 z-index 硬压侧栏 wrapper/hover 卡片。
-         仅画廊视图激活期挂载(galleryViewActive),进查看器随 Teleport 卸载(与
-         selection-outlet 对称)。 -->
+    <!-- 底栏轴控件通过 Teleport 脱离画廊层叠上下文，仅在画廊前台挂载。 -->
     <Teleport to="#statusbar-axis-outlet" v-if="canShowMinimap && galleryViewActive">
       <button
         class="timeline-toggle-btn"
@@ -311,7 +301,7 @@
         {{ activeAxis === 'timeline' ? timelineAxisLabel : t('toolbar.axisMinimap') }}
       </button>
 
-      <!-- 时间轴渲染方式一键切换(DOM ↔ Canvas 原型,§9 二期对比;测试用小药丸,显当前模式)。 -->
+      <!-- 时间轴 DOM/Canvas 调试切换，显示当前模式。 -->
       <button
         v-if="showRenderModeDebug && timelineVisible"
         class="timeline-mode-btn"
@@ -359,9 +349,9 @@
       </button>
     </Teleport>
 
-    <!-- 画廊渲染方式一键切换(§9 T4:DOM ↔ Canvas 原型对比,显当前模式)。 -->
+    <!-- 画廊 DOM/Canvas 调试切换，显示当前模式。 -->
     <button
-      v-if="showRenderModeDebug && media.totalRows > 0 && canvasCapable"
+      v-if="showRenderModeDebug && media.totalRows > 0"
       class="gallery-mode-btn"
       :class="{ 'is-canvas': galleryRenderMode === 'canvas' }"
       :title="t('toolbar.switchGalleryRender')"
@@ -435,9 +425,7 @@ import { useRequestQueue } from '../../composables/useRequestQueue'
 import { useGalleryPerfProbe } from '../../composables/useGalleryPerfProbe'
 import { registerGalleryBenchmark } from '../../composables/usePerformanceMonitor'
 
-// ── P4 结构拆分(2026-07-25):逻辑域下沉为 composable,根组件只留「胶水时序」──────
-// 拆分契约:composable 返回值原名导出、响应性(ref/computed)与模板绑定一致,模板 0 改动;
-// 越界 scoped CSS(:deep(.media-card*) 等)仍留宿主 MediaGrid.styles.css,不随任何逻辑迁移。
+// 各逻辑域由 composable 负责，根组件编排布局、滚动与生命周期时序。
 import { useGalleryEmptyState } from '../../composables/useGalleryEmptyState'
 import { useGallerySkeleton } from '../../composables/useGallerySkeleton'
 import { useGalleryAxisControls } from '../../composables/useGalleryAxisControls'
@@ -748,7 +736,7 @@ const bucketContentRef = ref<HTMLElement | null>(null)
 // 初值 true:首次挂载时 onMounted 的首算先于 onActivated,必须放行。
 let gridOnScreen = true
 
-// 滚动闸门 + 程序化滚动守卫(纯判定状态机;onGridScroll 主体按拆分方案 §3.3 方案 A 留本组件)。
+// 滚动闸门与程序化滚动守卫共用状态机。
 const {
   beginProgrammaticScroll,
   endProgrammaticScroll,
@@ -768,7 +756,6 @@ const {
   currentLogicalY,
   activeRows,
   activeRowsRef,
-  canvasCapable,
   canvasActive,
   canvasPatchTick,
   bumpCanvasPatchTick,
@@ -791,16 +778,13 @@ function scrollToY(y: number, smooth = true): void {
   void bucketScroll.scrollToLogicalY(y, { smooth })
 }
 
-// canvas 是原型:偏好为 canvas 时若 canvasCapable 不满足(iOS/超大库)仍自动回退 DOM。
 // 判据单点在 useGalleryVirtualEngine(两引擎的取行窗也按它自驱,§4.3 S3),此处只别名消费。
 const canvasMode = canvasActive
-// 打码能力只存在于 Canvas 渲染路径。支持态 = 渲染偏好为 canvas **且**引擎有能力(canvasCapable),
+// 打码能力只存在于 Canvas 渲染路径，支持态取决于渲染偏好，
 // 有意不含 canvasActive 里的 media.totalRows > 0:那条表示「当前有结果」,算进来会让筛选到空/
 // 空图库时按钮消失——而此时文件树仍在打码,用户没有关掉它的入口。
 // immediate 让首帧即定;unmount 撤回,免得画廊不在场还留着「支持」误导顶栏。
-const demoPrivacySupported = computed(
-  () => galleryRenderMode.value === 'canvas' && canvasCapable.value,
-)
+const demoPrivacySupported = computed(() => galleryRenderMode.value === 'canvas')
 watch(demoPrivacySupported, (v) => setDemoPrivacySupported(v), { immediate: true })
 onBeforeUnmount(() => setDemoPrivacySupported(false))
 // 画廊底面与 html[data-glass] 同源:gallery=auto 时沿用共享玻璃底(清透明,一条底面贯穿窗口),
@@ -852,7 +836,7 @@ const { captureReflowAnchor, resolveReflowAnchor } = useReflowAnchor({
 
 // 镜头排列切换的焦点恢复(§8.1):切换 groups/folders 或开关独有项时按聚焦卡片 item ID 恢复滚动位
 // 与焦点;id 已不在新布局则回顶部并聚焦镜头状态条主标题。目标由下方 resolveLayoutTarget
-// 交给 bucket 一次提交,P3 folders 排列切换同样生效。
+// 交给 bucket 一次提交，文件夹排列切换同样生效。
 const { resolveLensFocus } = useLensFocusRestore({
   gridRef: () => gridRef.value,
   getViewKey,
@@ -882,11 +866,18 @@ async function resolveLayoutTarget(version: number, generationCurrent: () => boo
 }
 
 // 可视项就地 patch(乐观 UI 回写的单一实现)。
-const { patchVisibleRating, patchVisibleFavorite, patchVisibleColorLabel, patchVisibleSelected } =
+const { patchVisibleRating, patchVisibleFavorite, patchVisibleColorLabel, captureSelectionPatch } =
   useGridItemPatching({
     activeRows,
     bumpCanvasPatchTick,
     isSelected: (id: number) => selection.isSelected(id),
+    readContext: () => ({
+      selectionEpoch: selection.selectionEpoch.value,
+      layoutVersion: media.layoutVersion,
+      viewKey: getViewKey(),
+      semanticKey: media.layoutSemanticKey,
+    }),
+    compute,
   })
 
 // 选区批量操作全集(含暂存删除 undo/redo + FLIP 重排时序契约)。
@@ -908,7 +899,7 @@ const {
   patchVisibleRating,
   patchVisibleFavorite,
   patchVisibleColorLabel,
-  patchVisibleSelected,
+  captureSelectionPatch,
 })
 
 // ── Context Menu ───────────────────────────────────────────────────────────
@@ -938,7 +929,7 @@ const { onCardPointerDown } = useMediaDragToFolder({
 // 语义子视图返回栏（人物 / 收藏夹）+ document 级键盘处理(ESC / 数字键批量评分)。
 const { backBar, exitToOverview, onKeyDown } = useGalleryKeyboard({
   selectionDescriptor,
-  patchVisibleSelected,
+  captureSelectionPatch,
   compute,
   // §8.1 browse-only:镜头态旁路 document 级选择语义(Ctrl+A/ESC 清选区),谓词由宿主注入。
   lensActive: () => lensActive.value,
@@ -1019,7 +1010,7 @@ function onGridScroll() {
     // 平滑滚动已停稳 — 恢复 画廊→侧栏 联动。
     endProgrammaticScroll()
     if (gridRef.value) {
-      // bucket 缓存逻辑 y(B3 映射态下物理 scrollTop 不自足);方案 A 仍缓存物理。
+      // 缓存逻辑 y；映射态下物理 scrollTop 无法独立还原位置。
       scrollCache.set(
         getViewKey(),
         currentLogicalY.value,
@@ -1040,7 +1031,7 @@ function scrollGridToBottom() {
 
 // ── 布局 ─────────────────────────────────────────────────────────────────
 // 挂载期的布局初始化 + ResizeObserver 是「把上面十余个 composable 的初始化时序拼起来」的
-// 胶水(拆分方案 §2.1 明列不下沉):改一行时序即可能复现骨架闪帧 / 滚动位丢失的既往真机问题。
+// 布局与滚动恢复时序集中在此，避免骨架闪帧与滚动位置丢失。
 
 let resizeObserver: ResizeObserver | null = null
 
@@ -1199,9 +1190,7 @@ function onGalleryReactivate(): void {
   if (!ui.routeReturnSidebarTransitioning) void settleRouteReturnLayout()
 }
 
-// KeepAlive 前台/后台编排(2026-07-10 深审问题1治本 + 2026-09-12 异步子树首拍缺席治本):
-// `/view` 由路由驱动的覆盖层呈现,本网格始终留在 DOM;`/doc`、`/audio` 及异组件页仍会失活。
-// 覆盖层的键盘/性能/几何冻结由 contentViewerRoute watcher 收口,失活则由本编排收口。
+// /view 覆盖层保留底层 DOM，由 watcher 冻结键盘、性能和几何；异组件路由交由失活钩子。
 const galleryForeground = useKeepAliveForeground({
   // 画廊路由且非 `/view` 覆盖层存续:异组件路由的「后台」不是前台,异步子树在其间 resolve
   // 不得挂上文档级监听。
@@ -1304,16 +1293,14 @@ async function onRequestThumb(id: number) {
       if (item) {
         item.thumbStatus = result.thumbStatus
         item.thumbPath = result.thumbPath
-        // 缩略图生成结果带回 thumbhash → 前端算占位色回填(单项、罕发,与后端 hydrate 的批量
-        // 占位色在 ±2/通道内一致;此刻 status 多已迁 1,真图随即替换占位,差异不可辨)。
+        // 生成结果回填 thumbhash 占位色，真图就绪后替换占位。
         item.placeholderColor = result.thumbhash ? thumbhashToAverageColor(result.thumbhash) : null
         bumpCanvasPatchTick()
         break
       }
     }
   } catch {
-    // request cancelled or failed — leave placeholder
-    // 请求取消或失败 — 保留占位符
+    // 请求取消或失败时保留占位。
   }
 }
 
@@ -1356,8 +1343,7 @@ useViewportDimPriority({
   ],
 })
 
-// dev 门控性能探针(2026-07-09 画廊极密网格方案 §10):localStorage['scrollery.debug.perfProbe']=1
-// 开启,默认零成本(关闭即死代码、不注册监听)。getter 注入,不改模板与热路径 render。
+// 开发构建设置 scrollery.debug.perfProbe=1 启用探针；关闭时不注册监听器。
 useGalleryPerfProbe({
   gridEl: () => gridRef.value,
   isScrolling: () => isScrolling.value,
@@ -1366,15 +1352,12 @@ useGalleryPerfProbe({
 
 onBeforeUnmount(() => {
   cancelViewerPreload()
-  // 性能基准/闸门/定时器/观察者全归 useKeepAliveForeground 的卸载出口(leaveGalleryForeground):
-  // 该出口即 F4 契约的落点——闸门是模块级单例,卸载不复位就会钉死在 true,下次进画廊全员
-  // deferred 直到用户滚动。
+  // 前台卸载出口回收监听、定时器和观察者，并复位共享闸门，避免下次激活仍被阻塞。
 })
 
 // ── 详情 ─────────────────────────────────────────────────────────────────
 
-// 事件类型收 MouseEvent | KeyboardEvent(R1-8):键盘激活(Enter/Space)完整复用点击语义——
-// 两类事件都携带 ctrlKey/metaKey/shiftKey,Ctrl+Enter 切选中、Shift+Enter 范围选中随之免费成立。
+// 键盘与鼠标激活共用修饰键语义，支持 Ctrl/Cmd 切选与 Shift 范围选择。
 function handleCardClick(item: LayoutRowItem, event: MouseEvent | KeyboardEvent) {
   const id = item.id
   // 拖拽（框选或拖图）刚结束 → 吞掉尾随的单击,避免「拖完又触发单击」(开详情/翻转选中)。

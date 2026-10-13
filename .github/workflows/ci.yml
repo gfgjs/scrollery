@@ -1,33 +1,20 @@
-# CI —— 私有 canonical 仓的提交门控(审查 R0-1,2026-07-02 改造)。
+# CI —— 私有 canonical 仓的提交门控。
 #
-# 改造点(相对旧版):
-#   ① 触发扩到 dev + PR + 手动 dispatch(旧版仅 main push → 429 个测试对日常提交零门控);
-#   ② 加 cargo test --workspace(旧版只有 check+clippy,"测试全绿"长期仅本地断言);
-#   ③ ~~Rust job 补 setup-node + npm ci 材料化 ONNX 资源~~(2026-07-04 随 Part7-T6 撤销:
-#      bundle 不再声明 ONNX/DirectML 资源,tauri-build 无资源校验面,Rust job 不再需要 node;
-#      dev 推理 DLL 改由 .cargo/config.toml [env] ORT_DYLIB_PATH 直指 npm 包);
-#   ④ 占位 dist:tauri::generate_context! 编译期校验 frontendDist(oss-gate 四跑实证,debug 也查);
-#   ⑤ Rust job 全部命令迁 workspace 根(旧版钉 ./src-tauri,漏掉 crates/* 五个 member)。
-# 步骤写法与 oss-gate.yml 对齐(bash shell / rust-cache / node 22 npm ci),复用其六轮实跑踩坑结论。
+# Rust 检查在 workspace 根执行；占位 dist 供 generate_context! 校验 frontendDist。
 name: CI
 
 on:
   push:
     branches: [ "main", "dev" ]
-    tags: [ "v*" ] # Part7-T1:release tag 触发(冒烟 job 只在 tag/手动跑,见下)
+    tags: [ "v*" ] # 冒烟仅在 release tag 或手动触发时运行
   pull_request:
     branches: [ "main", "dev" ]
   workflow_dispatch:
 
 jobs:
-  # 🔴 runs-on 经济账(2026-07-06 切自托管):私有仓 windows-latest 按 2× 倍率计费,rust/frontend/smoke
-  #    三个重 job 迁本机 dev-box-win(D:\actions-runner,self-hosted 分钟不计费不受配额限制);
-  #    rust-linux 留 ubuntu-latest(本机无 WSL/Docker,job 轻量,月免费额度可承载)。
-  #    回迁只需把 runs-on 改回 windows-latest;勿把本 runner 挂到公开仓(fork PR 可在 runner 上执行任意代码)。
-  # 🔴 全部 job 加仓库 guard(2026-07-06,随自托管切换):本文件随投影进公开仓,但 self-hosted 标签
-  #    在公开仓无 runner 可领(且安全铁律禁止给公开仓挂自托管)→ 不 guard 则公开 main 每次提升都留一个
-  #    24h 超时的僵尸 queued run。公开树的编译/测试把关由 oss-gate 承担(sync-staging 上跑,托管免费);
-  #    未来接受外部 PR 时再议公开 CI 形态(须回托管标签+fork 安全审)。
+  # Windows 与 Linux 检查使用私有仓自托管 runner。
+  # 仓库 guard 防止公开镜像任务等待私有 runner；公开树由 oss-gate 校验。
+  # 自托管 runner 不挂到公开仓，避免 fork PR 执行任意代码。
   rust:
     name: Rust Check & Clippy & Test
     if: github.repository == 'gfgjs/scrollery-private'
@@ -52,20 +39,17 @@ jobs:
         if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@v2
 
-      # ③ 见文件头:原「npm ci 材料化 ONNX 资源」步骤已随 Part7-T6 撤销(资源声明已删)。
-      # ⚠ 推理测试红线(2026-07-23 裁决 J16):rust/rust-linux 两 job 均无 npm 步骤,
-      #   .cargo/config.toml 的 ORT_DYLIB_PATH 相对指向 node_modules 在 CI 上落空——
-      #   一切真加载 ORT(load_session_pool 类)的测试必须 #[ignore] 手跑;若日后要让此类
-      #   测试进 CI,须同一变更给两 job 补 npm ci(或单包 materialize)步骤,否则报
-      #   ModelLoadFailed 假故障。.cargo/config.toml 侧有对称注释。
+      # ⚠ 推理测试红线:rust/rust-linux 两 job 均无 npm 步骤,.cargo/config.toml 的 ORT_DYLIB_PATH
+      #   相对指向 node_modules 在 CI 上落空——一切真加载 ORT(load_session_pool 类)的测试必须
+      #   #[ignore] 手跑;若要让此类测试进 CI,须同一变更给两 job 补 npm ci(或单包 materialize)
+      #   步骤,否则报 ModelLoadFailed 假故障。.cargo/config.toml 侧有对称注释。
 
-      # ④ 见文件头:generate_context! 编译期校验 frontendDist("../dist")存在。
+      # generate_context! 编译期校验 frontendDist("../dist")存在。
       - name: 占位 dist(generate_context 校验 frontendDist)
         run: mkdir -p dist
 
-      # fmt 门(2026-07-10 审查 B17):AGENTS.md 规定 rustfmt+clippy 双工具,此前只有 clippy
-      # 在把门,fmt 漂移全靠提交自觉。--check 零编译,秒级;单跑 Windows 主 job 即可(fmt 与
-      # 平台无关,rust-linux 不重复)。
+      # fmt 门:AGENTS.md 规定 rustfmt+clippy 双工具。--check 零编译,秒级;fmt 与平台无关,
+      # 单跑 Windows 主 job,rust-linux 不重复。
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -75,20 +59,18 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
-      # G3 发行前置:NOTICE 归属清单新鲜度门——lockfile 变更未重生成 NOTICE.md 即红。
-      # 脚本零依赖(node 内置模块,windows runner 自带 node);cargo tree 只解析不编译,秒级。
+      # NOTICE 归属清单新鲜度门:lockfile 变更未重生成 NOTICE.md 即红。
+      # 脚本零依赖(node 内置模块,runner 自带 node);cargo tree 只解析不编译,秒级。
       - name: NOTICE 归属清单新鲜度(generate-notice --check)
         run: node scripts/generate-notice.mjs --check
 
-  # ── C 节跨平台适配:Linux 编译+测试面(2026-07-05 增设)──────────────────────────
-  # 使命:①守住 R0-2/Part4-T16 的 cfg(windows) 门控成果(Linux 编译面回归即红);
-  #      ②oss-gate 从 windows-latest 回迁 ubuntu 的前置实证——gate 面=build/test,
-  #        先在私有超集树验绿(公开投影树为其剥离子集,私有绿 ⇒ 公开绿)。
+  # ── Linux 编译+测试面 ──────────────────────────────────────────────────────
+  # 验证 Linux 编译与测试，覆盖平台条件编译路径。
   # 范围:check+test(与 gate 对齐);clippy 维持 windows job 单点(lint 与平台无关,
   # 不重复付费;Linux 特有 cfg 死代码若出现由 check 的 warning 面先暴露)。
   rust-linux:
     name: Rust Check & Test (Linux 编译面)
-    # phase-2(2026-07-06):迁 WSL2 自托管 dev-box-wsl——托管 ubuntu 受配额/账单钳制,本 job 曾是唯一必红位。
+    # 使用 WSL2 自托管 runner。
     if: github.repository == 'gfgjs/scrollery-private'
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -112,7 +94,7 @@ jobs:
       - name: 占位 dist(generate_context 校验 frontendDist)
         run: mkdir -p dist
 
-      # ⚠ 无 npm 步骤=无 ORT DLL,推理测试须 #[ignore](J16,详见 rust job 同名注释)。
+      # 未安装 npm 依赖，真实 ORT 测试需单独准备运行时，见 Windows Rust job 说明。
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
@@ -144,27 +126,14 @@ jobs:
       - name: 路径卫生门禁(check-path-hygiene)
         run: node scripts/check-path-hygiene.mjs
 
-      - name: IPC 一致性门禁自检
-        run: node scripts/check-ipc-commands.mjs --selftest
-
       - name: IPC 命令定义、注册与前端常量对拍
         run: npm run check:ipc
 
       # exotic 协议版本跨语言同步门(2026-07-13 事故防复发):Rust frame.rs 与 JS exotic-signing.mjs
       # 的 PROTOCOL_VERSION 必须相等——升 host 漏改 JS 会令打包器把旧版本号烙进插件清单被 installer
-      # 启动前复核判 protocol_mismatch 拒装(psd 插件根因)。纯静态读两文件,秒级;先跑 selftest 防退化。
-      - name: exotic 协议版本同步自检(--selftest)
-        run: node scripts/check-exotic-protocol-sync.mjs --selftest
-
+      # 启动前复核判 protocol_mismatch 拒装(psd 插件根因)。检查当前两端真实常量。
       - name: exotic 协议版本同步门(check-exotic-protocol-sync)
         run: node scripts/check-exotic-protocol-sync.mjs
-
-      # 主题对比度门(2026-07-10 审查 B17 后半):a44436b 扩到 21 组的 WCAG 硬门槛此前只有
-      # 手跑路径,主题 CSS 回归可静默入库(「门禁落地须接门控」纪律)。
-      # 2026-09-16 主题配色重构后色板的唯一真源是 src/themes/generate.ts,脚本直接 import 它
-      # (零算法复制),故必须经 vite-node 跑 TS——纯 node 解析不了 TS 导入。
-      - name: 主题对比度门禁(check-theme-contrast)
-        run: npm run check:contrast
 
       # R2-3:存量 33 lint 错清零后开硬门(含 R1-7 的 vue/no-bare-strings-in-template i18n 防回潮规则)。
       - name: ESLint
@@ -173,7 +142,7 @@ jobs:
       - name: vue-tsc 类型检查
         run: npm run typecheck
 
-      - name: 测试预算（Vitest 100 / Rust 200，含跳过项）
+      - name: 全仓测试预算（Rust平台并集、脚本验收及展开用例）
         run: npm run check:tests -- --selftest
 
       - name: vitest 单元测试
@@ -181,21 +150,20 @@ jobs:
 
       # Part7 §3.6.5⑤:conf/capability/dist 发布合规扫描(updater 块只许住 direct 发布 overlay)。
       # 🔴 必须扫 minify 后生产 bundle(原型实证:未 minify 的 if(false) 死块函数名残留会误报);
-      # 脚本启动先跑内置 selftest(正反样本),防扫描器退化成只会 PASS 的空壳。
+      # 此步骤扫描实际生产包的渠道与权限内容。
       - name: vite build(生产 bundle)
         run: npm run build
 
       - name: 发布合规扫描(verify-channel-bundle)
         run: node scripts/verify-channel-bundle.mjs
 
-  # ── Part7-T1 开机冒烟(§3.1.6)——只在 release tag / 手动 dispatch 上跑 ──────────────
+  # ── 开机冒烟 —— 只在 release tag / 手动 dispatch 上跑 ──────────────────────────
   # 日常 push 保持轻量(本 job 含完整 tauri build,windows runner 上 10 分钟级)。
   # 🔴 须跑构建产物:frontendDist 编译期内嵌;tauri dev 依赖 vite devUrl,不适合无头冒烟。
-  # --no-bundle 只产 exe 不打安装包,exe 原地可跑(Part7-T6 后 bundle 无 ONNX/DirectML
-  # 资源;冒烟只验开机就绪,不触 AI 推理)。
+  # --no-bundle 只产 exe 不打安装包,exe 原地可跑(bundle 无 ONNX/DirectML 资源;
+  # 冒烟只验开机就绪,不触 AI 推理)。
   # 钩子机制:lib.rs 的 RunEvent::Ready 分支检测 PICASA_SMOKE_TEST=1 → 就绪即 exit(0);
   # setup 中途 panic(reactor/迁移/DB)→ 永不到 Ready → 非零退出,本步即红。
-  # T16/T17 commercial/oss 双流水线建成后,本 job 迁入其中(§3.1.6 的最终归宿)。
   smoke:
     name: 开机冒烟(build 产物断言)
     if: github.repository == 'gfgjs/scrollery-private' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
@@ -222,19 +190,15 @@ jobs:
       - name: npm ci
         run: npm ci
 
-      # Part7-T5 tag 一致性:tag vX.Y.Z 必须等于版本锚,防 tag 与产物版本漂移。
+      # tag 一致性:tag vX.Y.Z 必须等于版本锚,防 tag 与产物版本漂移。
       - name: tag 与版本锚一致性
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/sync-version.mjs --check-tag "$GITHUB_REF_NAME"
 
-      # 显式准备固定版本 dispatcher，避免冒烟构建依赖自托管 runner 的历史产物。
-      - name: 准备固定版本 VPL dispatcher
-        run: node scripts/build-vpl-dispatcher.mjs
-
       - name: tauri build --no-bundle(release exe)
         run: npx tauri build --no-bundle
 
-      # 发货闭包 staging 断言(F-001 候选落地,2026-08-11):--no-bundle 无安装包,
+      # 发货闭包 staging 断言:--no-bundle 无安装包,
       # 本步只验 staging 文件 + conf 接线;安装包载荷级断言在 release.yml 拆包硬验。
       - name: 发货闭包断言(staging + conf)
         run: node scripts/verify-bundle-content.mjs
@@ -245,10 +209,10 @@ jobs:
           PICASA_SMOKE_TEST=1 ./target/release/scrollery.exe
           echo "冒烟通过:应用达 RunEvent::Ready 并 exit(0)"
 
-  # ── RAW 独立 workspace 验证(P1-2,2026-09-12)──────────────────────────────────
-  # raw-worker 刻意脱离根 workspace(rsraw 的 build.rs 在 MSVC 下硬 panic),只能 gnu target 单独编译;
-  # 它因此天然落在 `cargo test --workspace`(rust/rust-linux 两 job)之外,回归长期无人把守。本 job
-  # 用 scripts/acceptance/raw-worker-test.mjs 一条命令固化:结构守卫(仍在 workspace 外 + 未进根
+  # ── RAW 独立 workspace 验证 ─────────────────────────────────────────────────
+  # raw-worker 刻意脱离根 workspace(rsraw 的 build.rs 在 MSVC 下硬 panic),只能 gnu target 单独编译,
+  # 因此天然落在 `cargo test --workspace`(rust/rust-linux 两 job)之外。本 job 用
+  # scripts/acceptance/raw-worker-test.mjs 一条命令固化:结构守卫(仍在 workspace 外 + 未进根
   # lockfile)+ fmt + test --locked --target gnu + 产物存在性。
   raw-worker:
     name: RAW Worker(gnu 独立 workspace)

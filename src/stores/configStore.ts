@@ -6,11 +6,12 @@
 // writeSettings 走统一批量入口;派生流水线重启由后端按批量差异统一触发,故这里不再逐 setter 重启。
 import { computed, watch } from 'vue'
 import { defineStore } from 'pinia'
+import { DEFAULTS } from '../constants/defaults'
+import type { GalleryBlendSettings } from '../types/config'
 import { logger, setLoggerEnabled } from '../utils/logger'
 import {
   initializeSettings,
   readSetting,
-  refreshSettingsFromBackend,
   settingsConfirmedValues,
   settingsReady,
   writeSettings,
@@ -32,13 +33,13 @@ import {
 } from '../composables/settingsValues'
 import {
   applyUiFontSize,
-  applyTimelineScrollWidth,
-  applyTimelineAxisWidth,
   applyAxisViewportOpacity,
 } from '../utils/uiScale'
 
 /** 缩略图解码策略候选(与后端 schema 枚举同值)。 */
 const THUMB_STRATEGIES = ['cpu', 'gpu', 'direct'] as const
+/** GPU 引擎候选。 */
+const GPU_ENGINES = ['wic'] as const
 /** AI 硬件策略候选。 */
 const AI_PROVIDER_OVERRIDES = ['auto', 'cpu'] as const
 /** AI 模型下载源候选。 */
@@ -56,14 +57,8 @@ export const useConfigStore = defineStore('config', () => {
   // 与后端 DEFAULT_THUMB_CACHE_MAX_MB 同值)。
   const thumbCacheMaxMb = computed(() => readSettingNumber('thumb_cache_max_mb', 10240))
   const thumbSize = computed(() => readSettingNumber('thumb_size', 512))
-  const thumbFastThreads = computed(() => readSettingNumber('thumb_fast_threads', 0))
-  const thumbTailThreads = computed(() => readSettingNumber('thumb_tail_threads', 2))
-  const thumbGpuInflight = computed(() => readSettingNumber('thumb_gpu_inflight', 2))
-  const thumbGpuPerAdapter = computed(() => readSettingNumber('thumb_gpu_per_adapter', 1))
-  const thumbProcessMemoryMb = computed(() => readSettingNumber('thumb_process_memory_mb', 1024))
-  const thumbTotalMemoryMb = computed(() => readSettingNumber('thumb_total_memory_mb', 2048))
-  const thumbWorksetMb = computed(() => readSettingNumber('thumb_workset_mb', 1024))
-  // 缩略图 WebP 编码质量:1..=99 有损(默认 80),100=无损。变更后后端复位存量项。
+  // 缩略图 WebP 编码质量:1..=99 有损(默认 80),100=无损。变更后后端会把存量已生成项
+  // 与封面派生一并复位,按需以新质量重生成。
   const thumbWebpQuality = computed(() => readSettingNumber('thumb_webp_quality', 80))
   const timelineScrollWidth = computed(() => readSettingNumber('timeline_scroll_width', 8))
   const timelineAxisWidth = computed(() => readSettingNumber('timeline_axis_width', 44))
@@ -75,8 +70,27 @@ export const useConfigStore = defineStore('config', () => {
   const axisViewportOpacity = computed(() => readSettingNumber('axis_viewport_opacity', 100))
   const uiFontSize = computed(() => readSettingNumber('ui_font_size', 13))
   const enableHoverScale = computed(() => readSettingBool('enable_thumb_hover_scale', true))
+  const galleryBlendEnabled = computed(() =>
+    readSettingBool('gallery_blend_enabled', DEFAULTS.GALLERY_BLEND_ENABLED),
+  )
+  const galleryBlendEdgeWidth = computed(() =>
+    readSettingNumber('gallery_blend_edge_width', DEFAULTS.GALLERY_BLEND_EDGE_WIDTH),
+  )
+  const galleryBlendBlurRadius = computed(() =>
+    readSettingNumber('gallery_blend_blur_radius', DEFAULTS.GALLERY_BLEND_BLUR_RADIUS),
+  )
+  const galleryBlendStrength = computed(() =>
+    readSettingNumber('gallery_blend_strength', DEFAULTS.GALLERY_BLEND_STRENGTH),
+  )
+  const galleryBlend = computed<GalleryBlendSettings>(() => ({
+    enabled: galleryBlendEnabled.value,
+    edgeWidth: galleryBlendEdgeWidth.value,
+    blurRadius: galleryBlendBlurRadius.value,
+    strength: galleryBlendStrength.value,
+  }))
   const logLevel = computed(() => readSettingEnum('log_level', LOG_LEVELS, 'info'))
-  const thumbStrategy = computed(() => readSettingEnum('thumb_strategy', THUMB_STRATEGIES, 'cpu'))
+  const thumbStrategy = computed(() => readSettingEnum('thumb_strategy', THUMB_STRATEGIES, 'gpu'))
+  const gpuEngine = computed(() => readSettingEnum('gpu_engine', GPU_ENGINES, 'wic'))
   const aiProviderOverride = computed(() =>
     readSettingEnum('ai_provider_override', AI_PROVIDER_OVERRIDES, 'auto'),
   )
@@ -159,11 +173,6 @@ export const useConfigStore = defineStore('config', () => {
     await writeSettings({ [key]: value })
   }
 
-  /** 外置配置文件热更新:中央服务已统一应用快照,DOM 副作用由 applyDomAffectingValues 的 watch 收敛。 */
-  async function refreshFromBackend() {
-    await refreshSettingsFromBackend()
-  }
-
   // ── 各设置项的提交入口 ─────────────────────────────────────────────────
   // 统一姿态:只提交,不本地赋值——显示値由中央快照驱动(采集即预览由中央服务负责),
   // 因此不存在「本地先改、后端后改」的抢跑,失败时也不会留下与后端不一致的本地值。
@@ -177,38 +186,15 @@ export const useConfigStore = defineStore('config', () => {
   function setThumbSize(val: number) {
     return writeSettings({ thumb_size: val.toString() })
   }
-  function setThumbFastThreads(val: number) {
-    return writeSettings({ thumb_fast_threads: val.toString() })
-  }
-  function setThumbTailThreads(val: number) {
-    return writeSettings({ thumb_tail_threads: val.toString() })
-  }
-  function setThumbGpuInflight(val: number) {
-    return writeSettings({ thumb_gpu_inflight: val.toString() })
-  }
-  function setThumbGpuPerAdapter(val: number) {
-    return writeSettings({ thumb_gpu_per_adapter: val.toString() })
-  }
-  function setThumbProcessMemoryMb(val: number) {
-    return writeSettings({ thumb_process_memory_mb: val.toString() })
-  }
-  function setThumbTotalMemoryMb(val: number) {
-    return writeSettings({ thumb_total_memory_mb: val.toString() })
-  }
-  function setThumbWorksetMb(val: number) {
-    return writeSettings({ thumb_workset_mb: val.toString() })
-  }
   /** 编码质量(1-100,100=无损):先收敛再提交。 */
   function setThumbWebpQuality(val: number) {
     const clamped = Math.min(100, Math.max(1, Math.round(val)))
     return writeSettings({ thumb_webp_quality: clamped.toString() })
   }
   function setTimelineScrollWidth(val: number) {
-    applyTimelineScrollWidth(val)
     return writeSettings({ timeline_scroll_width: val.toString() })
   }
   function setTimelineAxisWidth(val: number) {
-    applyTimelineAxisWidth(val)
     return writeSettings({ timeline_axis_width: val.toString() })
   }
   function setScrollThumbMinHeight(val: number) {
@@ -218,17 +204,28 @@ export const useConfigStore = defineStore('config', () => {
   /** 轴视窗不透明度:先收敛再提交,与 applyAxisViewportOpacity 的区间一致(20–200)。 */
   function setAxisViewportOpacity(val: number) {
     const clamped = Math.min(200, Math.max(20, Math.round(val)))
-    applyAxisViewportOpacity(clamped)
     return writeSettings({ axis_viewport_opacity: clamped.toString() })
   }
   function setUiFontSize(val: number) {
-    // 单一事实源(P1-18):与 App.vue 启动应用共用同一函数,消除 1px 漂移。
-    applyUiFontSize(val)
     return writeSettings({ ui_font_size: val.toString() })
   }
   function setEnableHoverScale(val: boolean) {
-    applyHoverScale(val)
     return writeSettings({ enable_thumb_hover_scale: val.toString() })
+  }
+  function setGalleryBlendEnabled(val: boolean) {
+    return writeSettings({ gallery_blend_enabled: val.toString() })
+  }
+  function setGalleryBlendEdgeWidth(val: number) {
+    const clamped = Math.min(8, Math.max(0, Math.round(val)))
+    return writeSettings({ gallery_blend_edge_width: clamped.toString() })
+  }
+  function setGalleryBlendBlurRadius(val: number) {
+    const clamped = Math.min(24, Math.max(0, Math.round(val)))
+    return writeSettings({ gallery_blend_blur_radius: clamped.toString() })
+  }
+  function setGalleryBlendStrength(val: number) {
+    const clamped = Math.min(100, Math.max(0, Math.round(val)))
+    return writeSettings({ gallery_blend_strength: clamped.toString() })
   }
   function setLogLevel(val: string) {
     // 切换态同步(方案 §4):off 时立刻关掉前端队列开关,不等落盘往返;
@@ -238,6 +235,9 @@ export const useConfigStore = defineStore('config', () => {
   }
   function setThumbStrategy(val: string) {
     return writeSettings({ thumb_strategy: val })
+  }
+  function setGpuEngine(val: string) {
+    return writeSettings({ gpu_engine: val })
   }
   function setAiProviderOverride(val: string) {
     return writeSettings({ ai_provider_override: val })
@@ -273,13 +273,6 @@ export const useConfigStore = defineStore('config', () => {
     thumbSkipMaxKb,
     thumbCacheMaxMb,
     thumbSize,
-    thumbFastThreads,
-    thumbTailThreads,
-    thumbGpuInflight,
-    thumbGpuPerAdapter,
-    thumbProcessMemoryMb,
-    thumbTotalMemoryMb,
-    thumbWorksetMb,
     thumbWebpQuality,
     timelineScrollWidth,
     timelineAxisWidth,
@@ -287,8 +280,14 @@ export const useConfigStore = defineStore('config', () => {
     axisViewportOpacity,
     uiFontSize,
     enableHoverScale,
+    galleryBlendEnabled,
+    galleryBlendEdgeWidth,
+    galleryBlendBlurRadius,
+    galleryBlendStrength,
+    galleryBlend,
     logLevel,
     thumbStrategy,
+    gpuEngine,
     aiProviderOverride,
     aiBatchSize,
     aiDownloadSource,
@@ -301,18 +300,10 @@ export const useConfigStore = defineStore('config', () => {
     // 生命周期与提交
     loadConfig,
     saveConfig,
-    refreshFromBackend,
     applyDomAffectingValues,
     setThumbSkipMaxKb,
     setThumbCacheMaxMb,
     setThumbSize,
-    setThumbFastThreads,
-    setThumbTailThreads,
-    setThumbGpuInflight,
-    setThumbGpuPerAdapter,
-    setThumbProcessMemoryMb,
-    setThumbTotalMemoryMb,
-    setThumbWorksetMb,
     setThumbWebpQuality,
     setTimelineScrollWidth,
     setTimelineAxisWidth,
@@ -320,8 +311,13 @@ export const useConfigStore = defineStore('config', () => {
     setAxisViewportOpacity,
     setUiFontSize,
     setEnableHoverScale,
+    setGalleryBlendEnabled,
+    setGalleryBlendEdgeWidth,
+    setGalleryBlendBlurRadius,
+    setGalleryBlendStrength,
     setLogLevel,
     setThumbStrategy,
+    setGpuEngine,
     setAiProviderOverride,
     setAiBatchSize,
     setAiDownloadSource,

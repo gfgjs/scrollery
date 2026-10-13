@@ -1,7 +1,7 @@
 //! 画廊 SQL builder:FROM/JOIN/WHERE/ORDER 主体构造与 `ViewDescriptor` 编译。
 //!
-//! `query_layout_items`(item_queries)与 `view_to_sql` 共用本模块,是视图定义的单一事实源
-//! (T18 §4);`push_in_predicate`/`push_root_exclusion` 经 `layout` facade 具名重导出供
+//! `query_layout_items` 与 `view_to_sql` 共用本模块作为视图定义；
+//! `push_in_predicate`/`push_root_exclusion` 经 `layout` facade 具名重导出供
 //! 跨模块复用。
 
 use crate::db::models::{
@@ -14,7 +14,7 @@ use crate::error::{AppError, Result};
 /// 构造画廊查询的「FROM/JOIN/WHERE/ORDER BY」主体（SELECT 列由调用方前置）。
 ///
 /// `query_layout_items`（取完整 `LayoutItem`）与 `view_to_sql`（只取 `m.id`）共用本函数 —— 二者
-/// 共享同一套 FROM/JOIN/WHERE/ORDER 构造，是视图定义的单一事实源（T18 §4）。
+/// 共享同一套 FROM/JOIN/WHERE/ORDER 构造，是视图定义的单一事实源。
 /// 全部谓词参数绑定（符合「SQL 必参数绑定」铁律）；`extras` 由调用方传入空 Vec、本函数追加。
 pub(in crate::db::queries::layout) fn push_query_body(
     sql: &mut String,
@@ -132,7 +132,11 @@ pub(in crate::db::queries::layout) fn push_where_predicates(
     if filter.trashed_only == Some(true) {
         sql.push_str("\n         WHERE m.is_deleted=1 AND m.companion_of IS NULL");
     } else {
-        sql.push_str("\n         WHERE m.is_deleted=0 AND m.companion_of IS NULL");
+        // 默认画廊排除物理缺失(missing):文件已从磁盘消失的旧行不再占位。offline 保留离线
+        // 浏览,故只排除 missing。回收站分支不加此谓词——用户删除项无论是否缺失都保留其
+        // 既有语义。后缀格式(含无空格 `availability!='missing'`)与 item_queries.rs 的
+        // `BROAD_BASE` 逐字节一致,canonical 的 `+` 抑制检测依赖此后缀。
+        sql.push_str("\n         WHERE m.is_deleted=0 AND m.companion_of IS NULL AND m.availability!='missing'");
     }
 
     let mut param_idx = 0usize;
@@ -251,8 +255,9 @@ pub(in crate::db::queries::layout) fn push_where_predicates(
                     extras.push(Box::new(pattern));
                 }
                 "date" => {
+                    // sort_datetime 与图库标签都是拍摄墙钟；localtime 会再次加时区，导致搜不到界面日期。
                     param_idx += 1;
-                    sql.push_str(&format!(" AND strftime('%Y-%m-%d %H:%M:%S', m.sort_datetime, 'unixepoch', 'localtime') LIKE ?{} ESCAPE '\\'", param_idx));
+                    sql.push_str(&format!(" AND strftime('%Y-%m-%d %H:%M:%S', m.sort_datetime, 'unixepoch') LIKE ?{} ESCAPE '\\'", param_idx));
                     extras.push(Box::new(pattern));
                 }
                 "device" => {
@@ -272,7 +277,7 @@ pub(in crate::db::queries::layout) fn push_where_predicates(
                     let p1 = format!("?{}", param_idx);
                     param_idx += 1;
                     let p2 = format!("?{}", param_idx);
-                    // 预留经纬度字符串或未来 city 字段匹配
+                    // 位置筛选匹配经纬度文本。
                     sql.push_str(&format!(" AND (CAST(im.exif_gps_lat AS TEXT) LIKE {} ESCAPE '\\' OR CAST(im.exif_gps_lng AS TEXT) LIKE {} ESCAPE '\\')", p1, p2));
                     extras.push(Box::new(pattern.clone()));
                     extras.push(Box::new(pattern));
@@ -285,7 +290,7 @@ pub(in crate::db::queries::layout) fn push_where_predicates(
                         extras.push(Box::new(pattern.clone()));
                     }
                     sql.push_str(&format!(
-                        " AND (m.file_name LIKE {} ESCAPE '\\' OR d.rel_path LIKE {} ESCAPE '\\' OR d.name LIKE {} ESCAPE '\\' OR strftime('%Y-%m-%d %H:%M:%S', m.sort_datetime, 'unixepoch', 'localtime') LIKE {} ESCAPE '\\' OR im.exif_make LIKE {} ESCAPE '\\' OR im.exif_model LIKE {} ESCAPE '\\' OR im.exif_lens LIKE {} ESCAPE '\\' OR CAST(im.exif_gps_lat AS TEXT) LIKE {} ESCAPE '\\' OR CAST(im.exif_gps_lng AS TEXT) LIKE {} ESCAPE '\\')",
+                        " AND (m.file_name LIKE {} ESCAPE '\\' OR d.rel_path LIKE {} ESCAPE '\\' OR d.name LIKE {} ESCAPE '\\' OR strftime('%Y-%m-%d %H:%M:%S', m.sort_datetime, 'unixepoch') LIKE {} ESCAPE '\\' OR im.exif_make LIKE {} ESCAPE '\\' OR im.exif_model LIKE {} ESCAPE '\\' OR im.exif_lens LIKE {} ESCAPE '\\' OR CAST(im.exif_gps_lat AS TEXT) LIKE {} ESCAPE '\\' OR CAST(im.exif_gps_lng AS TEXT) LIKE {} ESCAPE '\\')",
                         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]
                     ));
                 }
@@ -484,4 +489,145 @@ fn build_duplicate_lens_sql(
             Box::new(false),
         ],
     ))
+}
+
+#[cfg(test)]
+mod availability_query_contract_tests {
+    //! 缺失可见性契约:同一 fixture 上断言画廊、目录树、文件列表、统计四处查询对
+    //! `availability='missing'` 的一致排除,以及 offline 保留、回收站语义不变。
+    //!
+    //! 覆盖本轮查询侧改动:默认画廊 WHERE 基础谓词、目录 CTE 与 candidate/has_children 的
+    //! `is_missing`、文件列表谓词、`get_app_stats` 口径、`upsert_directory` 冲突清除 is_missing。
+    //! 与 `query_layout_items` 共用 `push_where_predicates` 的 canonical/filename/view 路径
+    //! 由该共享谓词保证一致,此处不逐一重复断言。
+    use crate::db::models::MediaFilter;
+    use rusqlite::{params, Connection};
+
+    /// 一个扫描根 + 根目录(id10);子目录 id11(`keep`)、其子目录 id12(`keep/sub`,初始缺失)。
+    fn fixture() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO scan_roots (id, path, alias) VALUES (1, '/r', 'R');
+             INSERT INTO directories (id, root_id, parent_id, rel_path, name, depth, is_missing) VALUES
+                 (10, 1, NULL, '', 'r', 0, 0),
+                 (11, 1, 10, 'keep', 'keep', 1, 0),
+                 (12, 1, 11, 'keep/sub', 'sub', 2, 1);",
+        )
+        .unwrap();
+        c
+    }
+
+    fn add(c: &Connection, id: i64, dir: i64, name: &str, avail: &str, is_deleted: i64) {
+        c.execute(
+            "INSERT INTO media_items
+                (id, directory_id, file_name, file_size, file_mtime, file_format,
+                 media_type, width, height, sort_datetime, cache_key, availability, is_deleted)
+             VALUES (?1, ?2, ?3, 1, 1, 'jpg', 'image', 0, 0, ?4, ?4, ?5, ?6)",
+            params![id, dir, name, id, avail, is_deleted],
+        )
+        .unwrap();
+    }
+
+    fn gallery_ids(c: &Connection) -> Vec<i64> {
+        let mut ids: Vec<i64> =
+            super::super::query_layout_items_canonical(c, &MediaFilter::default())
+                .unwrap()
+                .into_iter()
+                .map(|it| it.id)
+                .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn children(c: &Connection, parent: i64) -> Vec<crate::db::models::DirNode> {
+        crate::db::queries::scan::get_directory_children(c, parent, None).unwrap()
+    }
+
+    fn file_names(c: &Connection, dir: i64) -> Vec<String> {
+        let mut names: Vec<String> =
+            crate::db::queries::scan::list_directory_files(c, dir, None, None, None)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.file_name)
+                .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn missing_is_excluded_across_gallery_tree_files_and_stats() {
+        let c = fixture();
+        add(&c, 1, 10, "online.jpg", "online", 0);
+        add(&c, 2, 10, "missing.jpg", "missing", 0);
+        add(&c, 3, 10, "offline.jpg", "offline", 0);
+        add(&c, 4, 10, "trashed.jpg", "missing", 1);
+        add(&c, 5, 11, "keep.jpg", "online", 0);
+
+        // 默认画廊:排除 missing(含回收站里的 missing),保留 offline。
+        assert_eq!(gallery_ids(&c), vec![1, 3, 5], "默认画廊口径");
+
+        // 回收站:保留既有语义(missing 项照常出现)。
+        let trash = MediaFilter {
+            trashed_only: Some(true),
+            ..Default::default()
+        };
+        let mut trash_ids: Vec<i64> = super::super::query_layout_items_canonical(&c, &trash)
+            .unwrap()
+            .into_iter()
+            .map(|it| it.id)
+            .collect();
+        trash_ids.sort_unstable();
+        assert_eq!(trash_ids, vec![4], "回收站保留 missing 项");
+
+        // 目录树:根目录可见;缺失子目录不进候选,也不计入父目录 has_children。
+        let roots: Vec<i64> = crate::db::queries::scan::get_directory_tree(&c, 1, None)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(roots, vec![10], "根目录可见");
+        let level = children(&c, 10);
+        assert_eq!(
+            level.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![11],
+            "缺失子目录不出现"
+        );
+        assert!(
+            !level[0].has_children,
+            "仅含缺失子目录的目录 has_children=false"
+        );
+
+        // 文件列表:排除 missing,保留 offline。
+        assert_eq!(
+            file_names(&c, 10),
+            vec!["offline.jpg".to_string(), "online.jpg".to_string()],
+            "文件列表排除 missing"
+        );
+
+        // 统计口径与画廊一致:计 online+offline,不计 missing;回收站计数不变。
+        let stats = crate::db::queries::media::get_app_stats(&c).unwrap();
+        assert_eq!(stats.total_items, 3, "统计排除 missing");
+        assert_eq!(stats.total_images, 3);
+        assert_eq!(stats.total_deleted, 1, "回收站计数不随 missing 过滤变化");
+
+        // upsert 冲突清除 is_missing:目录重现后重新可见并恢复 has_children。
+        crate::db::queries::scan::upsert_directory(&c, 1, Some(11), "keep/sub", "sub", 2, None)
+            .unwrap();
+        let level = children(&c, 10);
+        assert_eq!(level.len(), 1);
+        assert!(level[0].has_children, "子目录重现后 has_children=true");
+
+        // 缺失目录本身被排除;upsert 冲突再次清除 is_missing 后恢复。
+        c.execute("UPDATE directories SET is_missing=1 WHERE id=11", [])
+            .unwrap();
+        assert!(children(&c, 10).is_empty(), "缺失目录本身不可见");
+        crate::db::queries::scan::upsert_directory(&c, 1, Some(10), "keep", "keep", 1, None)
+            .unwrap();
+        assert_eq!(
+            children(&c, 10).iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![11],
+            "upsert 冲突清除 is_missing"
+        );
+    }
 }

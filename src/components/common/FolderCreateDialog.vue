@@ -1,6 +1,6 @@
 <template>
-  <!-- 外壳迁 UiDialog:恒 Teleport(修此前原位渲染被祖先 overflow/transform 裁剪的隐患)+
-       焦点陷阱(此前仅 focus 遮罩、Tab 会逃逸;初始焦点由 data-autofocus 落到文件夹名输入)。
+  <!-- UiDialog 通过 Teleport 避开祖先 overflow/transform 裁剪，并提供
+       焦点陷阱；初始焦点由 data-autofocus 落到文件夹名输入。
        本组件由父 v-if 条件挂载,故 open 恒 true;焦点陷阱经 useFocusTrap immediate 挂载即 engage。 -->
   <UiDialog
     :open="true"
@@ -150,7 +150,7 @@ async function create() {
   color: var(--color-text-tertiary);
 }
 
-/* 基路径行:输入占满 + 右侧「选择」按钮(原内联 style 收进 class,S1 机械批) */
+/* 基路径行：输入占满，右侧为「选择」按钮。 */
 .base-path-row {
   display: flex;
   gap: var(--spacing-sm);

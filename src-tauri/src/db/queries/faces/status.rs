@@ -38,11 +38,10 @@ pub struct PendingFaceItem {
     pub id: i64,
     pub abs_path: String,
     pub file_format: String,
-    pub thumb_status: i64,
-    pub thumb_path: Option<String>,
     pub width: i64,
     pub height: i64,
     pub cache_key: i64,
+    pub source_revision: i64,
 }
 
 /// 取一批待人脸检测的图像（`face_status=0`）。
@@ -52,7 +51,7 @@ pub fn get_pending_face_items(conn: &Connection, limit: i64) -> Result<Vec<Pendi
                 CASE WHEN d.rel_path = '' THEN r.path || '/' || m.file_name
                      ELSE r.path || '/' || d.rel_path || '/' || m.file_name
                 END,
-                m.file_format, m.thumb_status, m.thumb_path, m.width, m.height, m.cache_key
+                m.file_format, m.width, m.height, m.cache_key, m.source_revision
          FROM media_items m
          JOIN directories d ON m.directory_id = d.id
          JOIN scan_roots r ON d.root_id = r.id
@@ -66,14 +65,97 @@ pub fn get_pending_face_items(conn: &Connection, limit: i64) -> Result<Vec<Pendi
             id: row.get(0)?,
             abs_path: row.get(1)?,
             file_format: row.get(2)?,
-            thumb_status: row.get(3)?,
-            thumb_path: row.get(4)?,
-            width: row.get(5)?,
-            height: row.get(6)?,
-            cache_key: row.get(7)?,
+            width: row.get(3)?,
+            height: row.get(4)?,
+            cache_key: row.get(5)?,
+            source_revision: row.get(6)?,
         })
     })?;
     rows.map(|r| r.map_err(AppError::from)).collect()
+}
+
+/// 人脸输入可复用的已提交显示产物；尺寸仍由调用方核对文件头。
+pub struct FaceDisplayArtifact {
+    pub item_id: i64,
+    pub cache_key: i64,
+    pub source_revision: i64,
+    pub fingerprint: String,
+    pub path: String,
+}
+
+/// 按任务完整源身份批量读取显示产物，限定同一输出策略，排除失败和已删除源。
+pub fn find_face_display_artifacts(
+    conn: &Connection,
+    items: &[(i64, i64, i64)],
+    policy: &str,
+) -> Result<Vec<FaceDisplayArtifact>> {
+    let mut artifacts = Vec::new();
+    for chunk in items.chunks(256) {
+        let slots = vec!["(?,?,?)"; chunk.len()].join(",");
+        let sql = format!(
+            "WITH requested(item_id,cache_key,source_revision) AS (VALUES {slots})
+             SELECT a.item_id,a.cache_key,a.source_revision,a.fingerprint,a.path
+             FROM requested q JOIN media_items m ON m.id=q.item_id AND m.cache_key=q.cache_key
+                 AND m.source_revision=q.source_revision AND m.is_deleted=0
+             JOIN image_artifacts a ON a.item_id=m.id AND a.cache_key=m.cache_key
+                 AND a.source_revision=m.source_revision
+             WHERE a.kind='display' AND a.status=1 AND a.path IS NOT NULL
+                 AND substr(a.fingerprint,1,length(?)+1)=? || ':'"
+        );
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() * 3 + 2);
+        for &(id, key, revision) in chunk {
+            values.extend([id.into(), key.into(), revision.into()]);
+        }
+        values.extend([policy.to_string().into(), policy.to_string().into()]);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok(FaceDisplayArtifact {
+                item_id: row.get(0)?,
+                cache_key: row.get(1)?,
+                source_revision: row.get(2)?,
+                fingerprint: row.get(3)?,
+                path: row.get(4)?,
+            })
+        })?;
+        for row in rows {
+            artifacts.push(row?);
+        }
+    }
+    Ok(artifacts)
+}
+
+#[cfg(test)]
+mod display_input_tests {
+    use super::*;
+
+    #[test]
+    fn query_filters_policy_status_and_full_source_identity() {
+        let c = Connection::open_in_memory().unwrap();
+        crate::db::schema::initialize_schema(&c).unwrap();
+        c.execute_batch("INSERT INTO scan_roots(id,path,alias) VALUES(1,'/r','r');
+            INSERT INTO directories(id,root_id,rel_path,name) VALUES(1,1,'','r');
+            INSERT INTO media_items(id,directory_id,file_name,file_size,file_mtime,file_format,media_type,width,height,sort_datetime,cache_key,source_revision)
+                VALUES(1,1,'a.jpg',1,1,'jpg','image',2400,1600,1,10,2);
+            INSERT INTO image_artifacts(item_id,cache_key,source_revision,kind,fingerprint,status,path) VALUES
+                (1,10,2,'display','policy:1024',1,'ok.webp'),
+                (1,10,2,'display','other:1024',1,'wrong-policy.webp'),
+                (1,10,1,'display','policy:1024',1,'stale.webp'),
+                (1,10,2,'display','policy:512',2,'failed.webp'),
+                (1,10,2,'ai','policy:2048',1,'wrong-kind.webp');").unwrap();
+        let artifacts = find_face_display_artifacts(&c, &[(1, 10, 2)], "policy").unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].path, "ok.webp");
+        assert!(find_face_display_artifacts(&c, &[(1, 10, 1)], "policy")
+            .unwrap()
+            .is_empty());
+        let pending = get_pending_face_items(&c, 16).unwrap();
+        assert_eq!(pending[0].source_revision, 2);
+        c.execute("UPDATE media_items SET is_deleted=1 WHERE id=1", [])
+            .unwrap();
+        assert!(find_face_display_artifacts(&c, &[(1, 10, 2)], "policy")
+            .unwrap()
+            .is_empty());
+    }
 }
 
 /// 统计待人脸检测的项数量。

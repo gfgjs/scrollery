@@ -182,3 +182,23 @@ impl ProgressThrottle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalize_kills_when_budget_exhausted() {
+        let mut m = FinalizeMonitor::default();
+        let t0 = Instant::now();
+        assert_eq!(m.on_tick(t0, 0), FinalizeAction::Wait); // 第 1 拍宽限
+                                                            // 第 2 拍进入 finalize,起点 = 本拍,进入时 0 字节 → 预算 60s。
+        let entered = t0 + Duration::from_secs(1);
+        assert_eq!(m.on_tick(entered, 0), FinalizeAction::Heartbeat);
+        // 越 60s(从进入时刻起)→ kill(产物字节数即便增长,预算按进入时快照,不被抬高)。
+        assert_eq!(
+            m.on_tick(entered + Duration::from_secs(60), 999_999_999),
+            FinalizeAction::Kill
+        );
+    }
+}

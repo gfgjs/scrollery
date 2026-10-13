@@ -1,12 +1,5 @@
-// src/composables/useSelection.ts
-// 旗舰级选择 composable —— 手势采集层 + classicMode.apply 调度 + SelectionState 持有。
-//
-// Part5 T4b：选区脱离 DOM。内部状态由「裸 Set」改为判别联合 SelectionState（explicit{ids} |
-// all{excluded}），离散意图经 classicMode 策略解释，顺序/全集取自 useViewIds 的布局序
-// flat_ids 而非可视 DOM。这根治 G1 三症状：Shift 跨视口失效 / Ctrl+A 只选一屏 / 框选漏滚出项。
-// 🔴 开发期不冻结契约：当前固定 classic 模式 + 当前意图集，两层结构令后续演进影响面收敛。
-//
-// 设计依据：docs/refactor_2026/2026-06-30-Part5-选区契约与可插拔多模式设计.md §3/§4/§6。
+// 手势生成选区意图，由 classicMode 应用于 SelectionState。
+// 区间与全集取自布局序 flat_ids，避免虚拟化视口限制选区范围。
 
 import { ref, shallowRef, computed, readonly, watch } from 'vue'
 import {
@@ -28,7 +21,7 @@ import { useViewIds } from './useViewIds'
 import { buildCurrentViewDescriptor } from './useViewDescriptor'
 import type { ViewDescriptorDto } from '../types/view'
 
-/** 批量命令的选区入参实型（R1-2/S4：泛型协议层绑定后端 ViewDescriptor 镜像）。 */
+/** 批量命令的选区入参实型，绑定后端 ViewDescriptor 镜像。 */
 export type BackendSelectionDescriptor = SelectionDescriptor<ViewDescriptorDto>
 
 // 视图布局序全集（range / 全选物化 / 反选 的顺序与全集来源,脱离可视 DOM）。
@@ -165,10 +158,8 @@ export function useSelection() {
 
   /**
    * 物化当前选区为 id 数组。
-   * R1-2/S4 后批量命令（收藏/评分/色签/删除/恢复）已改走 [`toBackendDescriptor`] 零物化直传;
-   * 本函数保留给**确需具体 id** 的消费者:移动/复制/加收藏夹（后端命令按 id 编排）、删除暂存
-   * 置灰集与撤销闭包、框选基线快照、语义搜索视图的回退路径。all 态在这些场景仍会物化大数组
-   * （其 SelectAll 深迁移属 T18 后续,按需再动）。
+   * 批量命令走 [`toBackendDescriptor`] 传递描述符；移动/复制/加入收藏夹、删除暂存与撤销、
+   * 框选基线及语义搜索回退路径需要具体 id。这些路径在 all 态下会物化大数组。
    */
   function materializeIds(): number[] {
     if (state.value.kind === 'explicit') return [...state.value.ids]

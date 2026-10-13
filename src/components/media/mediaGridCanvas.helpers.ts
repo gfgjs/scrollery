@@ -1,5 +1,5 @@
-// Canvas 版画廊网格的纯几何计算(命中检测 + cover 裁剪)。抽为纯函数以便单测,
-// 与 MediaGridCanvas.vue 的绘制/IO 分离。承接项目「纯映射进 helpers + spec」惯例。
+// Canvas 网格的几何计算、绘制生命周期与预取调度逻辑。
+// 预取推进器会调用注入的 ensure；具体位图加载仍由组件提供。
 import type { LayoutRow, LayoutRowItem } from '../../types/layout'
 
 /** 命中结果:项 + 所在行的逻辑 y(悬停卡定位需要格子的完整矩形,item 自身只带 x/w/h)。 */
@@ -112,11 +112,11 @@ export interface CanvasPrefetchBudgets {
 /**
  * 按当前一屏真实格数计算 Canvas 预取预算。
  *
- * 旧实现固定为前方 96 / 后方 48，在 60px 极密网格下一屏可达数千格时只够约 2–4 行，
- * 稍快滚动就会越过热区。这里让条目预算与一屏容量同阶：默认前方覆盖 1.25 屏、后方保留
- * 0.5 屏；小屏/大卡片保持旧下限，异常超宽视口再由硬上限和组件侧 512MB 位图预算兜底。
+ * 条目预算须与一屏容量同阶：60px 极密网格下一屏可达数千格，固定预算只够约 2–4 行，
+ * 稍快滚动就越过热区。默认前方覆盖 1.25 屏、后方保留 0.5 屏；小屏/大卡片保持下限，
+ * 异常超宽视口再由硬上限和组件侧 512MB 位图预算兜底。
  * 方向系数可调:闸门关闭(飞掠/拖拽)期组件用「仅前方 1 屏、后方 0」的收缩预算——
- * behindFactor ≤ 0 时后方预算严格为 0(不落旧下限 48),表示该方向整体停取。
+ * behindFactor ≤ 0 时后方预算严格为 0(不落标准下限),表示该方向整体停取。
  */
 export function canvasPrefetchBudgets(
   visibleCells: number,
@@ -137,7 +137,7 @@ export interface PrefetchWalkBudgets {
   maxInFlight: number
 }
 
-/** runPrefetchWalk 的 IO 面(组件注入;纯函数不识别缓存/闸门,只按回调观察)。 */
+/** runPrefetchWalk 的 IO 回调；推进器通过 ensure 发起加载，由组件决定缓存和闸门行为。 */
 export interface PrefetchWalkIo {
   /** 计划游标:下一个候选项,耗尽返回 null。 */
   next: () => LayoutRowItem | null
@@ -161,11 +161,13 @@ export interface PrefetchWalkResult {
 
 /**
  * 预取分片推进器:沿计划游标逐项 ensure,直至任一预算上限。**新启动数**与墙钟是两个
- * 独立预算——旧实现按「走过的项」计数,计划每帧随滚动重建后游标从暖头重扫,预算被
- * 已缓存/在途项白白耗尽,冷尾永远够不着(2026-07-17 阶段 6 根因之一);暖项走查是
- * 亚微秒级 Map/Set 探查,交给墙钟上限约束即可。
+ * 独立预算——计划每帧随滚动重建后游标从暖头重扫,若按「走过的项」计数,预算会被已缓存/
+ * 在途项白白耗尽、冷尾永远够不着;暖项走查是亚微秒级 Map/Set 探查,交给墙钟上限约束即可。
  */
-export function runPrefetchWalk(io: PrefetchWalkIo, budgets: PrefetchWalkBudgets): PrefetchWalkResult {
+export function runPrefetchWalk(
+  io: PrefetchWalkIo,
+  budgets: PrefetchWalkBudgets,
+): PrefetchWalkResult {
   const startedAt = io.now()
   let started = 0
   let walked = 0
@@ -296,20 +298,15 @@ export interface HoverRect {
   y: number
   w: number
   h: number
-  /** 弹出动画起始缩放(= 格原尺寸/目标尺寸,CSS 从 scale(scale0) 过渡到 1)。 */
+  /** 原尺寸与目标尺寸之比；CSS 以原尺寸排版，从 1 过渡到 1/scale0。 */
   scale0: number
-  /** 变换基点 = 原格中心在目标矩形内的坐标(px)。贴边钳位后目标矩形中心 ≠ 格中心,
-   *  CSS 须以格中心为 transform-origin,scale(scale0) 的动画起点才与画格逐像素重合
-   *  (默认居中 origin 会让贴边格的动画从偏移位开始,观感漂移)。 */
-  originX: number
-  originY: number
 }
 
 /**
  * 悬停卡目标矩形:以格中心等比放大 k = max(baseScale, min(minPx/min(w,h), maxScale))——
  * 常规格子放大 1.06 对齐 DOM hover;极小格向最小可用尺寸 minPx 放大(放大镜式,交互控件
- * 可点),但倍率**封顶 maxScale**:真机两轮反馈(先 1.5 仍嫌突兀 → 1.2)宁可略小于 minPx
- * 也保持温和。放大态再视口内推挤钳位:不越 [0,viewW]×[0,viewH],目标大于视口则居中
+ * 可点),但倍率**封顶 maxScale**:宁可略小于 minPx 也保持温和。放大态再视口内推挤钳位:
+ * 不越 [0,viewW]×[0,viewH],目标大于视口则居中
  * (贴边格子向内推,类 tooltip shift)。原位态(k=1)**不钳位**:钳位会把贴视口缘的格
  * (滚动停在中途时的首/尾行)平移出原格,卡与画格错位——DOM 模式里格子从不因 hover 挪位。
  * @param enableScale 是否启用用户设置的悬停放大；关闭时保持原格矩形(不钳位、不放大)。
@@ -324,10 +321,7 @@ export function computeHoverRect(
   enableScale = true,
 ): HoverRect {
   const k = enableScale
-    ? Math.max(
-        baseScale,
-        Math.min(minPx / Math.max(1, Math.min(cell.w, cell.h)), maxScale),
-      )
+    ? Math.max(baseScale, Math.min(minPx / Math.max(1, Math.min(cell.w, cell.h)), maxScale))
     : 1
   const w = cell.w * k
   const h = cell.h * k
@@ -343,8 +337,6 @@ export function computeHoverRect(
     w,
     h,
     scale0: 1 / k,
-    originX: cell.x + cell.w / 2 - x,
-    originY: cell.y + cell.h / 2 - y,
   }
 }
 

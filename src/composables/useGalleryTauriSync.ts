@@ -9,6 +9,7 @@ import { useMediaStore } from '../stores/mediaStore'
 import { useDedupStore } from '../stores/dedupStore'
 import { useUiStore } from '../stores/uiStore'
 import { EVENTS } from '../constants/ipc'
+import { logger } from '../utils/logger'
 import { needsViewportMeta } from '../components/media/mediaGrid.helpers'
 import type { LayoutRow } from '../types/layout'
 
@@ -41,7 +42,7 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
     }
   }
 
-  // useTauriListen 内部处理 disposed 竞态并在作用域销毁时解绑(P1-11),故直接在 setup 同步注册。
+  // useTauriListen 处理 disposed 竞态并在作用域销毁时解绑，故直接在 setup 同步注册。
   useTauriListen(EVENTS.MEDIA_ENRICHED, () => {
     // 数据增强每批触发一次:2s 首沿窗口——每个待刷新窗口自首事件起最多等待 2s,
     // 窗口内的后续事件不延后。(旧写法是纯尾沿防抖:持续富化期间事件不断推后,
@@ -55,10 +56,39 @@ export function useGalleryTauriSync(deps: GalleryTauriSyncDeps) {
     }, 2000)
   })
 
-  // 卷插拔监听（Part2 T2）：卷在线态变化 → 重算刷新 availability 徽标（离线灰显隐）。
+  // 卷插拔监听：卷在线态变化时刷新 availability 徽标。
   // 卷态变化频率极低（拔插），无需防抖，直接重算即可。
   useTauriListen(EVENTS.VOLUMES_CHANGED, () => {
     deps.requestCompute()
+  })
+
+  // 文件监听对账完成（fs_watch 广播 { rootId, directories }）：磁盘内容变化后
+  // 统计数与会入库项可能已变，刷新统计并请求重算当前视图（requestCompute 自带离屏 deferred）。
+  // 目录树侧由 useFolderTreeSync 各自监听同一事件做原位刷新，与此处互不依赖。
+  //
+  // 可视元数据（名称/路径/EXIF）会因磁盘改动而变，而 id 不变 → viewport-meta 的 watch 源
+  // （layoutSemanticKey + 元素列表）不变，watch 不会重跑，旧名称/路径会滞留。故这里先清空
+  // meta 窗口，再按当前可视行主动重取一次（口径与下方 viewport-meta watch 完全一致）。
+  function refreshViewportMeta() {
+    media.ensureMeta([]) // 清空待发集合并撤销在途响应，避免旧结果回写
+    if (!media.layoutSemanticKey || !ui.showThumbInfo || !needsViewportMeta(ui.thumbInfoElements)) return
+    const rows = deps.activeRows()
+    if (rows.length === 0 && media.totalRows > 0) return // 换代中：与 watch 一致，等首段就绪
+    const ids: number[] = []
+    for (const row of rows) {
+      if (row.rowType === 'normal') {
+        for (const it of row.items) ids.push(it.id)
+      }
+    }
+    if (ids.length > 0) media.ensureMeta(ids)
+  }
+
+  useTauriListen(EVENTS.FILES_CHANGED, () => {
+    void media.loadStats().catch((error) => {
+      logger.error('[GalleryTauriSync] files:changed 刷新统计失败', { error })
+    })
+    deps.requestCompute()
+    refreshViewportMeta()
   })
 
   // 组件卸载与(父 composable / effectScope)销毁都会走到这里:监听器解绑由

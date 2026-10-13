@@ -6,7 +6,7 @@
 //   与 useTitlebarMode 默认合并的不对称是有意的(各自被推翻/保留的「原设计」不同)。
 // 状态经本模块级单例共享(SelectionToolbar 形态分支 + AppStatusBar 让位判断 + 设置页开关同源)。
 //
-// 存储(设置集中保存,批次B):selection_bar_docked(bool) / selection_bar_offset(内联表 {x,y}) /
+// 设置存储：selection_bar_docked(bool) / selection_bar_offset(内联表 {x,y}) /
 // selection_bar_align(枚举)三键均在后端 schema 注册;offset 在 IPC 上是规范 JSON 文本,形状校验
 // 复用 parseStoredOffset(纯函数,spec 穷举)。本文件不再自持 localStorage,重置后经中央快照回落默认。
 import { computed, ref } from 'vue'

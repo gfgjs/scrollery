@@ -25,7 +25,7 @@ const CUE_NUMBER_RE = /^\d+$/
 // srt 常见格式标签白名单(保留),其余尖括号一律转义防注入
 // 正则同时匹配纯标签和带属性的标签,后续在转义前剥除属性
 // (VTT cue 中白名单标签不需要也不该携带 HTML 属性)
-const ALLOWED_TAG_RE = /<(\/?)(b|i|u)(\s[^>]*)?>/gi
+const TAG_OR_BRACKET_RE = /<(\/?)(b|i|u)(\s[^>]*)?>|[<>]/gi
 
 /**
  * 将单条 srt 时间戳(逗号或点分隔毫秒)标准化为 WebVTT 要求的点分隔、
@@ -45,15 +45,11 @@ function normalizeTimestamp(raw: string): string | null {
  * 防止字幕文本中夹带任意 HTML/脚本注入。
  */
 function escapeTextKeepAllowedTags(text: string): string {
-  const placeholders: string[] = []
-  const withPlaceholders = text.replace(ALLOWED_TAG_RE, (_, slash: string, tagName: string) => {
-    // 归一化白名单标签:剥除可能存在的属性,转换为小写纯标签
-    const normalized = `<${slash}${tagName.toLowerCase()}>`
-    placeholders.push(normalized)
-    return ` ${placeholders.length - 1} `
+  // 直接处理标签与尖括号，不用会与字幕原文数字冲突的临时占位符。
+  return text.replace(TAG_OR_BRACKET_RE, (token, slash: string, tagName?: string) => {
+    if (tagName) return `<${slash}${tagName.toLowerCase()}>`
+    return token === '<' ? '&lt;' : '&gt;'
   })
-  const escaped = withPlaceholders.replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  return escaped.replace(/ (\d+) /g, (_, idx: string) => placeholders[Number(idx)])
 }
 
 /**

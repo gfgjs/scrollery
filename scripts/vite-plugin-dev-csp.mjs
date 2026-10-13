@@ -1,4 +1,4 @@
-// dev 态注入 CSP(2026-07-16 安全审查 #4:此前 dev 环境完全没有 CSP)。
+// dev 态注入 CSP。
 //
 // 为什么必须由 Vite 注入、Tauri 管不到(已读 tauri 2.11.4 源码核实,非推理):
 // Tauri 的 CSP 注入(tauri crate manager/mod.rs 的 set_csp,含内联脚本/样式的自动 CSP 哈希)

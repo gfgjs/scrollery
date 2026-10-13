@@ -1,6 +1,5 @@
 <script setup lang="ts">
-// 时间线直方图 + 级别分布(日志能力重构 S5 P2,方案 §5「时间线直方图+级别分布」)。
-// 手写内联 SVG 堆叠柱状图——不引图表库(§9.1 护栏 #1「此外一律不引」精神下 S5 同样不新增前端依赖),
+// 时间线直方图与级别分布使用内联 SVG 堆叠柱状图，
 // 数据来自后端 compute_log_histogram(rusqlite 临时表 GROUP BY strftime 分桶),本组件只管渲染。
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'

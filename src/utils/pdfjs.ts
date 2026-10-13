@@ -1,5 +1,5 @@
 // src/utils/pdfjs.ts
-// pdf.js 懒加载单例（§3.4/§5.1）。首次使用时才动态 import，并配置同源 worker
+// pdf.js 懒加载单例。首次使用时才动态 import，并配置同源 worker
 // （Vite 打包，CSP worker-src 回退 script-src 'self' → 允许）。文档缩略图与阅读器共用。
 
 let pdfjs: typeof import('pdfjs-dist') | null = null

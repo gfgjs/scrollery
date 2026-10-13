@@ -1,5 +1,5 @@
 // src-tauri/src/ai/face_pipeline/writer.rs
-//! Writer 阶段:批量收集结果,先删后插 `faces` 行,更新 `face_status`,驱动增量聚类。
+//! Writer：批量收集结果，更新 `faces` 与 `face_status`，驱动增量聚类。
 
 use std::sync::Arc;
 
@@ -33,9 +33,9 @@ pub(super) fn write_face_results(
     // - 大批（BATCH_SIZE=512）：对累积的 `cluster_pending` 跑一次昂贵的增量聚类。
     // 解耦后 `processedItems`（数 face_status≠0）平滑增长，而聚类仍低频跑。
     // (item_id, cache_key 快照):X1 条件写要求落库时逐项核对 cache_key 未变。
-    let mut done_ids: Vec<(i64, i64)> = Vec::with_capacity(STATUS_FLUSH_EVERY);
+    let mut done_ids: Vec<(i64, i64, i64)> = Vec::with_capacity(STATUS_FLUSH_EVERY);
     let mut rows: Vec<NewFace> = Vec::new();
-    let mut failed_ids: Vec<(i64, i64)> = Vec::new();
+    let mut failed_ids: Vec<(i64, i64, i64)> = Vec::new();
     // 脸已落库、status 已 Done、但尚未聚类的 item_id。聚类按 item_id 从库读回脸，故此处累积安全。
     let mut cluster_pending: Vec<i64> = Vec::with_capacity(BATCH_SIZE as usize);
     let mut total_written: u64 = 0;
@@ -53,11 +53,11 @@ pub(super) fn write_face_results(
 
                 match result.records {
                     Some(mut recs) => {
-                        done_ids.push((result.item_id, result.cache_key));
+                        done_ids.push((result.item_id, result.cache_key, result.source_revision));
                         rows.append(&mut recs);
                     }
                     None => {
-                        failed_ids.push((result.item_id, result.cache_key));
+                        failed_ids.push((result.item_id, result.cache_key, result.source_revision));
                     }
                 }
 
@@ -141,7 +141,7 @@ pub(super) fn write_face_results(
 /// 落库 → `Done` 永远蕴含脸已写，崩溃/取消时不会出现「Done 但零脸」的漏脸。
 fn flush_face_rows(
     state: &Arc<AppState>,
-    done_ids: &mut Vec<(i64, i64)>,
+    done_ids: &mut Vec<(i64, i64, i64)>,
     rows: &mut Vec<NewFace>,
     profile: &FaceProfile,
     cluster_pending: &mut Vec<i64>,
@@ -190,7 +190,7 @@ fn flush_cluster(state: &Arc<AppState>, cluster_pending: &mut Vec<i64>, profile:
 }
 
 /// 把一批失败项标记为 `face_status=Error`（镜像 CLIP 的 `flush_failed`;X1 条件写,失效项不标）。
-fn flush_face_failed(state: &Arc<AppState>, failed_ids: &mut Vec<(i64, i64)>) {
+fn flush_face_failed(state: &Arc<AppState>, failed_ids: &mut Vec<(i64, i64, i64)>) {
     let conn = state.db_writer.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = batch_update_face_status_guarded(&conn, failed_ids, FaceStatus::Error.as_i64())
     {

@@ -1,12 +1,11 @@
 <template>
-  <!-- 画廊筛选 chips(顶栏重构 Phase G G4)。从 AppToolbar 抽出以支持 Priority+ 逐项折叠:
+  <!-- 画廊筛选 chips 支持按优先级逐项折叠：
        内联实例(variant=inline)承载 useToolbarOverflow 的测量对象(data-toolbar-item), 按
        visibleCount 逐项显隐;溢出项由「筛选 ⋯」弹层里的 menu 实例(variant=menu)渲染。
        两实例状态全经 filterStore 同步, 无重复真值源(同 GalleryViewControls 双渲染模式)。
        chip 顺序即优先级(靠前越晚折叠), 顺序与位次的**唯一事实源**是
-       filterChips.descriptors.ts —— 模板一律经 idx('xxx') 取位次, 不再手写 0..7 字面量:
-       插一个 chip 曾要把后面每个数字手工加一, 错了不报错只是折错 chip(S 线 §5)。 -->
-  <!-- ── 重复镜头组(2026-09-02 方案 §4.1,固定在筛选 chip 集合首段)──────────────────── -->
+       filterChips.descriptors.ts，模板经 idx('xxx') 取位次。 -->
+  <!-- 重复镜头组固定在筛选 chip 集合首位。 -->
   <!-- 重复项入口:未激活点击进入 groups;激活时选中态高亮,再点退出镜头。
        激活反馈即时(store 动作同步改状态),不等后端布局完成。 -->
   <div
@@ -48,7 +47,7 @@
     </div>
   </div>
 
-  <!-- ── 普通筛选 chips:镜头激活时整体暂停(§4.1)——不卸载 fmt 实例(useFormatFilter 的剪枝
+  <!-- 普通筛选 chips 在镜头激活时整体暂停；不卸载 fmt 实例（useFormatFilter 的剪枝
        watch 在 script setup 常驻),仅从 DOM 摘除渲染与交互入口;存在性同步收束在 descriptors 里,
        DOM 序与 CHIPS 序保持逐项对应(useToolbarOverflow 位次前提)。 -->
   <template v-if="!lensActive">
@@ -111,8 +110,8 @@
       </button>
     </div>
   </div>
-  <!-- 细分格式（S 线 §7）: 一级触发器, 不把几十个格式 chip 铺在顶栏。位次紧随「收藏」= §5
-       字面顺序(R-17 挪位;DOM 序必须与 filterChips.descriptors 的 CHIPS 序逐项对应)。
+  <!-- 细分格式使用一级触发器，避免在顶栏铺开几十个格式 chip。位次紧随「收藏」，
+       DOM 顺序须与 filterChips.descriptors 的 CHIPS 顺序一致。
        文案「格式」→「格式 N」随已选**个数**变宽 —— 该反应源已在描述符里随 chip 一同声明。 -->
   <div
     v-show="inDom(idx('format'))"
@@ -155,7 +154,7 @@
       </div>
     </div>
   </div>
-  <!-- 颜色标签筛选（T16）：内联色块直接绑 colorLabel（精确匹配某色档）；点当前色清空。 -->
+  <!-- 颜色标签筛选按色档精确匹配；点当前色清空。 -->
   <div
     v-show="inDom(idx('color'))"
     :data-toolbar-item="itemAttr"
@@ -172,7 +171,7 @@
       </div>
     </div>
   </div>
-  <!-- 日期范围筛选（T15）：chip 切换弹层，弹层内两个原生日期输入绑 from/to。
+  <!-- 日期范围筛选的弹层使用两个原生日期输入绑定 from/to。
        两端皆备方下发 date_range 谓词（见 filterStore.toApiFilter）；active 态同步。 -->
   <div
     v-show="inDom(idx('date'))"
@@ -212,7 +211,7 @@
   </template>
   <!-- </template v-if="!lensActive"> 普通筛选 chips 到此为止(含上方两个弹层) -->
 
-  <!-- 已暂停筛选摘要弹层:只读陈列,无修改入口(§4.1);定位/dismiss 交 UiPopover 原语。 -->
+  <!-- 已暂停筛选摘要只读展示，定位与关闭交给 UiPopover。 -->
   <UiPopover
     v-model:open="showPausedPopover"
     :anchor="pausedChipRef ?? null"
@@ -305,13 +304,12 @@ const props = defineProps<{
 const filter = useFilterStore()
 const { t } = useI18n()
 
-// ── 重复镜头(2026-09-02 方案 §4.1)──────────────────────────────────────────────
-// URL 是镜头模式的事实源(§10.1),store.mode 由 useGalleryQuerySync 从路由收敛;本组件只发动作。
+// URL 是重复镜头模式的事实源，useGalleryQuerySync 将路由同步到 store；本组件只发动作。
 const lens = useDuplicateLensStore()
 const lensActive = computed(() => lens.isLensActive)
 
 function toggleLens() {
-  // 未激活点击进入 groups(§4.1 首次默认);已激活再点退出镜头、恢复返回快照。
+  // 未激活时进入 groups，已激活时退出镜头并恢复返回快照。
   if (lensActive.value) lens.exitLens()
   else lens.enterLens('groups')
 }
@@ -322,7 +320,7 @@ function toggleLens() {
  */
 const chipState = computed<FilterChipState>(() => chipStateOf(filter, lensActive.value))
 
-/** 已暂停筛选的维度数(§4.1「已暂停 N 个筛选」的 N;与 hasActiveFilters 同一套维度判定)。 */
+/** 已暂停的筛选维度数；与 hasActiveFilters 使用同一套维度判定。 */
 const pausedCount = computed(() => pausedFilterCount(chipState.value))
 
 /** data-toolbar-item 仅内联实例需要(测量对象在 .toolbar__filters 容器内 querySelector);

@@ -1,168 +1,14 @@
 // crates/scrollery-ai-core/src/clip.rs
 //! Chinese-CLIP 推理：图像预处理与文本分词。
 //!
-//! 模型：eisneim/cn-clip_vit-b-16（FP16 外部数据格式，需要 ORT 1.26+）
+//! 图像编码器按 profile 的 `image_size` 缩放、中心裁剪并归一化，再输出单位向量。
+//! 文本编码器按 profile 的词表、序列长度和输入名分词与推理。
 //!
-//! 图像编码器管线:RGB → Resize(shortest_edge=224, Bicubic) → CenterCrop(224)
-//!   → Normalise(CLIP mean/std) → CHW f32 张量 → "image" 输入
-//!   → "unnorm_image_features" [1,512] → L2 归一化 → 512 维单位向量
-//!
-//! 文本编码器管线:BERT 分词(vocab.txt,21128 tokens)→ token_ids i64[1,52]
-//!   → "text" 输入 → "unnorm_text_features" [1,512] → L2 归一化 → 512 维单位向量
-//!
-//! # 踩坑记录 — 接入 CLIP 类多模态模型的经验总结
-//!
-//! 以下经验适用于所有 CLIP 变体（OpenAI CLIP / Chinese-CLIP / SigLIP / EVA-CLIP 等）
-//! 和任何使用 ONNX Runtime 进行跨模态（图像-文本）语义搜索的场景。
-//!
-//! ## 坑1（致命）：vocab.txt 必须与模型的文本编码器严格匹配
-//!
-//! 这是我们遇到的**准确率低至 30% 的根因**。
-//!
-//! `eisneim/cn-clip_vit-b-16` 仓库附带的 `vocab.txt` 是 **英文 OpenAI CLIP**
-//! 的 BPE 词表（~5594 tokens），而 Chinese-CLIP 的文本编码器是
-//! `RoBERTa-wwm-ext-base-chinese`（= BERT），需要 `bert-base-chinese` 的
-//! WordPiece 词表（**21128 tokens**）。
-//!
-//! 用错误的词表时，所有中文字符都被编码为 `[UNK]`：
-//! ```text
-//! 错误："小猫" → [CLS=2, UNK=1, UNK=1, SEP=3]
-//!       "花朵" → [CLS=2, UNK=1, UNK=1, SEP=3]   // 完全相同！
-//!       cosine_similarity = 1.0000                 // 无法区分任何查询
-//!
-//! 正确："小猫" → [CLS=101, 小=2207, 猫=4344, SEP=102]
-//!       "花朵" → [CLS=101, 花=5709, 朵=3321, SEP=102]
-//!       cosine_similarity = 0.8499                 // 合理的语义相似度
-//! ```
-//!
-//! **检查方法**：加载 vocab 后检查 `vocab_size`，BERT 系列应 ≥ 20000。
-//! **正确来源**：`OFA-Sys/chinese-clip-vit-base-patch16` 的 `vocab.txt`。
-//! **通用规则**：永远从模型原始作者（OFA-Sys）获取 vocab，而不是第三方 ONNX 导出者。
-//!
-//! ## 坑2：图像预处理顺序不能搞反 — 先 Resize 后 CenterCrop
-//!
-//! CLIP 系列的标准预处理是：
-//! ```text
-//! 正确：Resize(shortest_edge=224, BICUBIC) → CenterCrop(224) → Normalize
-//! 错误：CenterCrop(最大正方形)              → Resize(224)     → Normalize
-//! ```
-//!
-//! 区别示例（1920×1080 照片）：
-//! - 错误做法：先裁成 1080×1080（丢失左右各 420px），再缩到 224
-//! - 正确做法：先缩到 398×224（保持比例），再裁成 224×224（只丢各 87px）
-//!
-//! 错误做法丢失大量语义信息，图像特征与训练时期望的特征偏离。
-//!
-//! **检查方法**：找一张宽幅全景照（如 16:9），分别用两种方式预处理后做推理，
-//! 比较与 Python `cn_clip.clip.image_transform` 的输出差异。
-//!
-//! **通用规则**：查看模型仓库的 `preprocessor_config.json` 或 Python 推理代码，
-//! 严格按照 `Resize → CenterCrop` 的顺序实现。
-//!
-//! ## 坑3：插值方法必须一致 — CatmullRom ≈ PIL.Image.BICUBIC
-//!
-//! CLIP 训练时使用 PIL 的 BICUBIC 插值。Rust `image` crate 中：
-//! - `CatmullRom` ≈ Bicubic（推荐，与 PIL 最接近）
-//! - `Lanczos3` = sinc 插值（高频响应不同，会产生微妙的特征偏移）
-//!
-//! **通用规则**：查看 `preprocessor_config.json` 的 `"resample"` 字段，
-//! PIL resample 枚举：0=NEAREST, 1=LANCZOS, 2=BILINEAR, 3=BICUBIC。
-//!
-//! ## 坑4：tokenizers crate 不会自动添加 [CLS]/[SEP]
-//!
-//! 与 Python `transformers.BertTokenizer` 不同，Rust `tokenizers` crate 的
-//! `encode(text, true)` 中 `true` 只是个提示，如果没有配置 PostProcessor，
-//! 它不知道要添加什么特殊 token。
-//!
-//! **必须手动配置** `TemplateProcessing` 或 `BertProcessing`：
-//! （示意伪代码，故标 `ignore` 不编译——省略了 import / builder 收尾，仅展示 API 形状）
-//! ```ignore
-//! TemplateProcessing::builder()
-//!     .try_single("[CLS]:0 $A:0 [SEP]:0")
-//!     .special_tokens(vec![("[CLS]", 101), ("[SEP]", 102)])
-//! ```
-//!
-//! **检查方法**：编码 "小猫" 后打印 token IDs，确认首位是 101、末位是 102。
-//!
-//! ## 坑5：手动截断会丢失 [SEP] — 使用 TruncationParams
-//!
-//! 如果在 `encode()` 返回后手动 `ids[..MAX_SEQ_LEN]` 截断，
-//! 超长文本的最后一个 token（[SEP]=102）会被截掉，破坏 BERT 的句边界语义。
-//!
-//! **正确做法**：配置 `tokenizer.with_truncation(Some(TruncationParams { ... }))`，
-//! tokenizers crate 会智能截断内容 token 并保留 [CLS] 和 [SEP]。
-//! 同时配置 `with_padding(Some(PaddingParams { ... }))` 让 crate 自动填充到固定长度。
-//!
-//! ## 坑6：ONNX 模型输出可能未归一化
-//!
-//! 部分导出的 ONNX 模型输出的是**未归一化**的原始特征向量（如 `unnorm_*`），
-//! 必须在推理后手动 L2 归一化才能用于余弦相似度搜索。
-//! 也有些模型（如旧版 cn-clip-vit-b16-*.onnx）输出已归一化的向量。
-//!
-//! **检查方法**：看输出 tensor 名称是否有 `unnorm` 前缀，
-//! 或检查输出向量的 L2 范数是否 ≈ 1.0。
-//!
-//! # 踩坑记录 — 导出篇（PyTorch → ONNX，2026-06 导 ViT-L/14@336 时踩齐）
-//!
-//! 导出脚本见 `tools/export_clip_l14_336_onnx.py`（含逐条详注）、
-//! 验证脚本 `tools/validate_clip_l14_336_onnx.py`。以下按出现顺序：
-//!
-//! ## 坑7（关键·决定精度）：cn-clip 的 BERT 文本编码器在 fp16 下数值塌缩
-//!
-//! fp16 文本编码器**能加载但算错**：注意力分数 / softmax / LayerNorm 在 fp16 下溢出，
-//! 所有文本嵌入退化为几乎相同的向量。实测（ORT CPU）：fp16 输出 vs PyTorch(fp32) 余弦
-//! 仅 ~0.2，且任意两条不同文本互相余弦 0.999+（完全无法区分）。这与近期 commit
-//! 「文本编码器强制走 CPU（DirectML 静默算错文本模型）」是同一现象。
-//! **对策**：ViT-L 走精确 **fp32**（profile `cn-clip-vit-l14-336` 即 `.fp32.onnx`）；
-//! 轻量化用 B/16 fp16（eisneim 仓库直供、已验证可用）。
-//! **通用规则**：fp16 验证**绝不能只看「能加载」**，必须与原始 PyTorch 输出逐条比对余弦 ≥0.99。
-//!
-//! ## 坑8：opset 必须 ≥17，否则 fp16 触发 ORT 的 LayerNorm 融合崩溃
-//!
-//! opset 14 把 LayerNorm 拆成 ReduceMean/Sqrt/Sub/Div/... 一堆原语；转 fp16 后
-//! ORT 的 `SimplifiedLayerNormFusion` 想把它们重新融合，却被中间插入的 Cast 节点卡住，
-//! 加载即报 `GetIndexFromName ... InsertedPrecisionFreeCast ... 不存在`。
-//! opset 17 把 LayerNorm 导成单个 `LayerNormalization` 算子，无可重融合的原语 → 规避。
-//! （SDPA 算子另需 opset≥14；torch 2.12 把注意力融合成 `scaled_dot_product_attention`。）
-//!
-//! ## 坑9：官方 cn_clip.deploy 的 fp16 入口已失效
-//!
-//! 官方脚本 `from onnxmltools.utils import convert_float_to_float16` 在新版 onnxmltools
-//! 中已退化为「抛 NotImplementedError」的桩函数（`tools/convert_large_onnx.bat` 注释记录了
-//! 这个「依赖地狱」）。**对策**：改用 `onnxruntime.transformers.float16.convert_float_to_float16`
-//! （它能正确改写视觉模型里的 Cast 节点，`onnxconverter_common` 的同名函数则不能，会产生
-//! 「conv1 输入 float / 权重 float16」类型冲突）。
-//!
-//! ## 坑10：torch 2.12 默认 dynamo 导出器 + Windows 大文件写盘
-//!
-//! - torch 2.12 默认 dynamo（torch.export）路径不能稳妥处理 `(None, text)` / `(image, None)`
-//!   这种 None 占位入参，也可能不严格沿用 io 名 → 显式 `dynamo=False` 走旧 TorchScript 导出器。
-//! - 旧导出器把 ~1.2GB 的 fp32 图**一次性写盘**，在 Windows 触发 `[Errno 22] Invalid argument`
-//!   → 改为导出到内存 `io.BytesIO`，再用 onnx 的外部数据格式保存（按块写盘）。
-//!
-//! ## 坑11（隐蔽）：onnx 写外部数据是 append 模式，重导前必须删旧 `.extra_file`
-//!
-//! `onnx.save_model(save_as_external_data=True)` 写权重时以**追加模式 `'ab'`** 打开
-//! `.extra_file`。若上次导出的 `.extra_file` 还在，新权重会被**追加**而非覆盖 →
-//! 文件体积**正好翻倍**；更坑的是 header 偏移指向新追加段，模型**仍能正常加载、推理结果正确**，
-//! 只是白白多占一倍磁盘/下载。仅删 `.onnx` 头不够，**必须连 `.extra_file` 一起删**。
-//!
-//! ## 关于动态 batch 轴
-//!
-//! 图像塔导出默认把 batch 轴设为动态（`dynamic_axes={"image": {0: "batch"}}`），
-//! 区别于 eisneim B/16 把 batch 钉死为 1。动态轴下 `encode_image_batch` 会整批送入（强 GPU 提速）；
-//! 钉死为 1 时则回退逐张推理（`image_input_fixed_batch` 探测）。两种导出本函数都能正确处理。
-//!
-//! ## 诊断技巧：写 Python 对比脚本
-//!
-//! 当搜索准确率不符合预期时，最有效的诊断方法是写一个 Python 脚本：
-//! 1. 用 `tokenizers` Python 库（与 Rust crate 同源）加载 vocab 并编码
-//! 2. 用 `onnxruntime` 加载同一个 ONNX 模型并推理
-//! 3. 比较文本间的余弦相似度是否合理
-//! 4. 关键判据：语义不同的文本（如"小猫"vs"花朵"）相似度不应该 > 0.95
-//!
-//! 如果 Python 也产出错误结果，说明是数据问题（vocab/模型文件）；
-//! 如果 Python 正确但 Rust 不对，说明是代码问题（预处理/tokenizer 配置）。
+//! 词表必须与文本塔匹配：Chinese-CLIP 使用 BERT WordPiece，错误词表会使中文查询退化为 [UNK]。
+//! 加载时按 profile 的最小词表规模校验；TemplateProcessing 添加 [CLS]/[SEP]，
+//! TruncationParams 保留句末 [SEP]，PaddingParams 补齐到 profile 的序列长度。
+//! 图像预处理按短边缩放后中心裁剪，CatmullRom 对齐训练所用的 bicubic。
+//! 未归一化的模型输出按 profile 再做 L2；固定与动态 batch 均由输入形状决定派发方式。
 
 use std::path::Path;
 
@@ -293,15 +139,8 @@ pub fn encode_image(
     run_image_inference(session_pool, array, profile)
 }
 
-/// 将预解码的图像（RGBA u8 像素）编码为 512-d 单位向量。
-///
-/// The image should already be resized to `short_edge=224` by the `ImageEngine`.
-/// This function only performs lightweight CenterCrop + Normalize + CHW conversion
-/// on the small (~336×224) image before running CLIP inference.
-///
-/// 图像应已由 `ImageEngine` 缩放至 `short_edge=224`。
-/// 本函数仅在小图（约 336×224）上执行轻量的 CenterCrop + 归一化 + CHW 转换，
-/// 然后运行 CLIP 推理。
+/// 将预缩放的 RGBA 图像编码为 profile 指定维度的单位向量。
+/// 本函数按 `profile.image_size` 中心裁剪、归一化并转换为 CHW 张量。
 pub fn encode_image_from_decoded(
     session_pool: &crate::engine::SessionPool,
     decoded: &DecodedImage,
@@ -338,6 +177,21 @@ fn image_input_fixed_batch(session: &ort::session::Session, image_input: &str) -
         Some(d) if d > 0 => Some(d as usize),
         _ => None,
     }
+}
+
+/// 读取已装载图像编码器的真实 batch 轴；动态轴返回 `None`。
+///
+/// 调度方在装载时保存此值，避免固定大批模型被拆成小批后反复填充。
+pub fn fixed_image_batch(
+    pool: &crate::engine::SessionPool,
+    profile: &ModelProfile,
+) -> Result<Option<usize>> {
+    let guard = pool
+        .get()
+        .ok_or_else(|| AiError::Internal("Session pool disconnected".into()))?;
+    let names = session_input_names(&guard);
+    let input = resolve_single_input_name(&names, &profile.image_input, "image")?;
+    Ok(image_input_fixed_batch(&guard, &input))
 }
 
 /// 装载期契约自检(2026-07-10 审查 K1 后半):用 ONNX 元数据在**激活时**即拒错配模型,
@@ -444,6 +298,52 @@ pub fn encode_image_batch(
     encode_image_batch_timed(session_pool, batch_tensor, profile, None)
 }
 
+/// 生成连续推理输入；固定尾批沿用末样本填充，不改输入数值。
+fn image_row_data(
+    batch: &mut Option<Array4<f32>>,
+    start: usize,
+    end: usize,
+    run_rows: usize,
+) -> Vec<f32> {
+    let original = batch.as_ref().expect("输入张量在分块完成前保留");
+    if start == 0 && end == original.shape()[0] && run_rows == end && original.is_standard_layout()
+    {
+        // 完整批直接交出已有缓冲区；带偏移的拥有切片仍只保留它的有效元素。
+        let len = original.len();
+        let (mut data, offset) = batch
+            .take()
+            .expect("完整批只消费一次")
+            .into_raw_vec_and_offset();
+        if let Some(offset) = offset.filter(|offset| *offset != 0) {
+            data.drain(..offset);
+        }
+        data.truncate(len);
+        return data;
+    }
+    let sub = batch
+        .as_ref()
+        .expect("输入张量在分块完成前保留")
+        .slice(ndarray::s![start..end, .., .., ..])
+        .to_owned();
+    let cur = end - start;
+    if run_rows > cur {
+        let (_, channels, height, width) = sub.dim();
+        let mut padded = Array4::<f32>::zeros((run_rows, channels, height, width));
+        padded
+            .slice_mut(ndarray::s![0..cur, .., .., ..])
+            .assign(&sub);
+        let last = sub.slice(ndarray::s![cur - 1..cur, .., .., ..]);
+        for r in cur..run_rows {
+            padded
+                .slice_mut(ndarray::s![r..r + 1, .., .., ..])
+                .assign(&last);
+        }
+        padded.into_raw_vec_and_offset().0
+    } else {
+        sub.into_raw_vec_and_offset().0
+    }
+}
+
 /// 同 [`encode_image_batch`];`timing` 为 `Some` 时才采集分段耗时。
 pub fn encode_image_batch_timed(
     session_pool: &crate::engine::SessionPool,
@@ -452,7 +352,6 @@ pub fn encode_image_batch_timed(
     timing: Option<&mut ImageBatchTiming>,
 ) -> Result<Vec<Vec<f32>>> {
     let s = profile.image_size as i64;
-    let side = profile.image_size as usize;
     let dim = profile.embed_dim;
     let n_total = batch_tensor.shape()[0];
 
@@ -474,6 +373,7 @@ pub fn encode_image_batch_timed(
     //   输出、丢弃填充行。这样无论 dyn / 固定 batch 导出，推理都正确。
     let fixed = image_input_fixed_batch(&guard, &image_input);
     let chunk = fixed.unwrap_or(n_total).max(1);
+    let mut batch_tensor = Some(batch_tensor);
 
     let mut results: Vec<Vec<f32>> = Vec::with_capacity(n_total);
 
@@ -482,35 +382,14 @@ pub fn encode_image_batch_timed(
         let cur = end - start;
         clock.begin();
 
-        // 物化连续的 [cur,3,S,S] 子批 —— 切片视图非拥有所有权的 Vec，而 `Tensor::from_array` 需要拥有的扁平数据。
-        let sub = batch_tensor
-            .slice(ndarray::s![start..end, .., .., ..])
-            .to_owned();
-
         // 固定 batch 模型且本块不足 k → 补齐到 k（用最后一帧填充）；否则直接用 cur 行。
         let run_rows = match fixed {
             Some(k) if cur < k => k,
             _ => cur,
         };
-        let tensor = if run_rows > cur {
-            let mut padded = Array4::<f32>::zeros((run_rows, 3, side, side));
-            padded
-                .slice_mut(ndarray::s![0..cur, .., .., ..])
-                .assign(&sub);
-            let last = sub.slice(ndarray::s![cur - 1..cur, .., .., ..]).to_owned();
-            for r in cur..run_rows {
-                padded
-                    .slice_mut(ndarray::s![r..r + 1, .., .., ..])
-                    .assign(&last);
-            }
-            let shape: [i64; 4] = [run_rows as i64, 3, s, s];
-            let (flat_data, _offset) = padded.into_raw_vec_and_offset();
-            Tensor::from_array((shape, flat_data)).map_err(AiError::Ort)?
-        } else {
-            let shape: [i64; 4] = [cur as i64, 3, s, s];
-            let (flat_data, _offset) = sub.into_raw_vec_and_offset();
-            Tensor::from_array((shape, flat_data)).map_err(AiError::Ort)?
-        };
+        let shape: [i64; 4] = [run_rows as i64, 3, s, s];
+        let flat_data = image_row_data(&mut batch_tensor, start, end, run_rows);
+        let tensor = Tensor::from_array((shape, flat_data)).map_err(AiError::Ort)?;
         clock.end(|t| &mut t.prep_us);
 
         clock.begin();
@@ -555,14 +434,10 @@ pub fn encode_image_batch_timed(
     Ok(results)
 }
 
-/// 将图像预处理为 [1, 3, 224, 224] f32 数组。
+/// 将图像预处理为 `[1, 3, image_size, image_size]` f32 数组。
 ///
-/// 流水线与官方 Chinese-CLIP (cn_clip) 一致：
-///   RGB → 按短边缩放到224(Bicubic) → 中心裁剪224 → 归一化
-///
-/// 【关键修复】旧代码先 CenterCrop(最大正方形) 再 Resize(224, Lanczos3)，
-/// 导致宽幅图像丢失大量语义内容（如 1920×1080 图片会先裁掉左右各 420px）。
-/// 正确做法是先按短边等比缩放，再裁剪，最大限度保留图像内容。
+/// RGB → 按短边等比缩放至 `profile.image_size` → 中心裁剪 → 归一化。
+/// 先缩放再裁剪，避免宽幅图像在缩放前丢失过多内容。
 pub fn preprocess_image(img: &DynamicImage, profile: &ModelProfile) -> Array4<f32> {
     let img_size = profile.image_size;
     let (mean, std) = (profile.mean, profile.std);
@@ -586,7 +461,7 @@ pub fn preprocess_image(img: &DynamicImage, profile: &ModelProfile) -> Array4<f3
     let cropped = image::imageops::crop_imm(&resized, cx, cy, img_size, img_size).to_image();
 
     // 4. HWC → CHW，使用 CLIP 均值/标准差归一化
-    //    平坦 slice 写(T18.5):ndarray 逐元素索引在 dev 构建(opt-0)是热点;
+    //    平坦 slice 写：ndarray 逐元素索引在 dev 构建(opt-0)是热点；
     //    算术保持逐位一致(黄金向量/双后端对拍依赖确定性),仅改寻址方式。
     let side = img_size as usize;
     let mut tensor = Array4::<f32>::zeros((1, 3, side, side));
@@ -610,8 +485,7 @@ pub fn preprocess_image(img: &DynamicImage, profile: &ModelProfile) -> Array4<f3
 
 /// 对预缩放的 `DecodedImage`（RGBA u8 像素）进行轻量预处理。
 ///
-/// 图像预期 `短边 = 224`（如 336×224 或 224×224）。
-/// 执行：CenterCrop(224×224) → RGBA→RGB → /255 → CLIP 归一化 → HWC→CHW。
+/// 图像预期已按 profile 缩放；执行中心裁剪至 `profile.image_size`、归一化与 CHW 转换。
 pub fn preprocess_decoded(decoded: &DecodedImage, profile: &ModelProfile) -> Array4<f32> {
     let (mean, std) = (profile.mean, profile.std);
     let (w, h) = (decoded.width as usize, decoded.height as usize);
@@ -623,7 +497,7 @@ pub fn preprocess_decoded(decoded: &DecodedImage, profile: &ModelProfile) -> Arr
 
     let mut tensor = Array4::<f32>::zeros((1, 3, crop_size, crop_size));
     {
-        // 平坦 slice 写(T18.5,同 preprocess_image):仅改寻址,算术逐位不变;
+        // 平坦 slice 写：与 preprocess_image 使用相同寻址，算术逐位不变；
         // 越界像素保持 0.0(与原实现的防御语义一致)。
         let dst = tensor.as_slice_mut().expect("零初始化张量必为标准布局");
         let px = &decoded.pixels;
@@ -657,8 +531,7 @@ pub struct ClipTokenizer {
 impl ClipTokenizer {
     /// 按 `ModelProfile` 描述从模型目录加载分词器。
     ///
-    /// 目前仅支持 BERT WordPiece（cn-clip 系列）；异构分词器（BPE/SentencePiece）留第二阶段
-    /// —— 届时新增的 `TokenizerKind` 变体会让下方 `match` 非穷尽编译报错，强制补全实现。
+    /// 支持 profile 声明的 BERT WordPiece 分词器。
     pub fn from_profile(models_dir: &Path, profile: &ModelProfile) -> Result<Self> {
         use tokenizers::models::wordpiece::WordPiece;
         use tokenizers::normalizers::bert::BertNormalizer;
@@ -858,6 +731,18 @@ fn maybe_normalize(v: Vec<f32>, profile: &ModelProfile) -> Vec<f32> {
     }
 }
 
-// 纯字节序/归一化工具已外移至 crate::embedding(T16 准备:不在 inference 门内,
-// host 删 ort 后仍可用);此处原位再导出保持既有 `clip::*` 引用路径不变。
+// 嵌入向量工具来自无需 inference feature 的 crate::embedding；在此再导出供调用方使用。
 pub use crate::embedding::{bytes_to_embedding, embedding_to_bytes, l2_normalize};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_rows_preserve_chunk_and_tail_values() {
+        let mut batch =
+            Some(Array4::from_shape_vec((3, 1, 1, 2), vec![1., 2., 3., 4., 5., 6.]).unwrap());
+        assert_eq!(image_row_data(&mut batch, 0, 2, 2), vec![1., 2., 3., 4.]);
+        assert_eq!(image_row_data(&mut batch, 2, 3, 2), vec![5., 6., 5., 6.]);
+    }
+}

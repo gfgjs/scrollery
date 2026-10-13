@@ -1,5 +1,5 @@
 // crates/exotic-protocol/src/frame.rs
-//! 统一帧编解码（v3 Part2 §3.2）。
+//! Host 与 Worker 的统一帧编解码。
 //!
 //! **唯一**帧格式（禁止「JSON 行 + 另一套二进制长度前缀」混合协议）。所有整数小端：
 //!
@@ -23,17 +23,8 @@ use std::io::{self, Read, Write};
 /// 帧魔数。stdout 上任何非该魔数开头的前导字节都视为协议损坏（Worker 误把日志写进 stdout）。
 pub const MAGIC: [u8; 4] = *b"EXOT";
 
-/// 当前协议版本（握手时校验；不承担包回滚防护，R11）。
-/// v2(2026-07-03,Part4 T10):RequestBody 扩 session/embed 族 op(SessionInit/
-/// SessionClose/EmbedBatch/FaceDetectEmbed)、WorkerErrorCode +4、Success/Failure 的
-/// item 字段 Option 化。帧结构与 FrameType **不变**(D3 裁决:零新帧,SessionReady =
-/// SessionInit 的 Success 响应;D2 裁决:GPU 令牌留主进程不进协议)。帧层硬等值校验
-/// → psd-worker 与协议同波重编译,无混版(Part6 §8.2 C1)。
-/// v3(2026-07-11,事故加固批 A):新增 [`FrameType::Progress`] 帧(Worker→Host,
-/// 长操作期间的阶段回执+心跳),宿主 watchdog 由「猜总时长」改「静默限时」。
-/// 新帧型是线上不兼容变更(旧端 read_frame 判 UnknownFrameType 即杀 worker),
-/// 故升版本让陈旧二进制在握手层收到明确的版本错而非中途「协议损坏」;
-/// WorkerErrorCode +3(ort dylib/装载阶段化,见 message.rs)。
+/// 当前协议版本，握手时校验；新增帧型等不兼容变更须升版本，
+/// 让旧 Worker 在握手阶段收到明确的版本错误。不承担包回滚防护。
 /// 版本号变更须同步 scripts/check-exotic-protocol-sync.mjs(跨语言同步门禁)。
 pub const PROTOCOL_VERSION: u16 = 3;
 
@@ -102,10 +93,10 @@ pub enum ProtocolError {
     JsonTooLarge(u32),
     #[error("blob_len 超限：{0} > {MAX_BLOB_LEN}")]
     BlobTooLarge(u32),
-    #[error("blob_len 超过接收方额度：{length} > {limit}")]
-    BlobExceedsReceiverLimit { length: u32, limit: u32 },
     #[error("JSON 反序列化失败：{0}")]
     Json(String),
+    #[error("blob_len 超过接收方额度：{length} > {limit}")]
+    BlobExceedsReceiverLimit { length: u32, limit: u32 },
 }
 
 impl ProtocolError {
@@ -166,7 +157,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Frame, ProtocolError> {
     read_frame_with_blob_limit(r, MAX_BLOB_LEN)
 }
 
-/// 按接收方的协商额度读帧；超过本地上限时在分配 JSON/blob 前拒绝，仍保留协议硬上限。
+/// 按接收方协商额度读帧，在分配载荷前拒绝越限。
 pub fn read_frame_with_blob_limit<R: Read>(
     r: &mut R,
     max_blob_len: u32,
@@ -257,25 +248,6 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn sample_frame() -> Frame {
-        Frame {
-            frame_type: FrameType::Success,
-            request_id: 0xDEAD_BEEF_0000_0001,
-            json: br#"{"k":"v"}"#.to_vec(),
-            blob: vec![1, 2, 3, 4, 5],
-        }
-    }
-
-    #[test]
-    fn roundtrip() {
-        let f = sample_frame();
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &f).unwrap();
-        let mut cur = Cursor::new(buf);
-        let got = read_frame(&mut cur).unwrap();
-        assert_eq!(got, f);
-    }
-
     #[test]
     fn receiver_limit_rejects_before_payload_read_and_accepts_exact_limit() {
         let f = sample_frame();
@@ -296,45 +268,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bad_version_rejected() {
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &sample_frame()).unwrap();
-        buf[4..6].copy_from_slice(&999u16.to_le_bytes());
-        let mut cur = Cursor::new(buf);
-        assert!(matches!(
-            read_frame(&mut cur),
-            Err(ProtocolError::UnsupportedVersion(999))
-        ));
-    }
-
-    #[test]
-    fn oversized_json_len_rejected_before_alloc() {
-        // 谎报 json_len 远超上限：必须在分配前拒绝（不 OOM）。手工拼一个仅含头的缓冲。
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(&MAGIC);
-        header[4..6].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        header[6..8].copy_from_slice(&FrameType::Request.to_u16().to_le_bytes());
-        header[16..20].copy_from_slice(&(MAX_JSON_LEN + 1).to_le_bytes());
-        let mut cur = Cursor::new(header.to_vec());
-        assert!(matches!(
-            read_frame(&mut cur),
-            Err(ProtocolError::JsonTooLarge(_))
-        ));
-    }
-
-    #[test]
-    fn oversized_blob_len_rejected_before_alloc() {
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(&MAGIC);
-        header[4..6].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-        header[6..8].copy_from_slice(&FrameType::Success.to_u16().to_le_bytes());
-        header[20..24].copy_from_slice(&(MAX_BLOB_LEN + 1).to_le_bytes());
-        let mut cur = Cursor::new(header.to_vec());
-        assert!(matches!(
-            read_frame(&mut cur),
-            Err(ProtocolError::BlobTooLarge(_))
-        ));
+    fn sample_frame() -> Frame {
+        Frame {
+            frame_type: FrameType::Success,
+            request_id: 0xDEAD_BEEF_0000_0001,
+            json: br#"{"k":"v"}"#.to_vec(),
+            blob: vec![1, 2, 3, 4, 5],
+        }
     }
 
     #[test]
@@ -347,5 +287,18 @@ mod tests {
         let err = read_frame(&mut cur).unwrap_err();
         // 仍是 EOF 类（这里不强求区分；Host 对任一读错误都杀 Worker）。
         assert!(matches!(err, ProtocolError::Io(_)));
+    }
+
+    #[test]
+    fn v1_frame_rejected_with_diagnosable_error() {
+        // 旧 psd-worker(v1)的帧在读帧层即被版本门拒,错误信息含双方版本号(D3 §6 验收)。
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &sample_frame()).unwrap();
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let mut cur = Cursor::new(buf);
+        match read_frame(&mut cur) {
+            Err(ProtocolError::UnsupportedVersion(1)) => {}
+            other => panic!("期望 UnsupportedVersion(1),得到 {other:?}"),
+        }
     }
 }

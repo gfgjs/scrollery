@@ -1,12 +1,10 @@
 // src/composables/useFolderTreeDragDrop.ts
-// 目录 + 文件两路指针拖拽、共用的 ghost/边缘自动滚动/落点高亮——从 FoldersSection.vue 域 16、
-// 17、18(以及域 15 的 canDropOnId/recomputeDrop)迁出(见
-// docs/planning/2026-07-25-超长文件拆分方案/analysis/FoldersSection-vue.md §2.1)。
+// 目录 + 文件两路指针拖拽、共用的 ghost/边缘自动滚动/落点高亮。
 //
-// §3 风险④(不变量):autoScrollRaf/autoScrollDir/autoScrollRecompute/lastDragPoint 四个状态
+// 不变量:autoScrollRaf/autoScrollDir/autoScrollRecompute/lastDragPoint 四个状态
 // 必须整体留在本 composable 内(不可再切分目录拖拽与文件拖拽到两个文件),否则两路拖拽会各自
 // 起一个 rAF 循环,失去「贴边滚动全局单飞」的不变量;本 composable 自己注册
-// onBeforeUnmount(stopAutoScroll),避免卸载时残留悬空 rAF(T1-c)。
+// onBeforeUnmount(stopAutoScroll),避免卸载时残留悬空 rAF。
 import { ref, onBeforeUnmount, type ComputedRef, type ShallowRef } from 'vue'
 import { beginPointerDrag, DRAG_THRESHOLD } from './usePointerDrag'
 import {
@@ -200,7 +198,9 @@ export function useFolderTreeDragDrop(deps: FolderTreeDragDropDeps) {
       }
     } catch (err) {
       const e = err as { code?: string; message?: string } | null | undefined
-      if (e && e.code === 'DirectoryExists') {
+      if (copy && e?.code === 'Cancelled') {
+        toast.addToast('info', t('history.copyCancelled'))
+      } else if (e && e.code === 'DirectoryExists') {
         toast.addToast('error', t('sidebar.dirExistsNoMerge', { name: e.message }))
       } else {
         toast.addToast('error', t('sidebar.opFailed', { error: e?.message ?? err }))
