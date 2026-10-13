@@ -19,9 +19,9 @@ Application version at generation time: 0.1.0
 
 | License (as declared) | Packages |
 | --- | ---: |
-| MIT | 249 |
-| MIT OR Apache-2.0 | 216 |
-| Apache-2.0 OR MIT | 33 |
+| MIT | 250 |
+| MIT OR Apache-2.0 | 215 |
+| Apache-2.0 OR MIT | 32 |
 | MIT/Apache-2.0 | 27 |
 | Unicode-3.0 | 18 |
 | Apache-2.0 | 16 |
@@ -61,7 +61,7 @@ Application version at generation time: 0.1.0
 | Unlicense | 1 |
 | Zlib | 1 |
 
-## Rust crates (460) — desktop application and workers
+## Rust crates (459) — desktop application and workers
 
 Dependency closure (normal deps) of the shipped binaries `scrollery`,
 `ai-worker` and `psd-worker`, resolved for `x86_64-pc-windows-msvc`.
@@ -402,7 +402,6 @@ Dependency closure (normal deps) of the shipped binaries `scrollery`,
 | [tauri-plugin-os](https://crates.io/crates/tauri-plugin-os) | 2.3.2 | Apache-2.0 OR MIT |
 | [tauri-plugin-shell](https://crates.io/crates/tauri-plugin-shell) | 2.3.5 | Apache-2.0 OR MIT |
 | [tauri-plugin-updater](https://crates.io/crates/tauri-plugin-updater) | 2.10.1 | Apache-2.0 OR MIT |
-| [tauri-plugin-window-state](https://crates.io/crates/tauri-plugin-window-state) | 2.4.1 | Apache-2.0 OR MIT |
 | [tauri-runtime](https://crates.io/crates/tauri-runtime) | 2.11.3 | Apache-2.0 OR MIT |
 | [tauri-runtime-wry](https://crates.io/crates/tauri-runtime-wry) | 2.11.4 | Apache-2.0 OR MIT |
 | [tauri-utils](https://crates.io/crates/tauri-utils) | 2.9.3 | Apache-2.0 OR MIT |
@@ -586,7 +585,6 @@ Production dependency closure from `package-lock.json`, plus explicitly shipped 
 | [@tauri-apps/plugin-dialog](https://www.npmjs.com/package/@tauri-apps/plugin-dialog) | 2.7.1 | MIT OR Apache-2.0 |  |
 | [@tauri-apps/plugin-os](https://www.npmjs.com/package/@tauri-apps/plugin-os) | 2.3.2 | MIT OR Apache-2.0 |  |
 | [@tauri-apps/plugin-shell](https://www.npmjs.com/package/@tauri-apps/plugin-shell) | 2.3.5 | MIT OR Apache-2.0 |  |
-| [@tauri-apps/plugin-window-state](https://www.npmjs.com/package/@tauri-apps/plugin-window-state) | 2.4.1 | MIT OR Apache-2.0 |  |
 | [@types/debug](https://www.npmjs.com/package/@types/debug) | 4.1.13 | MIT |  |
 | [@types/hast](https://www.npmjs.com/package/@types/hast) | 3.0.4 | MIT |  |
 | [@types/katex](https://www.npmjs.com/package/@types/katex) | 0.16.8 | MIT |  |
@@ -634,6 +632,7 @@ Production dependency closure from `package-lock.json`, plus explicitly shipped 
 | [is-what](https://www.npmjs.com/package/is-what) | 5.5.0 | MIT |  |
 | [katex](https://www.npmjs.com/package/katex) | 0.16.47 | MIT |  |
 | [magic-string](https://www.npmjs.com/package/magic-string) | 0.30.21 | MIT |  |
+| [marked](https://www.npmjs.com/package/marked) | 18.0.13 | MIT |  |
 | [mdast-util-to-hast](https://www.npmjs.com/package/mdast-util-to-hast) | 13.2.1 | MIT |  |
 | [micromark](https://www.npmjs.com/package/micromark) | 4.0.2 | MIT |  |
 | [micromark-core-commonmark](https://www.npmjs.com/package/micromark-core-commonmark) | 2.0.3 | MIT |  |

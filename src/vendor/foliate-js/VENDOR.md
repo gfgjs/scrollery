@@ -58,7 +58,7 @@ Foliate **GTK app** / Vivliostyle / KOReader —— 它们是 (A)GPL 族;而 **f
   sibling `view.d.ts`(仅声明 Scrollery 消费面)提供。升级若改动 view.js 公开面,同步更新
   `view.d.ts`。
 - **许可登记**:vendored 源不在 `package-lock.json`,`scripts/generate-notice.mjs` 收录不到 →
-  该脚本已内置 `VENDORED_FRONTEND` 手工登记表(含本条目),NOTICE.md 的「Vendored source」
+  该脚本已内置 `VENDORED_FRONTEND` 手工登记表(含本条目),docs/legal/NOTICE.md 的「Vendored source」
   小节由此生成,`--check` 门控覆盖。**升级改版本/commit 时须同步该表**。
 
 ## 升级流程
@@ -68,5 +68,5 @@ Foliate **GTK app** / Vivliostyle / KOReader —— 它们是 (A)GPL 族;而 **f
 3. 重做 `pdf.js` stub(整体替换)。
 4. 若上游改了 `view.js` / `epub.js` 公开面,同步 `view.d.ts` 与 BookReader 消费点。
 5. 更新本文件的「钉定 commit」+ `scripts/generate-notice.mjs` 的 `VENDORED_FRONTEND` 版本;
-   跑 `node scripts/generate-notice.mjs` 重生成 NOTICE.md。
+   跑 `node scripts/generate-notice.mjs` 重生成 docs/legal/NOTICE.md。
 6. `npm run build` + `npm run typecheck` 过;GUI 真机跑方案 §9 epub 清单(升级回归硬门)。

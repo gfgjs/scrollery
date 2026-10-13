@@ -23,7 +23,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 # 第一方许可（2026-09-14 决议）：主程序第一方源码统一 AGPL-3.0-only，不附链接例外；商业授权单独签署、
-# 经明确授权后生效，不改变任何人依 AGPL 取得的权利（见 COMMERCIAL.md）。未来独立商业组件另定、不预承诺。
+# 经明确授权后生效，不改变任何人依 AGPL 取得的权利（见 docs/legal/COMMERCIAL.md）。未来独立商业组件另定、不预承诺。
 # 各 member 经 `license.workspace = true` 继承；独立 workspace(raw-worker/raw-probe)各自声明。
 license = "AGPL-3.0-only"
 

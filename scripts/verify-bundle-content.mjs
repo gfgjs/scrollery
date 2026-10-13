@@ -44,11 +44,11 @@ const REQUIRED_PAYLOAD = [
 // AGPL-3.0-only 要求随包提供许可证全文与对应源码入口(§4/§6)。
 // 以下清单同时承载第三方归属与项目商业授权说明；商业授权说明是本项目额外的交付要求。
 const REQUIRED_LEGAL_RESOURCES = [
-  ['../LICENSE', 'LICENSE'],
-  ['../NOTICE.md', 'NOTICE.md'],
-  ['../SOURCE.md', 'SOURCE.md'],
-  ['../COMMERCIAL.md', 'COMMERCIAL.md'],
-  ['../ADDITIONAL-PERMISSION.md', 'ADDITIONAL-PERMISSION.md'],
+  ['../docs/legal/LICENSE', 'LICENSE'],
+  ['../docs/legal/NOTICE.md', 'NOTICE.md'],
+  ['../docs/legal/SOURCE.md', 'SOURCE.md'],
+  ['../docs/legal/COMMERCIAL.md', 'COMMERCIAL.md'],
+  ['../docs/legal/ADDITIONAL-PERMISSION.md', 'ADDITIONAL-PERMISSION.md'],
   ['../target/legal', 'legal'],
 ];
 
@@ -363,11 +363,11 @@ function main() {
         }
         const legalTree = legalSourceFiles(ROOT);
         const legalSources = [
-          { name: 'license', source: path.join(ROOT, 'LICENSE') },
-          { name: 'notice.md', source: path.join(ROOT, 'NOTICE.md') },
-          { name: 'source.md', source: path.join(ROOT, 'SOURCE.md') },
-          { name: 'commercial.md', source: path.join(ROOT, 'COMMERCIAL.md') },
-          { name: 'additional-permission.md', source: path.join(ROOT, 'ADDITIONAL-PERMISSION.md') },
+          { name: 'license', source: path.join(ROOT, 'docs', 'legal', 'LICENSE') },
+          { name: 'notice.md', source: path.join(ROOT, 'docs', 'legal', 'NOTICE.md') },
+          { name: 'source.md', source: path.join(ROOT, 'docs', 'legal', 'SOURCE.md') },
+          { name: 'commercial.md', source: path.join(ROOT, 'docs', 'legal', 'COMMERCIAL.md') },
+          { name: 'additional-permission.md', source: path.join(ROOT, 'docs', 'legal', 'ADDITIONAL-PERMISSION.md') },
           ...legalTree.map((name) => ({ name, source: path.join(ROOT, 'target', name) })),
         ].map(({ name, source }) => ({ name, size: statSync(source).size }));
         const legalNameMissing = isMsi ? [] : checkLegalEntries(names, legalSources.map(({ name }) => name));

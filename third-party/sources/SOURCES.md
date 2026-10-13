@@ -1,6 +1,6 @@
 # Third-party source packages
 
-本目录归档随安装包分发的第三方编译件所对应的**上游源码包**，用于履行 `ADDITIONAL-PERMISSION.md`
+本目录归档随安装包分发的第三方编译件所对应的**上游源码包**，用于履行 [附加许可](../../docs/legal/ADDITIONAL-PERMISSION.md)
 中 Graphviz / Viz.js 源码与构建脚本的提供义务，以及 Expat 的义务。构建流程不读取也不解压这些
 文件；包内版本已核实，无需联网重取。SHA256 为文件级固定值。
 

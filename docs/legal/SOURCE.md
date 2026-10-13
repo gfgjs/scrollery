@@ -13,7 +13,7 @@ as part of the Corresponding Source, as that permission requires. Their original
 licenses remain applicable.
 
 The Graphviz, Viz.js and Expat source archives and the Viz.js build instructions
-are included in [`third-party/sources/`](third-party/sources/SOURCES.md) in the
+are included in [`third-party/sources/`](../../third-party/sources/SOURCES.md) in the
 source repository. Use the copies from the same revision as the build.
 
 ## Where to get the corresponding source

@@ -19,9 +19,7 @@ Scrollery 是一款本地优先的桌面媒体资产管理器，用于整理、�
 
 ## 预览版
 
-截至 2026-10-03，[GitHub Releases](https://github.com/gfgjs/scrollery/releases) 尚未发布安装包。目前可以从源码构建，开发与打包以 Windows x64 为主；macOS、iOS 和 Android 尚未提供可下载版本。
-
-预览期间，官方预览版免费。官方稳定版计划一次性付费，价格、升级范围和过渡安排将在发布前公布。详细安排见[商业计划](COMMERCIAL.md)。
+开发与打包以 Windows x64 为主，安装包发布情况见 [GitHub Releases](https://github.com/gfgjs/scrollery/releases)；也可以从源码构建。macOS 尚未测试。
 
 使用时还有这些限制：
 
@@ -44,12 +42,12 @@ npm run tauri dev
 
 遇到问题或有功能建议，可以提交 [Issue](https://github.com/gfgjs/scrollery/issues)。报告问题时，请附上系统与应用版本、复现步骤和相关日志。
 
-欢迎改进代码和文档。提交 Pull Request 前请阅读[贡献指南](CONTRIBUTING.md)；合入贡献前需要签署 [CLA](CLA.md)。
+欢迎改进代码和文档。提交 Pull Request 前请阅读[贡献指南](docs/development.md#contributing)；合入贡献前需要签署 [CLA](docs/legal/CLA.md)。
 
 ## 许可
 
-第一方源码采用 [AGPL-3.0-only](LICENSE)，可按该许可使用、修改、分发和商用。源码的商业使用无需另购商业授权。Graphviz / Viz.js 组合适用[限定附加许可](ADDITIONAL-PERMISSION.md)，第三方组件许可见 [NOTICE](NOTICE.md)。
+第一方源码采用 [AGPL-3.0-only](docs/legal/LICENSE)，可按该许可使用、修改、分发和商用。源码的商业使用无需另购商业授权。Graphviz / Viz.js 组合适用[限定附加许可](docs/legal/ADDITIONAL-PERMISSION.md)，第三方组件许可见 [NOTICE](docs/legal/NOTICE.md)。
 
-Scrollery 的名称、Logo 和图标受[商标规则](TRADEMARK.md)约束；非官方发行需使用自己的品牌。
+Scrollery 的名称、Logo 和图标受[商标规则](docs/legal/TRADEMARK.md)约束；非官方发行需使用自己的品牌。
 
 Copyright 2026 The Scrollery Authors.

@@ -30,4 +30,4 @@ node scripts/bench/thumbnail-baseline-selftest.mjs
 
 自检从 PowerShell AST 加载生产函数和采样循环，使用合成记录验证过滤、身份、聚合和 CSV；另启动一个本次自有、隐藏的空闲 PowerShell 子进程核验真实 CIM 父子关系，结束时清理该进程。它不运行应用、native worker 或真实基准。合成 CSV/JSON 留在 `target/T5/selftest-<随机标识>/`。
 
-六个具名字面量 `testCase` 使用现有测试预算收集规则，计入 `script` 池共 **6 项**；不能仅按一个启动命令计为 1 项。逐项理由见本轮 [T5 验证证据](../../docs/tasks/2026-10-11-continuous-improvement/references/T5/result.md)。
+六个具名字面量 `testCase` 使用现有测试预算收集规则，计入 `script` 池共 **6 项**；不能仅按一个启动命令计为 1 项。逐项理由见本轮 [T5 验证证据](../../docs/tasks/2026-10-11-持续改进实施/references/T5/result.md)。

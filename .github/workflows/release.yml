@@ -1,6 +1,6 @@
 # 公开仓免费版发布：v* tag 创建 release，手动触发上传验收工件。
 # 仓库守卫限制公开仓执行；本工作流不使用签名凭据。
-# 发布说明取自 CHANGELOG.md 对应版本小节，缺失时中止发布。
+# 发布说明取自 docs/CHANGELOG.md 对应版本小节，缺失时中止发布。
 name: OSS Release
 
 on:
