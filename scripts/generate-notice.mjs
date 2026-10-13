@@ -12,7 +12,7 @@
 //           手工登记表补上——新增/升级 vendored 源时须同步该表(见对应 VENDOR.md)。
 //
 // 产物:
-//   NOTICE.md(仓库根,tracked)——归属清单；由 lockfile 与下方手工登记表生成,无时间戳,
+//   docs/legal/NOTICE.md(tracked)——归属清单；由 lockfile 与下方手工登记表生成,无时间戳,
 //     重复生成逐字节稳定(--check 的前提)。
 //   target/sbom/scrollery.cdx.json(untracked)——CycloneDX SBOM，发布时作为工件附带。
 //
@@ -409,7 +409,7 @@ const lock = JSON.parse(fs.readFileSync(path.join(repo, 'package-lock.json'), 'u
 const rustDeps = collectRust();
 const npmDeps = collectNpmFromLock(lock);
 const notice = renderNotice(rustDeps, npmDeps, appVersion);
-const noticePath = path.join(repo, 'NOTICE.md');
+const noticePath = path.join(repo, 'docs', 'legal', 'NOTICE.md');
 
 const strongCount = [...rustDeps, ...npmDeps, ...VENDORED_FRONTEND, ...SHIPPED_RUNTIME_COMPONENTS].filter(
   (d) => flagLicense(normalizeSpdx(d.license)) === 'strong'

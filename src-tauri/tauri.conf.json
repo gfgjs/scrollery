@@ -46,11 +46,11 @@
       "binaries/DirectML.dll": "DirectML.dll",
       "binaries/dxcompiler.dll": "dxcompiler.dll",
       "binaries/dxil.dll": "dxil.dll",
-      "../LICENSE": "LICENSE",
-      "../NOTICE.md": "NOTICE.md",
-      "../SOURCE.md": "SOURCE.md",
-      "../COMMERCIAL.md": "COMMERCIAL.md",
-      "../ADDITIONAL-PERMISSION.md": "ADDITIONAL-PERMISSION.md",
+      "../docs/legal/LICENSE": "LICENSE",
+      "../docs/legal/NOTICE.md": "NOTICE.md",
+      "../docs/legal/SOURCE.md": "SOURCE.md",
+      "../docs/legal/COMMERCIAL.md": "COMMERCIAL.md",
+      "../docs/legal/ADDITIONAL-PERMISSION.md": "ADDITIONAL-PERMISSION.md",
       "../target/legal": "legal"
     },
     "icon": [

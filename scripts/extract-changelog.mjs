@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 提取 CHANGELOG.md 中指定版本小节，供公开版发布说明使用。
+// 提取 docs/CHANGELOG.md 中指定版本小节，供公开版发布说明使用。
 // 用法:node scripts/extract-changelog.mjs <version> [changelog-path]
 //   <version> 不带 v 前缀(如 0.1.0);正文写 stdout。
 // 缺小节 / 小节为空 → exit 1(发布失败):公开仓历史是 squash 同步提交,发布说明
@@ -7,7 +7,7 @@
 
 import { readFileSync } from 'node:fs';
 
-const [version, file = 'CHANGELOG.md'] = process.argv.slice(2);
+const [version, file = 'docs/CHANGELOG.md'] = process.argv.slice(2);
 if (!version) {
   console.error('用法:node scripts/extract-changelog.mjs <version> [changelog-path]');
   process.exit(2);

@@ -433,6 +433,10 @@ fn db_failure_after_publish_returns_recoverable_state_and_retries_idempotently()
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].stage, q::STAGE_PUBLISHED);
         assert_eq!(pending[0].id, recovery_id);
+        assert!(
+            pending[0].payload_digest.is_none(),
+            "同卷 rename 无复制凭据"
+        );
         assert_eq!(
             dir_row(&conn, 10).2,
             "Photos/Move",
@@ -448,8 +452,11 @@ fn db_failure_after_publish_returns_recoverable_state_and_retries_idempotently()
     let report = retry_entry(f.db(), &f.cache_dir(), recovery_id)
         .unwrap()
         .expect("日志行仍在");
-    let report = complete_platform_cleanup(&f, &plan, recovery_id, report);
+    // 两个扫描根位于同一临时卷，rename 已移除源；各平台均应直接收尾。
+    // 跨卷复制的源残留才需要 complete_platform_cleanup 的 Unix 手动清理。
     assert!(!report.needs_retry, "重试后不应仍需重试: {report:?}");
+    assert_eq!(report.detail, "completed");
+    assert!(!plan.src_abs.exists(), "重试不得重建已搬走的源目录");
     {
         let conn = f.conn();
         assert!(

@@ -2,6 +2,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
+[Development and contributing](docs/development.md) · [Changelog](docs/CHANGELOG.md)
+
 **A local-first, high-performance media asset manager built for large personal libraries.**
 
 Scrollery is a local-first desktop application for organizing, browsing, and finding media in large personal libraries. Its architecture is designed around responsive gallery browsing, background processing, and predictable performance as a library grows from thousands to hundreds of thousands of items.
@@ -15,9 +17,9 @@ We want the transition from preview to a stable release to be clear from the beg
 
 - Official preview builds are free during the Public Preview period.
 - The official stable distribution is planned as a **paid, one-time purchase**. Pricing, upgrade coverage, and transition details will be announced before the stable release.
-- The application source code — desktop frontend, Rust host, bundled workers, and the feature activation implementation — is published under the [GNU Affero General Public License, version 3 only](LICENSE) (AGPL-3.0-only), including the right to build it independently and to use it commercially.
-- A [limited additional permission](ADDITIONAL-PERMISSION.md) permits the bundled Graphviz 2.40.1 / Viz.js 2.1.2 combination. Third-party licenses and the source-provision requirements remain applicable.
-- The planned [commercial offerings](COMMERCIAL.md) are separate from the AGPL release: a one-time purchase of the official stable release under an end-user commercial license, and a negotiated license for enterprise / OEM use that the AGPL does not fit. Ordinary commercial use of the AGPL-licensed source requires neither.
+- The application source code — desktop frontend, Rust host, bundled workers, and the feature activation implementation — is published under the [GNU Affero General Public License, version 3 only](docs/legal/LICENSE) (AGPL-3.0-only), including the right to build it independently and to use it commercially.
+- A [limited additional permission](docs/legal/ADDITIONAL-PERMISSION.md) permits the bundled Graphviz 2.40.1 / Viz.js 2.1.2 combination. Third-party licenses and the source-provision requirements remain applicable.
+- The planned [commercial offerings](docs/legal/COMMERCIAL.md) are separate from the AGPL release: a one-time purchase of the official stable release under an end-user commercial license, and a negotiated license for enterprise / OEM use that the AGPL does not fit. Ordinary commercial use of the AGPL-licensed source requires neither.
 - Future independent commercial components are planned to be licensed separately; **no open-source commitment is made for them in advance**.
 - Paid offerings are planned to provide the official signed installers, managed updates, selected professional components, and official support. Building from source gives you the code in the tree; it does not include purchase entitlements or the official services.
 - Online or hosted services, if introduced in the future, may be offered separately. The planned NAS server and web components have not been built yet; if a future version supports remote network interaction and AGPL section 13 applies to it, its operator must offer those users the Corresponding Source of the modified version running.
@@ -92,7 +94,7 @@ Builds produced from this repository are community/self-built distributions. The
 
 In Features & Plugins, advanced image editing, OCR, image enhancement, and the PSD engine each have an **Activate for free** button. One click saves a local state without a license key or online verification. Each feature activates independently; restarts, plugin uninstallation, and settings resets preserve the records. RAW decoding and video format extensions remain free.
 
-Plugin installation, platform support, and model preparation are shown separately. Enhancement release models are still missing. Focused source tests and browser-harness interaction checks cover activation; native multi-window events and a new installer have not been verified. Commercial plans are described in [COMMERCIAL.md](COMMERCIAL.md).
+Plugin installation, platform support, and model preparation are shown separately. Enhancement release models are still missing. Focused source tests and browser-harness interaction checks cover activation; native multi-window events and a new installer have not been verified. Commercial plans are described in [COMMERCIAL.md](docs/legal/COMMERCIAL.md).
 
 ## Repository layout
 
@@ -114,7 +116,7 @@ src-tauri/src/
 
 ## Contributing
 
-Bug reports, focused proposals, documentation improvements, and code contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Contributions require the project [CLA](CLA.md).
+Bug reports, focused proposals, documentation improvements, and code contributions are welcome. Please read the [contribution guide](docs/development.md#contributing) before opening a pull request. Contributions require the project [CLA](docs/legal/CLA.md).
 
 Security-sensitive issues should not be disclosed in a public issue; follow the repository's security-reporting instructions when available.
 
@@ -122,6 +124,6 @@ Security-sensitive issues should not be disclosed in a public issue; follow the 
 
 Copyright 2026 The Scrollery Authors.
 
-All first-party source code in this repository is licensed under the [GNU Affero General Public License, version 3 only](LICENSE) (AGPL-3.0-only). Commercial use is permitted under the AGPL and needs no separate license; the planned [commercial offerings](COMMERCIAL.md) — the paid official stable release and negotiated enterprise / OEM licensing — are separate from the AGPL release. Future independent commercial components are planned to be licensed separately, without an open-source commitment in advance. Third-party components keep their own licenses, listed in [NOTICE.md](NOTICE.md), and releases previously published under the Mozilla Public License 2.0 remain available under the terms they were released with.
+All first-party source code in this repository is licensed under the [GNU Affero General Public License, version 3 only](docs/legal/LICENSE) (AGPL-3.0-only). Commercial use is permitted under the AGPL and needs no separate license; the planned [commercial offerings](docs/legal/COMMERCIAL.md) — the paid official stable release and negotiated enterprise / OEM licensing — are separate from the AGPL release. Future independent commercial components are planned to be licensed separately, without an open-source commitment in advance. Third-party components keep their own licenses, listed in [NOTICE.md](docs/legal/NOTICE.md), and releases previously published under the Mozilla Public License 2.0 remain available under the terms they were released with.
 
-The source license does **not** grant permission to use the Scrollery name, logo, or icons for a fork or derived product. Unofficial distributions must use their own branding and must not imply endorsement or official status. See [TRADEMARK.md](TRADEMARK.md).
+The source license does **not** grant permission to use the Scrollery name, logo, or icons for a fork or derived product. Unofficial distributions must use their own branding and must not imply endorsement or official status. See [TRADEMARK.md](docs/legal/TRADEMARK.md).

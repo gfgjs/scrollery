@@ -59,7 +59,7 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
-      # NOTICE 归属清单新鲜度门:lockfile 变更未重生成 NOTICE.md 即红。
+      # NOTICE 归属清单新鲜度门:lockfile 变更未重生成 docs/legal/NOTICE.md 即红。
       # 脚本零依赖(node 内置模块,runner 自带 node);cargo tree 只解析不编译,秒级。
       - name: NOTICE 归属清单新鲜度(generate-notice --check)
         run: node scripts/generate-notice.mjs --check
