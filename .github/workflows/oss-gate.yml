@@ -22,6 +22,12 @@ jobs:
     steps:
       - name: Checkout sync-staging
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检查公开树路径
+        shell: pwsh
+        run: ./scripts/oss-projection-policy.ps1 -Repo . -Ref HEAD -History
 
       # Tauri v2 Linux 前置(webkit2gtk 4.1 等;与私有 ci.yml rust-linux job 同清单)。
       - name: Tauri Linux 系统依赖
